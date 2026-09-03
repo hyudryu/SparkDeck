@@ -23,7 +23,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -405,6 +405,11 @@ class SparkDeckService:
         )
         self._deployment_create_lock = asyncio.Lock()
         self._deployment_reconciliation_lock = asyncio.Lock()
+        # Aliases, deployment ids, and runtime-served model ids share one
+        # public selector namespace.  Renames may await inventory discovery
+        # before persisting, so a per-deployment lifecycle lock cannot prevent
+        # two different records from claiming the same selector concurrently.
+        self._deployment_alias_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -1890,7 +1895,26 @@ class SparkDeckService:
                 raise ValueError(
                     "deployment does not have editable saved launch settings"
                 )
-            return await self._update_saved_deployment(stored, changes)
+            # Saved aliases and future runtime-served model ids occupy the same
+            # public selector namespace as live and discovered deployments.
+            # Serialize the complete read/validate/write operation with create
+            # and rename, and refresh the row after acquiring the lock so a
+            # concurrent saved edit cannot be overwritten from a stale copy.
+            async with self._deployment_alias_lock:
+                current = self.store.deployment(
+                    stored["id"], include_private=True,
+                )
+                if current is None:
+                    raise LookupError("deployment not found")
+                current_settings = current.get("settings") or {}
+                if (
+                    current_settings.get("manager_deployment_id")
+                    or current.get("container_name")
+                ):
+                    raise ValueError(
+                        "deployment does not have editable saved launch settings"
+                    )
+                return await self._update_saved_deployment(current, changes)
 
         allowed = {
             "extra_args", "launch_controls",
@@ -2229,10 +2253,6 @@ class SparkDeckService:
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
-        if alias != stored.get("alias"):
-            existing = self.store.deployment(alias)
-            if existing and existing["id"] != stored["id"]:
-                raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         if "environment" in changes:
@@ -2482,6 +2502,16 @@ class SparkDeckService:
             and len(effective_nodes) < 2
         ):
             raise ValueError("sharded deployment requires at least two nodes")
+        model_repository = str(
+            (stored.get("model") or {}).get("repository") or ""
+        ).strip()
+        await self._assert_deployment_alias_available(
+            alias,
+            stored["id"],
+            reserved_selectors=self._managed_deployment_reserved_selectors(
+                model_repository, settings,
+            ),
+        )
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
                 stored["id"], self._local_configuration(settings), alias,
@@ -2898,9 +2928,24 @@ class SparkDeckService:
         deployment_id = str(uuid.uuid4())
         # A launch can take minutes, but serializing creation is intentional:
         # alias uniqueness must be established before Docker is mutated.
-        async with self._deployment_create_lock:
-            if self.store.deployment(alias):
-                raise ValueError(f"deployment alias '{alias}' is already in use")
+        # Creation and rename both mutate the public selector namespace. Keep a
+        # single lock order (create, then alias) so a long-running create cannot
+        # deadlock with reconciliation and a rename cannot claim the alias while
+        # creation is between its inventory check and durable persistence.
+        async with self._deployment_create_lock, self._deployment_alias_lock:
+            reserved_selectors: list[str] = []
+            if kind is DeploymentKind.MANAGED:
+                # A managed runtime can be selected by its backing repository
+                # as well as any explicit --served-model-name values. Reserve
+                # those future request ids before persisting the bookmark so a
+                # friendly alias on an existing (including discovered)
+                # deployment cannot be silently shadowed when this one starts.
+                reserved_selectors.extend(
+                    self._managed_deployment_reserved_selectors(model, settings)
+                )
+            await self._assert_deployment_alias_available(
+                alias, deployment_id, reserved_selectors=reserved_selectors,
+            )
             artifact_is_local = False
             model_is_local_path = False
             artifact_homes: list[str] | None = None
@@ -3866,17 +3911,206 @@ class SparkDeckService:
                 "settings via the deployment's settings file instead"
             )
         settings = dict(container.get("load_settings") or {})
+        if container.get("direct_start") and settings.get(
+            "_shell_wrapper_unsupported"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command uses an unsupported shell wrapper"
+            )
+        if container.get("direct_start") and settings.get(
+            "_shell_path_expansion"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on shell pathname expansion"
+            )
+        if container.get("direct_start") and settings.get(
+            "_shell_brace_expansion"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash brace expansion"
+            )
+        if container.get("direct_start") and settings.get(
+            "_shell_ansi_c_quoting"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash ANSI-C quoting"
+            )
+        if container.get("direct_start") and settings.get(
+            "_shell_locale_quoting"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash locale-translated quoting"
+            )
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
-        try:
-            tensor_parallel = max(1, int(settings.get("tensor_parallel_size") or 1))
-        except (TypeError, ValueError):
-            tensor_parallel = 1
+        direct_recovery = (
+            self._direct_start_launch_contract(container, runtime, str(
+                settings.get("model") or container.get("model") or ""
+            ))
+            if container.get("direct_start") else None
+        )
+        if container.get("direct_start") and direct_recovery is None:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch topology could not be recovered"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("mounts_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "custom mounts cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("launch_prefix_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "executable prefix cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("environment_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container environment overrides cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("user_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container user override cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("working_dir_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container working directory override cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("gpu_requests_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "GPU device request does not match Manager's all-GPU contract"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("ipc_mode_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "IPC mode does not match Manager's host IPC contract"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("read_only_rootfs_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "read-only root filesystem contract cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("runtime_contract_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "Docker process or security contract cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("resource_constraints_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "Docker resource constraints do not match Manager's launch contract"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("image_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "image reference no longer resolves to the source image"
+            )
+        if direct_recovery is not None:
+            launch_settings, layout = direct_recovery
+            required_nodes = layout["required_node_count"]
+            deployment_mode = layout["deployment_mode"]
+        else:
+            try:
+                tensor_parallel = max(
+                    1, int(settings.get("tensor_parallel_size") or 1),
+                )
+            except (TypeError, ValueError):
+                tensor_parallel = 1
+            required_nodes = tensor_parallel
+            deployment_mode = "sharded" if tensor_parallel > 1 else "single"
+            launch_settings = None
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("node_ids must not contain duplicates")
-        if len(node_ids) != tensor_parallel:
+        if (
+            container.get("direct_start")
+            and not self._direct_start_network_mode_is_replayable(
+                container, len(node_ids),
+            )
+        ):
+            topology = "single-host" if len(node_ids) == 1 else "distributed"
             raise ValueError(
-                f"tensor parallel size {tensor_parallel} requires exactly "
-                f"{tensor_parallel} node(s)"
+                "discovered deployment cannot be promoted safely because its "
+                f"Docker network mode does not match Manager's {topology} "
+                "launch contract"
+            )
+        if (
+            container.get("direct_start")
+            and not self._direct_start_host_options_are_replayable(
+                container, len(node_ids),
+            )
+        ):
+            topology = "single-host" if len(node_ids) == 1 else "distributed"
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                f"Docker device or ulimit settings do not match Manager's "
+                f"{topology} launch contract"
+            )
+        flexible_node_count = (
+            bool(layout.get("flexible_node_count")) if direct_recovery else False
+        )
+        parallel_rank_count = (
+            layout.get("parallel_rank_count") if direct_recovery else None
+        )
+        if flexible_node_count and isinstance(parallel_rank_count, int):
+            if not node_ids or parallel_rank_count % len(node_ids):
+                raise ValueError(
+                    f"{parallel_rank_count} parallel GPU ranks must divide evenly "
+                    "across the selected nodes"
+                )
+            # A one-host parallel launch keeps every rank inside that host.
+            # Multi-host selections use Manager's distributed sharded launch.
+            # Manager preflight validates ranks-per-host against live GPU
+            # telemetry for both vLLM and SGLang.
+            deployment_mode = "single" if len(node_ids) == 1 else "sharded"
+        elif len(node_ids) != required_nodes:
+            if direct_recovery is None:
+                raise ValueError(
+                    f"tensor parallel size {required_nodes} requires exactly "
+                    f"{required_nodes} node(s)"
+                )
+            raise ValueError(
+                f"this deployment requires exactly {required_nodes} node(s)"
             )
         self._reject_sensitive_launch_args(settings.get("extra_args"))
         if settings.get("editable") is False:
@@ -3895,25 +4129,50 @@ class SparkDeckService:
                 "controller-local model paths can only run on the controller node"
             )
 
-        recover = getattr(self.manager, "_recovered_deployment_launch_settings", None)
-        if not callable(recover):
-            raise RuntimeError("discovered deployment cannot be promoted on this controller")
-        launch_settings = recover({
-            "name": deployment.get("alias"),
-            "model": launch_model,
-            "engine": runtime,
-            "mode": "sharded" if tensor_parallel > 1 else "single",
-            "node_ids": list(node_ids),
-            "api_port": container.get("port"),
-        }, container)
+        launch_image = container.get("image")
+        if direct_recovery is not None:
+            pin_image = getattr(
+                self.manager, "pin_container_image_on_nodes", None,
+            )
+            if not callable(pin_image):
+                raise RuntimeError(
+                    "discovered deployment cannot validate its image on selected nodes"
+                )
+            launch_image = await pin_image(
+                str(container.get("name") or ""), str(launch_image or ""), node_ids,
+            )
+
+        if launch_settings is None:
+            recover = getattr(
+                self.manager, "_recovered_deployment_launch_settings", None,
+            )
+            if not callable(recover):
+                raise RuntimeError(
+                    "discovered deployment cannot be promoted on this controller"
+                )
+            launch_settings = recover({
+                "name": deployment.get("alias"),
+                "model": launch_model,
+                "engine": runtime,
+                "mode": deployment_mode,
+                "node_ids": list(node_ids),
+                "api_port": container.get("port"),
+            }, container)
+        if container.get("direct_start") and not self._recovered_launch_is_portable(
+            launch_settings,
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on shell expansion"
+            )
         promotion_record_id = str(uuid.uuid4())
         launch_settings.update({
             "deployment_name": deployment.get("alias"),
             "model": launch_model,
             "engine": runtime,
-            "image": container.get("image"),
+            "image": launch_image,
             "environment": settings.get("environment") or {},
-            "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
+            "deployment_mode": deployment_mode,
             "node_ids": list(node_ids),
             # This stable reverse link identifies a partially-created Manager
             # record if launch or SQLite adoption fails and must be rolled back.
@@ -3959,6 +4218,199 @@ class SparkDeckService:
                 ) from exc
             raise
 
+    def _recovered_launch_is_portable(
+        self, launch_settings: dict[str, Any],
+    ) -> bool:
+        """Whether recovered argv can be replayed by an exec-form container."""
+        checker = getattr(self.manager, "_has_unresolvable_shell_tokens", None)
+        if not callable(checker) or not isinstance(launch_settings, dict):
+            return False
+        extra_args = launch_settings.get("extra_args")
+        if not isinstance(extra_args, list) or any(
+            not isinstance(item, str) for item in extra_args
+        ):
+            return False
+        model = launch_settings.get("model")
+        argv = [str(model), *extra_args] if model not in (None, "") else extra_args
+        environment = launch_settings.get("environment")
+        if environment is None:
+            environment = {}
+        if not isinstance(environment, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            return False
+        index = 0
+        while index < len(extra_args):
+            token = extra_args[index]
+            key, separator, inline = token.partition("=")
+            if key == "--speculative-config":
+                value = inline if separator else (
+                    extra_args[index + 1] if index + 1 < len(extra_args) else ""
+                )
+                match = re.fullmatch(
+                    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value.strip(),
+                )
+                if match is not None and match.group(1) not in environment:
+                    return False
+                if not separator:
+                    index += 1
+            index += 1
+        try:
+            return not checker(argv)
+        except (TypeError, ValueError):
+            return False
+
+    def _direct_start_launch_contract(
+        self, container: dict[str, Any], runtime: str, model: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Recover a direct start and infer its exec-form topology safely."""
+        recover = getattr(
+            self.manager, "_recovered_deployment_launch_settings", None,
+        )
+        contract_fn = getattr(self.manager, "recipe_deployment_contract", None)
+        if not callable(recover) or not callable(contract_fn):
+            return None
+        settings = container.get("load_settings") or {}
+        if (
+            settings.get("_shell_wrapper_unsupported") is True
+            or settings.get("_shell_path_expansion") is True
+            or settings.get("_shell_brace_expansion") is True
+            or settings.get("_shell_ansi_c_quoting") is True
+            or settings.get("_shell_locale_quoting") is True
+        ):
+            return None
+        try:
+            launch_settings = recover({
+                "name": container.get("alias") or container.get("served_model") or model,
+                "model": settings.get("model") or model,
+                "engine": runtime,
+                "mode": "single",
+                "node_ids": [LOCAL_NODE_ID],
+                "api_port": container.get("port"),
+            }, container)
+            if not isinstance(launch_settings, dict):
+                return None
+            contract = contract_fn({
+                **launch_settings,
+                # Direct containers have no persisted SparkDeck topology. Let
+                # Manager infer sharding from the recovered TP/PP argv.
+                "deployment_mode": None,
+                "node_ids": [LOCAL_NODE_ID],
+            })
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(contract, dict) or contract.get("supported") is False:
+            return None
+        mode = contract.get("deployment_mode")
+        required = contract.get("required_node_count")
+        if mode not in {"single", "sharded", "replicated"} or (
+            not isinstance(required, int) or isinstance(required, bool) or required < 1
+        ):
+            return None
+        rank_count = (
+            contract.get("tensor_parallel_size", 1)
+            * contract.get("pipeline_parallel_size", 1)
+        )
+        cli_option = getattr(self.manager, "_cli_option", None)
+        recovered_args = launch_settings.get("extra_args") or []
+        has_explicit_hosts = any(
+            str(token).partition("=")[0] == "--nnodes"
+            for token in recovered_args
+        )
+        raw_explicit_hosts = (
+            cli_option(recovered_args, {"--nnodes"})
+            if callable(cli_option) and has_explicit_hosts else None
+        )
+        try:
+            explicit_hosts = (
+                int(raw_explicit_hosts) if has_explicit_hosts else None
+            )
+        except (TypeError, ValueError):
+            return None
+        if has_explicit_hosts:
+            if (
+                explicit_hosts is None or explicit_hosts < 1
+                or rank_count % explicit_hosts
+            ):
+                return None
+            required = explicit_hosts
+            mode = "single" if explicit_hosts == 1 else "sharded"
+        return launch_settings, {
+            "deployment_mode": mode,
+            "required_node_count": required,
+            "model_revision": _optional_string(contract.get("model_revision")),
+            # Without an explicit --nnodes, direct vLLM and SGLang containers
+            # prove the argv's rank layout but not a SparkDeck host layout.
+            # Accept any divisor whose ranks fit; Manager preflight performs
+            # the authoritative per-host GPU-capacity check.
+            "parallel_rank_count": rank_count,
+            "flexible_node_count": (
+                runtime in {RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value}
+                and rank_count > 1
+                and not has_explicit_hosts
+            ),
+            # Publish only the combined, sanitized capability bits. The
+            # frontend needs these to avoid offering a host count that rank
+            # divisibility permits but Docker network/device replay rejects.
+            "single_host_topology_replayable": (
+                self._direct_start_topology_is_replayable(container, 1)
+            ),
+            "distributed_host_topology_replayable": (
+                self._direct_start_topology_is_replayable(container, 2)
+            ),
+        }
+
+    @staticmethod
+    def _direct_start_network_mode_is_replayable(
+        container: dict[str, Any], node_count: int,
+    ) -> bool:
+        """Match the source network mode to the selected managed topology."""
+        capability = (
+            "single_network_mode_replayable"
+            if node_count == 1
+            else "distributed_network_mode_replayable"
+        )
+        return container.get(capability) is True
+
+    @staticmethod
+    def _direct_start_host_options_are_replayable(
+        container: dict[str, Any], node_count: int,
+    ) -> bool:
+        """Match ulimits and explicit devices to the managed topology."""
+        capability = (
+            "single_host_options_replayable"
+            if node_count == 1
+            else "distributed_host_options_replayable"
+        )
+        return container.get(capability) is True
+
+    @classmethod
+    def _direct_start_topology_is_replayable(
+        cls, container: dict[str, Any], node_count: int,
+    ) -> bool:
+        return (
+            cls._direct_start_network_mode_is_replayable(container, node_count)
+            and cls._direct_start_host_options_are_replayable(container, node_count)
+        )
+
+    @classmethod
+    def _direct_start_has_replayable_network_topology(
+        cls, container: dict[str, Any], layout: dict[str, Any],
+    ) -> bool:
+        """Whether at least one inferred layout preserves Docker topology."""
+        if layout.get("flexible_node_count") is True:
+            return (
+                cls._direct_start_topology_is_replayable(container, 1)
+                or cls._direct_start_topology_is_replayable(container, 2)
+            )
+        required = layout.get("required_node_count")
+        if not isinstance(required, int) or isinstance(required, bool):
+            return False
+        return cls._direct_start_topology_is_replayable(
+            container, required,
+        )
+
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -3996,7 +4448,6 @@ class SparkDeckService:
             has_lifecycle_hook = bool(
                 str(discovered.get("start_command") or "").strip()
                 or str(discovered.get("stop_command") or "").strip()
-                or discovered.get("direct_start")
             )
             if has_lifecycle_hook and not promote:
                 # A hook-backed deployment always starts on the nodes owned by
@@ -4005,17 +4456,19 @@ class SparkDeckService:
                 # Start into a managed-conversion request.
                 node_ids = None
             else:
-                tensor_parallel = deployment.get("settings", {}).get(
-                    "tensor_parallel_size", 1,
-                )
                 try:
-                    required_nodes = max(1, int(tensor_parallel or 1))
+                    required_nodes = max(
+                        1, int(deployment.get("required_node_count") or 1),
+                    )
                 except (TypeError, ValueError):
                     required_nodes = 1
-                if len(node_ids) != required_nodes:
+                if (
+                    not discovered.get("direct_start")
+                    and len(node_ids) != required_nodes
+                ):
                     raise ValueError(
-                        f"tensor parallel size {required_nodes} requires exactly "
-                        f"{required_nodes} node(s)"
+                        f"tensor parallel size {required_nodes} requires "
+                        f"exactly {required_nodes} node(s)"
                     )
                 if promote or required_nodes > 1 or node_ids != ["local"]:
                     return await self._promote_discovered_deployment(
@@ -4438,16 +4891,51 @@ class SparkDeckService:
         await process.wait()
         return bytes(stdout_tail), bytes(stderr_tail)
 
-    def _preparable_deployment_model(
+    async def _preparable_deployment_model(
         self, deployment_id: str,
     ) -> tuple[dict[str, Any], str, str]:
-        """Resolve one managed deployment to its (record, model, revision)."""
+        """Resolve a saved or safely promotable deployment for preparation."""
         deployment = self.store.deployment(deployment_id, include_private=True)
+        direct_recovery: tuple[dict[str, Any], dict[str, Any]] | None = None
+        if deployment is None and deployment_id.startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            runtime = self._container_runtime(container)
+            deployment = self._discovered_deployment(
+                container,
+                runtime,
+                container.get("model") or container.get("served_model"),
+            )
+            if not (
+                deployment.get("direct_start")
+                and deployment.get("promotable") is True
+            ):
+                raise ValueError(
+                    "discovered deployment cannot prepare weights before promotion"
+                )
+            load_settings = container.get("load_settings") or {}
+            direct_recovery = self._direct_start_launch_contract(
+                container,
+                runtime,
+                str(
+                    load_settings.get("model") or container.get("model")
+                    or container.get("served_model") or ""
+                ),
+            )
+            if direct_recovery is None:
+                raise ValueError(
+                    "discovered deployment launch identity could not be recovered"
+                )
         if deployment is None:
             raise LookupError("deployment not found")
-        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+        if (
+            deployment.get("kind") != DeploymentKind.MANAGED.value
+            and not deployment_id.startswith("container:")
+        ):
             raise ValueError("external endpoints do not use cached model weights")
-        model = str((deployment.get("model") or {}).get("repository") or "")
+        model = str(
+            (direct_recovery[0].get("model") if direct_recovery else None)
+            or (deployment.get("model") or {}).get("repository") or ""
+        )
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         if resolve_local and resolve_local(model):
             raise ValueError(
@@ -4456,7 +4944,14 @@ class SparkDeckService:
         if not model:
             raise ValueError("deployment does not reference a Hugging Face model")
         revision = (
-            _optional_string((deployment.get("model") or {}).get("revision"))
+            _optional_string(
+                direct_recovery[1].get("model_revision")
+                if direct_recovery else None
+            )
+            or _optional_string(deployment.get("model_revision"))
+            or _optional_string(
+                (deployment.get("model") or {}).get("revision")
+            )
             or "main"
         )
         return deployment, model, revision
@@ -4721,8 +5216,10 @@ class SparkDeckService:
     async def deployment_preparation_preflight(
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
-        """Plan per-node weight preparation for a saved deployment."""
-        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        """Plan per-node weight preparation for a saved or promoted launch."""
+        deployment, model, revision = await self._preparable_deployment_model(
+            deployment_id,
+        )
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
@@ -4734,8 +5231,10 @@ class SparkDeckService:
         self, deployment_id: str, node_ids: list[str],
         download_node_id: str | None = None,
     ) -> dict[str, Any]:
-        """Queue Virtual NAS weight preparation for a saved deployment."""
-        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        """Queue Virtual NAS preparation for a saved or promoted launch."""
+        deployment, model, revision = await self._preparable_deployment_model(
+            deployment_id,
+        )
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             result = await self._prepare_llama_files(
@@ -5286,24 +5785,97 @@ class SparkDeckService:
                 result.update(self._saved_layout_contract(settings, clone.runtime.value))
             return result
 
+    def _managed_deployment_reserved_selectors(
+        self, model: str, settings: dict[str, Any],
+    ) -> list[str]:
+        """Return the selectors a saved managed launch will publish."""
+        selectors = [model] if model else []
+        resolver = getattr(self.manager, "_deployment_served_models", None)
+        if callable(resolver):
+            selectors.extend(resolver({
+                "model": model,
+                "launch_settings": {**settings, "model": model},
+            }))
+        return selectors
+
+    async def _assert_deployment_alias_available(
+        self, alias: str, deployment_id: str, *,
+        reserved_selectors: Iterable[str] = (),
+    ) -> None:
+        requested: list[tuple[str, str]] = [(alias, "alias")]
+        seen = {alias.casefold()}
+        for raw_selector in reserved_selectors:
+            selector = str(raw_selector).strip()
+            folded = selector.casefold()
+            if not selector or folded in seen:
+                continue
+            seen.add(folded)
+            requested.append((selector, "selector"))
+        for item in await self.deployments():
+            if str(item.get("id") or "") == deployment_id:
+                continue
+            public_ids = self._deployment_public_model_ids(item)
+            if item.get("status") == "saved":
+                repository = str(
+                    (item.get("model") or {}).get("repository") or ""
+                ).strip()
+                if repository:
+                    public_ids.append(repository)
+            identity_occupied = {
+                str(item.get("id") or "").casefold(),
+                str(item.get("alias") or "").casefold(),
+            }
+            occupied = {
+                *identity_occupied,
+                *(str(value).casefold() for value in public_ids),
+            }
+            for selector, label in requested:
+                # Multiple saved launch profiles may intentionally target the
+                # same repository (for example TP2 and TP4). Only the display
+                # alias must be unique across the full public namespace. A
+                # prospective served selector must still respect the public
+                # ids owned by live and discovered deployments; the exemption
+                # applies only between saved profiles that have not launched.
+                selector_occupied = (
+                    identity_occupied
+                    if label == "selector" and item.get("status") == "saved"
+                    else occupied
+                )
+                if selector.casefold() in selector_occupied:
+                    raise ValueError(
+                        f"deployment {label} '{selector}' is already in use"
+                    )
+
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
         if not alias:
             raise ValueError("alias is required")
         if deployment_id.startswith("container:"):
-            raise ValueError("discovered containers cannot be renamed")
+            async with self._deployment_lifecycle_lock(deployment_id):
+                container = await self._resolve_discovered_container(deployment_id)
+                name = str(container.get("name") or "")
+                if self._owning_cluster_deployment(name) is not None:
+                    raise ValueError(
+                        "rename the cluster deployment instead of one discovered member"
+                    )
+                self._reject_external_lifecycle_in_flight(name)
+                async with self._deployment_alias_lock:
+                    await self._assert_deployment_alias_available(
+                        alias, deployment_id,
+                    )
+                    await self.manager.update_container_alias(name, alias)
+                return await self.deployment_detail(deployment_id)
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored:
             raise LookupError("deployment not found")
-        existing = self.store.deployment(alias)
-        if existing and existing["id"] != stored["id"]:
-            raise ValueError(f"deployment alias '{alias}' is already in use")
-        manager_id = stored.get("settings", {}).get("manager_deployment_id")
-        if manager_id:
-            # Keep the Manager record in sync so /api/state and MCP cluster
-            # listings (and future Manager-driven rebuilds) use the new name.
-            self.manager.update_deployment_alias(manager_id, alias)
-        self.store.update_alias(stored["id"], alias)
+        async with self._deployment_alias_lock:
+            await self._assert_deployment_alias_available(alias, deployment_id)
+            manager_id = stored.get("settings", {}).get("manager_deployment_id")
+            if manager_id:
+                # Keep the Manager record in sync so /api/state and MCP cluster
+                # listings (and future Manager-driven rebuilds) use the new name.
+                self.manager.update_deployment_alias(manager_id, alias)
+            self.store.update_alias(stored["id"], alias)
         stored.pop("_base_url", None)
         stored.pop("_credential_ref", None)
         return {**stored, "alias": alias}
@@ -5351,6 +5923,28 @@ class SparkDeckService:
         settings = self._safe_configuration(container.get("load_settings") or {})
         if settings.get("context_length") is None and settings.get("context_window") is not None:
             settings["context_length"] = settings["context_window"]
+        direct_recovery = (
+            self._direct_start_launch_contract(container, runtime, model)
+            if container.get("direct_start") else None
+        )
+        direct_portable = bool(
+            direct_recovery
+            and self._recovered_launch_is_portable(direct_recovery[0])
+            and container.get("mounts_replayable") is True
+            and container.get("launch_prefix_replayable") is True
+            and container.get("environment_replayable") is True
+            and container.get("user_replayable") is True
+            and container.get("working_dir_replayable") is True
+            and container.get("gpu_requests_replayable") is True
+            and container.get("ipc_mode_replayable") is True
+            and container.get("read_only_rootfs_replayable") is True
+            and container.get("runtime_contract_replayable") is True
+            and self._direct_start_has_replayable_network_topology(
+                container, direct_recovery[1],
+            )
+            and container.get("resource_constraints_replayable") is True
+            and container.get("image_replayable") is True
+        )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify
@@ -5373,7 +5967,7 @@ class SparkDeckService:
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
                 and not str(container.get("stop_command") or "").strip()
-                and not container.get("direct_start")
+                and (not container.get("direct_start") or direct_portable)
             ),
             "controllable": True,
             "logs_available": True,
@@ -5411,6 +6005,8 @@ class SparkDeckService:
             "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
             "required_node_count": tensor_parallel,
         })
+        if direct_recovery is not None:
+            result.update(direct_recovery[1])
         if status == "starting" and phase:
             result.update({
                 "launch_phase": str(phase.get("phase") or "starting"),
@@ -5505,6 +6101,17 @@ class SparkDeckService:
             resolver = getattr(self.manager, "_deployment_served_models", None)
             if linked is not None and callable(resolver):
                 configured = resolver(linked)
+            elif deployment.get("status") == "saved" and callable(resolver):
+                # A bookmark has no Manager record yet, but its first launch
+                # will publish the repository or an explicit served-model
+                # name from these settings. Reserve those future request ids
+                # now so a discovered container alias cannot capture one and
+                # be silently shadowed when the bookmark starts.
+                model = deployment.get("model") or {}
+                configured = resolver({
+                    "model": str(model.get("repository") or ""),
+                    "launch_settings": dict(deployment.get("settings") or {}),
+                })
         normalized = list(dict.fromkeys(
             str(value).strip() for value in configured if str(value).strip()
         ))

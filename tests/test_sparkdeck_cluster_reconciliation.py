@@ -66,6 +66,136 @@ class FakeManager:
 
 
 class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_creation_rejects_discovered_public_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "container:discovered",
+                "alias": "Discovered display name",
+                "runtime": "vllm",
+                "kind": "external",
+                "model": {"repository": "org/discovered"},
+                "served_models": ["public-selector"],
+            }])
+            try:
+                with self.assertRaisesRegex(ValueError, "already in use"):
+                    await service.create_deployment({
+                        "model": "org/new",
+                        "alias": "PUBLIC-SELECTOR",
+                        "runtime": "vllm",
+                        "kind": "managed",
+                    })
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_creation_reserves_managed_repository_against_discovered_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "container:discovered",
+                "alias": "ORG/NEW",
+                "runtime": "vllm",
+                "kind": "external",
+                "model": {"repository": "org/discovered"},
+            }])
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "selector 'org/new' is already in use",
+                ):
+                    await service.create_deployment({
+                        "model": "org/new",
+                        "alias": "New deployment",
+                        "runtime": "vllm",
+                        "kind": "managed",
+                    })
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_creation_reserves_explicit_served_name_against_discovered_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "container:discovered",
+                "alias": "PUBLIC-SELECTOR",
+                "runtime": "vllm",
+                "kind": "external",
+                "model": {"repository": "org/discovered"},
+            }])
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "selector 'public-selector' is already in use",
+                ):
+                    await service.create_deployment({
+                        "model": "org/new",
+                        "alias": "New deployment",
+                        "runtime": "vllm",
+                        "kind": "managed",
+                        "settings": {
+                            "extra_args": [
+                                "--served-model-name", "public-selector",
+                            ],
+                        },
+                    })
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_creation_reserves_managed_selectors_against_live_public_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "live-deployment",
+                "alias": "Production Vision",
+                "runtime": "vllm",
+                "kind": "managed",
+                "status": "running",
+                "model": {"repository": "org/production"},
+                "served_models": ["org/new", "vision-public"],
+            }])
+            try:
+                cases = (
+                    ({"model": "org/new"}, "selector 'org/new'"),
+                    ({
+                        "model": "org/other",
+                        "settings": {
+                            "extra_args": [
+                                "--served-model-name", "vision-public",
+                            ],
+                        },
+                    }, "selector 'vision-public'"),
+                )
+                for overrides, message in cases:
+                    with self.subTest(message=message):
+                        body = {
+                            "alias": f"New deployment {message}",
+                            "runtime": "vllm",
+                            "kind": "managed",
+                            **overrides,
+                        }
+                        with self.assertRaisesRegex(
+                            ValueError, f"{message} is already in use",
+                        ):
+                            await service.create_deployment(body)
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
     async def test_cluster_rename_persists_service_and_manager_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -110,6 +240,152 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                     "Production model",
                 )
             finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_discovered_and_stored_renames_cannot_claim_same_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = Manager.__new__(Manager)
+            manager.http = httpx.AsyncClient()
+            manager.deployments = []
+            manager.container_aliases = {}
+            service = SparkDeckService(manager, root)
+            service.store.add_deployment(Deployment(
+                id="record-1",
+                alias="Stored name",
+                runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/stored"),
+            ))
+            inventory_calls = 0
+            persistence_entered = asyncio.Event()
+            allow_persistence = asyncio.Event()
+
+            async def deployments():
+                nonlocal inventory_calls
+                inventory_calls += 1
+                return [
+                    *service.store.deployments(),
+                    {
+                        "id": "container:discovered",
+                        "alias": manager.container_aliases.get(
+                            "discovered", "Discovered name",
+                        ),
+                        "runtime": "vllm",
+                        "kind": "external",
+                        "model": {"repository": "org/discovered"},
+                    },
+                ]
+
+            async def update_container_alias(name, alias):
+                persistence_entered.set()
+                await allow_persistence.wait()
+                manager.container_aliases[name] = alias
+                return {"ok": True, "name": name, "alias": alias}
+
+            service.deployments = deployments
+            service._resolve_discovered_container = AsyncMock(
+                return_value={"name": "discovered"},
+            )
+            service.deployment_detail = AsyncMock(return_value={
+                "id": "container:discovered", "alias": "Shared name",
+            })
+            manager.update_container_alias = update_container_alias
+            try:
+                discovered = asyncio.create_task(service.rename_deployment(
+                    "container:discovered", "Shared name",
+                ))
+                await asyncio.wait_for(persistence_entered.wait(), timeout=1)
+                stored = asyncio.create_task(service.rename_deployment(
+                    "record-1", "shared NAME",
+                ))
+                await asyncio.sleep(0)
+
+                # The stored rename cannot run its awaited inventory check
+                # until the discovered alias has been durably persisted.
+                self.assertEqual(inventory_calls, 1)
+                allow_persistence.set()
+                await discovered
+                with self.assertRaisesRegex(ValueError, "already in use"):
+                    await stored
+                self.assertEqual(inventory_calls, 2)
+                self.assertEqual(
+                    service.store.deployment("record-1")["alias"], "Stored name",
+                )
+            finally:
+                allow_persistence.set()
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_discovered_rename_serializes_with_deployment_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = Manager.__new__(Manager)
+            manager.http = httpx.AsyncClient()
+            manager.deployments = []
+            manager.container_aliases = {}
+            service = SparkDeckService(manager, root)
+            persistence_entered = asyncio.Event()
+            allow_persistence = asyncio.Event()
+            inventory_calls = 0
+
+            async def deployments():
+                nonlocal inventory_calls
+                inventory_calls += 1
+                return [
+                    *service.store.deployments(),
+                    {
+                        "id": "container:discovered",
+                        "alias": manager.container_aliases.get(
+                            "discovered", "Discovered name",
+                        ),
+                        "runtime": "vllm",
+                        "kind": "external",
+                        "model": {"repository": "org/discovered"},
+                    },
+                ]
+
+            async def update_container_alias(name, alias):
+                persistence_entered.set()
+                await allow_persistence.wait()
+                manager.container_aliases[name] = alias
+                return {"ok": True, "name": name, "alias": alias}
+
+            service.deployments = deployments
+            service._resolve_discovered_container = AsyncMock(
+                return_value={"name": "discovered"},
+            )
+            service.deployment_detail = AsyncMock(return_value={
+                "id": "container:discovered", "alias": "Shared name",
+            })
+            manager.update_container_alias = update_container_alias
+            try:
+                rename = asyncio.create_task(service.rename_deployment(
+                    "container:discovered", "Shared name",
+                ))
+                await asyncio.wait_for(persistence_entered.wait(), timeout=1)
+                create = asyncio.create_task(service.create_deployment({
+                    "model": "org/new",
+                    "alias": "shared NAME",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                }))
+                await asyncio.sleep(0)
+
+                # Create takes the create lock first, then waits on the alias
+                # lock held through rename persistence. It must not perform a
+                # stale inventory check before the renamed alias is visible.
+                self.assertFalse(create.done())
+                self.assertEqual(inventory_calls, 1)
+                allow_persistence.set()
+                await rename
+                with self.assertRaisesRegex(ValueError, "already in use"):
+                    await asyncio.wait_for(create, timeout=1)
+                self.assertEqual(inventory_calls, 2)
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                allow_persistence.set()
                 await service.close()
                 await manager.http.aclose()
 

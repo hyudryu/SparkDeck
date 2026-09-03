@@ -297,7 +297,7 @@ _STORAGE_PRIVATE_KEYS = {
 _STORAGE_INSTRUCTIONS = [
     "Pair SparkDeck nodes over a cluster-private network such as Tailscale.",
     "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
-    "Complete externally managed ComfyUI bundles are inventoried read-only.",
+    "ComfyUI weights can be deleted in place; recognized complete bundles can also be transferred.",
     "Choose an online source and one or more online targets with enough free space.",
 ]
 
@@ -836,6 +836,19 @@ async def agent_pull_image(req: Request):
         raise HTTPException(502, str(exc)[:500]) from exc
 
 
+@app.post("/api/agent/images/identity")
+async def agent_image_identity(req: Request):
+    _require_agent(req)
+    body = await req.json()
+    image = str(body.get("image") or "").strip()
+    if not image:
+        raise HTTPException(400, "image is required")
+    try:
+        return {"id": await manager.resolve_image_identity(image)}
+    except Exception as exc:
+        raise HTTPException(404, str(exc)[:500]) from exc
+
+
 @app.get("/api/agent/images")
 async def agent_images(req: Request):
     _require_agent(req)
@@ -1352,6 +1365,8 @@ async def agent_create_container(req: Request):
             llama_context_length=body.get("llama_context_length"),
             llama_parallel_slots=body.get("llama_parallel_slots"),
             llama_gpu_layers=body.get("llama_gpu_layers"),
+            shm_size=body.get("shm_size"),
+            infiniband_device=body.get("infiniband_device"),
         )
     except Exception as exc:
         detail = str(exc)

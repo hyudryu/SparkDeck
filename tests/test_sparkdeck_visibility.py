@@ -277,14 +277,15 @@ class SavedConfigurationContractTests(unittest.TestCase):
 
         self.assertEqual(contract["required_node_count"], 3)
 
-    def test_sglang_contract_keeps_rank_count_for_saved_nodes(self):
+    def test_sglang_contract_preserves_divisible_saved_host_count(self):
         contract = self.manager.recipe_deployment_contract({
             "engine": "sglang", "deployment_mode": "sharded", "sg_tp_size": 4,
             "node_ids": ["local", "node-2"],
         })
 
         self.assertEqual(contract["deployment_mode"], "sharded")
-        self.assertEqual(contract["required_node_count"], 4)
+        self.assertEqual(contract["required_node_count"], 2)
+        self.assertEqual(contract["tensor_parallel_size"], 4)
 
     def test_sglang_tp_sets_sharded_node_count(self):
         contract = self.manager.recipe_deployment_contract({

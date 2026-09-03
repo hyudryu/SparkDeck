@@ -103,6 +103,10 @@ export interface Deployment {
   settings: DeploymentSettings
   deployment_mode?: string
   required_node_count?: number
+  parallel_rank_count?: number
+  flexible_node_count?: boolean
+  single_host_topology_replayable?: boolean
+  distributed_host_topology_replayable?: boolean
   last_error?: string
   created_at?: string
   updated_at?: string
@@ -966,6 +970,14 @@ export interface UsageMember {
   alias?: string | null
   merge_group?: string | null
   routed_to?: string | null
+  deployment_id?: string | null
+  pricing?: UsagePricing | null
+}
+
+export interface UsagePricing {
+  input_cost_per_1m: number | null
+  cache_cost_per_1m: number | null
+  output_cost_per_1m: number | null
 }
 
 export interface UsageGroup {

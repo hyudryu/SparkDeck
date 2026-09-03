@@ -214,6 +214,34 @@ def validate_model_id(model_id: str) -> str:
     return value
 
 
+def validate_storage_model_id(model_id: str) -> str:
+    """Validate an inventory identity accepted by storage-only operations.
+
+    Most inventory entries are canonical Hugging Face repository IDs. Generic
+    ComfyUI entries instead use ``section/group`` and the group can contain a
+    display-space (for example ``checkpoints/Minimax Video``). Those identities
+    never become cache paths; delete re-resolves their files from the bounded
+    ComfyUI roots. Keep the broader form limited to known ComfyUI sections.
+    """
+    value = str(model_id or "").strip()
+    try:
+        return validate_model_id(value)
+    except ValueError as error:
+        parts = value.split("/")
+        if (
+            len(parts) != 2
+            or parts[0] not in _COMFYUI_SECTION_DIRS
+            or not parts[1]
+            or parts[1] != parts[1].strip()
+            or parts[1] in {".", ".."}
+            or len(parts[1]) > 255
+            or "\\" in parts[1]
+            or any(ord(character) < 32 or ord(character) == 127 for character in parts[1])
+        ):
+            raise error
+        return value
+
+
 def validate_revision(revision: str | None) -> str:
     value = str(revision or "main").strip() or "main"
     components = value.split("/")
@@ -2363,21 +2391,32 @@ class VirtualNAS:
         return size
 
     def delete_model(self, model_id: str) -> dict[str, Any]:
-        model_id = validate_model_id(model_id)
+        model_id = validate_storage_model_id(model_id)
         if self.model_in_transfer(model_id, LOCAL_NODE_ID):
             raise RuntimeError("model is in use by a virtual NAS transfer")
-        repository = self._model_path(model_id)
-        if repository.exists():
+        try:
+            repository = self._model_path(validate_model_id(model_id))
+        except ValueError:
+            # Non-Hub ComfyUI display identities are resolved only through
+            # the bounded external model roots below, never as cache paths.
+            repository = None
+        if repository is not None and repository.exists():
             if repository.is_symlink() or not repository.is_dir():
                 raise ValueError("cached model repository is not a safe directory")
             hub = self._hub()
             if repository.resolve().parent != hub:
                 raise ValueError("model cache path escapes the Hugging Face hub")
+            external_roots = self._external_model_roots_provider()
+            has_external_copy = (
+                _external_comfyui_bundle_files(external_roots, model_id)
+                is not None
+                or bool(_external_comfyui_fallback_copies(
+                    external_roots, model_id,
+                ))
+            )
             if (
                 _is_complete_repository(repository)
-                or _external_comfyui_bundle_files(
-                    self._external_model_roots_provider(), model_id,
-                ) is None
+                or not has_external_copy
             ):
                 self._delete_cached_repository(repository)
                 return {"ok": True, "model_id": model_id}
@@ -2446,6 +2485,8 @@ class VirtualNAS:
             except OSError:
                 continue
         copies = _external_comfyui_bundle_copies(raw_roots, model_id)
+        if not copies:
+            copies = _external_comfyui_fallback_copies(raw_roots, model_id)
         if not copies:
             raise LookupError("cached model not found")
         paths = [path for files in copies for path in files.values()]
@@ -2842,7 +2883,9 @@ class VirtualNAS:
         return dict(job)
 
     def model_in_transfer(self, model_id: str, node_id: str | None = None) -> bool:
-        model_id = validate_model_id(model_id)
+        # Delete also calls this guard for generic ComfyUI inventory entries,
+        # whose storage-only identity may contain a display-space.
+        model_id = validate_storage_model_id(model_id)
         local_stream = bool(
             node_id in (None, LOCAL_NODE_ID)
             and self._streaming_models.get(model_id, 0)
@@ -3857,15 +3900,15 @@ def _external_comfyui_inventory(roots: list[Path]) -> list[dict[str, Any]]:
     return sorted(models.values(), key=lambda item: str(item["model_id"]))
 
 
-def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, Any]]:
-    """Report unrecognized ComfyUI weights grouped by section directory.
+def _comfyui_fallback_groups(root: Path, claimed: set[Path]) -> dict[str, list[Path]]:
+    """Resolve unrecognized ComfyUI weights by their inventory identity.
 
     Weight files inside a dedicated subdirectory of a conventional section
     (e.g. ``checkpoints/Minimax Video/``) collapse into one entry named by
     that directory; loose files at a section root become one entry per file
     stem. Files already claimed by a known bundle are never duplicated.
     """
-    entries: list[dict[str, Any]] = []
+    grouped: dict[str, list[Path]] = {}
     for section in _COMFYUI_SECTION_DIRS:
         try:
             section_dir = root / section
@@ -3901,33 +3944,83 @@ def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, 
         except (OSError, RuntimeError, ValueError):
             continue
         for name, files in groups.items():
-            try:
-                stats = [path.stat() for path in files]
-            except OSError:
-                continue
-            last_modified = max(stat.st_mtime for stat in stats)
-            entries.append({
-                "model_id": f"{section}/{name}",
-                "size_bytes": sum(stat.st_size for stat in stats),
-                "file_count": len(files),
-                "partial": False,
-                "has_partial_download": False,
-                "partial_size_bytes": 0,
-                "partial_revision_size_bytes": {},
-                "partial_revisions": [],
-                "partial_revision_refs": {},
-                "revision": "ComfyUI",
-                "revisions": [],
-                "revision_refs": {},
-                "last_modified": datetime.fromtimestamp(
-                    last_modified, timezone.utc,
-                ).isoformat(),
-                "source": "ComfyUI",
-                "externally_managed": True,
-                "transferable": False,
-                "deletable": False,
-            })
+            grouped[f"{section}/{name}"] = files
+    return grouped
+
+
+def _comfyui_fallback_entries(root: Path, claimed: set[Path]) -> list[dict[str, Any]]:
+    """Report safe generic ComfyUI groups that can also be deleted."""
+    entries: list[dict[str, Any]] = []
+    for model_id, files in _comfyui_fallback_groups(root, claimed).items():
+        try:
+            stats = [path.stat() for path in files]
+        except OSError:
+            continue
+        last_modified = max(stat.st_mtime for stat in stats)
+        entries.append({
+            "model_id": model_id,
+            "size_bytes": sum(stat.st_size for stat in stats),
+            "file_count": len(files),
+            "partial": False,
+            "has_partial_download": False,
+            "partial_size_bytes": 0,
+            "partial_revision_size_bytes": {},
+            "partial_revisions": [],
+            "partial_revision_refs": {},
+            "revision": "ComfyUI",
+            "revisions": [],
+            "revision_refs": {},
+            "last_modified": datetime.fromtimestamp(
+                last_modified, timezone.utc,
+            ).isoformat(),
+            "source": "ComfyUI",
+            "externally_managed": True,
+            "transferable": False,
+        })
     return entries
+
+
+def _external_comfyui_fallback_copies(
+    roots: list[Path], model_id: str,
+) -> list[dict[str, Path]]:
+    """Re-resolve every safe copy of a generic ComfyUI inventory entry."""
+    try:
+        model_id = validate_storage_model_id(model_id)
+    except ValueError:
+        return []
+    section = model_id.split("/", 1)[0]
+    if section not in _COMFYUI_SECTION_DIRS:
+        return []
+    copies: list[dict[str, Path]] = []
+    seen: set[str] = set()
+    for raw_root in roots:
+        try:
+            if raw_root.is_symlink() or not raw_root.is_dir():
+                continue
+            root = raw_root.resolve(strict=True)
+        except OSError:
+            continue
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        # Mirror inventory's claimed-file set before resolving the requested
+        # generic group. A caller must not be able to guess a fallback-style
+        # identity for one component of a recognized bundle that inventory
+        # never exposed as a standalone row.
+        claimed: set[Path] = set()
+        for _, required, alternative_groups, optional in _COMFYUI_MODEL_BUNDLES:
+            bundle_files = _resolve_comfyui_bundle_files(
+                root, required, alternative_groups, optional,
+            )
+            if bundle_files is not None:
+                claimed.update(bundle_files.values())
+        files = _comfyui_fallback_groups(root, claimed).get(model_id)
+        if files:
+            copies.append({
+                path.relative_to(root).as_posix(): path for path in files
+            })
+    return copies
 
 
 def _safe_incomplete_snapshot_revisions(

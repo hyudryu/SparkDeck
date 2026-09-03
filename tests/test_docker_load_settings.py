@@ -20,6 +20,7 @@ class FakeContainer:
         self.labels = config.get("Labels") or {}
         self.ports = {}
         self.attrs = {
+            "Id": cid,
             "Config": copy.deepcopy(config),
             "HostConfig": copy.deepcopy(host_config),
             "Created": "2026-08-05T00:00:00Z",
@@ -135,6 +136,803 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["environment"], {
             "VLLM_CACHE_ROOT": "/cache/vllm",
             "NCCL_DEBUG": "INFO",
+            "SPECULATIVE_CONFIG": '{"method":"dspark"}',
+        })
+        self.assertTrue(summary["launch_prefix_replayable"])
+
+    def test_external_summary_marks_entrypoint_wrapper_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "wrapped-entrypoint-id",
+            "wrapped-entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["/opt/bootstrap", "vllm"],
+                "Cmd": ["serve", "org/model", "--max-num-seqs", "8"],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_rejects_absolute_vllm_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "canonical-entrypoint-id",
+            "canonical-entrypoint-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["/opt/venv/bin/vllm"],
+                "Cmd": ["serve", "org/model", "--max-num-seqs", "8"],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_rejects_absolute_shell_vllm_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "absolute-shell-entrypoint-id",
+            "absolute-shell-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "/bin/bash", "--noprofile", "-lc",
+                    "exec /opt/venv/bin/vllm serve org/model --max-num-seqs 8",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_marks_sglang_entrypoint_wrapper_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "wrapped-sglang-id",
+            "wrapped-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["/opt/bootstrap", "python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_rejects_absolute_sglang_python3_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "canonical-sglang-id",
+            "canonical-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["/usr/bin/python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_allows_bare_sglang_python3(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "bare-sglang-id",
+            "bare-sglang",
+            {
+                "Image": "example/sglang:latest",
+                "Entrypoint": ["python3"],
+                "Cmd": [
+                    "-m", "sglang.launch_server", "--model-path", "org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["launch_prefix_replayable"])
+
+    def test_external_summary_marks_shell_prelude_unreplayable(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "shell-prelude-id",
+            "shell-prelude-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "/bin/bash", "-lc",
+                    "source /opt/runtime/setup.sh; exec vllm serve org/model",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertTrue(summary["load_settings"]["editable"])
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def _environment_summary(
+        self, image_environment: list[str], container_environment: list[str],
+    ):
+        image = SimpleNamespace(attrs={
+            "Config": {"Env": image_environment, "Labels": {}},
+        })
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(get=mock.Mock(return_value=image)),
+        )
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "environment-container-id",
+            "environment-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-num-seqs", "8"],
+                "Env": container_environment,
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+        container.attrs["Image"] = "sha256:immutable-image"
+        return self.manager._container_summary(container)
+
+    def test_unpreserved_container_environment_override_is_not_replayable(self):
+        private_endpoint = "https://private-hub.example.invalid"
+        summary = self._environment_summary(
+            ["PATH=/usr/bin", "HF_ENDPOINT=https://huggingface.co"],
+            [f"HF_ENDPOINT={private_endpoint}", "PATH=/usr/bin"],
+        )
+
+        self.assertFalse(summary["environment_replayable"])
+        self.assertNotIn("HF_ENDPOINT", summary["load_settings"]["environment"])
+        self.assertNotIn(private_endpoint, json.dumps(summary))
+
+    def test_unchanged_image_environment_defaults_are_replayable(self):
+        environment = [
+            "PATH=/usr/bin", "HF_ENDPOINT=https://private-hub.example.invalid",
+        ]
+
+        summary = self._environment_summary(environment, list(environment))
+
+        self.assertTrue(summary["environment_replayable"])
+
+    def test_allowlisted_container_environment_override_is_replayable(self):
+        summary = self._environment_summary(
+            ["PATH=/usr/bin", "NCCL_DEBUG=WARN"],
+            ["PATH=/usr/bin", "NCCL_DEBUG=INFO"],
+        )
+
+        self.assertTrue(summary["environment_replayable"])
+        self.assertEqual(
+            summary["load_settings"]["environment"], {"NCCL_DEBUG": "INFO"},
+        )
+
+    def _direct_portability_summary(
+        self, device_requests, resolved_image_id, *,
+        image_user="", container_user="", image_working_dir="",
+        container_working_dir="", ipc_mode="host", network_mode="default",
+        read_only_rootfs=False, image_config_overrides=None,
+        container_config_overrides=None, resource_overrides=None,
+        daemon_info_overrides=None,
+    ):
+        source_image_id = "sha256:source-image"
+        image_config = {
+            "Env": [], "Labels": {}, "User": image_user,
+            "WorkingDir": image_working_dir,
+        }
+        image_config.update(image_config_overrides or {})
+        image = SimpleNamespace(
+            id=resolved_image_id,
+            attrs={
+                "Id": resolved_image_id,
+                "Config": image_config,
+            },
+        )
+        daemon_info = {
+            "DefaultRuntime": "runc", "LoggingDriver": "json-file",
+            "CgroupVersion": "2",
+        }
+        daemon_info.update(daemon_info_overrides or {})
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(get=mock.Mock(return_value=image)),
+            info=mock.Mock(return_value=daemon_info),
+        )
+        self.manager.settings = {"shm_size": "16g"}
+        host_config = {
+            "DeviceRequests": device_requests,
+            "IpcMode": ipc_mode,
+            "NetworkMode": network_mode,
+            "ReadonlyRootfs": read_only_rootfs,
+            "Ulimits": None,
+            "Devices": None,
+            "Privileged": False,
+            "AutoRemove": False,
+            "PublishAllPorts": False,
+            "PortBindings": (
+                {} if network_mode == "host" else
+                {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}]}
+            ),
+            "CapAdd": None,
+            "CapDrop": None,
+            "SecurityOpt": None,
+            "GroupAdd": None,
+            "ExtraHosts": None,
+            "Dns": None,
+            "DnsOptions": None,
+            "DnsSearch": None,
+            "Links": None,
+            "VolumesFrom": None,
+            "LxcConf": None,
+            "Sysctls": None,
+            "Tmpfs": None,
+            "PidMode": "",
+            "UsernsMode": "",
+            "UTSMode": "",
+            "CgroupnsMode": "private",
+            "OomScoreAdj": 0,
+            "Isolation": "",
+            "VolumeDriver": "",
+            "Init": False,
+            "Runtime": "runc",
+            "LogConfig": {"Type": "json-file", "Config": {}},
+            "RestartPolicy": {
+                "Name": "unless-stopped", "MaximumRetryCount": 0,
+            },
+            "Memory": 0,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "NanoCpus": 0,
+            "CpuShares": 0,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "PidsLimit": None,
+            "OomKillDisable": None,
+            "ShmSize": 16 * 1024 ** 3,
+        }
+        host_config.update(resource_overrides or {})
+        containers = FakeContainers()
+        container_config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": ["vllm", "serve"],
+            "Cmd": ["org/model", "--max-num-seqs", "8"],
+            "Env": [],
+            "User": container_user,
+            "WorkingDir": container_working_dir,
+            "Hostname": "portable-con",
+            "Domainname": "",
+            "StopTimeout": None,
+            "Tty": False,
+            "OpenStdin": False,
+            "StdinOnce": False,
+            "Labels": {"io.sparkdeck.direct-start": "1"},
+        }
+        container_config.update(container_config_overrides or {})
+        container = FakeContainer(
+            containers,
+            "portable-container-id",
+            "portable-vllm",
+            container_config,
+            host_config,
+        )
+        container.attrs["Image"] = source_image_id
+        network_name = "bridge" if network_mode in {"default", "bridge"} else network_mode
+        container.attrs["NetworkSettings"] = {
+            "Networks": {
+                network_name: {
+                    "IPAMConfig": None,
+                    "Links": None,
+                    "Aliases": None,
+                    "DriverOpts": None,
+                },
+            },
+        }
+        return self.manager._container_summary(container)
+
+    def test_direct_summary_accepts_matching_all_gpu_and_image_contract(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image")
+
+        self.assertTrue(summary["gpu_requests_replayable"])
+        self.assertTrue(summary["ipc_mode_replayable"])
+        self.assertTrue(summary["read_only_rootfs_replayable"])
+        self.assertTrue(summary["runtime_contract_replayable"])
+        self.assertTrue(summary["single_network_mode_replayable"])
+        self.assertFalse(summary["distributed_network_mode_replayable"])
+        self.assertTrue(summary["single_host_options_replayable"])
+        self.assertFalse(summary["distributed_host_options_replayable"])
+        self.assertTrue(summary["image_replayable"])
+        self.assertTrue(summary["user_replayable"])
+        self.assertTrue(summary["working_dir_replayable"])
+        self.assertTrue(summary["resource_constraints_replayable"])
+        self.assertEqual(summary["load_settings"]["shm_size"], 16 * 1024 ** 3)
+        self.assertIs(summary["load_settings"]["infiniband_device"], False)
+
+    def test_image_default_bash_env_keeps_shell_promotion_read_only(self):
+        environment = ["BASH_ENV=/opt/runtime/init.sh"]
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image",
+            image_config_overrides={"Env": environment},
+            container_config_overrides={
+                "Entrypoint": ["/bin/bash"],
+                "Cmd": [
+                    "--noprofile", "-lc",
+                    "exec vllm serve org/model --max-num-seqs 8",
+                ],
+                "Env": environment,
+            },
+        )
+
+        self.assertTrue(summary["environment_replayable"])
+        self.assertTrue(
+            summary["load_settings"]["_shell_wrapper_unsupported"],
+        )
+
+    def test_direct_summary_rejects_non_default_resource_constraints(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        constraints = {
+            "Memory": 8 * 1024 ** 3,
+            "MemoryReservation": 4 * 1024 ** 3,
+            "MemorySwap": -1,
+            "NanoCpus": 2_000_000_000,
+            "CpuShares": 512,
+            "CpuPeriod": 100_000,
+            "CpuQuota": 50_000,
+            "CpusetCpus": "0-3",
+            "CpusetMems": "0",
+            "PidsLimit": 1024,
+            "OomKillDisable": True,
+            "ShmSize": 8 * 1024 ** 3,
+            "MemorySwappiness": 10,
+            "CpuRealtimeRuntime": 50_000,
+            "BlkioWeight": 500,
+            "StorageOpt": {"size": "20G"},
+            "IOMaximumIOps": 1000,
+        }
+
+        for field, value in constraints.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request,
+                    "sha256:source-image",
+                    resource_overrides={field: value},
+                )
+                self.assertFalse(summary["resource_constraints_replayable"])
+
+    def test_direct_summary_fails_closed_on_incomplete_resource_inspection(self):
+        self.manager.settings = {"shm_size": "16g"}
+
+        self.assertFalse(self.manager._container_resources_are_replayable({
+            "HostConfig": {
+                "Memory": 0,
+                # Remaining required fields deliberately unavailable.
+                "ShmSize": 16 * 1024 ** 3,
+            },
+        }))
+
+    def test_direct_summary_rejects_non_host_ipc_mode(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", ipc_mode="private")
+
+        self.assertFalse(summary["ipc_mode_replayable"])
+
+    def test_direct_summary_rejects_read_only_root_filesystem(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", read_only_rootfs=True)
+
+        self.assertFalse(summary["read_only_rootfs_replayable"])
+
+    def test_direct_summary_classifies_managed_network_modes(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+
+        host = self._direct_portability_summary(
+            gpu_request, "sha256:source-image", network_mode="host",
+        )
+        custom = self._direct_portability_summary(
+            gpu_request, "sha256:source-image", network_mode="model-net",
+        )
+
+        self.assertFalse(host["single_network_mode_replayable"])
+        self.assertTrue(host["distributed_network_mode_replayable"])
+        self.assertFalse(custom["single_network_mode_replayable"])
+        self.assertFalse(custom["distributed_network_mode_replayable"])
+
+    def test_direct_summary_network_and_rootfs_inspection_fail_closed(self):
+        self.assertEqual(
+            self.manager._container_network_modes_are_replayable({
+                "HostConfig": {"NetworkMode": None},
+            }),
+            (False, False),
+        )
+        self.assertFalse(
+            self.manager._container_read_only_rootfs_is_replayable({
+                "HostConfig": {},
+            })
+        )
+
+    def test_direct_summary_rejects_extra_network_contract(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        cases = (
+            {"PublishAllPorts": True},
+            {"PortBindings": {
+                "9000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "19000"}],
+            }},
+            {"PortBindings": {
+                "8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18000"}],
+            }},
+            {"PortBindings": {"8000/tcp": [
+                {"HostIp": "0.0.0.0", "HostPort": "18000"},
+                {"HostIp": "::", "HostPort": "18001"},
+            ]}},
+            {"PortBindings": {
+                "8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}],
+                "9000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "19000"}],
+            }},
+        )
+
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    resource_overrides=overrides,
+                )
+                self.assertFalse(summary["single_network_mode_replayable"])
+
+        summary = self._direct_portability_summary(
+            gpu_request, "sha256:source-image",
+        )
+        summary_attrs = {
+            "HostConfig": {
+                "NetworkMode": "default", "PublishAllPorts": False,
+                "PortBindings": {
+                    "8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}],
+                },
+            },
+            "NetworkSettings": {"Networks": {
+                "bridge": {
+                    "Aliases": ["custom-alias"], "IPAMConfig": None,
+                    "Links": None, "DriverOpts": None,
+                },
+            }},
+        }
+        self.assertEqual(
+            self.manager._container_network_modes_are_replayable(summary_attrs),
+            (False, False),
+        )
+
+    def test_direct_summary_rejects_unreplayed_process_and_security_options(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        host_cases = {
+            "Privileged": True,
+            "CapAdd": ["SYS_ADMIN"],
+            "SecurityOpt": ["seccomp=unconfined"],
+            "PidMode": "host",
+            "Runtime": "nvidia",
+            "OomScoreAdj": -500,
+            "Dns": ["1.1.1.1"],
+            "Tmpfs": {"/run": "rw"},
+            "LxcConf": [{"Key": "lxc.apparmor.profile", "Value": "unconfined"}],
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+        }
+        for field, value in host_cases.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    resource_overrides={field: value},
+                )
+                self.assertFalse(summary["runtime_contract_replayable"])
+
+        config_cases = {
+            "Healthcheck": {"Test": ["CMD", "false"]},
+            "StopSignal": "SIGKILL",
+            "StopTimeout": 10,
+            "Tty": True,
+            "OpenStdin": True,
+            "Hostname": "custom-hostname",
+        }
+        for field, value in config_cases.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    container_config_overrides={field: value},
+                )
+                self.assertFalse(summary["runtime_contract_replayable"])
+
+    def test_cgroup_v1_daemon_default_is_replayable(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }], "sha256:source-image",
+            resource_overrides={"CgroupnsMode": "host"},
+            daemon_info_overrides={"CgroupVersion": "1"},
+        )
+
+        self.assertTrue(summary["runtime_contract_replayable"])
+
+    def test_direct_summary_accepts_inherited_health_and_stop_signal(self):
+        inherited = {
+            "Healthcheck": {"Test": ["CMD", "true"]},
+            "StopSignal": "SIGUSR1",
+        }
+        summary = self._direct_portability_summary(
+            [{
+                "Driver": "", "Count": -1, "DeviceIDs": None,
+                "Capabilities": [["gpu"]], "Options": {},
+            }],
+            "sha256:source-image",
+            image_config_overrides=inherited,
+            container_config_overrides=inherited,
+        )
+
+        self.assertTrue(summary["runtime_contract_replayable"])
+
+    def test_direct_summary_classifies_topology_ulimits_and_devices(self):
+        empty = {"HostConfig": {"Ulimits": None, "Devices": None}}
+        distributed = {"HostConfig": {
+            "Ulimits": [{"Name": "memlock", "Soft": -1, "Hard": -1}],
+            "Devices": None,
+        }}
+        stack = {"HostConfig": {
+            "Ulimits": [
+                {"Name": "memlock", "Soft": -1, "Hard": -1},
+                {"Name": "stack", "Soft": 67108864, "Hard": 67108864},
+            ],
+            "Devices": None,
+        }}
+
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(empty),
+            (True, False),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(distributed),
+            (False, True),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(stack),
+            (False, False),
+        )
+
+    def test_distributed_topology_requires_managed_infiniband_mapping(self):
+        ulimits = [{"Name": "memlock", "Soft": -1, "Hard": -1}]
+        devices = [{
+                "PathOnHost": "/dev/infiniband",
+                "PathInContainer": "/dev/infiniband",
+                "CgroupPermissions": "rwm",
+            }]
+        attrs = {"HostConfig": {"Ulimits": ulimits, "Devices": devices}}
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(attrs),
+            (False, True),
+        )
+        self.assertIs(
+            self.manager._container_infiniband_device_requirement(attrs), True,
+        )
+        summary = self._direct_portability_summary(
+            [{
+                "Driver": "", "Count": -1, "DeviceIDs": None,
+                "Capabilities": [["gpu"]], "Options": {},
+            }],
+            "sha256:source-image", network_mode="host",
+            resource_overrides={"Ulimits": ulimits, "Devices": devices},
+        )
+        self.assertTrue(summary["distributed_host_options_replayable"])
+        self.assertIs(summary["load_settings"]["infiniband_device"], True)
+
+    def test_direct_summary_rejects_container_user_override(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", container_user="1000:1000")
+
+        self.assertFalse(summary["user_replayable"])
+
+    def test_direct_summary_accepts_inherited_image_user(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_user="1000:1000",
+            container_user="1000:1000")
+
+        self.assertTrue(summary["user_replayable"])
+
+    def test_direct_summary_rejects_working_directory_override(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_working_dir="/workspace",
+            container_working_dir="/models")
+
+        self.assertFalse(summary["working_dir_replayable"])
+
+    def test_direct_summary_accepts_inherited_image_working_directory(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_working_dir="/workspace",
+            container_working_dir="/workspace")
+
+        self.assertTrue(summary["working_dir_replayable"])
+
+    def test_working_directory_uses_immutable_source_image_default(self):
+        image = SimpleNamespace(attrs={
+            "Config": {"WorkingDir": "/workspace"},
+        })
+        images = SimpleNamespace(get=mock.Mock(return_value=image))
+        self.manager.client = SimpleNamespace(images=images)
+
+        replayable = self.manager._container_working_dir_is_replayable({
+            "Image": "sha256:immutable-source",
+            "Config": {
+                "Image": "example/vllm:latest",
+                "WorkingDir": "/workspace",
+            },
+        })
+
+        self.assertTrue(replayable)
+        images.get.assert_called_once_with("sha256:immutable-source")
+
+    def test_working_directory_fails_closed_without_image_config(self):
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(
+                get=mock.Mock(side_effect=RuntimeError("image unavailable")),
+            ),
+        )
+
+        replayable = self.manager._container_working_dir_is_replayable({
+            "Image": "sha256:immutable-source",
+            "Config": {"WorkingDir": "/workspace"},
+        })
+
+        self.assertFalse(replayable)
+
+    def test_container_user_replayability_fails_closed_without_image_config(self):
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(
+                get=mock.Mock(side_effect=RuntimeError("image unavailable")),
+            ),
+        )
+
+        replayable = self.manager._container_user_is_replayable({
+            "Image": "sha256:source-image",
+            "Config": {"User": ""},
+        })
+
+        self.assertFalse(replayable)
+
+    def test_direct_summary_rejects_restricted_gpu_device_ids(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": 0,
+            "DeviceIDs": ["2", "3"],
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image")
+
+        self.assertFalse(summary["gpu_requests_replayable"])
+        self.assertTrue(summary["image_replayable"])
+
+    def test_direct_summary_rejects_repointed_mutable_image_tag(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:new-image")
+
+        self.assertTrue(summary["gpu_requests_replayable"])
+        self.assertFalse(summary["image_replayable"])
+
+    def test_recovered_launch_preserves_discovered_runtime_environment(self):
+        recovered = self.manager._recovered_deployment_launch_settings(
+            {
+                "name": "example",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+            },
+            {
+                "image": "example/vllm:latest",
+                "load_settings": {
+                    "command_flags": (
+                        "--speculative-config '${SPECULATIVE_CONFIG}'"
+                    ),
+                    "environment": {
+                        "SPECULATIVE_CONFIG": '{"method":"dspark"}',
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(recovered["environment"], {
             "SPECULATIVE_CONFIG": '{"method":"dspark"}',
         })
 
@@ -379,6 +1177,69 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "sha256:hooked-image",
         )
 
+    def test_hf_cache_target_is_cached_per_immutable_image_id(self):
+        image_id = "sha256:" + "a" * 64
+        image = mock.Mock()
+        image.id = image_id
+        image.attrs = {
+            "Id": image_id,
+            "Config": {"Env": ["HF_HOME=/opt/hf-cache"]},
+        }
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.return_value = image
+
+        first = self.manager._image_hf_cache_target(image_id)
+        second = self.manager._image_hf_cache_target(image_id)
+
+        self.assertEqual(first, "/opt/hf-cache")
+        self.assertEqual(second, "/opt/hf-cache")
+        self.manager.client.images.get.assert_called_once_with(image_id)
+
+    def test_hf_cache_target_revalidates_mutable_tag_identity(self):
+        old_id = "sha256:" + "a" * 64
+        old_image = mock.Mock()
+        old_image.id = old_id
+        old_image.attrs = {
+            "Id": old_id,
+            "Config": {"Env": ["HF_HOME=/old-cache"]},
+        }
+        new_id = "sha256:" + "b" * 64
+        new_image = mock.Mock()
+        new_image.id = new_id
+        new_image.attrs = {
+            "Id": new_id,
+            "Config": {"Env": ["HF_HOME=/new-cache"]},
+        }
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = [old_image, new_image]
+
+        first = self.manager._image_hf_cache_target("example/vllm:latest")
+        second = self.manager._image_hf_cache_target("example/vllm:latest")
+
+        self.assertEqual(first, "/old-cache")
+        self.assertEqual(second, "/new-cache")
+        self.assertEqual(self.manager.client.images.get.call_count, 2)
+
+    def test_hf_cache_target_does_not_cache_inspection_failure(self):
+        image_id = "sha256:" + "a" * 64
+        image = mock.Mock()
+        image.id = image_id
+        image.attrs = {
+            "Id": image_id,
+            "Config": {"Env": ["HF_HOME=/opt/hf-cache"]},
+        }
+        self.manager.client = mock.Mock()
+        self.manager.client.images.get.side_effect = [
+            RuntimeError("docker hiccup"), image,
+        ]
+
+        first = self.manager._image_hf_cache_target("example/vllm:latest")
+        second = self.manager._image_hf_cache_target("example/vllm:latest")
+
+        self.assertEqual(first, "/root/.cache/huggingface")
+        self.assertEqual(second, "/opt/hf-cache")
+        self.assertEqual(self.manager.client.images.get.call_count, 2)
+
     def test_summary_omits_absent_or_blank_lifecycle_hook_labels(self):
         self._stub_image_labels({})
         container = self._hooked_container({
@@ -490,9 +1351,15 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             self.manager.container_aliases_path = Path(directory) / "container_aliases.json"
             self.manager.container_aliases = {}
 
-            result = await self.manager.update_container_alias(name, "Fast benchmark")
+            real_to_thread = asyncio.to_thread
+            with mock.patch(
+                "manager.asyncio.to_thread",
+                new=mock.AsyncMock(side_effect=real_to_thread),
+            ) as to_thread:
+                result = await self.manager.update_container_alias(name, "Fast benchmark")
 
             self.assertEqual(result["alias"], "Fast benchmark")
+            to_thread.assert_awaited_once_with(containers.get, name)
             self.assertEqual(container.name, name)
             self.assertEqual(
                 json.loads(self.manager.container_aliases_path.read_text()),
@@ -590,6 +1457,47 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(settings["editable"])
 
+    def test_embedded_shell_expansion_and_operators_are_read_only(self):
+        model = "example/Model"
+        unsafe_values = (
+            "model-${SUFFIX}",
+            "prefix-$REVISION",
+            "$(revision-command)",
+            "`revision-command`",
+            "value;next-command",
+            "value&&next-command",
+            "value|next-command",
+            ">server.log",
+        )
+
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                command = [
+                    "vllm", "serve", model,
+                    "--served-model-name", value,
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertFalse(settings["editable"])
+
+    def test_short_speculative_environment_reference_is_read_only(self):
+        model = "example/Model"
+        for option_args in (
+            ["-sc", "${SPECULATIVE_CONFIG}"],
+            ["-sc=${SPECULATIVE_CONFIG}"],
+        ):
+            with self.subTest(option_args=option_args):
+                command = ["vllm", "serve", model, *option_args]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertFalse(settings["editable"])
+
     def test_shell_wrapped_template_command_stays_editable(self):
         script = (
             "exec vllm serve example/Model "
@@ -598,6 +1506,297 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         command = ["/bin/bash", "-lc", script]
 
         settings = self.manager._container_load_settings(command, "vllm", "example/Model")
+
+        self.assertTrue(settings["editable"])
+
+    def test_shell_wrapped_path_expansion_is_marked_nonportable(self):
+        model = "example/Model"
+        unsafe_values = (
+            "/templates/*.jinja",
+            "/templates/model?.jinja",
+            "/templates/[ab].jinja",
+            "~/templates/chat.jinja",
+            "--chat-template=~/templates/chat.jinja",
+        )
+
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                option = (
+                    value if value.startswith("--")
+                    else f"--chat-template {value}"
+                )
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} {option}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_path_expansion"])
+
+    def test_quoted_and_escaped_shell_path_literals_remain_portable(self):
+        model = "example/Model"
+        literal_values = (
+            "'/templates/*.jinja'",
+            '"/templates/model?.jinja"',
+            r"/templates/\[ab\].jinja",
+            r"\~/templates/chat.jinja",
+        )
+
+        for value in literal_values:
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertNotIn("_shell_path_expansion", settings)
+
+    def test_shell_wrapped_brace_expansion_is_marked_nonportable(self):
+        model = "example/Model"
+        for value in (
+            "/templates/{chat,base}.jinja",
+            "/templates/template-{1..4}.jinja",
+            "/templates/template-{d..a..2}.jinja",
+            "${CHAT_TEMPLATE:-/templates/{chat,base}.jinja}",
+            "${CHAT_TEMPLATE:-/templates/{1..4}.jinja}",
+        ):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_shell_wrapped_ansi_c_quoting_is_marked_nonportable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --served-model-name $'model\\nname'",
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_ansi_c_quoting"])
+
+    def test_quoted_ansi_c_syntax_literal_remains_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f'''exec vllm serve {model} --served-model-name "$'literal'"''',
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_ansi_c_quoting", settings)
+
+    def test_shell_wrapped_locale_quoting_is_marked_nonportable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f'exec vllm serve {model} --served-model-name $"translated"',
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_locale_quoting"])
+
+    def test_quoted_locale_syntax_literal_remains_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --served-model-name '$\"literal\"'",
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_locale_quoting", settings)
+
+    def test_bash_options_do_not_hide_brace_expansion(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "--noprofile", "-lc",
+            f"exec vllm serve {model} "
+            "--chat-template /templates/{chat,base}.jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_bash_extglob_option_does_not_hide_path_expansion(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-O", "extglob", "-lc",
+            f"exec vllm serve {model} "
+            "--chat-template /templates/@(chat|base).jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_path_expansion"])
+
+    def test_non_bash_shell_wrapper_is_marked_unsupported(self):
+        model = "example/Model"
+        for shell in ("/bin/zsh", "/bin/ksh", "/usr/bin/fish"):
+            with self.subTest(shell=shell):
+                command = [
+                    shell, "-lc",
+                    f"exec vllm serve {model} "
+                    "--chat-template /templates/{chat,base}.jinja",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_wrapper_unsupported"])
+
+    def test_bash_shell_wrapper_is_within_replay_contract(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/bin/bash", "--noprofile", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertNotIn("_shell_wrapper_unsupported", settings)
+
+    def test_login_bash_without_noprofile_is_not_replayable(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/bin/bash", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertTrue(settings["_shell_wrapper_unsupported"])
+
+    def test_custom_executable_named_bash_is_not_trusted(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/opt/custom/bash", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertTrue(settings["_shell_wrapper_unsupported"])
+
+    def test_literal_braces_and_parameter_expansion_remain_portable(self):
+        model = "example/Model"
+        for value in (
+            "'/templates/{chat,base}.jinja'",
+            '"/templates/{chat,base}.jinja"',
+            r"/templates/\{chat,base\}.jinja",
+            "/templates/{literal}.jinja",
+            "${CHAT_TEMPLATE}",
+        ):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertNotIn("_shell_brace_expansion", settings)
+
+    def test_plain_sh_brace_literals_remain_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/sh", "-c",
+            f"exec vllm serve {model} --chat-template /templates/{{chat,base}}.jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_brace_expansion", settings)
+
+    def test_shell_wrapped_command_boundary_is_read_only(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8\nrun-after-vllm",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
+    def test_shell_wrapped_comment_is_read_only(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8 # tuned for this host",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
+    def test_literal_hashes_do_not_look_like_shell_comments(self):
+        model = "example/Model"
+        for value in ("release#1", "'release #1'", r"release\#1"):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --served-model-name {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+
+    def test_shell_wrapped_line_continuation_stays_editable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8 \\\n"
+            "  --enable-prefix-caching",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
 
         self.assertTrue(settings["editable"])
 
@@ -742,7 +1941,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertIsNone(api.created_config)
 
-    async def test_update_keeps_shell_speculative_reference_for_runtime_expansion(self):
+    async def test_update_double_quotes_shell_speculative_reference_for_expansion(self):
         name = "external-vllm"
         script = (
             "exec vllm serve example/Model --host 0.0.0.0 --port 8000 "
@@ -781,11 +1980,46 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         replacement_script = api.created_config["Cmd"][-1]
-        # A shell-wrapped container expands the reference at runtime; the
-        # recreate must keep it untouched instead of freezing a literal.
-        self.assertIn("'${SPECULATIVE_CONFIG}'", replacement_script)
+        # Single quotes pass the placeholder literally. The recreate must
+        # use double quotes so Bash expands the JSON as one argv value.
+        self.assertIn('"${SPECULATIVE_CONFIG}"', replacement_script)
+        self.assertNotIn("'${SPECULATIVE_CONFIG}'", replacement_script)
         self.assertIn("--max-num-seqs 4", replacement_script)
         self.assertIn("SPECULATIVE_CONFIG={}", ",".join(api.created_config["Env"]))
+
+    def test_shell_speculative_env_repair_updates_repeated_effective_option(self):
+        script = (
+            "vllm serve org/model --speculative-config '${FIRST_CONFIG}' "
+            "-sc='${EFFECTIVE_CONFIG}'"
+        )
+
+        updated = self.manager._quote_shell_speculative_environment_reference(
+            script,
+        )
+
+        self.assertIn('--speculative-config "${FIRST_CONFIG}"', updated)
+        self.assertIn('-sc="${EFFECTIVE_CONFIG}"', updated)
+        self.assertNotIn("'${FIRST_CONFIG}'", updated)
+        self.assertNotIn("'${EFFECTIVE_CONFIG}'", updated)
+
+    def test_shell_speculative_env_repair_handles_line_continuation(self):
+        script = (
+            "vllm serve org/model \\\n"
+            "  --speculative-config \\\n"
+            "    '${SPECULATIVE_CONFIG}' \\\n"
+            "  --max-num-seqs 8"
+        )
+
+        updated = self.manager._quote_shell_speculative_environment_reference(
+            script,
+        )
+
+        self.assertIn(
+            "--speculative-config \\\n    \"${SPECULATIVE_CONFIG}\"",
+            updated,
+        )
+        self.assertNotIn("'${SPECULATIVE_CONFIG}'", updated)
+        self.assertIn("\\\n  --max-num-seqs 8", updated)
 
     async def test_update_rejects_shell_template_argv_command(self):
         name = "external-vllm"

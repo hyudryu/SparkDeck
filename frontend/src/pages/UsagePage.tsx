@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react'
 import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, Pencil, RefreshCw, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
-import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember, UsageSummary } from '../api/types'
+import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember, UsagePricing, UsageSummary } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
@@ -154,6 +154,77 @@ function ModelShare({ rows }: { rows: UsageGroup[] }) {
   return <div className="usage-share"><div className="usage-donut" style={{ '--usage-donut': `conic-gradient(${stops.join(',')})` } as CSSProperties}><strong>{formatTokens(total)}</strong><span>tokens</span></div><div className="usage-share-list">{values.map((item, index) => <div key={item.key}><i style={{ background: chartColors[index % chartColors.length] }} /><span><strong>{item.label}</strong><small>{formatTokens(item.value)} tokens</small></span><b>{Math.round(item.value / total * 100)}%</b></div>)}</div></div>
 }
 
+type PricingDraft = Record<keyof UsagePricing, string>
+
+const pricingFields: Array<{ key: keyof UsagePricing; label: string }> = [
+  { key: 'input_cost_per_1m', label: 'Input price' },
+  { key: 'cache_cost_per_1m', label: 'Cached input price' },
+  { key: 'output_cost_per_1m', label: 'Output price' },
+]
+
+function pricingDraft(pricing?: UsagePricing | null): PricingDraft {
+  return {
+    input_cost_per_1m: pricing?.input_cost_per_1m == null ? '' : String(pricing.input_cost_per_1m),
+    cache_cost_per_1m: pricing?.cache_cost_per_1m == null ? '' : String(pricing.cache_cost_per_1m),
+    output_cost_per_1m: pricing?.output_cost_per_1m == null ? '' : String(pricing.output_cost_per_1m),
+  }
+}
+
+function parsePricing(draft: PricingDraft): UsagePricing | undefined {
+  const values = Object.fromEntries(pricingFields.map(({ key }) => {
+    const raw = draft[key].trim()
+    if (!raw) return [key, null]
+    const parsed = Number(raw)
+    return [key, Number.isFinite(parsed) && parsed >= 0 ? parsed : Number.NaN]
+  })) as unknown as UsagePricing
+  return pricingFields.some(({ key }) => Number.isNaN(values[key])) ? undefined : values
+}
+
+function pricingMatches(left: UsagePricing, right: UsagePricing) {
+  return pricingFields.every(({ key }) => left[key] === right[key])
+}
+
+function UsageMemberDetails({ member, busy, onEdit, onErase, onSavePricing }: {
+  member: UsageMember
+  busy?: string
+  onEdit: () => void
+  onErase: () => void
+  onSavePricing: (pricing: UsagePricing) => Promise<void>
+}) {
+  const currentPricing = member.pricing ?? {
+    input_cost_per_1m: null,
+    cache_cost_per_1m: null,
+    output_cost_per_1m: null,
+  }
+  const [baseline, setBaseline] = useState<UsagePricing>(currentPricing)
+  const [draft, setDraft] = useState<PricingDraft>(() => pricingDraft(member.pricing))
+  useEffect(() => {
+    const next = member.pricing ?? {
+      input_cost_per_1m: null,
+      cache_cost_per_1m: null,
+      output_cost_per_1m: null,
+    }
+    setBaseline(next)
+    setDraft(pricingDraft(next))
+  }, [member.model, member.pricing])
+  const parsed = parsePricing(draft)
+  const pricingBusy = busy === `pricing:${member.model}`
+  const canEditPricing = Boolean(member.deployment_id && member.pricing)
+  const changed = Boolean(parsed && !pricingMatches(parsed, baseline))
+  const savePricing = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!parsed || !canEditPricing || !changed || pricingBusy) return
+    try {
+      await onSavePricing(parsed)
+      setBaseline(parsed)
+      setDraft(pricingDraft(parsed))
+    } catch {
+      // The parent renders the request error and keeps this draft editable.
+    }
+  }
+  return <div className="usage-member"><div><strong>{member.alias || member.model}</strong><code>{member.model}</code>{member.routed_to && <small>Displayed under {member.routed_to}</small>}</div><div className="usage-member-controls"><form className="usage-pricing-form" aria-label={`Pricing for ${member.model}`} onSubmit={(event) => void savePricing(event)}><div className="usage-pricing-fields">{pricingFields.map(({ key, label }) => <label className="field" key={key}><span>{label}</span><input type="number" min="0" step="any" inputMode="decimal" value={draft[key]} disabled={!canEditPricing || pricingBusy} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} aria-label={`${label} for ${member.model}`} placeholder="Not set" /></label>)}</div><div className="usage-pricing-actions"><small>{canEditPricing ? 'Recorded USD per 1M tokens. Blank uses the configured fallback.' : 'Pricing unavailable because no unique deployment is linked to this usage key.'}</small><Button type="submit" variant="primary" disabled={!canEditPricing || !parsed || !changed || pricingBusy}>{pricingBusy ? 'Saving…' : 'Save pricing'}</Button></div></form><div className="row-actions"><Button type="button" variant="tertiary" aria-label={`Edit usage display for ${member.model}`} onClick={onEdit}><Pencil size={14} /> Edit</Button><Button type="button" variant="danger" disabled={busy === `erase:${member.model}`} onClick={onErase}><Trash2 size={14} /> Erase</Button></div></div></div>
+}
+
 export function UsagePage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const summary = useResource((signal) => api.usage.get(signal))
@@ -235,6 +306,17 @@ export function UsagePage() {
     } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not update the usage display') } finally { setBusy(undefined) }
   }
   const erase = async (model: string) => { if (!await confirm({ title: `Erase usage for ${model}?`, message: 'This removes all lifetime and hourly usage for this model and cannot be undone.', confirmLabel: 'Erase usage', danger: true })) return; setBusy(`erase:${model}`); setActionError(undefined); try { await api.usage.erase(model); setNotice(`Erased usage for ${model}.`); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not erase model usage') } finally { setBusy(undefined) } }
+  const savePricing = async (member: UsageMember, pricing: UsagePricing) => {
+    if (!member.deployment_id) return
+    setBusy(`pricing:${member.model}`); setActionError(undefined); setNotice(undefined)
+    try {
+      await api.usage.updatePricing(member.deployment_id, pricing)
+      setNotice(`Updated recorded pricing for ${member.model}.`); summary.reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Could not update recorded pricing')
+      throw reason
+    } finally { setBusy(undefined) }
+  }
   const routeModels = [...new Set([...Object.keys(summary.data?.models ?? {}), ...Object.keys(summary.data?.routing_rules ?? {}), ...Object.values(summary.data?.routing_rules ?? {}), ...(summary.data?.groups ?? []).map((group) => group.route_target).filter((target): target is string => Boolean(target))])].sort()
   const routingRules = Object.entries(summary.data?.routing_rules ?? {}).sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
   const routeOptions = editing ? routeModels.filter((model) => model !== editing.model) : []
@@ -269,7 +351,7 @@ export function UsagePage() {
       <div className="section-heading"><div><h2>Detailed accounting</h2><p>Aliases, merge groups, and routing rules affect display only; raw counters remain intact.</p></div></div>
       {!rows.length ? <EmptyState title="No token usage recorded" description="Run a model through any paired SparkDeck node to begin collecting cluster lifetime counters." /> : <Panel className="table-panel usage-table-panel"><div className="responsive-table usage-table" role="table" aria-label="Lifetime model usage"><div className="table-row table-header" role="row">{([['model', 'Model / alias'], ['input', 'Input miss'], ['cached', 'Cache hit'], ['output', 'Output'], ['requests', 'Requests'], ['speed', 'Avg speed'], ['cost', 'Cost']] as Array<[SortKey, string]>).map(([key, label]) => <button role="columnheader" key={key} onClick={() => setSort(key)} aria-sort={sortKey === key ? (sortAscending ? 'ascending' : 'descending') : 'none'}>{label}<span aria-hidden="true">{sortKey === key ? (sortAscending ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}</span></button>)}<span role="columnheader">Details</span></div>
         {rows.map((row) => { const open = expanded.has(row.key); return <div className="usage-row-group" key={row.key}><div className="table-row" role="row"><div role="cell" data-label="Model / alias"><strong>{row.label}</strong><small>{row.merge_group ? `${row.models.length} merged models` : row.route_target ?? row.models[0]}</small></div><div role="cell" data-label="Input miss"><strong>{row.stats.estimated_cached ? '~' : ''}{formatTokens(inputMisses(row))}</strong></div><div role="cell" data-label="Cache hit"><strong>{row.stats.estimated_cached ? '~' : ''}{formatTokens(row.stats.cached)}</strong><small>{row.stats.estimated_cached ? `${formatTokens(row.stats.measured_cached)} measured` : 'Measured reuse'}</small></div><div role="cell" data-label="Output"><strong>{formatTokens(row.stats.output)}</strong><small>{formatDuration(row.stats.gen_time_s)} decode</small></div><div role="cell" data-label="Requests">{formatTokens(row.stats.requests)}</div><div role="cell" data-label="Avg speed"><strong>{row.speed?.tok_s == null ? '--' : `${row.speed.tok_s.toFixed(1)} tok/s`}</strong><small>{row.speed?.legacy ? 'Legacy lifetime average' : row.speed?.tokens ? `Last ${formatTokens(row.speed.tokens)} output` : 'No speed samples'}</small></div><div role="cell" data-label="Cost"><strong>{formatCost(row.total_cost)}</strong><small>{row.cost_estimated ? 'Includes cache estimate' : 'Recorded pricing'}</small></div><div role="cell" data-label="Details" className="row-actions"><Button variant="tertiary" aria-expanded={open} aria-label={`${open ? 'Hide' : 'Show'} details for ${row.label}`} onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next })}>{open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</Button></div></div>
-          {open && <div className="usage-members" aria-label={`Models in ${row.label}`}>{row.members.map((member) => <div className="usage-member" key={member.model}><div><strong>{member.alias || member.model}</strong><code>{member.model}</code>{member.routed_to && <small>Displayed under {member.routed_to}</small>}</div><div className="row-actions"><Button variant="tertiary" aria-label={`Edit usage display for ${member.model}`} onClick={() => beginEdit(member)}><Pencil size={14} /> Edit</Button><Button variant="danger" disabled={busy === `erase:${member.model}`} onClick={() => void erase(member.model)}><Trash2 size={14} /> Erase</Button></div></div>)}</div>}</div> })}</div></Panel>}
+          {open && <div className="usage-members" aria-label={`Models in ${row.label}`}>{row.members.map((member) => <UsageMemberDetails key={member.model} member={member} busy={busy} onEdit={() => beginEdit(member)} onErase={() => void erase(member.model)} onSavePricing={(pricing) => savePricing(member, pricing)} />)}</div>}</div> })}</div></Panel>}
       <Panel className="usage-routing-panel" aria-labelledby="usage-routing-title"><div className="usage-panel-heading"><div><h2 id="usage-routing-title">Model routing rules</h2><p>Combine one model's accounting into another without changing the underlying counters.</p></div></div>
         <form className="usage-routing-form" aria-label="Add model routing rule" onSubmit={(event) => void saveRoute(event)}><label className="field"><span>Source model</span><select value={routeSource} disabled={busy?.startsWith('route:')} onChange={(event) => { const source = event.target.value; setRouteSource(source); setRouteDestination(summary.data?.routing_rules?.[source] ?? ''); setRouteError(undefined) }}><option value="">Select a model</option>{routeModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label className="field"><span>Destination model</span><select value={routeDestination} onChange={(event) => { setRouteDestination(event.target.value); setRouteError(undefined) }} disabled={!routeSource || busy?.startsWith('route:')}><option value="">Select a model</option>{routeModels.filter((model) => model !== routeSource).map((model) => <option key={model} value={model}>{model}</option>)}</select></label><Button type="submit" variant="primary" disabled={!routeSource || !routeDestination || routeSource === routeDestination || busy?.startsWith('route:')}>{summary.data?.routing_rules?.[routeSource] ? 'Update rule' : 'Add rule'}</Button></form>
         {routeError && <p className="inline-error usage-routing-error" role="alert">{routeError}</p>}

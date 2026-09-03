@@ -363,6 +363,10 @@ export interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   required_node_count?: number
+  parallel_rank_count?: number
+  flexible_node_count?: boolean
+  single_host_topology_replayable?: boolean
+  distributed_host_topology_replayable?: boolean
   model_revision?: string
   created_at?: string
   last_deployed_at?: string | number
@@ -437,6 +441,10 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     },
     deployment_mode: item.deployment_mode,
     required_node_count: item.required_node_count,
+    parallel_rank_count: item.parallel_rank_count,
+    flexible_node_count: item.flexible_node_count,
+    single_host_topology_replayable: item.single_host_topology_replayable,
+    distributed_host_topology_replayable: item.distributed_host_topology_replayable,
     node_ids: item.node_ids,
     selected_nodes: item.selected_nodes,
     created_at: item.created_at,
@@ -974,6 +982,14 @@ export const api = {
         // the backend to leave the stored merge group untouched.
         body: JSON.stringify({ model, alias, merge_group }),
       }),
+    updatePricing: (deploymentId: string, pricing: {
+      input_cost_per_1m: number | null
+      cache_cost_per_1m: number | null
+      output_cost_per_1m: number | null
+    }) => request<void>(`/api/deployments/${encodeURIComponent(deploymentId)}/pricing`, {
+      method: 'PUT',
+      body: JSON.stringify(pricing),
+    }),
     setRoute: (source: string, destination: string) =>
       request<void>('/api/token-stats/rules', {
         method: 'PUT',

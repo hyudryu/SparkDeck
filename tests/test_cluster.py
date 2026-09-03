@@ -2018,6 +2018,376 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cost["output_cost_per_1m"], 9.0)
 
+    def test_usage_member_exposes_actionable_persisted_deployment_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "org/model [nvfp4]": {
+                "input": 100, "cached": 25, "output": 40, "requests": 1,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-1",
+            "model": "org/model",
+            "pricing_model_key": "org/model [nvfp4]",
+            "launch_settings": {
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": 0.0,
+            },
+        }]
+
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(member["deployment_id"], "deployment-1")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": 1.25,
+            "cache_cost_per_1m": None,
+            "output_cost_per_1m": 0.0,
+        })
+
+    def test_usage_member_resolves_routed_destination_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/source": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"legacy/source": "org/master"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        member = row["members"][0]
+
+        self.assertEqual(row["pricing_model"], "org/master")
+        self.assertEqual(member["routed_to"], "org/master")
+        self.assertEqual(member["deployment_id"], "deployment-master")
+        self.assertEqual(member["pricing"]["output_cost_per_1m"], 4.0)
+
+    def test_routed_row_honors_explicit_all_zero_destination_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"claude-opus-4": "org/free-model"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-free",
+            "model": "org/free-model",
+            "pricing_model_key": "org/free-model",
+            "launch_settings": {
+                "input_cost_per_1m": 0.0,
+                "cache_cost_per_1m": 0.0,
+                "output_cost_per_1m": 0.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        member = row["members"][0]
+
+        self.assertEqual(row["pricing_model"], "org/free-model")
+        self.assertEqual(row["total_cost"], 0.0)
+        self.assertEqual(member["deployment_id"], "deployment-free")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": 0.0,
+            "cache_cost_per_1m": 0.0,
+            "output_cost_per_1m": 0.0,
+        })
+
+    def test_routed_row_exposes_one_pricing_editor_on_destination(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/source": {
+                "input": 100, "cached": 0, "output": 10,
+            },
+            "org/master": {
+                "input": 200, "cached": 0, "output": 20,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"legacy/source": "org/master"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        members = {member["model"]: member for member in row["members"]}
+
+        self.assertEqual(
+            members["org/master"]["deployment_id"], "deployment-master",
+        )
+        self.assertEqual(
+            members["org/master"]["pricing"]["output_cost_per_1m"], 4.0,
+        )
+        self.assertIsNone(members["legacy/source"]["deployment_id"])
+        self.assertIsNone(members["legacy/source"]["pricing"])
+        self.assertEqual(
+            sum(member["deployment_id"] is not None for member in row["members"]),
+            1,
+        )
+
+    def test_routed_merge_group_exposes_one_editor_per_pricing_deployment(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/source": {"input": 100, "cached": 0, "output": 10},
+            "org/master": {"input": 200, "cached": 0, "output": 20},
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {"org/master": "Combined model"}
+        instance.usage_routing_rules = {"legacy/source": "org/master"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 4.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        members = {member["model"]: member for member in row["members"]}
+
+        self.assertIsNone(row["route_target"])
+        self.assertEqual(row["merge_group"], "Combined model")
+        self.assertEqual(members["legacy/source"]["routed_to"], "org/master")
+        self.assertEqual(
+            members["org/master"]["deployment_id"], "deployment-master",
+        )
+        self.assertIsNone(members["legacy/source"]["deployment_id"])
+        self.assertIsNone(members["legacy/source"]["pricing"])
+        self.assertEqual(
+            sum(member["deployment_id"] is not None for member in row["members"]),
+            1,
+        )
+
+    def test_routed_row_uses_stable_editor_when_destination_has_no_usage(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "legacy/z-source": {"input": 100, "cached": 0, "output": 10},
+            "legacy/a-source": {"input": 200, "cached": 0, "output": 20},
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {
+            "legacy/z-source": "org/master",
+            "legacy/a-source": "org/master",
+        }
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-master",
+            "model": "org/master",
+            "pricing_model_key": "org/master",
+            "launch_settings": {"output_cost_per_1m": 4.0},
+        }]
+
+        row = instance.usage_rows()[0]
+        members = {member["model"]: member for member in row["members"]}
+
+        self.assertEqual(
+            members["legacy/a-source"]["deployment_id"],
+            "deployment-master",
+        )
+        self.assertIsNone(members["legacy/z-source"]["deployment_id"])
+        self.assertEqual(
+            sum(member["deployment_id"] is not None for member in row["members"]),
+            1,
+        )
+
+    def test_ambiguous_deployment_pricing_is_not_order_dependent_or_editable(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "org/model": {
+                "input": 0, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [
+            {
+                "id": "deployment-a",
+                "pricing_model_key": "org/model",
+                "launch_settings": {"output_cost_per_1m": 1.0},
+            },
+            {
+                "id": "deployment-b",
+                "pricing_model_key": "org/model",
+                "launch_settings": {"output_cost_per_1m": 9.0},
+            },
+        ]
+
+        cost = instance.calculate_cost("org/model", instance.token_stats["org/model"])
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(cost["output_cost_per_1m"], 0.0)
+        self.assertIsNone(member["deployment_id"])
+        self.assertIsNone(member["pricing"])
+
+    async def test_clone_identical_pricing_has_one_owner_and_saves_as_a_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.token_stats = {
+                "legacy/source": {
+                    "input": 1_000_000, "cached": 0, "output": 1_000_000,
+                },
+                "org/model": {
+                    "input": 100, "cached": 0, "output": 10,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.usage_routing_rules = {"legacy/source": "org/model"}
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            identical_pricing = {
+                "input_cost_per_1m": 1.0,
+                "cache_cost_per_1m": 0.25,
+                "output_cost_per_1m": 4.0,
+            }
+            instance.deployments = [
+                {
+                    "id": "clone-b",
+                    "created_at": 20,
+                    "pricing_model_key": "org/model",
+                    "launch_settings": dict(identical_pricing),
+                },
+                {
+                    "id": "source-a",
+                    "created_at": 10,
+                    "pricing_model_key": "org/model",
+                    "launch_settings": dict(identical_pricing),
+                },
+            ]
+
+            # Identical copied rates still price usage, and only the stable
+            # source owner is exposed even when routing combines two members.
+            cost = instance.calculate_cost(
+                "org/model", instance.token_stats["org/model"],
+            )
+            row = instance.usage_rows()[0]
+            members = {member["model"]: member for member in row["members"]}
+            self.assertEqual(cost["output_cost_per_1m"], 4.0)
+            self.assertEqual(
+                members["org/model"]["deployment_id"], "source-a",
+            )
+            self.assertIsNone(members["legacy/source"]["deployment_id"])
+            self.assertEqual(
+                sum(member["deployment_id"] is not None for member in row["members"]),
+                1,
+            )
+
+            await instance.update_deployment_pricing("source-a", {
+                "input_cost_per_1m": 2.0,
+                "cache_cost_per_1m": 0.5,
+                "output_cost_per_1m": 8.0,
+            })
+
+            self.assertEqual(
+                {
+                    deployment["launch_settings"]["output_cost_per_1m"]
+                    for deployment in instance.deployments
+                },
+                {8.0},
+            )
+            self.assertEqual(
+                instance.calculate_cost("org/model", {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                })["output_cost_per_1m"],
+                8.0,
+            )
+            with self.assertRaisesRegex(ValueError, "managed by deployment source-a"):
+                await instance.update_deployment_pricing("clone-b", {
+                    "output_cost_per_1m": 9.0,
+                })
+
+            await instance.update_deployment_pricing("source-a", {
+                "input_cost_per_1m": None,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": None,
+            })
+            self.assertEqual(
+                instance._usage_member_pricing("org/model")["deployment_id"],
+                "source-a",
+            )
+
+    def test_usage_pricing_prefers_unique_live_owner_among_blank_matches(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "deepseek/model [nvfp4]": {
+                "input": 0, "cached": 0, "output": 10, "requests": 1,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [
+            {
+                "id": "tp2-stopped",
+                "pricing_model_key": "deepseek/model [nvfp4]",
+                "status": "stopped",
+                "desired_state": "stopped",
+                "launch_settings": {},
+            },
+            {
+                "id": "tp4-running",
+                "pricing_model_key": "deepseek/model [nvfp4]",
+                "status": "ready",
+                "desired_state": "running",
+                "launch_settings": {},
+            },
+        ]
+
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(member["deployment_id"], "tp4-running")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": None,
+            "cache_cost_per_1m": None,
+            "output_cost_per_1m": None,
+        })
+
     def test_pricing_rejects_non_finite_numbers(self) -> None:
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=value):
@@ -2638,6 +3008,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             deployment = await instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
+                "shm_size": 64 * 1024 ** 3,
+                "infiniband_device": True,
                 "environment": {"NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1"},
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
@@ -2658,6 +3030,12 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 for member in deployment["members"]
             ))
             self.assertEqual(len(captured), 2)
+            self.assertEqual(
+                deployment["launch_settings"]["shm_size"], 64 * 1024 ** 3,
+            )
+            self.assertIs(
+                deployment["launch_settings"]["infiniband_device"], True,
+            )
             for rank, (node_id, payload) in enumerate(captured):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
@@ -2674,6 +3052,8 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload["environment"], {
                     "NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1",
                 })
+                self.assertEqual(payload["shm_size"], 64 * 1024 ** 3)
+                self.assertIs(payload["infiniband_device"], True)
 
     async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2864,6 +3244,149 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     })
 
         self.assertEqual(instance.deployments, [])
+
+    async def test_vllm_single_host_parallelism_validates_local_gpu_ranks(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {}
+        instance.deployments = []
+        local_gpus = [{"name": f"GPU {index}"} for index in range(8)]
+
+        async def cluster_nodes(local_stats=None):
+            return [{
+                "id": "local", "name": "GPU server", "online": True,
+                "docker_ready": True, "interfaces": [],
+                "stats": {"gpus": local_gpus},
+            }]
+
+        instance.cluster_nodes = cluster_nodes
+        instance._allocate_port = mock.AsyncMock(return_value=8000)
+
+        plan = await instance._preflight_deployment_launch({
+            "model": "example/Model",
+            "engine": "vllm",
+            "deployment_mode": "single",
+            "node_ids": ["local"],
+            "extra_args": ["--tensor-parallel-size", "8"],
+        })
+        self.assertEqual(plan["node_ids"], ["local"])
+
+        local_gpus.pop()
+        with self.assertRaisesRegex(ValueError, "8 GPU.*not enough devices"):
+            await instance._preflight_deployment_launch({
+                "model": "example/Model",
+                "engine": "vllm",
+                "deployment_mode": "single",
+                "node_ids": ["local"],
+                "extra_args": ["--tensor-parallel-size", "8"],
+            })
+
+    async def test_sglang_parallelism_preserves_world_size_across_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = []
+            captured = []
+            inventories = {
+                "local": [{"name": f"GPU {index}"} for index in range(8)],
+                "remote-1": [{"name": f"GPU {index}"} for index in range(4)],
+            }
+
+            async def cluster_nodes(local_stats=None):
+                return [
+                    {
+                        "id": "local", "name": "Spark 1", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.1",
+                        "fabric_interface": "cx7-local", "interfaces": [],
+                        "stats": {"gpus": inventories["local"]},
+                    },
+                    {
+                        "id": "remote-1", "name": "Spark 2", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.2",
+                        "fabric_interface": "cx7-remote", "interfaces": [],
+                        "stats": {"gpus": inventories["remote-1"]},
+                    },
+                ]
+
+            async def allocate_port():
+                return 8008
+
+            async def create_member(node_id, payload):
+                captured.append((node_id, payload))
+                return {
+                    "id": f"container-{node_id}", "status": "running",
+                    "model_source": "public_repository",
+                }
+
+            instance.cluster_nodes = cluster_nodes
+            instance._allocate_port = allocate_port
+            instance._create_member = create_member
+
+            single = await instance._preflight_deployment_launch({
+                "model": "org/model", "engine": "sglang",
+                "deployment_mode": "single", "node_ids": ["local"],
+                "sg_tp_size": 8,
+            })
+            self.assertEqual(single["body"]["sg_tp_size"], 8)
+            inventories["local"].pop()
+            with self.assertRaisesRegex(ValueError, "8 GPU.*not enough devices"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "sg_tp_size": 8,
+                })
+            inventories["local"] = [
+                {"name": f"GPU {index}"} for index in range(4)
+            ]
+
+            deployment = await instance.create_deployment({
+                "model": "org/model", "engine": "sglang",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "sg_tp_size": 8,
+            })
+
+            self.assertEqual(deployment["launch_settings"]["sg_tp_size"], 8)
+            contract = instance.recipe_deployment_contract(
+                deployment["launch_settings"],
+            )
+            self.assertEqual(contract["required_node_count"], 2)
+            self.assertEqual(contract["tensor_parallel_size"], 8)
+            self.assertEqual(len(captured), 2)
+            for rank, (_, payload) in enumerate(captured):
+                self.assertEqual(payload["sg_tp_size"], 8)
+                self.assertEqual(
+                    payload["extra_args"][
+                        payload["extra_args"].index("--nnodes") + 1
+                    ],
+                    "2",
+                )
+                self.assertEqual(
+                    payload["extra_args"][
+                        payload["extra_args"].index("--node-rank") + 1
+                    ],
+                    str(rank),
+                )
+
+            inventories["remote-1"].pop()
+            with self.assertRaisesRegex(ValueError, "4 GPU.*not enough devices"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "sg_tp_size": 8,
+                })
+
+            with self.assertRaisesRegex(ValueError, "divide evenly"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "sg_tp_size": 7,
+                })
 
     def test_stopped_deployment_launch_settings_are_saved_and_marked_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3717,6 +4240,128 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["launch_settings"]["cache_cost_per_1m"], 0.1)
             self.assertEqual(saved["launch_settings"]["output_cost_per_1m"], 3.5)
 
+    def test_stopped_variant_edit_migrates_pricing_identity_and_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.unsloth_settings = {}
+            instance.deployments = [{
+                "id": "deployment-1",
+                "name": "Vision",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "pricing_model_key": "org/model [nvfp4_ds_mla]",
+                "pricing": {
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+                "launch_settings": {
+                    "deployment_name": "Vision",
+                    "model": "org/model",
+                    "engine": "vllm",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+            }]
+
+            updated = instance.update_deployment_settings("deployment-1", {
+                "extra_args": ["--kv-cache-dtype", "fp8"],
+            })
+
+            self.assertEqual(updated["pricing_model_key"], "org/model [fp8]")
+            self.assertEqual(updated["pricing"], {
+                "input_cost_per_1m": 1.25,
+                "cache_cost_per_1m": 0.1,
+                "output_cost_per_1m": 3.5,
+            })
+            self.assertEqual(
+                instance._deployment_pricing(
+                    updated["launch_settings"],
+                ),
+                updated["pricing"],
+            )
+            self.assertEqual(
+                instance._usage_member_pricing("org/model [fp8]")["deployment_id"],
+                "deployment-1",
+            )
+            self.assertIsNone(
+                instance._usage_member_pricing(
+                    "org/model [nvfp4_ds_mla]",
+                )["deployment_id"]
+            )
+            cost = instance.calculate_cost("org/model [fp8]", {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            })
+            self.assertEqual(cost["input_cost_per_1m"], 1.25)
+            self.assertEqual(cost["output_cost_per_1m"], 3.5)
+            persisted = json.loads(instance.deployments_path.read_text())[0]
+            self.assertEqual(persisted["pricing_model_key"], "org/model [fp8]")
+
+    def test_stopped_priced_edit_rejects_conflicting_target_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.unsloth_settings = {}
+            moving = {
+                "id": "moving",
+                "name": "Moving",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "pricing_model_key": "org/model [nvfp4_ds_mla]",
+                "launch_settings": {
+                    "deployment_name": "Moving",
+                    "model": "org/model",
+                    "engine": "vllm",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+            }
+            occupied = {
+                "id": "occupied",
+                "model": "org/model",
+                "status": "stopped",
+                "pricing_model_key": "org/model [fp8]",
+                "launch_settings": {
+                    "model": "org/model",
+                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                    "input_cost_per_1m": 2.0,
+                    "cache_cost_per_1m": 0.2,
+                    "output_cost_per_1m": 4.0,
+                },
+            }
+            instance.deployments = [moving, occupied]
+
+            with self.assertRaisesRegex(
+                ValueError, "already owned.*different recorded rates",
+            ):
+                instance.update_deployment_settings("moving", {
+                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                })
+
+            self.assertEqual(moving["pricing_model_key"], "org/model [nvfp4_ds_mla]")
+            self.assertEqual(moving["launch_settings"]["extra_args"], [
+                "--kv-cache-dtype", "nvfp4_ds_mla",
+            ])
+            self.assertEqual(
+                instance._usage_member_pricing("org/model [fp8]")["deployment_id"],
+                "occupied",
+            )
+
     async def test_pricing_recovers_full_legacy_launch_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
@@ -4236,7 +4881,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         })
 
         first = await instance.create_container(
-            "org/first", name="first-r1",
+            "org/first", name="first-r1", infiniband_device=False,
             environment={
                 "NCCL_DEBUG": "WARN",
                 "SPECULATIVE_CONFIG": (
@@ -4250,13 +4895,15 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "nnodes": 2, "mode": "sharded",
             },
         )
-        second = await instance.create_container(
-            "org/second", name="second-r1",
-            cluster_member={
-                "deployment_id": "second", "node_id": "remote-1", "rank": 1,
-                "nnodes": 2, "mode": "sharded",
-            },
-        )
+        with mock.patch("manager.Path") as device_path:
+            device_path.return_value.exists.return_value = True
+            second = await instance.create_container(
+                "org/second", name="second-r1", infiniband_device=True,
+                cluster_member={
+                    "deployment_id": "second", "node_id": "remote-1", "rank": 1,
+                    "nnodes": 2, "mode": "sharded",
+                },
+            )
 
         self.assertEqual([first["port"], second["port"]], [8000, 8001])
         self.assertEqual(
@@ -4264,6 +4911,10 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             ["8000", "8001"],
         )
         self.assertTrue(all(options["network_mode"] == "host" for options in run_options))
+        self.assertNotIn("devices", run_options[0])
+        self.assertEqual(
+            run_options[1]["devices"], ["/dev/infiniband:/dev/infiniband"],
+        )
         self.assertEqual(run_options[0]["environment"]["NCCL_DEBUG"], "WARN")
         speculative = json.loads(instance._cli_option(
             run_options[0]["command"], {"--speculative-config"},
@@ -4283,6 +4934,18 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sglang["port"], 9000)
         self.assertEqual(run_options[-1]["labels"][SERVICE_PORT_LABEL], "9000")
         self.assertEqual(run_options[-1]["network_mode"], "host")
+
+        with mock.patch("manager.Path") as device_path:
+            device_path.return_value.exists.return_value = False
+            with self.assertRaisesRegex(ValueError, "requires /dev/infiniband"):
+                await instance.create_container(
+                    "org/missing-device", port=9001,
+                    infiniband_device=True,
+                    cluster_member={
+                        "deployment_id": "missing", "node_id": "remote-1",
+                        "rank": 1, "nnodes": 2, "mode": "sharded",
+                    },
+                )
 
         # A stopped host-network container still owns its restart port. Once
         # that container is removed from Docker inventory, the port is reusable.

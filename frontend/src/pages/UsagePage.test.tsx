@@ -179,6 +179,74 @@ describe('UsagePage', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/org%2Fmodel', expect.objectContaining({ method: 'DELETE' })))
   })
 
+  it('shows persisted deployment pricing and saves only changed values', async () => {
+    const pricedSummary = {
+      ...summary,
+      groups: summary.groups.map((group) => ({
+        ...group,
+        members: group.members.map((member) => ({
+          ...member,
+          deployment_id: 'deployment / one',
+          pricing: {
+            input_cost_per_1m: 1.25,
+            cache_cost_per_1m: 0,
+            output_cost_per_1m: 2.5,
+          },
+        })),
+      })),
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/hourly') || String(input).includes('/daily')) return json([])
+      return json(pricedSummary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    const inputPrice = screen.getByRole('spinbutton', { name: 'Input price for org/model' })
+    const cachedPrice = screen.getByRole('spinbutton', { name: 'Cached input price for org/model' })
+    const outputPrice = screen.getByRole('spinbutton', { name: 'Output price for org/model' })
+    const save = screen.getByRole('button', { name: 'Save pricing' })
+    expect(inputPrice).toHaveValue(1.25)
+    expect(cachedPrice).toHaveValue(0)
+    expect(outputPrice).toHaveValue(2.5)
+    expect(save).toBeDisabled()
+
+    await user.clear(cachedPrice)
+    await user.type(cachedPrice, '0.15')
+    expect(save).toBeEnabled()
+    await user.click(save)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/deployments/deployment%20%2F%20one/pricing', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({
+        input_cost_per_1m: 1.25,
+        cache_cost_per_1m: 0.15,
+        output_cost_per_1m: 2.5,
+      }),
+    })))
+    expect(await screen.findByText('Updated recorded pricing for org/model.')).toBeInTheDocument()
+    expect(save).toBeDisabled()
+  })
+
+  it('keeps pricing read-only when usage cannot be linked to one deployment', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('/hourly') || String(input).includes('/daily')) return json([])
+      return json(summary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    expect(screen.getByText('Pricing unavailable because no unique deployment is linked to this usage key.')).toBeInTheDocument()
+    expect(screen.getByRole('spinbutton', { name: 'Input price for org/model' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save pricing' })).toBeDisabled()
+    expect(fetchMock.mock.calls.every(([path]) => !String(path).includes('/token-cost/'))).toBe(true)
+  })
+
   it('starts and stops an interval meter at the bottom of the page', async () => {
     const current = {
       ...summary,

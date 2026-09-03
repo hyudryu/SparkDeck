@@ -53,6 +53,7 @@ from sparkdeck.virtual_nas import (
     partial_download_size_bytes,
     transfer_required_free_bytes,
     validate_model_id,
+    validate_storage_model_id,
     validate_revision,
 )
 from sparkdeck.updater import CAPABILITY, current_revision
@@ -688,6 +689,7 @@ class Manager:
         self._deployment_resume_wakeup = asyncio.Event()
         self._deployment_action_lock = asyncio.Lock()
         self._deployment_acceptance_lock = asyncio.Lock()
+        self._deployment_pricing_lock = asyncio.Lock()
         self._host_port_reservation_lock = asyncio.Lock()
         self._host_port_reservations: set[int] = set()
         # A controller restart can attach to an older deployment whose vLLM
@@ -1822,7 +1824,7 @@ class Manager:
         instructions = [
             "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
             "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
-            "Complete externally managed ComfyUI bundles are inventoried read-only and cannot be transferred or deleted here.",
+            "ComfyUI weights can be deleted in place; only recognized complete bundles can be transferred between nodes.",
         ]
         if not self.virtual_nas_enabled():
             self._virtual_nas_rate_samples = {}
@@ -3091,7 +3093,7 @@ class Manager:
         }
 
     async def delete_virtual_nas_model(self, node_id: str, model_id: str) -> dict:
-        model_id = validate_model_id(model_id)
+        model_id = validate_storage_model_id(model_id)
         node_id = str(node_id or "")
         if self.virtual_nas.model_in_transfer(model_id, node_id):
             raise RuntimeError("model is in use by a virtual NAS transfer")
@@ -3701,7 +3703,7 @@ class Manager:
 
     async def update_container_alias(self, name: str, alias: Any) -> dict:
         try:
-            self.client.containers.get(name)
+            await asyncio.to_thread(self.client.containers.get, name)
         except Exception as exc:
             raise ValueError("container not found") from exc
         normalized = self._normalized_alias(alias)
@@ -3760,6 +3762,28 @@ class Manager:
             raise ValueError(f"{field} must be a non-negative number")
         return result
 
+    @staticmethod
+    def _normalized_shm_size(value: Any) -> int | None:
+        """Return a positive Docker shared-memory size in bytes."""
+        if value in (None, ""):
+            return None
+        try:
+            size = docker.utils.parse_bytes(str(value))
+        except (TypeError, ValueError, docker.errors.DockerException) as exc:
+            raise ValueError("shm_size must be a positive byte size") from exc
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ValueError("shm_size must be a positive byte size")
+        return size
+
+    @staticmethod
+    def _normalized_infiniband_device(value: Any) -> bool | None:
+        """Normalize an explicit recovered InfiniBand mount requirement."""
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise ValueError("infiniband_device must be a boolean")
+        return value
+
     @classmethod
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
@@ -3792,6 +3816,10 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "shm_size": cls._normalized_shm_size(body.get("shm_size")),
+            "infiniband_device": cls._normalized_infiniband_device(
+                body.get("infiniband_device")
+            ),
             "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "input_cost_per_1m": cls._pricing_value(
                 body.get("input_cost_per_1m"), "input_cost_per_1m"
@@ -4331,6 +4359,17 @@ class Manager:
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
         }
+        previous_model = str(
+            current.get("model") or deployment.get("model") or ""
+        )
+        previous_args = current.get("extra_args")
+        previous_variant = self._variant_from_cmd(
+            previous_args
+            if isinstance(previous_args, list) and all(
+                isinstance(value, str) for value in previous_args
+            )
+            else []
+        )
         merged = {**current, **body}
         controls = body.get("launch_controls")
         if isinstance(controls, dict) and (merged.get("engine") or "vllm") == "sglang":
@@ -4385,6 +4424,45 @@ class Manager:
         # Preserve the assigned API port unless the editor explicitly changes it.
         if settings.get("port") is None:
             settings["port"] = deployment.get("api_port")
+        pricing_identity_changed = (
+            previous_model.casefold() != str(settings["model"]).casefold()
+            or previous_variant.casefold() != self._variant_from_cmd(
+                settings["extra_args"]
+            ).casefold()
+        )
+        migrated_pricing_key = None
+        if pricing_identity_changed and deployment.get("pricing_model_key"):
+            migrated_pricing_key = self._stats_key(
+                settings["model"], self._variant_from_cmd(settings["extra_args"]),
+            )
+            migrated_signature = tuple(
+                self._deployment_pricing(settings)[field]
+                for field in (
+                    "input_cost_per_1m",
+                    "cache_cost_per_1m",
+                    "output_cost_per_1m",
+                )
+            )
+            if any(value is not None for value in migrated_signature):
+                conflicting = next((
+                    candidate
+                    for candidate in self.deployments
+                    if candidate is not deployment
+                    and self._deployment_pricing_model_key(candidate).casefold()
+                    == migrated_pricing_key.casefold()
+                    and any(
+                        value is not None
+                        for value in self._deployment_pricing_signature(candidate)
+                    )
+                    and self._deployment_pricing_signature(candidate)
+                    != migrated_signature
+                ), None)
+                if conflicting is not None:
+                    raise ValueError(
+                        "deployment pricing identity is already owned by "
+                        f"deployment {conflicting.get('id')} with different "
+                        "recorded rates"
+                    )
         remaining_error = (
             _remove_persisted_error(
                 deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
@@ -4404,6 +4482,12 @@ class Manager:
             ) if persisted_args_error else deployment.get("status"),
             "error": remaining_error or None,
         })
+        if migrated_pricing_key is not None:
+            # pricing_model_key is captured when rates are first saved so the
+            # Usage editor can resolve the exact stats identity. A launch edit
+            # that changes the model/variant must move that pointer too; the
+            # persisted rate values themselves remain in launch_settings.
+            deployment["pricing_model_key"] = migrated_pricing_key
         deployment.pop("launch_settings_error", None)
         deployment.pop("kv_capacity", None)
         deployment.pop("auto_concurrency_adjustment", None)
@@ -4429,10 +4513,13 @@ class Manager:
             "model": deployment.get("model"),
             "engine": engine,
             "image": (primary_container or {}).get("image"),
+            "environment": load_settings.get("environment") or {},
             "extra_args": recovered_args,
             "gpu_memory_utilization": load_settings.get(
                 "gpu_memory_utilization"
             ),
+            "shm_size": load_settings.get("shm_size"),
+            "infiniband_device": load_settings.get("infiniband_device"),
             "deployment_mode": deployment.get("mode", "single"),
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
@@ -4474,10 +4561,111 @@ class Manager:
             model, cls._variant_from_cmd(settings.get("extra_args") or [])
         ) if model else ""
 
+    @classmethod
+    def _deployment_pricing_signature(cls, deployment: dict) -> tuple[Any, ...]:
+        pricing = cls._deployment_pricing(
+            deployment.get("launch_settings") or {}
+        )
+        return tuple(pricing[field] for field in (
+            "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+        ))
+
+    @staticmethod
+    def _deployment_pricing_owner_key(deployment: dict) -> tuple[float, str, str]:
+        """Keep one editor owner stable as clone runtime state changes."""
+        try:
+            created_at = float(deployment.get("created_at"))
+            if not math.isfinite(created_at):
+                created_at = math.inf
+        except (TypeError, ValueError):
+            created_at = math.inf
+        deployment_id = str(deployment.get("id") or "")
+        return created_at, deployment_id.casefold(), deployment_id
+
+    def _deployment_pricing_resolution(self, model: str) -> dict | None:
+        """Return the one deployment whose persisted rates price *model*.
+
+        Exact usage identity matching mirrors :meth:`calculate_cost`. When
+        duplicate deployments share an identity, one explicitly priced match
+        remains authoritative over otherwise blank matches. Clone-derived
+        priced matches with the exact same rates are one logical price and use
+        a stable owner; conflicting rates remain ambiguous. When every match
+        is blank, a unique live owner is actionable; this lets a running
+        deployment be priced even while a stopped deployment with the same
+        model identity is also saved. If several unpriced matches have the
+        same lifecycle state, the same stable owner rule keeps one editor
+        available without inventing a price.
+        """
+        model_key = str(model or "").strip().casefold()
+        if not model_key:
+            return None
+        matches = [
+            deployment
+            for deployment in getattr(self, "deployments", [])
+            if self._deployment_pricing_model_key(deployment).casefold()
+            == model_key
+        ]
+        priced = [
+            deployment for deployment in matches
+            if any(
+                (deployment.get("launch_settings") or {}).get(field) is not None
+                for field in (
+                    "input_cost_per_1m",
+                    "cache_cost_per_1m",
+                    "output_cost_per_1m",
+                )
+            )
+        ]
+        if priced:
+            signatures = {
+                self._deployment_pricing_signature(deployment)
+                for deployment in priced
+            }
+            if len(signatures) == 1:
+                return min(priced, key=self._deployment_pricing_owner_key)
+            return None
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        live_matches = [
+            deployment for deployment in matches
+            if str(deployment.get("desired_state") or "running").casefold()
+            != "stopped"
+            and str(deployment.get("status") or "").casefold()
+            not in {"stopped", "error", "removed"}
+        ]
+        if len(live_matches) == 1:
+            return live_matches[0]
+        return min(matches, key=self._deployment_pricing_owner_key)
+
+    def _usage_member_pricing(self, model: str) -> dict[str, Any]:
+        """Return actionable persisted pricing metadata for one Usage member."""
+        deployment = self._deployment_pricing_resolution(model)
+        deployment_id = str((deployment or {}).get("id") or "").strip()
+        if not deployment or not deployment_id:
+            return {"deployment_id": None, "pricing": None}
+        settings = deployment.get("launch_settings") or {}
+        return {
+            "deployment_id": deployment_id,
+            "pricing": self._deployment_pricing(settings),
+        }
+
     async def update_deployment_pricing(
         self, deployment_id: str, body: dict
     ) -> dict:
         """Update accounting metadata without restarting a running cluster."""
+        lock = getattr(self, "_deployment_pricing_lock", None)
+        if lock is None:
+            lock = self._deployment_pricing_lock = asyncio.Lock()
+        async with lock:
+            return await self._update_deployment_pricing_locked(
+                deployment_id, body,
+            )
+
+    async def _update_deployment_pricing_locked(
+        self, deployment_id: str, body: dict
+    ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
@@ -4505,12 +4693,46 @@ class Manager:
             deployment["launch_settings"] = launch_settings
             if primary and primary.get("stats_key"):
                 deployment["pricing_model_key"] = primary["stats_key"]
-        launch_settings.update(pricing)
         if not deployment.get("pricing_model_key"):
             deployment["pricing_model_key"] = (
                 self._deployment_pricing_model_key(deployment)
             )
-        deployment["pricing"] = pricing
+
+        pricing_key = self._deployment_pricing_model_key(deployment)
+        owner = self._deployment_pricing_resolution(pricing_key)
+        if owner is None:
+            raise ValueError(
+                "deployment pricing is ambiguous for this model identity"
+            )
+        if owner is not deployment:
+            raise ValueError(
+                "deployment pricing is managed by deployment "
+                f"{owner.get('id')}"
+            )
+
+        previous_signature = self._deployment_pricing_signature(deployment)
+        group = [deployment]
+        if any(value is not None for value in previous_signature):
+            # A clone copies the source rates. Treat those exact copies as one
+            # logical price: update them together so the unexposed clone can
+            # never retain a stale rate and turn the identity ambiguous after
+            # the visible owner is saved.
+            group = [
+                candidate
+                for candidate in self.deployments
+                if self._deployment_pricing_model_key(candidate).casefold()
+                == pricing_key.casefold()
+                and self._deployment_pricing_signature(candidate)
+                == previous_signature
+            ]
+        for candidate in group:
+            candidate_settings = candidate.get("launch_settings")
+            if not isinstance(candidate_settings, dict):
+                continue
+            candidate_settings.update(pricing)
+            candidate["pricing"] = dict(pricing)
+            if not candidate.get("pricing_model_key"):
+                candidate["pricing_model_key"] = pricing_key
         self._save_deployments()
         return {"ok": True, "deployment_id": deployment_id, **pricing}
 
@@ -4628,7 +4850,11 @@ class Manager:
         environment-backed ``--speculative-config`` reference is exempt: the
         controller resolves it from the recreated container environment.
         """
-        speculative_names = {"--speculative-config", "-sc"}
+        # Only the long form is exempt because
+        # _resolve_environment_backed_speculative_args resolves that spelling.
+        # Fail closed for ``-sc ${NAME}`` until the full parsing/editing path
+        # supports the alias too.
+        speculative_names = {"--speculative-config"}
         index = 0
         while index < len(args):
             token = str(args[index])
@@ -4663,16 +4889,422 @@ class Manager:
         exempt it there explicitly.
         """
         value = str(value or "")
-        return value.startswith("$") or "`" in value or "[@" in value
+        return bool(re.search(
+            # Parameter/command/arithmetic expansion may be embedded in an
+            # otherwise literal-looking value (for example model-${SUFFIX}).
+            # The remaining characters are shell control/redirection
+            # operators that shlex round-tripping would incorrectly turn into
+            # plain Docker argv.
+            r"\$(?:\{|\(|[A-Za-z0-9_@*#?!$-])|`|\\(?:\r\n|\n)|[;&|<>]",
+            value,
+        ))
+
+    @staticmethod
+    def _has_unescaped_shell_newline(value: str) -> bool:
+        """Return whether shell text contains a meaningful command newline.
+
+        ``shlex.split`` treats an unquoted newline as ordinary whitespace, but
+        a shell treats it as a command boundary.  A discovered shell-wrapped
+        launch therefore cannot be converted safely to exec-form argv when
+        more shell text follows such a newline.  Quoted newlines are literal
+        argument content and backslash-newline pairs are continuations, so
+        neither is a boundary.  A final newline is harmless.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if char == '"':
+                quote = None if quote == '"' else '"'
+                index += 1
+                continue
+            if char == "'" and quote is None:
+                quote = "'"
+                index += 1
+                continue
+            if char == "\\":
+                # Backslash escapes the next character outside single quotes,
+                # including an LF or a CRLF shell line continuation.
+                if index + 1 < len(text) and text[index + 1] == "\r":
+                    index += 3 if text[index + 2:index + 3] == "\n" else 2
+                else:
+                    index += 2
+                continue
+            if quote is None and char in {"\r", "\n"}:
+                next_index = index + 1
+                if char == "\r" and text[next_index:next_index + 1] == "\n":
+                    next_index += 1
+                if text[next_index:].strip():
+                    return True
+                index = next_index
+                continue
+            index += 1
+        return False
+
+    @staticmethod
+    def _has_unquoted_shell_comment(value: str) -> bool:
+        """Return whether shell text contains a POSIX comment introducer.
+
+        ``shlex.split`` does not recognize comments unless explicitly asked to,
+        so reconstructing a shell command from its tokens would turn ``#`` and
+        the comment text into ordinary vLLM argv. A hash starts a shell comment
+        only at the beginning of a word; quoted, escaped, and embedded hashes
+        remain literal argument content.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        word_start = True
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                word_start = False
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    word_start = False
+                    continue
+                word_start = False
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                word_start = False
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                word_start = False
+                continue
+            if char == "#" and word_start:
+                return True
+            word_start = char.isspace() or char in ";|&()<>"
+            index += 1
+        return False
+
+    @staticmethod
+    def _has_unquoted_shell_path_expansion(value: str) -> bool:
+        """Return whether shell text depends on pathname or tilde expansion.
+
+        Promotion turns a discovered shell command into exec-form argv. Globs
+        and a leading tilde are therefore unsafe even when ``shlex.split``
+        produces ordinary-looking tokens: the shell may already have replaced
+        them in the discovered container. Quoted or backslash-escaped
+        metacharacters are literals and remain replayable.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        word_start = True
+        bracket_candidate = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                word_start = False
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    word_start = False
+                    continue
+                word_start = False
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                word_start = False
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                word_start = False
+                continue
+            if char.isspace() or char in ";|&()<>":
+                word_start = True
+                bracket_candidate = False
+                index += 1
+                continue
+            if char in {"*", "?"}:
+                return True
+            # Bash extended globs can be enabled by a startup profile or a
+            # command-line ``-O extglob`` option.  The ordinary ``*`` and
+            # ``?`` forms are caught above; these operator spellings would
+            # otherwise survive shlex conversion and change meaning when the
+            # managed replacement switches to exec-form argv.
+            if char in {"@", "+", "!"} and text[index + 1:index + 2] == "(":
+                return True
+            if char == "[":
+                bracket_candidate = True
+            elif char == "]" and bracket_candidate:
+                return True
+            if char == "~" and (
+                word_start or (index > 0 and text[index - 1] == "=")
+            ):
+                return True
+            word_start = False
+            index += 1
+        return False
+
+    @staticmethod
+    def _has_unquoted_bash_brace_expansion(value: str) -> bool:
+        """Return whether Bash would expand an unquoted brace expression."""
+        text = str(value or "")
+        quote: str | None = None
+        brace_stack: list[dict[str, object]] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char.isspace() or char in ";|&()<>":
+                brace_stack.clear()
+                index += 1
+                continue
+            if char == "{":
+                # ``${...}`` is parameter expansion, not brace expansion. Keep
+                # it on the stack so commas inside it cannot make an enclosing
+                # ordinary brace look expandable.
+                dollar_escaped = False
+                if index > 0 and text[index - 1] == "$":
+                    slash_count = 0
+                    cursor = index - 2
+                    while cursor >= 0 and text[cursor] == "\\":
+                        slash_count += 1
+                        cursor -= 1
+                    dollar_escaped = slash_count % 2 == 1
+                parameter_open = (
+                    index > 0
+                    and text[index - 1] == "$"
+                    and not dollar_escaped
+                )
+                brace_stack.append({
+                    "kind": "parameter" if parameter_open else "brace",
+                    "start": index,
+                    "comma": False,
+                })
+            elif char == "," and brace_stack:
+                if brace_stack[-1]["kind"] == "brace":
+                    brace_stack[-1]["comma"] = True
+            elif char == "}" and brace_stack:
+                candidate = brace_stack.pop()
+                if candidate["kind"] == "brace":
+                    if candidate["comma"]:
+                        return True
+                    body = text[int(candidate["start"]) + 1:index]
+                    if re.fullmatch(
+                        r"(?:-?\d+|[A-Za-z])\.\."
+                        r"(?:-?\d+|[A-Za-z])(?:\.\.-?\d+)?",
+                        body,
+                    ):
+                        return True
+            index += 1
+        return False
+
+    @staticmethod
+    def _has_unquoted_bash_ansi_c_quoting(value: str) -> bool:
+        """Return whether Bash would interpret an ANSI-C quoted string.
+
+        Promotion converts a discovered shell command to exec-form argv.
+        Python's POSIX ``shlex`` parser does not implement Bash's ``$'...'``
+        escape decoding, so replaying such a command could silently change an
+        argument. The construct is active only outside another quote and when
+        the dollar is not backslash-escaped.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char == "$" and text[index + 1:index + 2] == "'":
+                return True
+            index += 1
+        return False
+
+    @staticmethod
+    def _has_unquoted_bash_locale_quoting(value: str) -> bool:
+        """Return whether Bash would interpret a locale-translated string.
+
+        Bash's ``$"..."`` form can translate the string through the active
+        locale before passing it to vLLM. Python's POSIX ``shlex`` parser does
+        not model that translation, so converting the command to exec-form
+        argv cannot promise to reproduce the discovered value.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char == "$" and text[index + 1:index + 2] == '"':
+                return True
+            index += 1
+        return False
+
+    @classmethod
+    def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
+        """Whether a managed launch reproduces the command before ``serve``."""
+        command = [str(value) for value in (cmd or [])]
+        if len(command) >= 3 and command[-2] in {"-c", "-lc"}:
+            match = cls._shell_vllm_command(command[-1])
+            if match is None:
+                return False
+            if match.group("executable") != "vllm":
+                return False
+            # Promotion switches to exec-form ``vllm serve``. Even a safe
+            # setup/export prelude would be lost, so accept only whitespace
+            # before a bare invocation (optionally introduced by ``exec``).
+            return not command[-1][:match.start()].strip()
+        try:
+            serve_index = command.index("serve")
+        except ValueError:
+            return False
+        if serve_index != 1:
+            return False
+        return command[0] == "vllm"
+
+    @staticmethod
+    def _sglang_exec_prefix_is_replayable(cmd: list[str]) -> bool:
+        """Whether a managed SGLang launch reproduces its executable prefix.
+
+        Manager always recreates SGLang containers as ``python3 -m
+        sglang.launch_server``. Fail closed on absolute/alternate interpreter
+        paths and wrapper/bootstrap commands that Manager would silently
+        replace with a potentially different executable resolved from PATH.
+        """
+        command = [str(value) for value in (cmd or [])]
+        if len(command) < 3 or command[1:3] != ["-m", "sglang.launch_server"]:
+            return False
+        return command[0] == "python3"
 
     @staticmethod
     def _shell_vllm_command(script: str):
         """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
         return re.search(
-            r"(?:^|;\s*|\bexec\s+)(?:[^\s;]*/)?vllm\s+serve\s+"
+            r"(?:^|;\s*|\bexec\s+)"
+            r"(?P<executable>(?:[^\s;]*/)?vllm)\s+serve\s+"
             r"(?P<model>(?:\"[^\"]*\"|'[^']*'|[^\s;]+))(?P<flags>.*)$",
             script or "",
             re.DOTALL,
+        )
+
+    @classmethod
+    def _quote_shell_speculative_environment_reference(cls, script: str) -> str:
+        """Keep an env-backed speculative config expandable by the shell.
+
+        ``shlex.quote('${NAME}')`` produces single quotes, which pass the
+        placeholder to vLLM literally. Shell-wrapped containers need double
+        quotes so the expanded JSON remains one argv value.
+        """
+        command = cls._shell_vllm_command(script)
+        if command is None:
+            return script
+        flags = command.group("flags")
+        scalar = r'''(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)'''
+        separator = r'''(?P<separator>=|(?:[ \t]|\\(?:\r\n|\n))+)'''
+        pattern = re.compile(
+            rf"(?<!\S)(?P<option>--speculative-config|-sc)"
+            rf"{separator}{scalar}"
+        )
+
+        def replace(match: re.Match[str]) -> str:
+            try:
+                values = shlex.split(match.group("value"))
+            except ValueError:
+                return match.group(0)
+            if len(values) != 1:
+                return match.group(0)
+            key = cls._environment_reference(values[0])
+            if key is None:
+                return match.group(0)
+            return (
+                f'{match.group("option")}{match.group("separator")}'
+                f'"${{{key}}}"'
+            )
+
+        # Repair every exact reference. vLLM/argparse uses the final repeated
+        # option, so stopping after the first match could leave the effective
+        # value single-quoted and therefore literal.
+        updated_flags = pattern.sub(replace, flags)
+        if updated_flags == flags:
+            return script
+        return (
+            script[:command.start("flags")]
+            + updated_flags
+            + script[command.end("flags"):]
         )
 
     @classmethod
@@ -4705,11 +5337,69 @@ class Manager:
         command_flags = ""
         analysis_cmd = cmd
         shell_wrapped = False
+        shell_command_boundary = False
+        shell_comment = False
+        shell_path_expansion = False
+        shell_brace_expansion = False
+        shell_ansi_c_quoting = False
+        shell_locale_quoting = False
+        shell_wrapper_unsupported = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
                 shell_wrapped = True
                 command_flags = match.group("flags").strip()
+                shell_command_boundary = self._has_unescaped_shell_newline(
+                    match.group("flags")
+                )
+                shell_comment = self._has_unquoted_shell_comment(
+                    match.group("flags")
+                )
+                shell_path_expansion = self._has_unquoted_shell_path_expansion(
+                    match.group("model") + match.group("flags")
+                )
+                # Docker may preserve Bash startup options before ``-c``/``-lc``
+                # (for example ``bash --noprofile -lc``). The executable is
+                # still the first argv element; indexing relative to ``-lc``
+                # would mistake the startup option for the shell and miss
+                # Bash-only brace expansion.
+                shell_path = cmd[0].replace("\\", "/")
+                shell = shell_path.rsplit("/", 1)[-1]
+                # Promotion converts shell-wrapped launches to exec-form argv.
+                # The scanners below model Bash plus common POSIX expansion,
+                # not zsh/ksh/fish (or arbitrary wrapper programs). Keep
+                # discovery and settings inspection available, but fail closed
+                # when the original interpreter is outside that contract.
+                shell_options = cmd[1:-2]
+                shell_wrapper_unsupported = (
+                    shell_path not in {"bash", "/bin/bash", "/usr/bin/bash"}
+                    or any(
+                        option not in {"--noprofile", "--norc"}
+                        for option in shell_options
+                    )
+                    or (
+                        cmd[-2] == "-lc"
+                        and "--noprofile" not in shell_options
+                    )
+                )
+                shell_brace_expansion = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_brace_expansion(
+                        match.group("model") + match.group("flags")
+                    )
+                )
+                shell_ansi_c_quoting = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_ansi_c_quoting(
+                        match.group("model") + match.group("flags")
+                    )
+                )
+                shell_locale_quoting = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_locale_quoting(
+                        match.group("model") + match.group("flags")
+                    )
+                )
                 try:
                     analysis_cmd = [
                         "vllm", "serve", shlex.split(match.group("model"))[0],
@@ -4805,9 +5495,11 @@ class Manager:
             extra_args.append(token)
             i += 1
         thinking_mode, _, _ = self._thinking_config(analysis_cmd)
-        return {
+        settings = {
             "editable": (
                 "serve" in analysis_cmd
+                and not shell_command_boundary
+                and not shell_comment
                 and (
                     shell_wrapped
                     or not self._has_unresolvable_shell_tokens(
@@ -4837,6 +5529,19 @@ class Manager:
             "extra_args": extra_args,
             "command_flags": command_flags,
         }
+        if shell_path_expansion:
+            # Internal promotion guard. SparkDeck's public settings sanitizer
+            # intentionally does not include private keys.
+            settings["_shell_path_expansion"] = True
+        if shell_brace_expansion:
+            settings["_shell_brace_expansion"] = True
+        if shell_ansi_c_quoting:
+            settings["_shell_ansi_c_quoting"] = True
+        if shell_locale_quoting:
+            settings["_shell_locale_quoting"] = True
+        if shell_wrapper_unsupported:
+            settings["_shell_wrapper_unsupported"] = True
+        return settings
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
@@ -5394,6 +6099,12 @@ class Manager:
         body["environment"] = normalize_runtime_environment(
             body.get("environment"), engine,
         )
+        if body.get("shm_size") not in (None, ""):
+            body["shm_size"] = self._normalized_shm_size(body["shm_size"])
+        if "infiniband_device" in body:
+            body["infiniband_device"] = self._normalized_infiniband_device(
+                body["infiniband_device"]
+            )
         controls = body.get("launch_controls")
         if controls is not None and engine != "llama.cpp":
             if not isinstance(controls, dict):
@@ -5446,7 +6157,7 @@ class Manager:
         if not model:
             raise ValueError("model is required")
         vllm_parallel_layout: tuple[int, int] | None = None
-        if mode == "sharded" and engine == "vllm":
+        if mode in {"single", "sharded"} and engine == "vllm":
             requested_args = list(body.get("extra_args") or [])
             requested_tp = self._cli_option(
                 requested_args, {"--tensor-parallel-size", "-tp"}, int
@@ -5481,12 +6192,45 @@ class Manager:
                         f"layout requires {ranks_per_node} GPU(s) per node; "
                         f"not enough devices on: {', '.join(gpu_short)}"
                     )
-                vllm_parallel_layout = (tp, pp)
-            else:
+                if mode == "sharded":
+                    vllm_parallel_layout = (tp, pp)
+            elif mode == "sharded":
                 # Default to one local tensor-parallel rank per node and
                 # pipeline parallelism across nodes. Models that do not
                 # implement SupportsPP can explicitly request TP=nnodes, PP=1.
                 vllm_parallel_layout = (1, len(node_ids))
+        if mode in {"single", "sharded"} and engine == "sglang":
+            requested_tp = self._validated_sg_scalar(
+                "sg_tp_size", body.get("sg_tp_size"),
+            )
+            if requested_tp is None and mode == "sharded":
+                # Preserve the existing one-rank-per-host default for ordinary
+                # sharded SGLang launches that do not choose an explicit TP.
+                requested_tp = len(node_ids)
+            if requested_tp is not None:
+                body["sg_tp_size"] = requested_tp
+                if requested_tp % len(node_ids):
+                    raise ValueError(
+                        "SGLang tensor parallel size must divide evenly across "
+                        "the selected nodes"
+                    )
+                ranks_per_node = requested_tp // len(node_ids)
+                gpu_short = []
+                for nid in node_ids:
+                    gpus = (available[nid].get("stats") or {}).get("gpus")
+                    if gpus is None:
+                        continue
+                    usable = [
+                        gpu for gpu in gpus
+                        if not (isinstance(gpu, dict) and gpu.get("error"))
+                    ]
+                    if len(usable) < ranks_per_node:
+                        gpu_short.append(available[nid].get("name", nid))
+                if gpu_short:
+                    raise ValueError(
+                        f"layout requires {ranks_per_node} GPU(s) per node; "
+                        f"not enough devices on: {', '.join(gpu_short)}"
+                    )
         requested_port = body.get("port")
         local_port = requested_port
         if LOCAL_NODE_ID in node_ids and local_port is not None:
@@ -5646,6 +6390,8 @@ class Manager:
             "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
+            "shm_size": body.get("shm_size"),
+            "infiniband_device": body.get("infiniband_device"),
             "environment": body.get("environment"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
@@ -5721,7 +6467,12 @@ class Manager:
                         "--node-rank", str(rank),
                         "--dist-init-addr", f"{master_ip}:29501",
                     ]
-                    payload["sg_tp_size"] = len(node_ids)
+                    # --tp-size is the total SGLang world size. A recovered
+                    # TP8 launch spread over two or four hosts must remain TP8,
+                    # with --nnodes describing only the host topology.
+                    payload["sg_tp_size"] = (
+                        body.get("sg_tp_size") or len(node_ids)
+                    )
             member_specs.append({
                 "node_id": node_id,
                 "node_name": node.get("name", node_id),
@@ -7281,22 +8032,137 @@ class Manager:
         images can set ``HF_HOME`` to another absolute path.  Mounting the
         host cache at the image's declared location keeps offline images able
         to resolve snapshots without overriding their runtime environment.
+        Targets are cached by Docker's immutable image ID, never a mutable
+        tag which can be repointed outside SparkDeck.
         """
         fallback = "/root/.cache/huggingface"
         if not image:
             return fallback
+        cache = getattr(self, "_image_hf_cache_target_cache", None)
+        if cache is None:
+            cache = self._image_hf_cache_target_cache = {}
+        image_ref = str(image).strip()
+        immutable_ref = bool(re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_ref))
+        if immutable_ref and image_ref.casefold() in cache:
+            return cache[image_ref.casefold()]
         try:
-            docker_image = self.client.images.get(image)
-            env = ((docker_image.attrs or {}).get("Config") or {}).get("Env") or []
+            docker_image = self.client.images.get(image_ref)
+            image_attrs = docker_image.attrs or {}
         except Exception:
+            # A transient Docker failure must not permanently force the
+            # fallback for this image; retry on the next inventory pass.
             return fallback
+        image_id = str(
+            getattr(docker_image, "id", "") or image_attrs.get("Id") or ""
+        ).strip().casefold()
+        if image_id and image_id in cache:
+            return cache[image_id]
+        env = (image_attrs.get("Config") or {}).get("Env") or []
+        target = fallback
         for entry in env:
             if not isinstance(entry, str) or not entry.startswith("HF_HOME="):
                 continue
-            target = entry.partition("=")[2].strip().rstrip("/")
-            if target.startswith("/") and target != "":
-                return target
-        return fallback
+            candidate = entry.partition("=")[2].strip().rstrip("/")
+            if candidate.startswith("/") and candidate != "":
+                target = candidate
+                break
+        # Test doubles and alternate Docker clients may omit the image ID.
+        # Their environment is still usable for this call, but without an
+        # immutable identity it is not safe to cache the result.
+        if image_id:
+            cache[image_id] = target
+        return target
+
+    def _container_mounts_are_replayable(
+        self, attrs: dict, image: str | None, model: str,
+    ) -> bool:
+        """Whether Manager can reproduce an inspected container's mounts.
+
+        Managed launches rebuild only the configured Hugging Face cache bind
+        and, for a controller-local model, a same-path model bind. Keep the
+        detailed host paths private while reporting whether every inspected
+        mount fits one of those two contracts.
+        """
+        mounts = attrs.get("Mounts")
+        binds = (attrs.get("HostConfig") or {}).get("Binds") or []
+        if not mounts and not binds:
+            # Managed launches add the configured Hugging Face cache bind.
+            # Treat a mountless direct-start container as non-replayable: the
+            # injected bind could hide weights baked into the image's HF_HOME.
+            return False
+
+        cache_target = self._image_hf_cache_target(image).rstrip("/") or "/"
+        configured_cache = str(
+            (getattr(self, "settings", {}) or {}).get("hf_cache") or ""
+        ).strip()
+        managed_cache_source = (
+            os.path.normcase(os.path.normpath(str(
+                Path(configured_cache).expanduser().resolve()
+            )))
+            if configured_cache
+            else None
+        )
+        local_model = self._resolve_local_path(model)
+        local_target = str(local_model).rstrip("/\\") if local_model else None
+
+        def _matches_managed_bind(source: str, destination: str) -> bool:
+            destination = destination.rstrip("/") or "/"
+            if destination == cache_target:
+                return bool(
+                    managed_cache_source
+                    and os.path.normcase(os.path.normpath(source))
+                    == managed_cache_source
+                )
+            source = source.rstrip("/\\")
+            return bool(
+                local_target
+                and destination == local_target
+                and source == local_target
+            )
+
+        if mounts and not isinstance(mounts, list):
+            return False
+        if isinstance(mounts, list) and mounts:
+            for mount in mounts:
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                # _build_volumes() recreates both accepted binds as plain rw.
+                # Reject read-only and option-bearing mounts instead of
+                # silently weakening or otherwise changing their semantics.
+                mode = str(mount.get("Mode") or "").strip().lower()
+                if mount.get("RW") is not True or mode not in {"", "rw"}:
+                    return False
+                if not _matches_managed_bind(
+                    str(mount.get("Source") or "").strip(),
+                    str(mount.get("Destination") or ""),
+                ):
+                    return False
+
+        # Older Docker API responses may omit the normalized Mounts list while
+        # retaining bind declarations in HostConfig. Parse destinations from
+        # the right so Windows drive-letter sources remain valid.
+        if binds and not isinstance(binds, list):
+            return False
+        for bind in binds:
+            if not isinstance(bind, str):
+                return False
+            try:
+                head, tail = bind.rsplit(":", 1)
+            except ValueError:
+                return False
+            if tail.startswith("/"):
+                source, destination, mode = head, tail, ""
+            else:
+                mode = tail.strip().lower()
+                try:
+                    source, destination = head.rsplit(":", 1)
+                except ValueError:
+                    return False
+            if mode not in {"", "rw"}:
+                return False
+            if not _matches_managed_bind(source, destination):
+                return False
+        return True
 
     def _build_volumes(
         self,
@@ -9414,6 +10280,18 @@ class Manager:
                 )
                 pricing_model = row["route_target"]
                 for candidate in pricing_candidates:
+                    candidate_pricing = self._usage_member_pricing(
+                        candidate,
+                    ).get("pricing")
+                    if candidate_pricing is not None and any(
+                        rate is not None
+                        for rate in candidate_pricing.values()
+                    ):
+                        # Persisted zero rates are still an explicit pricing
+                        # decision. Prefer them over a routed source's
+                        # non-zero built-in or deployment fallback.
+                        pricing_model = candidate
+                        break
                     candidate_cost = self.calculate_cost(candidate, {
                         "input": 1, "cached": 0, "output": 1,
                     })
@@ -9431,6 +10309,32 @@ class Manager:
                     "cached": effective_cached,
                     "output": row["stats"].get("output", 0),
                 })["total_cost"]
+                # A routed row can contain the destination plus several
+                # sources.  They all share one pricing deployment, so expose
+                # exactly one editor instead of letting multiple member forms
+                # overwrite the same persisted values with stale drafts.
+                # Prefer the logical destination when it has recorded usage;
+                # otherwise use a stable source member.
+                pricing_owner = next((
+                    member for member in row["members"]
+                    if member["model"] == row["route_target"]
+                ), None)
+                if pricing_owner is None:
+                    pricing_owner = min(
+                        row["members"],
+                        key=lambda member: (
+                            member["model"].casefold(), member["model"],
+                        ),
+                    )
+                pricing_owner.update(
+                    self._usage_member_pricing(pricing_model)
+                )
+                for member in row["members"]:
+                    if member is not pricing_owner:
+                        member.update({
+                            "deployment_id": None,
+                            "pricing": None,
+                        })
                 if estimated_cached:
                     row["cost_estimated"] = True
             else:
@@ -9440,6 +10344,36 @@ class Manager:
                     ).get("total_cost", 0.0)
                     for member in row["members"]
                 )
+                # A routing destination can itself belong to a merge group,
+                # in which case the public ``route_target`` is intentionally
+                # absent.  Keep using each member's private pricing identity
+                # and expose at most one editor for each resolved deployment.
+                # Prefer the destination's own usage member, then a stable
+                # source, so rerendering cannot move ownership arbitrarily.
+                pricing_members = sorted(
+                    row["members"],
+                    key=lambda member: (
+                        member["model"].casefold()
+                        != member["_pricing_model"].casefold(),
+                        member["model"].casefold(),
+                        member["model"],
+                    ),
+                )
+                pricing_owners: set[str] = set()
+                for member in pricing_members:
+                    resolved = self._usage_member_pricing(
+                        member["_pricing_model"],
+                    )
+                    deployment_id = resolved.get("deployment_id")
+                    if deployment_id and deployment_id in pricing_owners:
+                        member.update({
+                            "deployment_id": None,
+                            "pricing": None,
+                        })
+                        continue
+                    member.update(resolved)
+                    if deployment_id:
+                        pricing_owners.add(deployment_id)
                 if estimated_cached:
                     row["cost_estimated"] = True
             row["members"].sort(key=lambda member: (
@@ -9483,11 +10417,9 @@ class Manager:
         deployment_pricing: dict[str, Any] | None = None
 
         model_lower = model.casefold()
-        for deployment in getattr(self, "deployments", []):
+        deployment = self._deployment_pricing_resolution(model)
+        if deployment is not None:
             settings = deployment.get("launch_settings") or {}
-            pricing_model_key = self._deployment_pricing_model_key(deployment)
-            if not pricing_model_key or pricing_model_key.casefold() != model_lower:
-                continue
             values = {
                 "input": settings.get("input_cost_per_1m"),
                 "output": settings.get("output_cost_per_1m"),
@@ -9495,7 +10427,6 @@ class Manager:
             }
             if any(value is not None for value in values.values()):
                 deployment_pricing = values
-                break
 
         # Check per-model unsloth settings
         for key, settings in getattr(self, "unsloth_settings", {}).items():
@@ -9824,12 +10755,14 @@ class Manager:
         elif mode == "sharded":
             saved_count = len(saved_nodes)
             if (
-                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
+                engine in {"vllm", "sglang"}
+                and parallel_nodes > 1 and saved_count > 1
                 and parallel_nodes % saved_count == 0
             ):
-                # vLLM can place several ranks on each selected host. Preserve
-                # a saved topology when it evenly divides TP x PP; launch
-                # preflight verifies that every host has enough GPUs.
+                # vLLM and SGLang can place several ranks on each selected
+                # host. Preserve a saved topology when it evenly divides the
+                # total world size; launch preflight verifies that every host
+                # has enough GPUs.
                 required_nodes = saved_count
             elif parallel_nodes > 1:
                 required_nodes = parallel_nodes
@@ -10698,6 +11631,578 @@ class Manager:
 
         return [*_parts(config.get("Entrypoint")), *_parts(config.get("Cmd"))]
 
+    def _inspected_image_config(self, image_ref: str) -> dict | None:
+        """Return cached immutable image config, retrying transient failures."""
+        cache = getattr(self, "_image_config_cache", None)
+        if cache is None:
+            cache = self._image_config_cache = {}
+        if image_ref not in cache:
+            try:
+                image = self.client.images.get(image_ref)
+                config = (image.attrs or {}).get("Config") or {}
+            except Exception:
+                return None
+            cache[image_ref] = dict(config)
+        return cache[image_ref]
+
+    def _docker_daemon_contract_defaults(self) -> tuple[str, str, str] | None:
+        """Return daemon-selected runtime, logging, and cgroup defaults.
+
+        Managed launches leave both options unset, so comparing a discovered
+        container to hard-coded values such as ``runc`` and ``json-file`` is
+        incorrect on hosts with a different daemon policy. Cache only a
+        successful, complete probe so transient Docker failures retry later.
+        """
+        cached = getattr(self, "_docker_contract_defaults_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            info = self.client.info()
+            if not isinstance(info, dict):
+                return None
+            runtime = str(info.get("DefaultRuntime") or "").strip()
+            logging_driver = str(info.get("LoggingDriver") or "").strip()
+            cgroup_version = str(info.get("CgroupVersion") or "").strip()
+        except Exception:
+            return None
+        if not runtime or not logging_driver or cgroup_version not in {"1", "2"}:
+            return None
+        result = (runtime, logging_driver, cgroup_version)
+        self._docker_contract_defaults_cache = result
+        return result
+
+    def _container_environment_is_replayable(
+        self, attrs: dict, engine: str,
+    ) -> bool:
+        """Whether managed recreation preserves container env semantics.
+
+        Docker's container config contains image defaults merged with explicit
+        container overrides. Managed launches reuse the image, so unchanged
+        defaults need not be copied. Every differing value must survive the
+        credential-safe discovery allowlist. Only this capability bit is
+        returned; unapproved names and all of their values remain private.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+
+        def environment_map(entries: Any) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for entry in entries or []:
+                if not isinstance(entry, str) or "=" not in entry:
+                    continue
+                name, value = entry.split("=", 1)
+                result[name] = value
+            return result
+
+        current = environment_map(
+            ((attrs.get("Config") or {}).get("Env") or [])
+        )
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            # Without immutable image defaults we cannot distinguish a safe
+            # inherited value from a container-level override that promotion
+            # would silently discard.
+            return False
+        defaults = environment_map(image_config.get("Env") or [])
+        preserved = discovered_runtime_environment(current, engine)
+        missing = object()
+        for name in set(current) | set(defaults):
+            current_value = current.get(name, missing)
+            if current_value == defaults.get(name, missing):
+                continue
+            if (
+                isinstance(current_value, str)
+                and preserved.get(name) == current_value
+            ):
+                continue
+            return False
+        return True
+
+    def _container_user_is_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves the container user.
+
+        Managed launches do not set Docker's ``User`` override, so they run
+        as the immutable image default. A direct-start container is portable
+        only when its effective configured user exactly matches that default.
+        Fail closed when the image cannot be inspected or either value has an
+        unexpected type rather than silently changing runtime privileges.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+
+        current = (attrs.get("Config") or {}).get("User", "")
+        default = image_config.get("User", "")
+        current = "" if current is None else current
+        default = "" if default is None else default
+        return (
+            isinstance(current, str)
+            and isinstance(default, str)
+            and current == default
+        )
+
+    def _container_working_dir_is_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves the working directory.
+
+        Manager does not set a Docker ``working_dir`` override. A direct-start
+        container is therefore portable only when its configured working
+        directory matches the default from the immutable source image. Image
+        inspection failures and malformed values fail closed.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+
+        current = (attrs.get("Config") or {}).get("WorkingDir", "")
+        default = image_config.get("WorkingDir", "")
+        current = "" if current is None else current
+        default = "" if default is None else default
+        return (
+            isinstance(current, str)
+            and isinstance(default, str)
+            and current == default
+        )
+
+    @staticmethod
+    def _container_gpu_requests_are_replayable(attrs: dict) -> bool:
+        """Whether Manager's all-GPU request exactly preserves inspection.
+
+        Managed launches request one default-driver device allocation with
+        ``count=-1`` and only the generic GPU capability. A restricted device
+        list, driver-specific options, or an absent request must not be
+        silently widened to every GPU during direct-start promotion.
+        """
+        requests = ((attrs.get("HostConfig") or {}).get("DeviceRequests"))
+        if not isinstance(requests, list) or len(requests) != 1:
+            return False
+        request = requests[0]
+        if not isinstance(request, dict):
+            return False
+        count = request.get("Count")
+        return (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count == -1
+            and request.get("DeviceIDs") in (None, [])
+            and request.get("Driver") in (None, "")
+            and request.get("Options") in (None, {})
+            and request.get("Capabilities") == [["gpu"]]
+        )
+
+    @staticmethod
+    def _container_ipc_mode_is_replayable(attrs: dict) -> bool:
+        """Whether managed recreation preserves Docker's IPC namespace mode.
+
+        Manager always creates model containers with ``ipc_mode=host``. A
+        direct-start container using a private, shareable, or another
+        container's IPC namespace cannot be promoted without changing its
+        runtime contract. Missing or malformed inspection data fails closed.
+        """
+        host_config = attrs.get("HostConfig")
+        return (
+            isinstance(host_config, dict)
+            and host_config.get("IpcMode") == "host"
+        )
+
+    @staticmethod
+    def _container_read_only_rootfs_is_replayable(attrs: dict) -> bool:
+        """Whether Manager preserves the writable root-filesystem contract.
+
+        Managed model launches do not request Docker's read-only rootfs mode.
+        Promotion must therefore accept only an explicitly inspected ``false``
+        value. Missing or non-boolean inspection data fails closed instead of
+        silently making a previously read-only image filesystem writable.
+        """
+        host_config = attrs.get("HostConfig")
+        return (
+            isinstance(host_config, dict)
+            and host_config.get("ReadonlyRootfs") is False
+        )
+
+    def _container_runtime_contract_is_replayable(self, attrs: dict) -> bool:
+        """Whether unmanaged Docker process/security options are reproducible.
+
+        The managed builders intentionally do not replay arbitrary privilege,
+        namespace, DNS, health-check, or stdio configuration. Compare inherited
+        image values against the immutable source image and require the
+        remaining fields to match the options Manager actually creates. Only a
+        boolean capability leaves this method; raw host configuration remains
+        private.
+        """
+        config = attrs.get("Config")
+        host_config = attrs.get("HostConfig")
+        image_ref = str(attrs.get("Image") or "").strip()
+        image_config = (
+            self._inspected_image_config(image_ref) if image_ref else None
+        )
+        daemon_defaults = self._docker_daemon_contract_defaults()
+        if (
+            not isinstance(config, dict)
+            or not isinstance(host_config, dict)
+            or image_config is None
+            or daemon_defaults is None
+        ):
+            return False
+
+        # Manager reuses the immutable image without container-level overrides.
+        for field in ("Healthcheck", "StopSignal"):
+            if config.get(field) != image_config.get(field):
+                return False
+
+        container_id = str(attrs.get("Id") or "").strip()
+        hostname = config.get("Hostname")
+        if (
+            not container_id
+            or not isinstance(hostname, str)
+            or hostname.casefold() != container_id[:12].casefold()
+        ):
+            return False
+        if config.get("Domainname", "") != "":
+            return False
+        if config.get("MacAddress", "") != "":
+            return False
+        if config.get("StopTimeout") is not None:
+            return False
+        for field in ("Tty", "OpenStdin", "StdinOnce"):
+            if config.get(field) is not False:
+                return False
+
+        expected_empty_sequences = (
+            "CapAdd", "CapDrop", "SecurityOpt", "GroupAdd", "ExtraHosts",
+            "Dns", "DnsOptions", "DnsSearch", "Links", "VolumesFrom",
+            "LxcConf",
+        )
+        for field in expected_empty_sequences:
+            if field not in host_config or host_config[field] not in (None, []):
+                return False
+        for field in ("Sysctls", "Tmpfs"):
+            if field not in host_config or host_config[field] not in (None, {}):
+                return False
+
+        fixed_defaults = {
+            "Privileged": False,
+            "AutoRemove": False,
+            "PublishAllPorts": False,
+            "PidMode": "",
+            "UsernsMode": "",
+            "UTSMode": "",
+            "OomScoreAdj": 0,
+            "Isolation": "",
+            "VolumeDriver": "",
+        }
+        for field, expected in fixed_defaults.items():
+            if field not in host_config:
+                return False
+            value = host_config[field]
+            if isinstance(expected, bool):
+                if value is not expected:
+                    return False
+            elif isinstance(expected, int):
+                if (
+                    not isinstance(value, int) or isinstance(value, bool)
+                    or value != expected
+                ):
+                    return False
+            elif value != expected:
+                return False
+        _runtime, _logging_driver, cgroup_version = daemon_defaults
+        expected_cgroupns = "host" if cgroup_version == "1" else "private"
+        if host_config.get("CgroupnsMode") != expected_cgroupns:
+            return False
+        if host_config.get("Init") not in (None, False):
+            return False
+
+        runtime, logging_driver, _cgroup_version = daemon_defaults
+        if host_config.get("Runtime") != runtime:
+            return False
+        log_config = host_config.get("LogConfig")
+        if not isinstance(log_config, dict) or (
+            log_config.get("Type") != logging_driver
+            or log_config.get("Config") not in (None, {})
+        ):
+            return False
+        restart_policy = host_config.get("RestartPolicy")
+        maximum_retries = (
+            restart_policy.get("MaximumRetryCount", 0)
+            if isinstance(restart_policy, dict) else None
+        )
+        if not isinstance(restart_policy, dict) or (
+            restart_policy.get("Name") != "unless-stopped"
+            or not isinstance(maximum_retries, int)
+            or isinstance(maximum_retries, bool)
+            or maximum_retries != 0
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _container_infiniband_device_requirement(attrs: dict) -> bool | None:
+        """Return the exact managed InfiniBand device contract, if supported."""
+        host_config = attrs.get("HostConfig")
+        if not isinstance(host_config, dict) or "Devices" not in host_config:
+            return None
+        raw_devices = host_config.get("Devices")
+        if raw_devices is None:
+            raw_devices = []
+        if not isinstance(raw_devices, list):
+            return None
+        normalized_devices = []
+        for item in raw_devices:
+            if not isinstance(item, dict) or set(item) != {
+                "PathOnHost", "PathInContainer", "CgroupPermissions",
+            }:
+                return None
+            values = (
+                item.get("PathOnHost"), item.get("PathInContainer"),
+                item.get("CgroupPermissions"),
+            )
+            if not all(isinstance(value, str) for value in values):
+                return None
+            normalized_devices.append(values)
+        normalized_devices.sort()
+        if not normalized_devices:
+            return False
+        if normalized_devices == [
+            ("/dev/infiniband", "/dev/infiniband", "rwm"),
+        ]:
+            return True
+        return None
+
+    @classmethod
+    def _container_topology_options_are_replayable(
+        cls, attrs: dict,
+    ) -> tuple[bool, bool]:
+        """Return single/distributed compatibility for ulimits and devices."""
+        host_config = attrs.get("HostConfig")
+        if not isinstance(host_config, dict) or "Ulimits" not in host_config:
+            return False, False
+
+        raw_ulimits = host_config.get("Ulimits")
+        if raw_ulimits is None:
+            raw_ulimits = []
+        if not isinstance(raw_ulimits, list):
+            return False, False
+        normalized_ulimits = []
+        for item in raw_ulimits:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"Name", "Soft", "Hard"}
+            ):
+                return False, False
+            name = item.get("Name")
+            soft = item.get("Soft")
+            hard = item.get("Hard")
+            if (
+                not isinstance(name, str)
+                or not isinstance(soft, int) or isinstance(soft, bool)
+                or not isinstance(hard, int) or isinstance(hard, bool)
+            ):
+                return False, False
+            normalized_ulimits.append((name, soft, hard))
+        normalized_ulimits.sort()
+
+        infiniband_device = cls._container_infiniband_device_requirement(attrs)
+        if infiniband_device is None:
+            return False, False
+        single = not normalized_ulimits and infiniband_device is False
+        distributed_ulimits = normalized_ulimits == [("memlock", -1, -1)]
+        # Both supported source contracts are replayable. Promotion persists
+        # the inspected boolean so every target mounts the device, or omits it,
+        # exactly as the source did rather than consulting its own filesystem.
+        distributed = distributed_ulimits
+        return single, distributed
+
+    @staticmethod
+    def _container_network_modes_are_replayable(
+        attrs: dict,
+    ) -> tuple[bool, bool]:
+        """Return Manager-compatible single and distributed network modes.
+
+        A one-host managed launch publishes its service port on Docker's
+        built-in bridge. Multi-host sharded members instead use host networking
+        so their fabric rendezvous addresses and service ports are reachable.
+        Custom, disabled, and container-shared networks cannot be reproduced by
+        the managed builders and therefore fail both capability checks.
+        """
+        host_config = attrs.get("HostConfig")
+        networks = ((attrs.get("NetworkSettings") or {}).get("Networks"))
+        if not isinstance(host_config, dict) or not isinstance(networks, dict):
+            return False, False
+        mode = host_config.get("NetworkMode")
+        if not isinstance(mode, str):
+            return False, False
+        normalized = mode.strip().casefold()
+
+        def has_only_default_endpoint(name: str) -> bool:
+            if set(networks) != {name}:
+                return False
+            endpoint = networks.get(name)
+            if not isinstance(endpoint, dict):
+                return False
+            # Manager does not preserve static addressing, links, aliases, or
+            # per-network driver options. Generated IP/MAC values are omitted
+            # from this comparison because Docker assigns new ones on create.
+            return all(
+                field in endpoint and endpoint[field] in (None, [], {})
+                for field in ("IPAMConfig", "Links", "Aliases", "DriverOpts")
+            )
+
+        publish_all = host_config.get("PublishAllPorts")
+        port_bindings = host_config.get("PortBindings")
+        single_ports = False
+        if isinstance(port_bindings, dict) and len(port_bindings) == 1:
+            key, bindings = next(iter(port_bindings.items()))
+            if key == "8000/tcp" and isinstance(bindings, list) and bindings:
+                host_ports = {
+                    str(binding.get("HostPort") or "")
+                    for binding in bindings if isinstance(binding, dict)
+                }
+                single_ports = len(host_ports) == 1 and all(
+                    isinstance(binding, dict)
+                    and str(binding.get("HostPort") or "").isdigit()
+                    and str(binding.get("HostIp") or "") in {"", "0.0.0.0", "::"}
+                    for binding in bindings
+                )
+
+        single = (
+            normalized in {"default", "bridge"}
+            and publish_all is False
+            and single_ports
+            and has_only_default_endpoint("bridge")
+        )
+        distributed = (
+            normalized == "host"
+            and publish_all is False
+            and port_bindings in (None, {})
+            and has_only_default_endpoint("host")
+        )
+        return single, distributed
+
+    def _container_resources_are_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves Docker resource controls.
+
+        Managed model launches set only their configured shared-memory size;
+        all CPU, memory, block-I/O, and PID controls use Docker's unconstrained
+        defaults.  Inspection must prove the direct-start container has that
+        same contract.  Otherwise promotion could silently remove a limit and
+        let the recreated workload consume resources reserved for its peers.
+        """
+        host_config = attrs.get("HostConfig")
+        if not isinstance(host_config, dict):
+            return False
+
+        # These fields are present in current Docker inspection payloads and
+        # cover the resource flags most commonly set at container creation.
+        # Require them rather than treating incomplete inspection as default.
+        required_defaults = {
+            "Memory": 0,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "NanoCpus": 0,
+            "CpuShares": 0,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "PidsLimit": None,
+            "OomKillDisable": None,
+        }
+        def matches_default(value: Any, expected: Any) -> bool:
+            if isinstance(expected, int) and not isinstance(expected, bool):
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value == expected
+                )
+            return value == expected
+
+        for name, expected in required_defaults.items():
+            if (
+                name not in host_config
+                or not matches_default(host_config[name], expected)
+            ):
+                return False
+
+        # Docker API versions differ on whether these less common controls are
+        # serialized when unset.  If inspection supplies one, it still must be
+        # the value produced by an unconstrained managed launch.
+        optional_defaults = {
+            "MemorySwappiness": None,
+            "KernelMemory": 0,
+            "KernelMemoryTCP": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "DeviceCgroupRules": None,
+            "CgroupParent": "",
+            "StorageOpt": {},
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+        }
+        if any(
+            name in host_config
+            and not matches_default(host_config[name], expected)
+            for name, expected in optional_defaults.items()
+        ):
+            return False
+
+        configured_shm_size = (
+            (getattr(self, "settings", {}) or {}).get("shm_size")
+        )
+        if configured_shm_size in (None, ""):
+            return False
+        try:
+            expected_shm_size = docker.utils.parse_bytes(
+                str(configured_shm_size)
+            )
+        except (TypeError, ValueError):
+            return False
+        actual_shm_size = host_config.get("ShmSize")
+        return (
+            isinstance(actual_shm_size, int)
+            and not isinstance(actual_shm_size, bool)
+            and actual_shm_size == expected_shm_size
+        )
+
+    def _container_image_is_replayable(
+        self, attrs: dict, image_ref: str,
+    ) -> bool:
+        """Whether the launch reference still resolves to the source image.
+
+        ``Config.Image`` is commonly a mutable tag while ``attrs["Image"]``
+        is the immutable image ID used to create the container. Promotion may
+        reuse the public tag only while Docker proves it still names that same
+        image. The IDs stay local; discovery exposes only this capability bit.
+        Mutable references are intentionally not cached.
+        """
+        source_id = str(attrs.get("Image") or "").strip()
+        image_ref = str(image_ref or "").strip()
+        if not source_id or not image_ref:
+            return False
+        try:
+            image = self.client.images.get(image_ref)
+        except Exception:
+            return False
+        resolved_id = str(
+            getattr(image, "id", "")
+            or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+        ).strip()
+        return bool(resolved_id) and resolved_id.casefold() == source_id.casefold()
+
     def _container_summary(self, c) -> dict | None:
         labels = c.labels or {}
 
@@ -10785,6 +12290,18 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        if (
+            len(cmd) >= 3
+            and cmd[-2] in {"-c", "-lc"}
+            and any(
+                inspected_environment.get(name)
+                for name in ("BASH_ENV", "BASHOPTS", "SHELLOPTS")
+            )
+        ):
+            # These variables can source startup code or enable shell options
+            # before the visible script runs. The managed replacement uses
+            # exec-form argv and would silently discard those effects.
+            load_settings["_shell_wrapper_unsupported"] = True
         if not self._served_models_from_cmd(cmd) and cmd:
             # A shell-wrapped command (``bash -lc '<script>'``) hides the
             # vLLM flags inside a single argv token, so the plain scan above
@@ -10836,6 +12353,21 @@ class Manager:
             "managed": is_managed,
             "engine": engine_label,
             "load_settings": load_settings,
+            # Sanitized capability only: never expose inspected host paths.
+            "mounts_replayable": self._container_mounts_are_replayable(
+                attrs, attrs.get("Image") or image_tag, launch_model or model,
+            ),
+            # Managed vLLM and SGLang launches deliberately replace the image
+            # entrypoint with their canonical executable forms. Record whether
+            # doing so would discard a wrapper/bootstrap prefix from this
+            # container.
+            "launch_prefix_replayable": (
+                self._vllm_exec_prefix_is_replayable(cmd)
+                if engine_label == "vllm"
+                else self._sglang_exec_prefix_is_replayable(cmd)
+                if engine_label == "sglang"
+                else True
+            ),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),
             "started_at": (c.attrs.get("State") or {}).get("StartedAt"),
@@ -10877,6 +12409,58 @@ class Manager:
         summary["direct_start"] = (
             str(labels.get(DIRECT_START_LABEL) or "").strip() == "1"
         )
+        # Compute this after label provenance checks so one transient image
+        # inspection failure cannot be retried with different conclusions in
+        # the same inventory pass. Only the capability bit is serialized.
+        if summary["direct_start"]:
+            summary["environment_replayable"] = (
+                self._container_environment_is_replayable(attrs, engine_label)
+            )
+            summary["user_replayable"] = (
+                self._container_user_is_replayable(attrs)
+            )
+            summary["working_dir_replayable"] = (
+                self._container_working_dir_is_replayable(attrs)
+            )
+            summary["gpu_requests_replayable"] = (
+                self._container_gpu_requests_are_replayable(attrs)
+            )
+            summary["ipc_mode_replayable"] = (
+                self._container_ipc_mode_is_replayable(attrs)
+            )
+            summary["read_only_rootfs_replayable"] = (
+                self._container_read_only_rootfs_is_replayable(attrs)
+            )
+            summary["runtime_contract_replayable"] = (
+                self._container_runtime_contract_is_replayable(attrs)
+            )
+            (
+                summary["single_network_mode_replayable"],
+                summary["distributed_network_mode_replayable"],
+            ) = self._container_network_modes_are_replayable(attrs)
+            (
+                summary["single_host_options_replayable"],
+                summary["distributed_host_options_replayable"],
+            ) = self._container_topology_options_are_replayable(attrs)
+            infiniband_device = self._container_infiniband_device_requirement(
+                attrs
+            )
+            if infiniband_device is not None:
+                summary["load_settings"]["infiniband_device"] = (
+                    infiniband_device
+                )
+            summary["resource_constraints_replayable"] = (
+                self._container_resources_are_replayable(attrs)
+            )
+            if summary["resource_constraints_replayable"]:
+                # Replay this inspected byte count on every promotion target;
+                # remote agents may have a different controller default.
+                summary["load_settings"]["shm_size"] = (
+                    attrs["HostConfig"]["ShmSize"]
+                )
+            summary["image_replayable"] = self._container_image_is_replayable(
+                attrs, image_tag,
+            )
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary
@@ -10904,17 +12488,10 @@ class Manager:
         successful lookups are cached per image reference across inventory
         passes.
         """
-        cache = getattr(self, "_image_label_cache", None)
-        if cache is None:
-            cache = self._image_label_cache = {}
-        if image_ref not in cache:
-            try:
-                image = self.client.images.get(image_ref)
-                labels = (image.attrs.get("Config") or {}).get("Labels") or {}
-            except Exception:
-                return False
-            cache[image_ref] = dict(labels)
-        image_labels = cache[image_ref]
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+        image_labels = image_config.get("Labels") or {}
         return str(image_labels.get(key) or "").strip() != value
 
     async def list_containers(self) -> list[dict]:
@@ -11241,6 +12818,8 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        shm_size: Any = None,
+        infiniband_device: bool | None = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -11270,6 +12849,8 @@ class Manager:
             llama_context_length=llama_context_length,
             llama_parallel_slots=llama_parallel_slots,
             llama_gpu_layers=llama_gpu_layers,
+            shm_size=shm_size,
+            infiniband_device=infiniband_device,
         )
         if reserved_port is None:
             return await create_call
@@ -11354,6 +12935,7 @@ class Manager:
         llama_gpu_layers: int | None,
         cluster_member: dict | None,
         sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
     ) -> dict:
         if cluster_member and cluster_member.get("mode") == "sharded":
             raise ValueError("llama.cpp deployments cannot run sharded")
@@ -11434,7 +13016,7 @@ class Manager:
                 "detach": True,
                 "volumes": self._build_volumes("", self.settings["hf_cache"], image),
                 "ipc_mode": "host",
-                "shm_size": self.settings["shm_size"],
+                "shm_size": shm_size or self.settings["shm_size"],
                 "device_requests": [
                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                 ],
@@ -11491,14 +13073,32 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        shm_size: Any = None,
+        infiniband_device: bool | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
+        managed_shm_size = (
+            self._normalized_shm_size(shm_size)
+            or self.settings["shm_size"]
+        )
+        managed_infiniband_device = self._normalized_infiniband_device(
+            infiniband_device
+        )
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
+        if (
+            distributed_member
+            and managed_infiniband_device is True
+            and not Path("/dev/infiniband").exists()
+        ):
+            raise ValueError(
+                "source launch requires /dev/infiniband, but it is unavailable "
+                "on this node"
+            )
         if engine == "llama.cpp":
             return await self._create_llama_container(
                 model=model, port=port, image=image,
@@ -11509,6 +13109,7 @@ class Manager:
                 llama_gpu_layers=llama_gpu_layers,
                 cluster_member=cluster_member,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
             )
         if engine == "sglang":
             recipe_launch = None
@@ -11606,7 +13207,7 @@ class Manager:
                         model, self.settings["hf_cache"], image
                     ),
                     "ipc_mode": "host",
-                    "shm_size": self.settings["shm_size"],
+                    "shm_size": managed_shm_size,
                     "device_requests": [
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],
@@ -11626,7 +13227,10 @@ class Manager:
                         run_options.setdefault("environment", {}).update(
                             self._distributed_network_environment(iface)
                         )
-                    if Path("/dev/infiniband").exists():
+                    if managed_infiniband_device is True or (
+                        managed_infiniband_device is None
+                        and Path("/dev/infiniband").exists()
+                    ):
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
@@ -11761,7 +13365,7 @@ class Manager:
                         model, self.settings["hf_cache"], image
                     ),
                     "ipc_mode": "host",
-                    "shm_size": self.settings["shm_size"],
+                    "shm_size": managed_shm_size,
                     "device_requests": [
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],
@@ -11783,7 +13387,10 @@ class Manager:
                         run_options.setdefault("environment", {}).update(
                             self._distributed_network_environment(iface)
                         )
-                    if Path("/dev/infiniband").exists():
+                    if managed_infiniband_device is True or (
+                        managed_infiniband_device is None
+                        and Path("/dev/infiniband").exists()
+                    ):
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
@@ -11973,6 +13580,7 @@ class Manager:
             script = original[-1]
             trailing = "\n" if script.endswith("\n") else ""
             script = script[:match.start("flags")].rstrip() + " " + flags + trailing
+            script = self._quote_shell_speculative_environment_reference(script)
             return [*original[:-1], script]
 
         try:
@@ -12401,6 +14009,86 @@ class Manager:
         self._images_ts = now
         return self._images_cache
 
+    async def resolve_image_identity(self, image_ref: str) -> str:
+        """Resolve one Docker reference to its immutable local image ID."""
+        image_ref = str(image_ref or "").strip()
+        if not image_ref:
+            raise ValueError("image reference is required")
+
+        def _resolve() -> str:
+            image = self.client.images.get(image_ref)
+            image_id = str(
+                getattr(image, "id", "")
+                or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+            ).strip()
+            if not image_id:
+                raise RuntimeError("Docker returned an image without an immutable ID")
+            return image_id
+
+        return await asyncio.to_thread(_resolve)
+
+    async def pin_container_image_on_nodes(
+        self, container_name: str, image_ref: str, node_ids: list[str],
+    ) -> str:
+        """Validate a discovered container's image on every target and pin it.
+
+        A mutable tag is safe to recover only while it still resolves to the
+        exact image used by the source container. Every selected node must
+        already have that immutable image ID; managed launch then receives the
+        ID itself, so a tag repoint cannot produce mixed runtime code.
+        """
+        container_name = str(container_name or "").strip()
+        image_ref = str(image_ref or "").strip()
+        if not container_name or not image_ref:
+            raise ValueError("source container and image reference are required")
+
+        def _source_identity() -> str:
+            container = self.client.containers.get(container_name)
+            source_id = str((container.attrs or {}).get("Image") or "").strip()
+            if not source_id:
+                raise ValueError("source container has no immutable image identity")
+            image = self.client.images.get(image_ref)
+            resolved_id = str(
+                getattr(image, "id", "")
+                or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+            ).strip()
+            if not resolved_id or resolved_id.casefold() != source_id.casefold():
+                raise ValueError(
+                    "source image reference no longer resolves to the "
+                    "discovered container image"
+                )
+            return source_id
+
+        source_id = await asyncio.to_thread(_source_identity)
+        selected = await self.selected_cluster_nodes(node_ids)
+
+        async def resolve(node: dict) -> str:
+            if node["id"] == LOCAL_NODE_ID:
+                return await self.resolve_image_identity(source_id)
+            payload = await self.node_registry.request(
+                node["id"], "POST", "/api/agent/images/identity",
+                json_body={"image": source_id}, timeout=30,
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError("node returned an invalid image identity")
+            return str(payload.get("id") or "").strip()
+
+        resolved = await asyncio.gather(
+            *(resolve(node) for node in selected), return_exceptions=True,
+        )
+        mismatched = []
+        for node, result in zip(selected, resolved):
+            if isinstance(result, Exception) or (
+                not result or result.casefold() != source_id.casefold()
+            ):
+                mismatched.append(str(node.get("name") or node["id"]))
+        if mismatched:
+            raise ValueError(
+                "source image identity is unavailable on selected node(s): "
+                + ", ".join(mismatched)
+            )
+        return source_id
+
     async def cluster_image_inventory(self) -> dict:
         """Return image/container inventory from each enabled cluster node."""
         nodes = [
@@ -12445,6 +14133,7 @@ class Manager:
         await asyncio.to_thread(_do)
         self._images_cache = []
         self._images_ts = 0
+        getattr(self, "_image_hf_cache_target_cache", {}).clear()
         return {"ok": True, "image": image_id}
 
     async def remove_image_on_nodes(
@@ -12528,6 +14217,9 @@ class Manager:
                 error = str(payload["error"])
         if error:
             raise RuntimeError(error)
+        # Mutable tags may now point to a different image with another
+        # declared HF_HOME. Force the next launch/inventory to inspect it.
+        getattr(self, "_image_hf_cache_target_cache", {}).clear()
         return {"ok": True, "image": image}
 
     async def pull_image_on_nodes(

@@ -112,6 +112,12 @@ const usableGpuCount = (node: NodeInventoryItem) => {
   return gpus === undefined ? undefined : gpus.filter((gpu) => !gpu.error).length
 }
 
+const directTopologyIsReplayable = (deployment: Deployment, hostCount: number) => (
+  hostCount === 1
+    ? deployment.single_host_topology_replayable === true
+    : deployment.distributed_host_topology_replayable === true
+)
+
 const directParallelHostCounts = (
   deployment: Deployment,
   candidateNodes: NodeInventoryItem[],
@@ -120,6 +126,7 @@ const directParallelHostCounts = (
   if (!deployment.flexible_node_count || ranks < 1) return []
   return Array.from({ length: ranks }, (_, index) => index + 1)
     .filter((count) => ranks % count === 0)
+    .filter((count) => directTopologyIsReplayable(deployment, count))
     .filter((count) => {
       const ranksPerNode = ranks / count
       return candidateNodes.filter((node) => {
@@ -139,6 +146,7 @@ const validDirectParallelSelection = (
     return false
   }
   if (ranks % selectedNodes.length !== 0) return false
+  if (!directTopologyIsReplayable(deployment, selectedNodes.length)) return false
   const ranksPerNode = ranks / selectedNodes.length
   return selectedNodes.every((node) => {
     const gpuCount = usableGpuCount(node)
@@ -1328,7 +1336,10 @@ export function ModelsPage() {
     const selectableIds = selectableNodes.map((node) => node.id)
     const saved = (deployment.node_ids ?? []).filter((id) => selectableIds.includes(id))
     const flexibleCounts = directParallelHostCounts(deployment, selectableNodes)
-    const targetCount = flexibleCounts[0] ?? required
+    const flexibleParallel = Boolean(
+      deployment.flexible_node_count && deployment.parallel_rank_count,
+    )
+    const targetCount = flexibleParallel ? (flexibleCounts[0] ?? 0) : required
     let nodeIds = saved.slice(0, targetCount)
     if (nodeIds.length < targetCount) {
       const candidates = deployment.managed

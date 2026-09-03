@@ -138,6 +138,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "NCCL_DEBUG": "INFO",
             "SPECULATIVE_CONFIG": '{"method":"dspark"}',
         })
+        self.assertTrue(summary["launch_prefix_replayable"])
 
     def test_external_summary_marks_entrypoint_wrapper_unreplayable(self):
         containers = FakeContainers()
@@ -159,7 +160,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summary)
         self.assertFalse(summary["launch_prefix_replayable"])
 
-    def test_external_summary_allows_canonical_vllm_path(self):
+    def test_external_summary_rejects_absolute_vllm_path(self):
         containers = FakeContainers()
         container = FakeContainer(
             containers,
@@ -177,7 +178,29 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         summary = self.manager._container_summary(container)
 
         self.assertIsNotNone(summary)
-        self.assertTrue(summary["launch_prefix_replayable"])
+        self.assertFalse(summary["launch_prefix_replayable"])
+
+    def test_external_summary_rejects_absolute_shell_vllm_path(self):
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "absolute-shell-entrypoint-id",
+            "absolute-shell-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Cmd": [
+                    "/bin/bash", "--noprofile", "-lc",
+                    "exec /opt/venv/bin/vllm serve org/model --max-num-seqs 8",
+                ],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {},
+        )
+
+        summary = self.manager._container_summary(container)
+
+        self.assertIsNotNone(summary)
+        self.assertFalse(summary["launch_prefix_replayable"])
 
     def test_external_summary_marks_sglang_entrypoint_wrapper_unreplayable(self):
         containers = FakeContainers()
@@ -447,6 +470,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["user_replayable"])
         self.assertTrue(summary["working_dir_replayable"])
         self.assertTrue(summary["resource_constraints_replayable"])
+        self.assertEqual(summary["load_settings"]["shm_size"], 16 * 1024 ** 3)
 
     def test_image_default_bash_env_keeps_shell_promotion_read_only(self):
         environment = ["BASH_ENV=/opt/runtime/init.sh"]
@@ -1554,6 +1578,34 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(settings["editable"])
         self.assertNotIn("_shell_ansi_c_quoting", settings)
+
+    def test_shell_wrapped_locale_quoting_is_marked_nonportable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f'exec vllm serve {model} --served-model-name $"translated"',
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_locale_quoting"])
+
+    def test_quoted_locale_syntax_literal_remains_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --served-model-name '$\"literal\"'",
+        ]
+
+        settings = self.manager._container_load_settings(
+            command, "vllm", model,
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_locale_quoting", settings)
 
     def test_bash_options_do_not_hide_brace_expansion(self):
         model = "example/Model"

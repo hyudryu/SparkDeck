@@ -1448,6 +1448,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "engine": deployment.get("engine", "vllm"),
                 "environment": dict(settings.get("environment") or {}),
                 "extra_args": recovered_args,
+                "shm_size": settings.get("shm_size"),
             }
             if recovered["engine"] == "sglang":
                 recovered["sg_tp_size"] = settings.get(
@@ -1802,6 +1803,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
+                "shm_size": 64 * 1024 ** 3,
                 "command_flags": (
                     "--tensor-parallel-size 2 --pipeline-parallel-size 2 "
                     "--enable-prefix-caching"
@@ -1828,6 +1830,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(launch["deployment_mode"], "sharded")
             self.assertEqual(launch["node_ids"], selected)
             self.assertEqual(launch["image"], "sha256:source-image")
+            self.assertEqual(launch["shm_size"], 64 * 1024 ** 3)
             self.assertIn("--pipeline-parallel-size", launch["extra_args"])
             manager.pin_container_image_on_nodes.assert_awaited_once_with(
                 "external-stack", "example/vllm:latest", selected,
@@ -2122,6 +2125,39 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
             with self.assertRaisesRegex(ValueError, "Bash ANSI-C quoting"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_bash_locale_quoting_blocks_direct_start_promotion(self):
+        load_settings = server.manager._container_load_settings(
+            [
+                "/bin/bash", "--noprofile", "-lc",
+                'exec vllm serve org/model --served-model-name $"translated"',
+            ],
+            "vllm", "org/model",
+        )
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True, "load_settings": load_settings,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "Bash locale-translated quoting",
+            ):
                 await service.deployment_action(
                     "container:external-stack", "start",
                     node_ids=["local"], promote=True,
@@ -2503,6 +2539,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(deployment["promotable"])
+            self.assertFalse(
+                deployment["single_host_topology_replayable"]
+            )
+            self.assertTrue(
+                deployment["distributed_host_topology_replayable"]
+            )
             with self.assertRaisesRegex(ValueError, "single-host launch contract"):
                 await service._promote_discovered_deployment(
                     deployment, container, ["local"],
@@ -2531,6 +2573,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(deployment["promotable"])
+            self.assertTrue(
+                deployment["single_host_topology_replayable"]
+            )
+            self.assertFalse(
+                deployment["distributed_host_topology_replayable"]
+            )
             with self.assertRaisesRegex(ValueError, "distributed launch contract"):
                 await service._promote_discovered_deployment(
                     deployment, container, ["local", "worker-1"],
@@ -2582,6 +2630,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(deployment["promotable"])
+            self.assertFalse(
+                deployment["single_host_topology_replayable"]
+            )
+            self.assertTrue(
+                deployment["distributed_host_topology_replayable"]
+            )
             with self.assertRaisesRegex(ValueError, "device or ulimit settings"):
                 await service._promote_discovered_deployment(
                     deployment, container, ["local"],

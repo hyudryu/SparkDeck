@@ -1365,6 +1365,7 @@ async def agent_create_container(req: Request):
             llama_context_length=body.get("llama_context_length"),
             llama_parallel_slots=body.get("llama_parallel_slots"),
             llama_gpu_layers=body.get("llama_gpu_layers"),
+            shm_size=body.get("shm_size"),
         )
     except Exception as exc:
         detail = str(exc)

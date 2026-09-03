@@ -185,6 +185,26 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(sentinel, response.text)
         self.assertIn("REDACTED", response.text)
 
+    async def test_agent_launch_forwards_promoted_shared_memory_size(self):
+        create_container = AsyncMock(return_value={"status": "running"})
+        source_shm_size = 64 * 1024 ** 3
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager, "create_container", create_container),
+        ):
+            response = await self.client.post("/api/agent/containers", json={
+                "model": "org/model",
+                "cluster_member": {
+                    "deployment_id": "dep-1", "node_id": "worker-1",
+                },
+                "shm_size": source_shm_size,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            create_container.await_args.kwargs["shm_size"], source_shm_size,
+        )
+
     def test_log_redaction_handles_json_keys_and_raw_configured_token(self):
         sentinel = "hf_log_sentinel_secret"
         with patch.object(server.manager, "_resolved_hf_token", return_value=sentinel):

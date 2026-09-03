@@ -105,6 +105,8 @@ export interface Deployment {
   required_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
+  single_host_topology_replayable?: boolean
+  distributed_host_topology_replayable?: boolean
   last_error?: string
   created_at?: string
   updated_at?: string

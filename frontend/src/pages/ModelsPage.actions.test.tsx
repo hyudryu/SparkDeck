@@ -616,6 +616,7 @@ describe('models page running actions', () => {
       status: 'stopped', desired_state: 'stopped', direct_start: true,
       settings: { tensor_parallel_size: 4 }, deployment_mode: 'sharded',
       required_node_count: 4, parallel_rank_count: 4, flexible_node_count: true,
+      single_host_topology_replayable: true, distributed_host_topology_replayable: true,
       managed: false, controllable: true, promotable: true,
     }
     fetchMock.mockImplementation(async (input) => {
@@ -637,6 +638,78 @@ describe('models page running actions', () => {
     expect(screen.getByRole('button', { name: 'Start on 4 nodes' })).toBeEnabled()
   })
 
+  it('offers only distributed host counts for a host-network direct start', async () => {
+    const user = userEvent.setup()
+    const fourGpuNodes = nodes.map((node) => ({
+      ...node,
+      stats: { gpus: Array.from({ length: 4 }, (_, index) => ({ name: `GPU ${index}` })) },
+    }))
+    const external = {
+      id: 'container:host-tp4', alias: 'Host network TP4', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
+      direct_start: true, settings: { tensor_parallel_size: 4 },
+      deployment_mode: 'sharded', required_node_count: 4,
+      parallel_rank_count: 4, flexible_node_count: true,
+      single_host_topology_replayable: false, distributed_host_topology_replayable: true,
+      managed: false, controllable: true, promotable: true,
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: fourGpuNodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) return preparationResponse(external.model.repository, fourGpuNodes)
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    expect(await screen.findByText(/TP4 uses 4 GPU ranks and can run on 2, 4 nodes/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled()
+    await user.click(screen.getByRole('checkbox', { name: /Controller/ }))
+    expect(screen.getByRole('button', { name: 'Start on 1 node' })).toBeDisabled()
+  })
+
+  it('offers only one host for a bridge-network direct start', async () => {
+    const user = userEvent.setup()
+    const fourGpuNodes = nodes.map((node) => ({
+      ...node,
+      stats: { gpus: Array.from({ length: 4 }, (_, index) => ({ name: `GPU ${index}` })) },
+    }))
+    const external = {
+      id: 'container:bridge-tp4', alias: 'Bridge network TP4', runtime: 'vllm', kind: 'external',
+      model: { repository: 'org/model' }, status: 'stopped', desired_state: 'stopped',
+      direct_start: true, settings: { tensor_parallel_size: 4 },
+      deployment_mode: 'sharded', required_node_count: 4,
+      parallel_rank_count: 4, flexible_node_count: true,
+      single_host_topology_replayable: true, distributed_host_topology_replayable: false,
+      managed: false, controllable: true, promotable: true,
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: fourGpuNodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) return preparationResponse(external.model.repository, fourGpuNodes)
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    expect(await screen.findByText(/TP4 uses 4 GPU ranks and can run on exactly 1 node/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start on 1 node' })).toBeEnabled()
+    await user.click(screen.getByRole('checkbox', { name: /Node 4/ }))
+    expect(screen.getByRole('button', { name: 'Start on 2 nodes' })).toBeDisabled()
+  })
+
   it('allows TP8 direct promotion on one eight-GPU host', async () => {
     const user = userEvent.setup()
     const gpuRichNodes = nodes.map((node) => ({
@@ -652,6 +725,7 @@ describe('models page running actions', () => {
       direct_start: true, settings: { tensor_parallel_size: 8 },
       deployment_mode: 'sharded', required_node_count: 8,
       parallel_rank_count: 8, flexible_node_count: true,
+      single_host_topology_replayable: true, distributed_host_topology_replayable: true,
       managed: false, controllable: true, promotable: true,
     }
     fetchMock.mockImplementation(async (input) => {

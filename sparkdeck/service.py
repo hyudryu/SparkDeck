@@ -3939,6 +3939,13 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "launch command depends on Bash ANSI-C quoting"
             )
+        if container.get("direct_start") and settings.get(
+            "_shell_locale_quoting"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash locale-translated quoting"
+            )
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
         direct_recovery = (
             self._direct_start_launch_contract(container, runtime, str(
@@ -4270,6 +4277,7 @@ class SparkDeckService:
             or settings.get("_shell_path_expansion") is True
             or settings.get("_shell_brace_expansion") is True
             or settings.get("_shell_ansi_c_quoting") is True
+            or settings.get("_shell_locale_quoting") is True
         ):
             return None
         try:
@@ -4341,6 +4349,15 @@ class SparkDeckService:
                 runtime in {RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value}
                 and rank_count > 1
                 and not has_explicit_hosts
+            ),
+            # Publish only the combined, sanitized capability bits. The
+            # frontend needs these to avoid offering a host count that rank
+            # divisibility permits but Docker network/device replay rejects.
+            "single_host_topology_replayable": (
+                self._direct_start_topology_is_replayable(container, 1)
+            ),
+            "distributed_host_topology_replayable": (
+                self._direct_start_topology_is_replayable(container, 2)
             ),
         }
 

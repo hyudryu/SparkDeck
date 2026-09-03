@@ -3008,6 +3008,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             deployment = await instance.create_deployment({
                 "model": "deepseek-ai/DeepSeek-V4-Flash",
                 "engine": "vllm",
+                "shm_size": 64 * 1024 ** 3,
                 "environment": {"NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1"},
                 "deployment_mode": "sharded",
                 "node_ids": ["local", "remote-1"],
@@ -3028,6 +3029,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 for member in deployment["members"]
             ))
             self.assertEqual(len(captured), 2)
+            self.assertEqual(
+                deployment["launch_settings"]["shm_size"], 64 * 1024 ** 3,
+            )
             for rank, (node_id, payload) in enumerate(captured):
                 args = payload["extra_args"]
                 self.assertEqual(args[args.index("--node-rank") + 1], str(rank))
@@ -3044,6 +3048,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload["environment"], {
                     "NCCL_DEBUG": "WARN", "HF_HUB_OFFLINE": "1",
                 })
+                self.assertEqual(payload["shm_size"], 64 * 1024 ** 3)
 
     async def test_vllm_sharded_launch_uses_first_remote_node_as_coordinator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4294,6 +4299,63 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cost["output_cost_per_1m"], 3.5)
             persisted = json.loads(instance.deployments_path.read_text())[0]
             self.assertEqual(persisted["pricing_model_key"], "org/model [fp8]")
+
+    def test_stopped_priced_edit_rejects_conflicting_target_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.unsloth_settings = {}
+            moving = {
+                "id": "moving",
+                "name": "Moving",
+                "model": "org/model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "pricing_model_key": "org/model [nvfp4_ds_mla]",
+                "launch_settings": {
+                    "deployment_name": "Moving",
+                    "model": "org/model",
+                    "engine": "vllm",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "input_cost_per_1m": 1.25,
+                    "cache_cost_per_1m": 0.1,
+                    "output_cost_per_1m": 3.5,
+                },
+            }
+            occupied = {
+                "id": "occupied",
+                "model": "org/model",
+                "status": "stopped",
+                "pricing_model_key": "org/model [fp8]",
+                "launch_settings": {
+                    "model": "org/model",
+                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                    "input_cost_per_1m": 2.0,
+                    "cache_cost_per_1m": 0.2,
+                    "output_cost_per_1m": 4.0,
+                },
+            }
+            instance.deployments = [moving, occupied]
+
+            with self.assertRaisesRegex(
+                ValueError, "already owned.*different recorded rates",
+            ):
+                instance.update_deployment_settings("moving", {
+                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                })
+
+            self.assertEqual(moving["pricing_model_key"], "org/model [nvfp4_ds_mla]")
+            self.assertEqual(moving["launch_settings"]["extra_args"], [
+                "--kv-cache-dtype", "nvfp4_ds_mla",
+            ])
+            self.assertEqual(
+                instance._usage_member_pricing("org/model [fp8]")["deployment_id"],
+                "occupied",
+            )
 
     async def test_pricing_recovers_full_legacy_launch_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

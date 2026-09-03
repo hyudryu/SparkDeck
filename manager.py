@@ -3762,6 +3762,19 @@ class Manager:
             raise ValueError(f"{field} must be a non-negative number")
         return result
 
+    @staticmethod
+    def _normalized_shm_size(value: Any) -> int | None:
+        """Return a positive Docker shared-memory size in bytes."""
+        if value in (None, ""):
+            return None
+        try:
+            size = docker.utils.parse_bytes(str(value))
+        except (TypeError, ValueError, docker.errors.DockerException) as exc:
+            raise ValueError("shm_size must be a positive byte size") from exc
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ValueError("shm_size must be a positive byte size")
+        return size
+
     @classmethod
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
@@ -3794,6 +3807,7 @@ class Manager:
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),
+            "shm_size": cls._normalized_shm_size(body.get("shm_size")),
             "sparkdeck_record_id": body.get("sparkdeck_record_id"),
             "input_cost_per_1m": cls._pricing_value(
                 body.get("input_cost_per_1m"), "input_cost_per_1m"
@@ -4404,6 +4418,39 @@ class Manager:
                 settings["extra_args"]
             ).casefold()
         )
+        migrated_pricing_key = None
+        if pricing_identity_changed and deployment.get("pricing_model_key"):
+            migrated_pricing_key = self._stats_key(
+                settings["model"], self._variant_from_cmd(settings["extra_args"]),
+            )
+            migrated_signature = tuple(
+                self._deployment_pricing(settings)[field]
+                for field in (
+                    "input_cost_per_1m",
+                    "cache_cost_per_1m",
+                    "output_cost_per_1m",
+                )
+            )
+            if any(value is not None for value in migrated_signature):
+                conflicting = next((
+                    candidate
+                    for candidate in self.deployments
+                    if candidate is not deployment
+                    and self._deployment_pricing_model_key(candidate).casefold()
+                    == migrated_pricing_key.casefold()
+                    and any(
+                        value is not None
+                        for value in self._deployment_pricing_signature(candidate)
+                    )
+                    and self._deployment_pricing_signature(candidate)
+                    != migrated_signature
+                ), None)
+                if conflicting is not None:
+                    raise ValueError(
+                        "deployment pricing identity is already owned by "
+                        f"deployment {conflicting.get('id')} with different "
+                        "recorded rates"
+                    )
         remaining_error = (
             _remove_persisted_error(
                 deployment.get("error"), PERSISTED_DEPLOYMENT_ARGS_ERROR,
@@ -4423,14 +4470,12 @@ class Manager:
             ) if persisted_args_error else deployment.get("status"),
             "error": remaining_error or None,
         })
-        if pricing_identity_changed and deployment.get("pricing_model_key"):
+        if migrated_pricing_key is not None:
             # pricing_model_key is captured when rates are first saved so the
             # Usage editor can resolve the exact stats identity. A launch edit
             # that changes the model/variant must move that pointer too; the
             # persisted rate values themselves remain in launch_settings.
-            deployment["pricing_model_key"] = self._stats_key(
-                settings["model"], self._variant_from_cmd(settings["extra_args"]),
-            )
+            deployment["pricing_model_key"] = migrated_pricing_key
         deployment.pop("launch_settings_error", None)
         deployment.pop("kv_capacity", None)
         deployment.pop("auto_concurrency_adjustment", None)
@@ -4461,6 +4506,7 @@ class Manager:
             "gpu_memory_utilization": load_settings.get(
                 "gpu_memory_utilization"
             ),
+            "shm_size": load_settings.get("shm_size"),
             "deployment_mode": deployment.get("mode", "single"),
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
@@ -5116,6 +5162,45 @@ class Manager:
             index += 1
         return False
 
+    @staticmethod
+    def _has_unquoted_bash_locale_quoting(value: str) -> bool:
+        """Return whether Bash would interpret a locale-translated string.
+
+        Bash's ``$"..."`` form can translate the string through the active
+        locale before passing it to vLLM. Python's POSIX ``shlex`` parser does
+        not model that translation, so converting the command to exec-form
+        argv cannot promise to reproduce the discovered value.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char == "$" and text[index + 1:index + 2] == '"':
+                return True
+            index += 1
+        return False
+
     @classmethod
     def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
         """Whether a managed launch reproduces the command before ``serve``."""
@@ -5123,6 +5208,8 @@ class Manager:
         if len(command) >= 3 and command[-2] in {"-c", "-lc"}:
             match = cls._shell_vllm_command(command[-1])
             if match is None:
+                return False
+            if match.group("executable") != "vllm":
                 return False
             # Promotion switches to exec-form ``vllm serve``. Even a safe
             # setup/export prelude would be lost, so accept only whitespace
@@ -5134,8 +5221,7 @@ class Manager:
             return False
         if serve_index != 1:
             return False
-        executable = command[0].replace("\\", "/").rsplit("/", 1)[-1]
-        return executable == "vllm"
+        return command[0] == "vllm"
 
     @staticmethod
     def _sglang_exec_prefix_is_replayable(cmd: list[str]) -> bool:
@@ -5156,7 +5242,8 @@ class Manager:
     def _shell_vllm_command(script: str):
         """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
         return re.search(
-            r"(?:^|;\s*|\bexec\s+)(?:[^\s;]*/)?vllm\s+serve\s+"
+            r"(?:^|;\s*|\bexec\s+)"
+            r"(?P<executable>(?:[^\s;]*/)?vllm)\s+serve\s+"
             r"(?P<model>(?:\"[^\"]*\"|'[^']*'|[^\s;]+))(?P<flags>.*)$",
             script or "",
             re.DOTALL,
@@ -5243,6 +5330,7 @@ class Manager:
         shell_path_expansion = False
         shell_brace_expansion = False
         shell_ansi_c_quoting = False
+        shell_locale_quoting = False
         shell_wrapper_unsupported = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
@@ -5291,6 +5379,12 @@ class Manager:
                 shell_ansi_c_quoting = (
                     shell == "bash"
                     and self._has_unquoted_bash_ansi_c_quoting(
+                        match.group("model") + match.group("flags")
+                    )
+                )
+                shell_locale_quoting = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_locale_quoting(
                         match.group("model") + match.group("flags")
                     )
                 )
@@ -5431,6 +5525,8 @@ class Manager:
             settings["_shell_brace_expansion"] = True
         if shell_ansi_c_quoting:
             settings["_shell_ansi_c_quoting"] = True
+        if shell_locale_quoting:
+            settings["_shell_locale_quoting"] = True
         if shell_wrapper_unsupported:
             settings["_shell_wrapper_unsupported"] = True
         return settings
@@ -5991,6 +6087,8 @@ class Manager:
         body["environment"] = normalize_runtime_environment(
             body.get("environment"), engine,
         )
+        if body.get("shm_size") not in (None, ""):
+            body["shm_size"] = self._normalized_shm_size(body["shm_size"])
         controls = body.get("launch_controls")
         if controls is not None and engine != "llama.cpp":
             if not isinstance(controls, dict):
@@ -6276,6 +6374,7 @@ class Manager:
             "hf_token": self._resolved_hf_token(),
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
+            "shm_size": body.get("shm_size"),
             "environment": body.get("environment"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
@@ -12319,6 +12418,12 @@ class Manager:
             summary["resource_constraints_replayable"] = (
                 self._container_resources_are_replayable(attrs)
             )
+            if summary["resource_constraints_replayable"]:
+                # Replay this inspected byte count on every promotion target;
+                # remote agents may have a different controller default.
+                summary["load_settings"]["shm_size"] = (
+                    attrs["HostConfig"]["ShmSize"]
+                )
             summary["image_replayable"] = self._container_image_is_replayable(
                 attrs, image_tag,
             )
@@ -12679,6 +12784,7 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        shm_size: Any = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -12708,6 +12814,7 @@ class Manager:
             llama_context_length=llama_context_length,
             llama_parallel_slots=llama_parallel_slots,
             llama_gpu_layers=llama_gpu_layers,
+            shm_size=shm_size,
         )
         if reserved_port is None:
             return await create_call
@@ -12792,6 +12899,7 @@ class Manager:
         llama_gpu_layers: int | None,
         cluster_member: dict | None,
         sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
     ) -> dict:
         if cluster_member and cluster_member.get("mode") == "sharded":
             raise ValueError("llama.cpp deployments cannot run sharded")
@@ -12872,7 +12980,7 @@ class Manager:
                 "detach": True,
                 "volumes": self._build_volumes("", self.settings["hf_cache"], image),
                 "ipc_mode": "host",
-                "shm_size": self.settings["shm_size"],
+                "shm_size": shm_size or self.settings["shm_size"],
                 "device_requests": [
                     docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                 ],
@@ -12929,11 +13037,16 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        shm_size: Any = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
+        managed_shm_size = (
+            self._normalized_shm_size(shm_size)
+            or self.settings["shm_size"]
+        )
         distributed_member = bool(
             cluster_member and cluster_member.get("mode") == "sharded"
         )
@@ -12947,6 +13060,7 @@ class Manager:
                 llama_gpu_layers=llama_gpu_layers,
                 cluster_member=cluster_member,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
             )
         if engine == "sglang":
             recipe_launch = None
@@ -13044,7 +13158,7 @@ class Manager:
                         model, self.settings["hf_cache"], image
                     ),
                     "ipc_mode": "host",
-                    "shm_size": self.settings["shm_size"],
+                    "shm_size": managed_shm_size,
                     "device_requests": [
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],
@@ -13199,7 +13313,7 @@ class Manager:
                         model, self.settings["hf_cache"], image
                     ),
                     "ipc_mode": "host",
-                    "shm_size": self.settings["shm_size"],
+                    "shm_size": managed_shm_size,
                     "device_requests": [
                         docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                     ],

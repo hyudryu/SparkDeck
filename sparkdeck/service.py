@@ -3878,6 +3878,14 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "launch topology could not be recovered"
             )
+        if (
+            container.get("direct_start")
+            and container.get("mounts_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "custom mounts cannot be reproduced"
+            )
         if direct_recovery is not None:
             launch_settings, layout = direct_recovery
             required_nodes = layout["required_node_count"]
@@ -5482,6 +5490,7 @@ class SparkDeckService:
         direct_portable = bool(
             direct_recovery
             and self._recovered_launch_is_portable(direct_recovery[0])
+            and container.get("mounts_replayable") is True
         )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster

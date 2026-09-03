@@ -648,6 +648,29 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(settings["editable"])
 
+    def test_shell_wrapped_command_boundary_is_read_only(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8\nrun-after-vllm",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
+    def test_shell_wrapped_line_continuation_stays_editable(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-lc",
+            f"exec vllm serve {model} --max-num-seqs 8 \\\n"
+            "  --enable-prefix-caching",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+
     async def test_update_resolves_environment_backed_speculative_reference(self):
         name = "external-vllm"
         model = "example/Model"

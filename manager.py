@@ -4678,6 +4678,54 @@ class Manager:
         ))
 
     @staticmethod
+    def _has_unescaped_shell_newline(value: str) -> bool:
+        """Return whether shell text contains a meaningful command newline.
+
+        ``shlex.split`` treats an unquoted newline as ordinary whitespace, but
+        a shell treats it as a command boundary.  A discovered shell-wrapped
+        launch therefore cannot be converted safely to exec-form argv when
+        more shell text follows such a newline.  Quoted newlines are literal
+        argument content and backslash-newline pairs are continuations, so
+        neither is a boundary.  A final newline is harmless.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if char == '"':
+                quote = None if quote == '"' else '"'
+                index += 1
+                continue
+            if char == "'" and quote is None:
+                quote = "'"
+                index += 1
+                continue
+            if char == "\\":
+                # Backslash escapes the next character outside single quotes,
+                # including an LF or a CRLF shell line continuation.
+                if index + 1 < len(text) and text[index + 1] == "\r":
+                    index += 3 if text[index + 2:index + 3] == "\n" else 2
+                else:
+                    index += 2
+                continue
+            if quote is None and char in {"\r", "\n"}:
+                next_index = index + 1
+                if char == "\r" and text[next_index:next_index + 1] == "\n":
+                    next_index += 1
+                if text[next_index:].strip():
+                    return True
+                index = next_index
+                continue
+            index += 1
+        return False
+
+    @staticmethod
     def _shell_vllm_command(script: str):
         """Locate a vLLM invocation inside a ``sh -c``/``bash -lc`` script."""
         return re.search(
@@ -4763,11 +4811,15 @@ class Manager:
         command_flags = ""
         analysis_cmd = cmd
         shell_wrapped = False
+        shell_command_boundary = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
                 shell_wrapped = True
                 command_flags = match.group("flags").strip()
+                shell_command_boundary = self._has_unescaped_shell_newline(
+                    match.group("flags")
+                )
                 try:
                     analysis_cmd = [
                         "vllm", "serve", shlex.split(match.group("model"))[0],
@@ -4866,6 +4918,7 @@ class Manager:
         return {
             "editable": (
                 "serve" in analysis_cmd
+                and not shell_command_boundary
                 and (
                     shell_wrapped
                     or not self._has_unresolvable_shell_tokens(
@@ -7355,6 +7408,73 @@ class Manager:
             if target.startswith("/") and target != "":
                 return target
         return fallback
+
+    def _container_mounts_are_replayable(
+        self, attrs: dict, image: str | None, model: str,
+    ) -> bool:
+        """Whether Manager can reproduce an inspected container's mounts.
+
+        Managed launches rebuild only the configured Hugging Face cache bind
+        and, for a controller-local model, a same-path model bind. Keep the
+        detailed host paths private while reporting whether every inspected
+        mount fits one of those two contracts.
+        """
+        mounts = attrs.get("Mounts")
+        binds = (attrs.get("HostConfig") or {}).get("Binds") or []
+        if not mounts and not binds:
+            return True
+
+        cache_target = self._image_hf_cache_target(image).rstrip("/") or "/"
+        local_model = self._resolve_local_path(model)
+        local_target = str(local_model).rstrip("/\\") if local_model else None
+
+        if isinstance(mounts, list) and mounts:
+            for mount in mounts:
+                if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                    return False
+                destination = (
+                    str(mount.get("Destination") or "").rstrip("/") or "/"
+                )
+                if destination == cache_target:
+                    continue
+                source = str(mount.get("Source") or "").rstrip("/\\")
+                if (
+                    local_target
+                    and destination == local_target
+                    and source == local_target
+                ):
+                    continue
+                return False
+            return True
+
+        # Older Docker API responses may omit the normalized Mounts list while
+        # retaining bind declarations in HostConfig. Parse destinations from
+        # the right so Windows drive-letter sources remain valid.
+        if not isinstance(binds, list):
+            return False
+        for bind in binds:
+            if not isinstance(bind, str):
+                return False
+            parts = bind.rsplit(":", 2)
+            if len(parts) < 2:
+                return False
+            has_mode = parts[-1].lower() in {
+                "ro", "rw", "z", "cached", "delegated", "consistent",
+            }
+            destination = parts[-2] if has_mode else parts[-1]
+            destination = destination.rstrip("/") or "/"
+            if destination == cache_target:
+                continue
+            source = parts[-3] if has_mode and len(parts) == 3 else parts[-2]
+            source = source.rstrip("/\\")
+            if (
+                local_target
+                and destination == local_target
+                and source == local_target
+            ):
+                continue
+            return False
+        return True
 
     def _build_volumes(
         self,
@@ -10894,6 +11014,10 @@ class Manager:
             "managed": is_managed,
             "engine": engine_label,
             "load_settings": load_settings,
+            # Sanitized capability only: never expose inspected host paths.
+            "mounts_replayable": self._container_mounts_are_replayable(
+                attrs, image_tag, launch_model or model,
+            ),
             "vram_gb": vram_gb,
             "created": c.attrs.get("Created"),
             "started_at": (c.attrs.get("State") or {}).get("StartedAt"),

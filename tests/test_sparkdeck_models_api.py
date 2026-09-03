@@ -1524,6 +1524,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "command_flags": (
@@ -1562,6 +1563,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "command_flags": (
@@ -1589,6 +1591,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "command_flags": (
@@ -1621,10 +1624,92 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    def test_mount_replayability_allows_only_managed_volume_contracts(self):
+        inspect = server.manager._container_mounts_are_replayable
+        with patch.object(
+            server.manager, "_image_hf_cache_target", return_value="/opt/hf-cache",
+        ), patch.object(server.manager, "_resolve_local_path", return_value=None):
+            self.assertTrue(inspect({
+                "Mounts": [{
+                    "Type": "bind", "Source": "/host/hf",
+                    "Destination": "/opt/hf-cache",
+                }],
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [{
+                    "Type": "bind", "Source": "/host/config",
+                    "Destination": "/config",
+                }],
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [{
+                    "Type": "volume", "Source": "runtime-config",
+                    "Destination": "/config",
+                }],
+            }, "vision:latest", "org/model"))
+            self.assertTrue(inspect({
+                "HostConfig": {"Binds": ["/host/hf:/opt/hf-cache:rw"]},
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "HostConfig": {"Binds": ["/host/config:/config:ro"]},
+            }, "vision:latest", "org/model"))
+
+    async def test_custom_mount_direct_start_stays_on_fixed_lifecycle(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": False,
+            "load_settings": {
+                "command_flags": "--chat-template /config/template.jinja",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(container, "vllm", "org/model")
+            result = await service.deployment_action(
+                "container:external-stack", "start",
+            )
+
+            self.assertFalse(card["promotable"])
+            manager.start_container.assert_awaited_once_with(
+                "external-stack", explicit=True, managed=False,
+            )
+            manager.create_deployment.assert_not_awaited()
+            self.assertEqual(result["status"], "running")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_custom_mount_direct_start_rejects_explicit_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": False,
+            "load_settings": {
+                "command_flags": "--chat-template /config/template.jinja",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            with self.assertRaisesRegex(
+                ValueError, "custom mounts cannot be reproduced",
+            ):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_shell_dependent_direct_start_stays_on_fixed_lifecycle(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "command_flags": (
@@ -1656,6 +1741,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
                 "command_flags": (

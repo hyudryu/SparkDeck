@@ -1284,6 +1284,39 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(LookupError):
                 nas.delete_model("Comfy-Org/MiniMax-Music-3")
 
+    async def test_delete_prefers_displayed_fallback_over_partial_hub_residue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--checkpoints--foo"
+            residue = repository / "blobs" / "weights.incomplete"
+            residue.parent.mkdir(parents=True)
+            residue.write_bytes(b"partial")
+            (repository / "snapshots" / RESOLVED_REVISION).mkdir(parents=True)
+            root = Path(directory) / "ComfyUI" / "models"
+            fallback = root / "checkpoints" / "foo" / "model.safetensors"
+            fallback.parent.mkdir(parents=True)
+            fallback.write_bytes(b"external")
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                external_model_roots_provider=lambda: [root],
+            )
+
+            displayed = next(
+                model for model in nas.inventory()
+                if model["model_id"] == "checkpoints/foo"
+            )
+            self.assertEqual(displayed["source"], "ComfyUI")
+            self.assertTrue(displayed["has_partial_download"])
+
+            # Delete follows the external row shown in Storage, leaving the
+            # hidden resumable Hub residue for a subsequent refresh/delete.
+            self.assertTrue(nas.delete_model("checkpoints/foo")["ok"])
+            self.assertFalse(fallback.exists())
+            self.assertEqual(residue.read_bytes(), b"partial")
+
+            self.assertTrue(nas.delete_model("checkpoints/foo")["ok"])
+            self.assertFalse(repository.exists())
+
     async def test_delete_prefers_complete_hub_copy_over_external_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

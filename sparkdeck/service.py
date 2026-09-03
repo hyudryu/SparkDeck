@@ -2903,9 +2903,12 @@ class SparkDeckService:
         deployment_id = str(uuid.uuid4())
         # A launch can take minutes, but serializing creation is intentional:
         # alias uniqueness must be established before Docker is mutated.
-        async with self._deployment_create_lock:
-            if self.store.deployment(alias):
-                raise ValueError(f"deployment alias '{alias}' is already in use")
+        # Creation and rename both mutate the public selector namespace. Keep a
+        # single lock order (create, then alias) so a long-running create cannot
+        # deadlock with reconciliation and a rename cannot claim the alias while
+        # creation is between its inventory check and durable persistence.
+        async with self._deployment_create_lock, self._deployment_alias_lock:
+            await self._assert_deployment_alias_available(alias, deployment_id)
             artifact_is_local = False
             model_is_local_path = False
             artifact_homes: list[str] | None = None
@@ -3871,6 +3874,13 @@ class SparkDeckService:
                 "settings via the deployment's settings file instead"
             )
         settings = dict(container.get("load_settings") or {})
+        if container.get("direct_start") and settings.get(
+            "_shell_path_expansion"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on shell pathname expansion"
+            )
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
         direct_recovery = (
             self._direct_start_launch_contract(container, runtime, str(
@@ -4087,6 +4097,8 @@ class SparkDeckService:
         if not callable(recover) or not callable(contract_fn):
             return None
         settings = container.get("load_settings") or {}
+        if settings.get("_shell_path_expansion") is True:
+            return None
         try:
             launch_settings = recover({
                 "name": container.get("alias") or container.get("served_model") or model,

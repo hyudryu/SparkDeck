@@ -4831,6 +4831,67 @@ class Manager:
             index += 1
         return False
 
+    @staticmethod
+    def _has_unquoted_shell_path_expansion(value: str) -> bool:
+        """Return whether shell text depends on pathname or tilde expansion.
+
+        Promotion turns a discovered shell command into exec-form argv. Globs
+        and a leading tilde are therefore unsafe even when ``shlex.split``
+        produces ordinary-looking tokens: the shell may already have replaced
+        them in the discovered container. Quoted or backslash-escaped
+        metacharacters are literals and remain replayable.
+        """
+        text = str(value or "")
+        quote: str | None = None
+        word_start = True
+        bracket_candidate = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                word_start = False
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    word_start = False
+                    continue
+                word_start = False
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                word_start = False
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                word_start = False
+                continue
+            if char.isspace() or char in ";|&()<>":
+                word_start = True
+                bracket_candidate = False
+                index += 1
+                continue
+            if char in {"*", "?"}:
+                return True
+            if char == "[":
+                bracket_candidate = True
+            elif char == "]" and bracket_candidate:
+                return True
+            if char == "~" and (
+                word_start or (index > 0 and text[index - 1] == "=")
+            ):
+                return True
+            word_start = False
+            index += 1
+        return False
+
     @classmethod
     def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
         """Whether a managed launch reproduces the command before ``serve``."""
@@ -4940,6 +5001,7 @@ class Manager:
         shell_wrapped = False
         shell_command_boundary = False
         shell_comment = False
+        shell_path_expansion = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
@@ -4950,6 +5012,9 @@ class Manager:
                 )
                 shell_comment = self._has_unquoted_shell_comment(
                     match.group("flags")
+                )
+                shell_path_expansion = self._has_unquoted_shell_path_expansion(
+                    match.group("model") + match.group("flags")
                 )
                 try:
                     analysis_cmd = [
@@ -5046,7 +5111,7 @@ class Manager:
             extra_args.append(token)
             i += 1
         thinking_mode, _, _ = self._thinking_config(analysis_cmd)
-        return {
+        settings = {
             "editable": (
                 "serve" in analysis_cmd
                 and not shell_command_boundary
@@ -5080,6 +5145,11 @@ class Manager:
             "extra_args": extra_args,
             "command_flags": command_flags,
         }
+        if shell_path_expansion:
+            # Internal promotion guard. SparkDeck's public settings sanitizer
+            # intentionally does not include private keys.
+            settings["_shell_path_expansion"] = True
+        return settings
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
@@ -7565,7 +7635,10 @@ class Manager:
         mounts = attrs.get("Mounts")
         binds = (attrs.get("HostConfig") or {}).get("Binds") or []
         if not mounts and not binds:
-            return True
+            # Managed launches add the configured Hugging Face cache bind.
+            # Treat a mountless direct-start container as non-replayable: the
+            # injected bind could hide weights baked into the image's HF_HOME.
+            return False
 
         cache_target = self._image_hf_cache_target(image).rstrip("/") or "/"
         configured_cache = str(
@@ -7581,65 +7654,63 @@ class Manager:
         local_model = self._resolve_local_path(model)
         local_target = str(local_model).rstrip("/\\") if local_model else None
 
+        def _matches_managed_bind(source: str, destination: str) -> bool:
+            destination = destination.rstrip("/") or "/"
+            if destination == cache_target:
+                return bool(
+                    managed_cache_source
+                    and os.path.normcase(os.path.normpath(source))
+                    == managed_cache_source
+                )
+            source = source.rstrip("/\\")
+            return bool(
+                local_target
+                and destination == local_target
+                and source == local_target
+            )
+
+        if mounts and not isinstance(mounts, list):
+            return False
         if isinstance(mounts, list) and mounts:
             for mount in mounts:
                 if not isinstance(mount, dict) or mount.get("Type") != "bind":
                     return False
-                destination = (
-                    str(mount.get("Destination") or "").rstrip("/") or "/"
-                )
-                if destination == cache_target:
-                    source = str(mount.get("Source") or "").strip()
-                    if (
-                        managed_cache_source
-                        and os.path.normcase(os.path.normpath(source))
-                        == managed_cache_source
-                    ):
-                        continue
+                # _build_volumes() recreates both accepted binds as plain rw.
+                # Reject read-only and option-bearing mounts instead of
+                # silently weakening or otherwise changing their semantics.
+                mode = str(mount.get("Mode") or "").strip().lower()
+                if mount.get("RW") is not True or mode not in {"", "rw"}:
                     return False
-                source = str(mount.get("Source") or "").rstrip("/\\")
-                if (
-                    local_target
-                    and destination == local_target
-                    and source == local_target
+                if not _matches_managed_bind(
+                    str(mount.get("Source") or "").strip(),
+                    str(mount.get("Destination") or ""),
                 ):
-                    continue
-                return False
-            return True
+                    return False
 
         # Older Docker API responses may omit the normalized Mounts list while
         # retaining bind declarations in HostConfig. Parse destinations from
         # the right so Windows drive-letter sources remain valid.
-        if not isinstance(binds, list):
+        if binds and not isinstance(binds, list):
             return False
         for bind in binds:
             if not isinstance(bind, str):
                 return False
-            parts = bind.rsplit(":", 2)
-            if len(parts) < 2:
+            try:
+                head, tail = bind.rsplit(":", 1)
+            except ValueError:
                 return False
-            has_mode = parts[-1].lower() in {
-                "ro", "rw", "z", "cached", "delegated", "consistent",
-            }
-            destination = parts[-2] if has_mode else parts[-1]
-            destination = destination.rstrip("/") or "/"
-            source = parts[-3] if has_mode and len(parts) == 3 else parts[-2]
-            if destination == cache_target:
-                if (
-                    managed_cache_source
-                    and os.path.normcase(os.path.normpath(source))
-                    == managed_cache_source
-                ):
-                    continue
+            if tail.startswith("/"):
+                source, destination, mode = head, tail, ""
+            else:
+                mode = tail.strip().lower()
+                try:
+                    source, destination = head.rsplit(":", 1)
+                except ValueError:
+                    return False
+            if mode not in {"", "rw"}:
                 return False
-            source = source.rstrip("/\\")
-            if (
-                local_target
-                and destination == local_target
-                and source == local_target
-            ):
-                continue
-            return False
+            if not _matches_managed_bind(source, destination):
+                return False
         return True
 
     def _build_volumes(

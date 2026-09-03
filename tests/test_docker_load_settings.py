@@ -767,6 +767,57 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(settings["editable"])
 
+    def test_shell_wrapped_path_expansion_is_marked_nonportable(self):
+        model = "example/Model"
+        unsafe_values = (
+            "/templates/*.jinja",
+            "/templates/model?.jinja",
+            "/templates/[ab].jinja",
+            "~/templates/chat.jinja",
+            "--chat-template=~/templates/chat.jinja",
+        )
+
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                option = (
+                    value if value.startswith("--")
+                    else f"--chat-template {value}"
+                )
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} {option}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_path_expansion"])
+
+    def test_quoted_and_escaped_shell_path_literals_remain_portable(self):
+        model = "example/Model"
+        literal_values = (
+            "'/templates/*.jinja'",
+            '"/templates/model?.jinja"',
+            r"/templates/\[ab\].jinja",
+            r"\~/templates/chat.jinja",
+        )
+
+        for value in literal_values:
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertNotIn("_shell_path_expansion", settings)
+
     def test_shell_wrapped_command_boundary_is_read_only(self):
         model = "example/Model"
         command = [

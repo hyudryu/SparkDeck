@@ -2406,11 +2406,17 @@ class VirtualNAS:
             hub = self._hub()
             if repository.resolve().parent != hub:
                 raise ValueError("model cache path escapes the Hugging Face hub")
+            external_roots = self._external_model_roots_provider()
+            has_external_copy = (
+                _external_comfyui_bundle_files(external_roots, model_id)
+                is not None
+                or bool(_external_comfyui_fallback_copies(
+                    external_roots, model_id,
+                ))
+            )
             if (
                 _is_complete_repository(repository)
-                or _external_comfyui_bundle_files(
-                    self._external_model_roots_provider(), model_id,
-                ) is None
+                or not has_external_copy
             ):
                 self._delete_cached_repository(repository)
                 return {"ok": True, "model_id": model_id}

@@ -1679,19 +1679,37 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(inspect({
                 "Mounts": [{
                     "Type": "bind", "Source": managed_cache,
-                    "Destination": "/opt/hf-cache",
+                    "Destination": "/opt/hf-cache", "Mode": "rw", "RW": True,
+                }],
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [], "HostConfig": {"Binds": []},
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [{
+                    "Type": "bind", "Source": managed_cache,
+                    "Destination": "/opt/hf-cache", "Mode": "ro", "RW": False,
                 }],
             }, "vision:latest", "org/model"))
             self.assertFalse(inspect({
                 "Mounts": [{
+                    "Type": "bind", "Source": managed_cache,
+                    "Destination": "/opt/hf-cache", "Mode": "rw", "RW": True,
+                }],
+                "HostConfig": {
+                    "Binds": [f"{managed_cache}:/opt/hf-cache:ro"],
+                },
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
+                "Mounts": [{
                     "Type": "bind", "Source": "/host/config",
-                    "Destination": "/config",
+                    "Destination": "/config", "Mode": "rw", "RW": True,
                 }],
             }, "vision:latest", "org/model"))
             self.assertFalse(inspect({
                 "Mounts": [{
                     "Type": "volume", "Source": "runtime-config",
-                    "Destination": "/config",
+                    "Destination": "/config", "Mode": "rw", "RW": True,
                 }],
             }, "vision:latest", "org/model"))
             self.assertTrue(inspect({
@@ -1700,9 +1718,14 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 },
             }, "vision:latest", "org/model"))
             self.assertFalse(inspect({
+                "HostConfig": {
+                    "Binds": [f"{managed_cache}:/opt/hf-cache:ro"],
+                },
+            }, "vision:latest", "org/model"))
+            self.assertFalse(inspect({
                 "Mounts": [{
                     "Type": "bind", "Source": other_cache,
-                    "Destination": "/opt/hf-cache",
+                    "Destination": "/opt/hf-cache", "Mode": "rw", "RW": True,
                 }],
             }, "vision:latest", "org/model"))
             self.assertFalse(inspect({
@@ -1822,6 +1845,61 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             manager.start_container.assert_not_awaited()
             await manager.http.aclose()
             await service.close()
+
+    async def test_shell_path_expansion_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "load_settings": {
+                "command_flags": "--chat-template /templates/*.jinja",
+                "_shell_path_expansion": True,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "pathname expansion"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_literal_shell_path_metacharacters_remain_promotable(self):
+        for value in ("'/templates/*.jinja'", r"\~/templates/\*.jinja"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                load_settings = server.manager._container_load_settings(
+                    [
+                        "/bin/bash", "-lc",
+                        "exec vllm serve org/model "
+                        f"--chat-template {value}",
+                    ],
+                    "vllm", "org/model",
+                )
+                container = {
+                    "name": "external-stack", "model": "org/model",
+                    "engine": "vllm", "managed": False, "status": "exited",
+                    "direct_start": True, "mounts_replayable": True,
+                    "load_settings": load_settings,
+                }
+                service, manager = self._service(directory, container)
+
+                card = service._discovered_deployment(
+                    container, "vllm", "org/model",
+                )
+
+                self.assertTrue(card["promotable"])
+                await manager.http.aclose()
+                await service.close()
 
     async def test_filtered_speculative_environment_blocks_promotion(self):
         container = {

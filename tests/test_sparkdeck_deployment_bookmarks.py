@@ -9,7 +9,7 @@ import httpx
 
 from manager import Manager
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
-from sparkdeck.service import SparkDeckService
+from sparkdeck.service import SparkDeckService, _container_last_deployed_at
 
 
 def node(node_id: str, name: str, *, local: bool = False) -> dict:
@@ -195,6 +195,31 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("source_container_name", cloned["settings"])
         self.assertEqual(cloned["required_node_count"], 4)
+
+        # A clone intentionally has no node assignment until Run.  Its detail
+        # editor must still be able to rename it and save launch controls; node
+        # count validation belongs to the Run selection boundary.
+        edited = await self.service.update_deployment_settings(cloned["id"], {
+            "alias": "DeepSeek V4 tuned clone",
+            "launch_controls": {
+                **cloned["settings"]["launch_controls"],
+                "max_concurrency": 7,
+            },
+        })
+        self.assertEqual(edited["alias"], "DeepSeek V4 tuned clone")
+        self.assertEqual(edited["status"], "saved")
+        self.assertEqual(edited["node_ids"], [])
+        self.assertEqual(edited["launch_controls"]["max_concurrency"], 7)
+
+    def test_never_started_container_uses_creation_time_for_recency(self):
+        created = "2026-09-03T06:05:13.473523417Z"
+        self.assertEqual(
+            _container_last_deployed_at({
+                "started_at": "0001-01-01T00:00:00Z",
+                "created": created,
+            }),
+            created,
+        )
 
     async def test_clone_uses_current_manager_argv_instead_of_stale_controls(self):
         current_args = [

@@ -602,7 +602,13 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "SPECIAL_RUNTIME_FLAG=1", "NCCL_DEBUG=INFO",
                 "IMAGE_DEFAULT=keep-private",
             ],
-            "Labels": {"vllm-model": model},
+            "Labels": {
+                "vllm-model": model,
+                "io.sparkdeck.start-command": "/opt/stack/start.sh",
+                "io.sparkdeck.stop-command": "/opt/stack/stop.sh",
+                "io.sparkdeck.env-file": "/opt/stack/.env.dspark",
+                "keep-label": "yes",
+            },
         }
         host_config = {
             "NetworkMode": "host",
@@ -632,6 +638,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                     "max_concurrency": 3,
                     "environment": {"NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"},
                 },
+                detach_external_lifecycle=True,
             )
 
         replacement = containers.get(name)
@@ -646,6 +653,9 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(api.created_config["HostConfig"], host_config)
         self.assertEqual(api.created_config["Entrypoint"], ["vllm", "serve"])
+        self.assertEqual(api.created_config["Labels"], {
+            "vllm-model": model, "keep-label": "yes",
+        })
         self.assertEqual(api.created_config["Cmd"][0], model)
         self.assertEqual(
             self.manager._cli_option(

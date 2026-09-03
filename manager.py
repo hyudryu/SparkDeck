@@ -11858,7 +11858,10 @@ class Manager:
                 flag_tokens += [sorted(names)[0], str(old_value)]
         return [*prefix, *flag_tokens]
 
-    async def update_container_settings(self, name: str, settings: dict) -> dict:
+    async def update_container_settings(
+        self, name: str, settings: dict, *,
+        detach_external_lifecycle: bool = False,
+    ) -> dict:
         """Transactionally recreate a Docker model with an edited command.
 
         Docker cannot mutate a container command in place. The original is
@@ -11924,6 +11927,15 @@ class Manager:
 
             create_config = config
             create_config["Cmd"] = new_cmd
+            if detach_external_lifecycle:
+                # The replacement is now owned by SparkDeck's normal settings
+                # editor. Drop external hooks and their env-file contract so
+                # Run starts this exact command instead of regenerating stale
+                # hard-coded flags from an outside compose stack.
+                replacement_labels = dict(create_config.get("Labels") or {})
+                for key in (START_COMMAND_LABEL, STOP_COMMAND_LABEL, ENV_FILE_LABEL):
+                    replacement_labels.pop(key, None)
+                create_config["Labels"] = replacement_labels
             if requested_environment is not None:
                 existing_environment: dict[str, str] = {}
                 for entry in config.get("Env") or []:

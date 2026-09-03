@@ -467,7 +467,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--tensor-parallel-size", body["extra_args"])
         self.assertNotIn("--max-model-len", body["extra_args"])
 
-    async def test_discovered_vllm_settings_rebuild_the_container(self):
+    async def test_hook_backed_vllm_uses_normal_settings_and_detaches_hooks(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
             "kind": "external", "model": {"repository": "org/model"},
@@ -475,6 +475,9 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         }
         container = {
             "name": "vllm-dspark", "image": "example/dspark:latest",
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+            "settings_env_file": "/opt/stack/.env.dspark",
             "load_settings": {
                 "engine": "vllm", "editable": True,
                 "extra_args": ["--enable-prefix-caching"],
@@ -516,6 +519,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(update.await_args.kwargs["detach_external_lifecycle"])
         replacement = update.await_args.args[1]
         self.assertEqual(replacement["context_window"], 131072)
         self.assertEqual(replacement["max_concurrency"], 4)

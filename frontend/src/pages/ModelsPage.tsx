@@ -2203,7 +2203,11 @@ export function ModelsPage() {
             || target.transfer_after_download_eligible)
           .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
-          .filter((node) => !preparableLaunch || weighted.has(node.id) || prepEligible.has(node.id))
+          .filter((node) => (
+            (!deployment.managed && !preparableLaunch)
+            || weighted.has(node.id)
+            || prepEligible.has(node.id)
+          ))
           .map((node) => node.id)
         const unavailableReasons = Object.fromEntries((nodes.data ?? [])
           .filter((node) => !allowedIds.includes(node.id)).map((node) => {

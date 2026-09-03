@@ -5291,7 +5291,20 @@ class SparkDeckService:
         if not alias:
             raise ValueError("alias is required")
         if deployment_id.startswith("container:"):
-            raise ValueError("discovered containers cannot be renamed")
+            container = await self._resolve_discovered_container(deployment_id)
+            name = str(container.get("name") or "")
+            # Uniqueness must cover every live alias, not only persisted
+            # container_aliases entries: a discovered card without a custom
+            # alias displays its served-model or model name, and duplicated
+            # display aliases make gateway model selectors ambiguous.
+            folded = alias.casefold()
+            for item in await self.deployments():
+                if str(item.get("id") or "") == deployment_id:
+                    continue
+                if str(item.get("alias") or "").casefold() == folded:
+                    raise ValueError(f"deployment alias '{alias}' is already in use")
+            await self.manager.update_container_alias(name, alias)
+            return await self.deployment_detail(deployment_id)
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored:
             raise LookupError("deployment not found")

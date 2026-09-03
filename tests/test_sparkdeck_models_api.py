@@ -630,6 +630,102 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("${SPECULATIVE_CONFIG}", replacement["command_flags"])
         self.assertIn("--enable-prefix-caching", replacement["command_flags"])
 
+    async def test_rename_discovered_container_updates_display_alias(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {"name": "vllm-dspark", "image": "example/dspark:latest"}
+        rename = AsyncMock(return_value={"ok": True, "alias": "Vision exp"})
+        detail = AsyncMock(return_value={**card, "alias": "Vision exp"})
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.sparkdeck, "deployment_detail", detail),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "Vision exp"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["alias"], "Vision exp")
+        rename.assert_awaited_once_with("vllm-dspark", "Vision exp")
+        detail.assert_awaited_once_with("container:vllm-dspark")
+
+    async def test_rename_discovered_container_rejects_live_alias_conflicts(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        container = {"name": "vllm-dspark", "image": "example/dspark:latest"}
+        # The conflicting card has no persisted custom alias: "Vision exp"
+        # is its served-model fallback, so the rename must still be blocked.
+        other = {
+            "id": "container:vision-exp", "alias": "Vision exp", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/vision"},
+            "status": "running", "settings": {},
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, other]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "vision EXP"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
+    async def test_rename_discovered_container_rejects_saved_deployment_alias(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        saved = {
+            "id": "saved-1", "alias": "Saved model", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/model"},
+            "status": "saved", "settings": {},
+        }
+        container = {"name": "vllm-dspark", "image": "example/dspark:latest"}
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, saved]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "Saved model"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
     async def test_runtime_flags_preview_resolves_environment_backed_speculation(self):
         response = await self.client.post(
             "/api/v1/runtime-flags/preview",

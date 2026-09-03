@@ -1895,7 +1895,26 @@ class SparkDeckService:
                 raise ValueError(
                     "deployment does not have editable saved launch settings"
                 )
-            return await self._update_saved_deployment(stored, changes)
+            # Saved aliases and future runtime-served model ids occupy the same
+            # public selector namespace as live and discovered deployments.
+            # Serialize the complete read/validate/write operation with create
+            # and rename, and refresh the row after acquiring the lock so a
+            # concurrent saved edit cannot be overwritten from a stale copy.
+            async with self._deployment_alias_lock:
+                current = self.store.deployment(
+                    stored["id"], include_private=True,
+                )
+                if current is None:
+                    raise LookupError("deployment not found")
+                current_settings = current.get("settings") or {}
+                if (
+                    current_settings.get("manager_deployment_id")
+                    or current.get("container_name")
+                ):
+                    raise ValueError(
+                        "deployment does not have editable saved launch settings"
+                    )
+                return await self._update_saved_deployment(current, changes)
 
         allowed = {
             "extra_args", "launch_controls",
@@ -2234,10 +2253,6 @@ class SparkDeckService:
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
-        if alias != stored.get("alias"):
-            existing = self.store.deployment(alias)
-            if existing and existing["id"] != stored["id"]:
-                raise ValueError(f"deployment alias '{alias}' is already in use")
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
         if "environment" in changes:
@@ -2487,6 +2502,16 @@ class SparkDeckService:
             and len(effective_nodes) < 2
         ):
             raise ValueError("sharded deployment requires at least two nodes")
+        model_repository = str(
+            (stored.get("model") or {}).get("repository") or ""
+        ).strip()
+        await self._assert_deployment_alias_available(
+            alias,
+            stored["id"],
+            reserved_selectors=self._managed_deployment_reserved_selectors(
+                model_repository, settings,
+            ),
+        )
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
                 stored["id"], self._local_configuration(settings), alias,
@@ -2915,13 +2940,9 @@ class SparkDeckService:
                 # those future request ids before persisting the bookmark so a
                 # friendly alias on an existing (including discovered)
                 # deployment cannot be silently shadowed when this one starts.
-                reserved_selectors.append(model)
-                resolver = getattr(self.manager, "_deployment_served_models", None)
-                if callable(resolver):
-                    reserved_selectors.extend(resolver({
-                        "model": model,
-                        "launch_settings": {**settings, "model": model},
-                    }))
+                reserved_selectors.extend(
+                    self._managed_deployment_reserved_selectors(model, settings)
+                )
             await self._assert_deployment_alias_available(
                 alias, deployment_id, reserved_selectors=reserved_selectors,
             )
@@ -3958,6 +3979,14 @@ class SparkDeckService:
             )
         if (
             container.get("direct_start")
+            and container.get("ipc_mode_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "IPC mode does not match Manager's host IPC contract"
+            )
+        if (
+            container.get("direct_start")
             and container.get("image_replayable") is not True
         ):
             raise ValueError(
@@ -3992,9 +4021,10 @@ class SparkDeckService:
                     f"{parallel_rank_count} parallel GPU ranks must divide evenly "
                     "across the selected nodes"
                 )
-            # A one-host vLLM launch keeps TP/PP inside that host. Multi-host
-            # selections use Manager's distributed sharded launch. Manager
-            # preflight validates ranks-per-host against live GPU telemetry.
+            # A one-host parallel launch keeps every rank inside that host.
+            # Multi-host selections use Manager's distributed sharded launch.
+            # Manager preflight validates ranks-per-host against live GPU
+            # telemetry for both vLLM and SGLang.
             deployment_mode = "single" if len(node_ids) == 1 else "sharded"
         elif len(node_ids) != required_nodes:
             if direct_recovery is None:
@@ -4230,13 +4260,13 @@ class SparkDeckService:
             "deployment_mode": mode,
             "required_node_count": required,
             "model_revision": _optional_string(contract.get("model_revision")),
-            # Without an explicit --nnodes, direct vLLM containers prove the
-            # argv's rank layout but not a SparkDeck host layout. Accept any
-            # divisor whose ranks fit; Manager preflight performs the
-            # authoritative per-host GPU-capacity check.
+            # Without an explicit --nnodes, direct vLLM and SGLang containers
+            # prove the argv's rank layout but not a SparkDeck host layout.
+            # Accept any divisor whose ranks fit; Manager preflight performs
+            # the authoritative per-host GPU-capacity check.
             "parallel_rank_count": rank_count,
             "flexible_node_count": (
-                runtime == RuntimeKind.VLLM.value
+                runtime in {RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value}
                 and rank_count > 1
                 and not has_explicit_hosts
             ),
@@ -4727,11 +4757,13 @@ class SparkDeckService:
     ) -> tuple[dict[str, Any], str, str]:
         """Resolve a saved or safely promotable deployment for preparation."""
         deployment = self.store.deployment(deployment_id, include_private=True)
+        direct_recovery: tuple[dict[str, Any], dict[str, Any]] | None = None
         if deployment is None and deployment_id.startswith("container:"):
             container = await self._resolve_discovered_container(deployment_id)
+            runtime = self._container_runtime(container)
             deployment = self._discovered_deployment(
                 container,
-                self._container_runtime(container),
+                runtime,
                 container.get("model") or container.get("served_model"),
             )
             if not (
@@ -4741,6 +4773,19 @@ class SparkDeckService:
                 raise ValueError(
                     "discovered deployment cannot prepare weights before promotion"
                 )
+            load_settings = container.get("load_settings") or {}
+            direct_recovery = self._direct_start_launch_contract(
+                container,
+                runtime,
+                str(
+                    load_settings.get("model") or container.get("model")
+                    or container.get("served_model") or ""
+                ),
+            )
+            if direct_recovery is None:
+                raise ValueError(
+                    "discovered deployment launch identity could not be recovered"
+                )
         if deployment is None:
             raise LookupError("deployment not found")
         if (
@@ -4748,7 +4793,10 @@ class SparkDeckService:
             and not deployment_id.startswith("container:")
         ):
             raise ValueError("external endpoints do not use cached model weights")
-        model = str((deployment.get("model") or {}).get("repository") or "")
+        model = str(
+            (direct_recovery[0].get("model") if direct_recovery else None)
+            or (deployment.get("model") or {}).get("repository") or ""
+        )
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         if resolve_local and resolve_local(model):
             raise ValueError(
@@ -4757,7 +4805,11 @@ class SparkDeckService:
         if not model:
             raise ValueError("deployment does not reference a Hugging Face model")
         revision = (
-            _optional_string(deployment.get("model_revision"))
+            _optional_string(
+                direct_recovery[1].get("model_revision")
+                if direct_recovery else None
+            )
+            or _optional_string(deployment.get("model_revision"))
             or _optional_string(
                 (deployment.get("model") or {}).get("revision")
             )
@@ -5594,6 +5646,19 @@ class SparkDeckService:
                 result.update(self._saved_layout_contract(settings, clone.runtime.value))
             return result
 
+    def _managed_deployment_reserved_selectors(
+        self, model: str, settings: dict[str, Any],
+    ) -> list[str]:
+        """Return the selectors a saved managed launch will publish."""
+        selectors = [model] if model else []
+        resolver = getattr(self.manager, "_deployment_served_models", None)
+        if callable(resolver):
+            selectors.extend(resolver({
+                "model": model,
+                "launch_settings": {**settings, "model": model},
+            }))
+        return selectors
+
     async def _assert_deployment_alias_available(
         self, alias: str, deployment_id: str, *,
         reserved_selectors: Iterable[str] = (),
@@ -5729,6 +5794,7 @@ class SparkDeckService:
             and container.get("environment_replayable") is True
             and container.get("user_replayable") is True
             and container.get("gpu_requests_replayable") is True
+            and container.get("ipc_mode_replayable") is True
             and container.get("image_replayable") is True
         )
         result = {

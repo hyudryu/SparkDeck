@@ -241,6 +241,23 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(running.status_code, 409)
 
+    async def test_update_deployment_settings_maps_selector_conflict(self):
+        update = AsyncMock(side_effect=ValueError(
+            "deployment selector 'vision-public' is already in use"
+        ))
+        with patch.object(server.sparkdeck, "update_deployment_settings", update):
+            response = await self.client.put(
+                "/api/v1/deployments/dep-1/settings",
+                json={
+                    "extra_args": [
+                        "--served-model-name", "vision-public",
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+
 
 class DeploymentRenameStoreTests(unittest.TestCase):
     def test_update_alias_persists_new_name(self):
@@ -1426,11 +1443,17 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 if isinstance(command_flags, str)
                 else list(settings.get("extra_args") or [])
             )
-            return {
-                "model": deployment.get("model"),
+            recovered = {
+                "model": settings.get("model") or deployment.get("model"),
+                "engine": deployment.get("engine", "vllm"),
                 "environment": dict(settings.get("environment") or {}),
                 "extra_args": recovered_args,
             }
+            if recovered["engine"] == "sglang":
+                recovered["sg_tp_size"] = settings.get(
+                    "tensor_parallel_size"
+                )
+            return recovered
 
         @staticmethod
         def recipe_deployment_contract(recipe):
@@ -1487,6 +1510,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             container.setdefault("environment_replayable", True)
             container.setdefault("user_replayable", True)
             container.setdefault("gpu_requests_replayable", True)
+            container.setdefault("ipc_mode_replayable", True)
             container.setdefault("image_replayable", True)
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
@@ -1685,6 +1709,52 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(launch["deployment_mode"], "single")
             self.assertEqual(launch["node_ids"], ["local"])
             self.assertEqual(result["id"], "managed")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_direct_sglang_tp_is_flexible_and_preserved(self):
+        container = {
+            "name": "external-sglang-tp8", "model": "org/model",
+            "engine": "sglang", "managed": False, "status": "exited",
+            "direct_start": True, "mounts_replayable": True,
+            "load_settings": {
+                "model": "org/model", "tensor_parallel_size": 8,
+                "command_flags": "--tp-size 8 --context-length 32768",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "sglang", "org/model",
+            )
+            manager.create_deployment.return_value = {
+                "id": "managed-cluster", "launch_settings": {},
+            }
+            adopted = Mock(return_value={"id": "managed", "status": "starting"})
+
+            self.assertTrue(deployment["flexible_node_count"])
+            self.assertEqual(deployment["parallel_rank_count"], 8)
+            with patch.object(service, "_adopt_manager_replacement", adopted):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local"],
+                )
+                single = manager.create_deployment.await_args.args[0]
+                manager.create_deployment.reset_mock()
+                await service._promote_discovered_deployment(
+                    deployment, container,
+                    ["local", "worker-1", "worker-2", "worker-3"],
+                )
+                sharded = manager.create_deployment.await_args.args[0]
+
+            self.assertEqual(single["deployment_mode"], "single")
+            self.assertEqual(single["sg_tp_size"], 8)
+            self.assertEqual(sharded["deployment_mode"], "sharded")
+            self.assertEqual(sharded["sg_tp_size"], 8)
+            with self.assertRaisesRegex(ValueError, "ranks must divide evenly"):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local", "worker-1", "worker-2"],
+                )
+
             await manager.http.aclose()
             await service.close()
 
@@ -2106,10 +2176,11 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_start_promotion_can_prepare_selected_node_weights(self):
         container = {
-            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "name": "external-stack", "model": "served-alias", "engine": "vllm",
             "managed": False, "status": "exited", "direct_start": True,
             "mounts_replayable": True,
             "load_settings": {
+                "model": "org/actual-model",
                 "command_flags": "--max-num-seqs 8 --revision pinned-release",
                 "environment": {"HF_HUB_OFFLINE": "1"},
             },
@@ -2127,10 +2198,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(plan["eligible"])
             self.assertEqual(prepared["jobs"], [])
             manager.recipe_model_preparation_preflight.assert_awaited_once_with(
-                "org/model", "pinned-release", ["remote-1"],
+                "org/actual-model", "pinned-release", ["remote-1"],
             )
             manager.queue_recipe_model_preparation.assert_awaited_once_with(
-                "org/model", "pinned-release", ["remote-1"],
+                "org/actual-model", "pinned-release", ["remote-1"],
             )
             await manager.http.aclose()
             await service.close()
@@ -2228,6 +2299,32 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
             with self.assertRaisesRegex(ValueError, "GPU device request"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_non_host_ipc_mode_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "ipc_mode_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "host IPC contract"):
                 await service.deployment_action(
                     "container:external-stack", "start",
                     node_ids=["local"], promote=True,

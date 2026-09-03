@@ -1,5 +1,6 @@
 """Saved-deployment bookmarks: save, prepare weights via Virtual NAS, launch."""
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +76,7 @@ class FakeBookmarkManager:
 
     # Reuse Manager's real parser so llama.cpp controls surface correctly.
     _deployment_launch_controls = Manager._deployment_launch_controls
+    _deployment_served_models = Manager._deployment_served_models
     _normalize_runtime_environment = staticmethod(
         Manager._normalize_runtime_environment
     )
@@ -1129,6 +1131,91 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             "sharded-bookmark", include_private=True,
         )
         self.assertIsNone(stored["settings"]["tensor_parallel_size"])
+
+    async def test_saved_update_rejects_discovered_selector_shadowing(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "TP2", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        saved = (await self.service.deployments())[0]
+        discovered = {
+            "id": "container:vision", "alias": "Discovered Vision",
+            "runtime": "vllm", "kind": "external", "status": "stopped",
+            "model": {"repository": "org/discovered"},
+            "served_models": ["vision-public"], "settings": {},
+        }
+
+        with patch.object(
+            self.service, "deployments",
+            AsyncMock(return_value=[saved, discovered]),
+        ):
+            with self.assertRaisesRegex(ValueError, "already in use"):
+                await self.service.update_deployment_settings("TP2", {
+                    "alias": "VISION-PUBLIC",
+                })
+            with self.assertRaisesRegex(ValueError, "already in use"):
+                await self.service.update_deployment_settings("TP2", {
+                    "extra_args": [
+                        "--served-model-name", "discovered vision",
+                    ],
+                })
+
+        stored = self.service.store.deployment("TP2", include_private=True)
+        self.assertIsNotNone(stored)
+        self.assertNotIn("extra_args", stored["settings"])
+
+    async def test_saved_selector_updates_serialize_and_allow_same_repo_profiles(self):
+        for alias in ("TP2", "TP4"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": alias, "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+            })
+
+        # Multiple stopped launch profiles may intentionally use the same
+        # repository/request id. They remain distinguishable by their aliases.
+        for alias in ("TP2", "TP4"):
+            await self.service.update_deployment_settings(alias, {
+                "extra_args": ["--served-model-name", "org/model"],
+            })
+
+        original_assert = self.service._assert_deployment_alias_available
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def paused_assert(alias, deployment_id, **kwargs):
+            if alias == "shared-name" and not first_entered.is_set():
+                self.assertTrue(self.service._deployment_alias_lock.locked())
+                first_entered.set()
+                await release_first.wait()
+            return await original_assert(alias, deployment_id, **kwargs)
+
+        with patch.object(
+            self.service, "_assert_deployment_alias_available",
+            side_effect=paused_assert,
+        ):
+            first = asyncio.create_task(
+                self.service.update_deployment_settings("TP2", {
+                    "alias": "shared-name",
+                })
+            )
+            await first_entered.wait()
+            second = asyncio.create_task(
+                self.service.update_deployment_settings("TP4", {
+                    "alias": "shared-name",
+                })
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(second.done())
+            release_first.set()
+            await first
+            with self.assertRaisesRegex(ValueError, "already in use"):
+                await second
+
+        tp4 = self.service.store.deployment("TP4", include_private=True)
+        self.assertEqual(
+            tp4["settings"]["extra_args"],
+            ["--served-model-name", "org/model"],
+        )
 
     async def test_saved_bookmark_detail_seeds_controls_from_scalars(self):
         await self.service.create_deployment({

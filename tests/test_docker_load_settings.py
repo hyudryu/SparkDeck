@@ -304,7 +304,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
     def _direct_portability_summary(
         self, device_requests, resolved_image_id, *,
-        image_user="", container_user="",
+        image_user="", container_user="", ipc_mode="host",
     ):
         source_image_id = "sha256:source-image"
         image = SimpleNamespace(
@@ -332,7 +332,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "User": container_user,
                 "Labels": {"io.sparkdeck.direct-start": "1"},
             },
-            {"DeviceRequests": device_requests},
+            {"DeviceRequests": device_requests, "IpcMode": ipc_mode},
         )
         container.attrs["Image"] = source_image_id
         return self.manager._container_summary(container)
@@ -347,8 +347,20 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         }], "sha256:source-image")
 
         self.assertTrue(summary["gpu_requests_replayable"])
+        self.assertTrue(summary["ipc_mode_replayable"])
         self.assertTrue(summary["image_replayable"])
         self.assertTrue(summary["user_replayable"])
+
+    def test_direct_summary_rejects_non_host_ipc_mode(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", ipc_mode="private")
+
+        self.assertFalse(summary["ipc_mode_replayable"])
 
     def test_direct_summary_rejects_container_user_override(self):
         summary = self._direct_portability_summary([{
@@ -1082,6 +1094,19 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(settings["editable"])
                 self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_bash_options_do_not_hide_brace_expansion(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "--noprofile", "-lc",
+            f"exec vllm serve {model} "
+            "--chat-template /templates/{chat,base}.jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_brace_expansion"])
 
     def test_literal_braces_and_parameter_expansion_remain_portable(self):
         model = "example/Model"

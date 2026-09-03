@@ -3232,6 +3232,114 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "extra_args": ["--tensor-parallel-size", "8"],
             })
 
+    async def test_sglang_parallelism_preserves_world_size_across_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.settings = {
+                "cluster_fabric_ip": "169.254.10.1",
+                "cluster_fabric_interface": "cx7-local",
+            }
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = []
+            captured = []
+            inventories = {
+                "local": [{"name": f"GPU {index}"} for index in range(8)],
+                "remote-1": [{"name": f"GPU {index}"} for index in range(4)],
+            }
+
+            async def cluster_nodes(local_stats=None):
+                return [
+                    {
+                        "id": "local", "name": "Spark 1", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.1",
+                        "fabric_interface": "cx7-local", "interfaces": [],
+                        "stats": {"gpus": inventories["local"]},
+                    },
+                    {
+                        "id": "remote-1", "name": "Spark 2", "online": True,
+                        "docker_ready": True, "fabric_ip": "169.254.10.2",
+                        "fabric_interface": "cx7-remote", "interfaces": [],
+                        "stats": {"gpus": inventories["remote-1"]},
+                    },
+                ]
+
+            async def allocate_port():
+                return 8008
+
+            async def create_member(node_id, payload):
+                captured.append((node_id, payload))
+                return {
+                    "id": f"container-{node_id}", "status": "running",
+                    "model_source": "public_repository",
+                }
+
+            instance.cluster_nodes = cluster_nodes
+            instance._allocate_port = allocate_port
+            instance._create_member = create_member
+
+            single = await instance._preflight_deployment_launch({
+                "model": "org/model", "engine": "sglang",
+                "deployment_mode": "single", "node_ids": ["local"],
+                "sg_tp_size": 8,
+            })
+            self.assertEqual(single["body"]["sg_tp_size"], 8)
+            inventories["local"].pop()
+            with self.assertRaisesRegex(ValueError, "8 GPU.*not enough devices"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "sg_tp_size": 8,
+                })
+            inventories["local"] = [
+                {"name": f"GPU {index}"} for index in range(4)
+            ]
+
+            deployment = await instance.create_deployment({
+                "model": "org/model", "engine": "sglang",
+                "deployment_mode": "sharded",
+                "node_ids": ["local", "remote-1"],
+                "sg_tp_size": 8,
+            })
+
+            self.assertEqual(deployment["launch_settings"]["sg_tp_size"], 8)
+            contract = instance.recipe_deployment_contract(
+                deployment["launch_settings"],
+            )
+            self.assertEqual(contract["required_node_count"], 2)
+            self.assertEqual(contract["tensor_parallel_size"], 8)
+            self.assertEqual(len(captured), 2)
+            for rank, (_, payload) in enumerate(captured):
+                self.assertEqual(payload["sg_tp_size"], 8)
+                self.assertEqual(
+                    payload["extra_args"][
+                        payload["extra_args"].index("--nnodes") + 1
+                    ],
+                    "2",
+                )
+                self.assertEqual(
+                    payload["extra_args"][
+                        payload["extra_args"].index("--node-rank") + 1
+                    ],
+                    str(rank),
+                )
+
+            inventories["remote-1"].pop()
+            with self.assertRaisesRegex(ValueError, "4 GPU.*not enough devices"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "sg_tp_size": 8,
+                })
+
+            with self.assertRaisesRegex(ValueError, "divide evenly"):
+                await instance._preflight_deployment_launch({
+                    "model": "org/model", "engine": "sglang",
+                    "deployment_mode": "sharded",
+                    "node_ids": ["local", "remote-1"],
+                    "sg_tp_size": 7,
+                })
+
     def test_stopped_deployment_launch_settings_are_saved_and_marked_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

@@ -5209,7 +5209,12 @@ class Manager:
                 shell_path_expansion = self._has_unquoted_shell_path_expansion(
                     match.group("model") + match.group("flags")
                 )
-                shell = cmd[-3].replace("\\", "/").rsplit("/", 1)[-1]
+                # Docker may preserve Bash startup options before ``-c``/``-lc``
+                # (for example ``bash --noprofile -lc``). The executable is
+                # still the first argv element; indexing relative to ``-lc``
+                # would mistake the startup option for the shell and miss
+                # Bash-only brace expansion.
+                shell = cmd[0].replace("\\", "/").rsplit("/", 1)[-1]
                 shell_brace_expansion = (
                     shell == "bash"
                     and self._has_unquoted_bash_brace_expansion(
@@ -6003,6 +6008,38 @@ class Manager:
                 # pipeline parallelism across nodes. Models that do not
                 # implement SupportsPP can explicitly request TP=nnodes, PP=1.
                 vllm_parallel_layout = (1, len(node_ids))
+        if mode in {"single", "sharded"} and engine == "sglang":
+            requested_tp = self._validated_sg_scalar(
+                "sg_tp_size", body.get("sg_tp_size"),
+            )
+            if requested_tp is None and mode == "sharded":
+                # Preserve the existing one-rank-per-host default for ordinary
+                # sharded SGLang launches that do not choose an explicit TP.
+                requested_tp = len(node_ids)
+            if requested_tp is not None:
+                body["sg_tp_size"] = requested_tp
+                if requested_tp % len(node_ids):
+                    raise ValueError(
+                        "SGLang tensor parallel size must divide evenly across "
+                        "the selected nodes"
+                    )
+                ranks_per_node = requested_tp // len(node_ids)
+                gpu_short = []
+                for nid in node_ids:
+                    gpus = (available[nid].get("stats") or {}).get("gpus")
+                    if gpus is None:
+                        continue
+                    usable = [
+                        gpu for gpu in gpus
+                        if not (isinstance(gpu, dict) and gpu.get("error"))
+                    ]
+                    if len(usable) < ranks_per_node:
+                        gpu_short.append(available[nid].get("name", nid))
+                if gpu_short:
+                    raise ValueError(
+                        f"layout requires {ranks_per_node} GPU(s) per node; "
+                        f"not enough devices on: {', '.join(gpu_short)}"
+                    )
         requested_port = body.get("port")
         local_port = requested_port
         if LOCAL_NODE_ID in node_ids and local_port is not None:
@@ -6237,7 +6274,12 @@ class Manager:
                         "--node-rank", str(rank),
                         "--dist-init-addr", f"{master_ip}:29501",
                     ]
-                    payload["sg_tp_size"] = len(node_ids)
+                    # --tp-size is the total SGLang world size. A recovered
+                    # TP8 launch spread over two or four hosts must remain TP8,
+                    # with --nnodes describing only the host topology.
+                    payload["sg_tp_size"] = (
+                        body.get("sg_tp_size") or len(node_ids)
+                    )
             member_specs.append({
                 "node_id": node_id,
                 "node_name": node.get("name", node_id),
@@ -10494,12 +10536,14 @@ class Manager:
         elif mode == "sharded":
             saved_count = len(saved_nodes)
             if (
-                engine == "vllm" and parallel_nodes > 1 and saved_count > 1
+                engine in {"vllm", "sglang"}
+                and parallel_nodes > 1 and saved_count > 1
                 and parallel_nodes % saved_count == 0
             ):
-                # vLLM can place several ranks on each selected host. Preserve
-                # a saved topology when it evenly divides TP x PP; launch
-                # preflight verifies that every host has enough GPUs.
+                # vLLM and SGLang can place several ranks on each selected
+                # host. Preserve a saved topology when it evenly divides the
+                # total world size; launch preflight verifies that every host
+                # has enough GPUs.
                 required_nodes = saved_count
             elif parallel_nodes > 1:
                 required_nodes = parallel_nodes
@@ -11482,6 +11526,21 @@ class Manager:
             and request.get("Capabilities") == [["gpu"]]
         )
 
+    @staticmethod
+    def _container_ipc_mode_is_replayable(attrs: dict) -> bool:
+        """Whether managed recreation preserves Docker's IPC namespace mode.
+
+        Manager always creates model containers with ``ipc_mode=host``. A
+        direct-start container using a private, shareable, or another
+        container's IPC namespace cannot be promoted without changing its
+        runtime contract. Missing or malformed inspection data fails closed.
+        """
+        host_config = attrs.get("HostConfig")
+        return (
+            isinstance(host_config, dict)
+            and host_config.get("IpcMode") == "host"
+        )
+
     def _container_image_is_replayable(
         self, attrs: dict, image_ref: str,
     ) -> bool:
@@ -11713,6 +11772,9 @@ class Manager:
             )
             summary["gpu_requests_replayable"] = (
                 self._container_gpu_requests_are_replayable(attrs)
+            )
+            summary["ipc_mode_replayable"] = (
+                self._container_ipc_mode_is_replayable(attrs)
             )
             summary["image_replayable"] = self._container_image_is_replayable(
                 attrs, image_tag,

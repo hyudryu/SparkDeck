@@ -75,9 +75,10 @@ function formatTtft(value: number | undefined, streaming?: boolean) {
 
 function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics; streaming?: boolean }) {
   if (!metrics && !streaming) return null
+  const promptMeasured = streaming || metrics?.prompt_tokens_per_second !== undefined
   return (
     <dl className="response-metrics" role="group" aria-label="Response performance">
-      <div><dt>Prompt processing</dt><dd>{formatRate(metrics?.prompt_tokens_per_second, streaming)}</dd></div>
+      {promptMeasured && <div><dt>Prompt processing</dt><dd>{formatRate(metrics?.prompt_tokens_per_second, streaming)}</dd></div>}
       <div><dt>TTFT</dt><dd>{formatTtft(metrics?.ttft_ms, streaming)}</dd></div>
       <div><dt>Output speed</dt><dd>{formatRate(metrics?.output_tokens_per_second, streaming)}</dd></div>
     </dl>

@@ -1512,6 +1512,12 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             container.setdefault("working_dir_replayable", True)
             container.setdefault("gpu_requests_replayable", True)
             container.setdefault("ipc_mode_replayable", True)
+            container.setdefault("read_only_rootfs_replayable", True)
+            container.setdefault("runtime_contract_replayable", True)
+            container.setdefault("single_network_mode_replayable", True)
+            container.setdefault("distributed_network_mode_replayable", True)
+            container.setdefault("single_host_options_replayable", True)
+            container.setdefault("distributed_host_options_replayable", True)
             container.setdefault("resource_constraints_replayable", True)
             container.setdefault("image_replayable", True)
         manager = self.FakeManager()
@@ -2066,7 +2072,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_bash_brace_expansion_blocks_direct_start_promotion(self):
         load_settings = server.manager._container_load_settings(
             [
-                "/bin/bash", "-lc",
+                "/bin/bash", "--noprofile", "-lc",
                 "exec vllm serve org/model "
                 "--chat-template /templates/{chat,base}.jinja",
             ],
@@ -2098,7 +2104,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_bash_ansi_c_quoting_blocks_direct_start_promotion(self):
         load_settings = server.manager._container_load_settings(
             [
-                "/bin/bash", "-lc",
+                "/bin/bash", "--noprofile", "-lc",
                 "exec vllm serve org/model "
                 "--served-model-name $'model\\nname'",
             ],
@@ -2127,12 +2133,44 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_zsh_wrapper_blocks_direct_start_promotion(self):
+        load_settings = server.manager._container_load_settings(
+            [
+                "/bin/zsh", "-lc",
+                "exec vllm serve org/model "
+                "--chat-template /templates/{chat,base}.jinja",
+            ],
+            "vllm", "org/model",
+        )
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True, "load_settings": load_settings,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "unsupported shell wrapper"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
     async def test_literal_shell_path_metacharacters_remain_promotable(self):
         for value in ("'/templates/*.jinja'", r"\~/templates/\*.jinja"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 load_settings = server.manager._container_load_settings(
                     [
-                        "/bin/bash", "-lc",
+                        "/bin/bash", "--noprofile", "-lc",
                         "exec vllm serve org/model "
                         f"--chat-template {value}",
                     ],
@@ -2393,6 +2431,163 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(card["promotable"])
             manager.create_deployment.assert_not_awaited()
             manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_read_only_rootfs_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "read_only_rootfs_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "read-only root filesystem"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_unreplayed_runtime_contract_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "runtime_contract_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "process or security contract"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_host_network_direct_start_requires_distributed_selection(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "single_network_mode_replayable": False,
+            "distributed_network_mode_replayable": True,
+            "load_settings": {
+                "tensor_parallel_size": 4,
+                "command_flags": "--tensor-parallel-size 4",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            self.assertTrue(deployment["promotable"])
+            with self.assertRaisesRegex(ValueError, "single-host launch contract"):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local"],
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_bridge_network_direct_start_requires_single_host_selection(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "single_network_mode_replayable": True,
+            "distributed_network_mode_replayable": False,
+            "load_settings": {
+                "tensor_parallel_size": 4,
+                "command_flags": "--tensor-parallel-size 4",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            self.assertTrue(deployment["promotable"])
+            with self.assertRaisesRegex(ValueError, "distributed launch contract"):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local", "worker-1"],
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_custom_network_blocks_every_direct_start_topology(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "single_network_mode_replayable": False,
+            "distributed_network_mode_replayable": False,
+            "load_settings": {
+                "tensor_parallel_size": 4,
+                "command_flags": "--tensor-parallel-size 4",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            self.assertFalse(card["promotable"])
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_host_options_must_match_selected_topology(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "single_host_options_replayable": False,
+            "distributed_host_options_replayable": True,
+            "load_settings": {
+                "tensor_parallel_size": 4,
+                "command_flags": "--tensor-parallel-size 4",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            self.assertTrue(deployment["promotable"])
+            with self.assertRaisesRegex(ValueError, "device or ulimit settings"):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local"],
+                )
+
+            manager.create_deployment.assert_not_awaited()
             await manager.http.aclose()
             await service.close()
 

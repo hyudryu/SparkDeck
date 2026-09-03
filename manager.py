@@ -4984,6 +4984,13 @@ class Manager:
                 continue
             if char in {"*", "?"}:
                 return True
+            # Bash extended globs can be enabled by a startup profile or a
+            # command-line ``-O extglob`` option.  The ordinary ``*`` and
+            # ``?`` forms are caught above; these operator spellings would
+            # otherwise survive shlex conversion and change meaning when the
+            # managed replacement switches to exec-form argv.
+            if char in {"@", "+", "!"} and text[index + 1:index + 2] == "(":
+                return True
             if char == "[":
                 bracket_candidate = True
             elif char == "]" and bracket_candidate:
@@ -5236,6 +5243,7 @@ class Manager:
         shell_path_expansion = False
         shell_brace_expansion = False
         shell_ansi_c_quoting = False
+        shell_wrapper_unsupported = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
@@ -5255,7 +5263,25 @@ class Manager:
                 # still the first argv element; indexing relative to ``-lc``
                 # would mistake the startup option for the shell and miss
                 # Bash-only brace expansion.
-                shell = cmd[0].replace("\\", "/").rsplit("/", 1)[-1]
+                shell_path = cmd[0].replace("\\", "/")
+                shell = shell_path.rsplit("/", 1)[-1]
+                # Promotion converts shell-wrapped launches to exec-form argv.
+                # The scanners below model Bash plus common POSIX expansion,
+                # not zsh/ksh/fish (or arbitrary wrapper programs). Keep
+                # discovery and settings inspection available, but fail closed
+                # when the original interpreter is outside that contract.
+                shell_options = cmd[1:-2]
+                shell_wrapper_unsupported = (
+                    shell_path not in {"bash", "/bin/bash", "/usr/bin/bash"}
+                    or any(
+                        option not in {"--noprofile", "--norc"}
+                        for option in shell_options
+                    )
+                    or (
+                        cmd[-2] == "-lc"
+                        and "--noprofile" not in shell_options
+                    )
+                )
                 shell_brace_expansion = (
                     shell == "bash"
                     and self._has_unquoted_bash_brace_expansion(
@@ -5405,6 +5431,8 @@ class Manager:
             settings["_shell_brace_expansion"] = True
         if shell_ansi_c_quoting:
             settings["_shell_ansi_c_quoting"] = True
+        if shell_wrapper_unsupported:
+            settings["_shell_wrapper_unsupported"] = True
         return settings
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
@@ -11501,6 +11529,32 @@ class Manager:
             cache[image_ref] = dict(config)
         return cache[image_ref]
 
+    def _docker_daemon_contract_defaults(self) -> tuple[str, str, str] | None:
+        """Return daemon-selected runtime, logging, and cgroup defaults.
+
+        Managed launches leave both options unset, so comparing a discovered
+        container to hard-coded values such as ``runc`` and ``json-file`` is
+        incorrect on hosts with a different daemon policy. Cache only a
+        successful, complete probe so transient Docker failures retry later.
+        """
+        cached = getattr(self, "_docker_contract_defaults_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            info = self.client.info()
+            if not isinstance(info, dict):
+                return None
+            runtime = str(info.get("DefaultRuntime") or "").strip()
+            logging_driver = str(info.get("LoggingDriver") or "").strip()
+            cgroup_version = str(info.get("CgroupVersion") or "").strip()
+        except Exception:
+            return None
+        if not runtime or not logging_driver or cgroup_version not in {"1", "2"}:
+            return None
+        result = (runtime, logging_driver, cgroup_version)
+        self._docker_contract_defaults_cache = result
+        return result
+
     def _container_environment_is_replayable(
         self, attrs: dict, engine: str,
     ) -> bool:
@@ -11641,6 +11695,270 @@ class Manager:
             and host_config.get("IpcMode") == "host"
         )
 
+    @staticmethod
+    def _container_read_only_rootfs_is_replayable(attrs: dict) -> bool:
+        """Whether Manager preserves the writable root-filesystem contract.
+
+        Managed model launches do not request Docker's read-only rootfs mode.
+        Promotion must therefore accept only an explicitly inspected ``false``
+        value. Missing or non-boolean inspection data fails closed instead of
+        silently making a previously read-only image filesystem writable.
+        """
+        host_config = attrs.get("HostConfig")
+        return (
+            isinstance(host_config, dict)
+            and host_config.get("ReadonlyRootfs") is False
+        )
+
+    def _container_runtime_contract_is_replayable(self, attrs: dict) -> bool:
+        """Whether unmanaged Docker process/security options are reproducible.
+
+        The managed builders intentionally do not replay arbitrary privilege,
+        namespace, DNS, health-check, or stdio configuration. Compare inherited
+        image values against the immutable source image and require the
+        remaining fields to match the options Manager actually creates. Only a
+        boolean capability leaves this method; raw host configuration remains
+        private.
+        """
+        config = attrs.get("Config")
+        host_config = attrs.get("HostConfig")
+        image_ref = str(attrs.get("Image") or "").strip()
+        image_config = (
+            self._inspected_image_config(image_ref) if image_ref else None
+        )
+        daemon_defaults = self._docker_daemon_contract_defaults()
+        if (
+            not isinstance(config, dict)
+            or not isinstance(host_config, dict)
+            or image_config is None
+            or daemon_defaults is None
+        ):
+            return False
+
+        # Manager reuses the immutable image without container-level overrides.
+        for field in ("Healthcheck", "StopSignal"):
+            if config.get(field) != image_config.get(field):
+                return False
+
+        container_id = str(attrs.get("Id") or "").strip()
+        hostname = config.get("Hostname")
+        if (
+            not container_id
+            or not isinstance(hostname, str)
+            or hostname.casefold() != container_id[:12].casefold()
+        ):
+            return False
+        if config.get("Domainname", "") != "":
+            return False
+        if config.get("MacAddress", "") != "":
+            return False
+        if config.get("StopTimeout") is not None:
+            return False
+        for field in ("Tty", "OpenStdin", "StdinOnce"):
+            if config.get(field) is not False:
+                return False
+
+        expected_empty_sequences = (
+            "CapAdd", "CapDrop", "SecurityOpt", "GroupAdd", "ExtraHosts",
+            "Dns", "DnsOptions", "DnsSearch", "Links", "VolumesFrom",
+            "LxcConf",
+        )
+        for field in expected_empty_sequences:
+            if field not in host_config or host_config[field] not in (None, []):
+                return False
+        for field in ("Sysctls", "Tmpfs"):
+            if field not in host_config or host_config[field] not in (None, {}):
+                return False
+
+        fixed_defaults = {
+            "Privileged": False,
+            "AutoRemove": False,
+            "PublishAllPorts": False,
+            "PidMode": "",
+            "UsernsMode": "",
+            "UTSMode": "",
+            "OomScoreAdj": 0,
+            "Isolation": "",
+            "VolumeDriver": "",
+        }
+        for field, expected in fixed_defaults.items():
+            if field not in host_config:
+                return False
+            value = host_config[field]
+            if isinstance(expected, bool):
+                if value is not expected:
+                    return False
+            elif isinstance(expected, int):
+                if (
+                    not isinstance(value, int) or isinstance(value, bool)
+                    or value != expected
+                ):
+                    return False
+            elif value != expected:
+                return False
+        _runtime, _logging_driver, cgroup_version = daemon_defaults
+        expected_cgroupns = "host" if cgroup_version == "1" else "private"
+        if host_config.get("CgroupnsMode") != expected_cgroupns:
+            return False
+        if host_config.get("Init") not in (None, False):
+            return False
+
+        runtime, logging_driver, _cgroup_version = daemon_defaults
+        if host_config.get("Runtime") != runtime:
+            return False
+        log_config = host_config.get("LogConfig")
+        if not isinstance(log_config, dict) or (
+            log_config.get("Type") != logging_driver
+            or log_config.get("Config") not in (None, {})
+        ):
+            return False
+        restart_policy = host_config.get("RestartPolicy")
+        maximum_retries = (
+            restart_policy.get("MaximumRetryCount", 0)
+            if isinstance(restart_policy, dict) else None
+        )
+        if not isinstance(restart_policy, dict) or (
+            restart_policy.get("Name") != "unless-stopped"
+            or not isinstance(maximum_retries, int)
+            or isinstance(maximum_retries, bool)
+            or maximum_retries != 0
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _container_topology_options_are_replayable(
+        attrs: dict,
+    ) -> tuple[bool, bool]:
+        """Return single/distributed compatibility for ulimits and devices."""
+        host_config = attrs.get("HostConfig")
+        if (
+            not isinstance(host_config, dict)
+            or "Ulimits" not in host_config
+            or "Devices" not in host_config
+        ):
+            return False, False
+
+        raw_ulimits = host_config.get("Ulimits")
+        if raw_ulimits is None:
+            raw_ulimits = []
+        if not isinstance(raw_ulimits, list):
+            return False, False
+        normalized_ulimits = []
+        for item in raw_ulimits:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"Name", "Soft", "Hard"}
+            ):
+                return False, False
+            name = item.get("Name")
+            soft = item.get("Soft")
+            hard = item.get("Hard")
+            if (
+                not isinstance(name, str)
+                or not isinstance(soft, int) or isinstance(soft, bool)
+                or not isinstance(hard, int) or isinstance(hard, bool)
+            ):
+                return False, False
+            normalized_ulimits.append((name, soft, hard))
+        normalized_ulimits.sort()
+
+        raw_devices = host_config.get("Devices")
+        if raw_devices is None:
+            raw_devices = []
+        if not isinstance(raw_devices, list):
+            return False, False
+        normalized_devices = []
+        for item in raw_devices:
+            if not isinstance(item, dict) or set(item) != {
+                "PathOnHost", "PathInContainer", "CgroupPermissions",
+            }:
+                return False, False
+            host_path = item.get("PathOnHost")
+            container_path = item.get("PathInContainer")
+            permissions = item.get("CgroupPermissions")
+            if not all(isinstance(value, str) for value in (
+                host_path, container_path, permissions,
+            )):
+                return False, False
+            normalized_devices.append((host_path, container_path, permissions))
+        normalized_devices.sort()
+
+        single = not normalized_ulimits and not normalized_devices
+        distributed_ulimits = normalized_ulimits == [("memlock", -1, -1)]
+        expected_devices = (
+            [("/dev/infiniband", "/dev/infiniband", "rwm")]
+            if Path("/dev/infiniband").exists() else []
+        )
+        distributed = distributed_ulimits and normalized_devices == expected_devices
+        return single, distributed
+
+    @staticmethod
+    def _container_network_modes_are_replayable(
+        attrs: dict,
+    ) -> tuple[bool, bool]:
+        """Return Manager-compatible single and distributed network modes.
+
+        A one-host managed launch publishes its service port on Docker's
+        built-in bridge. Multi-host sharded members instead use host networking
+        so their fabric rendezvous addresses and service ports are reachable.
+        Custom, disabled, and container-shared networks cannot be reproduced by
+        the managed builders and therefore fail both capability checks.
+        """
+        host_config = attrs.get("HostConfig")
+        networks = ((attrs.get("NetworkSettings") or {}).get("Networks"))
+        if not isinstance(host_config, dict) or not isinstance(networks, dict):
+            return False, False
+        mode = host_config.get("NetworkMode")
+        if not isinstance(mode, str):
+            return False, False
+        normalized = mode.strip().casefold()
+
+        def has_only_default_endpoint(name: str) -> bool:
+            if set(networks) != {name}:
+                return False
+            endpoint = networks.get(name)
+            if not isinstance(endpoint, dict):
+                return False
+            # Manager does not preserve static addressing, links, aliases, or
+            # per-network driver options. Generated IP/MAC values are omitted
+            # from this comparison because Docker assigns new ones on create.
+            return all(
+                field in endpoint and endpoint[field] in (None, [], {})
+                for field in ("IPAMConfig", "Links", "Aliases", "DriverOpts")
+            )
+
+        publish_all = host_config.get("PublishAllPorts")
+        port_bindings = host_config.get("PortBindings")
+        single_ports = False
+        if isinstance(port_bindings, dict) and len(port_bindings) == 1:
+            key, bindings = next(iter(port_bindings.items()))
+            if key == "8000/tcp" and isinstance(bindings, list) and bindings:
+                host_ports = {
+                    str(binding.get("HostPort") or "")
+                    for binding in bindings if isinstance(binding, dict)
+                }
+                single_ports = len(host_ports) == 1 and all(
+                    isinstance(binding, dict)
+                    and str(binding.get("HostPort") or "").isdigit()
+                    and str(binding.get("HostIp") or "") in {"", "0.0.0.0", "::"}
+                    for binding in bindings
+                )
+
+        single = (
+            normalized in {"default", "bridge"}
+            and publish_all is False
+            and single_ports
+            and has_only_default_endpoint("bridge")
+        )
+        distributed = (
+            normalized == "host"
+            and publish_all is False
+            and port_bindings in (None, {})
+            and has_only_default_endpoint("host")
+        )
+        return single, distributed
+
     def _container_resources_are_replayable(self, attrs: dict) -> bool:
         """Whether managed recreation preserves Docker resource controls.
 
@@ -11691,6 +12009,8 @@ class Manager:
         # the value produced by an unconstrained managed launch.
         optional_defaults = {
             "MemorySwappiness": None,
+            "KernelMemory": 0,
+            "KernelMemoryTCP": 0,
             "CpuRealtimePeriod": 0,
             "CpuRealtimeRuntime": 0,
             "BlkioWeight": 0,
@@ -11844,6 +12164,18 @@ class Manager:
             inspected_environment, engine_label,
         )
         load_settings = self._container_load_settings(cmd, engine_label, model)
+        if (
+            len(cmd) >= 3
+            and cmd[-2] in {"-c", "-lc"}
+            and any(
+                inspected_environment.get(name)
+                for name in ("BASH_ENV", "BASHOPTS", "SHELLOPTS")
+            )
+        ):
+            # These variables can source startup code or enable shell options
+            # before the visible script runs. The managed replacement uses
+            # exec-form argv and would silently discard those effects.
+            load_settings["_shell_wrapper_unsupported"] = True
         if not self._served_models_from_cmd(cmd) and cmd:
             # A shell-wrapped command (``bash -lc '<script>'``) hides the
             # vLLM flags inside a single argv token, so the plain scan above
@@ -11970,6 +12302,20 @@ class Manager:
             summary["ipc_mode_replayable"] = (
                 self._container_ipc_mode_is_replayable(attrs)
             )
+            summary["read_only_rootfs_replayable"] = (
+                self._container_read_only_rootfs_is_replayable(attrs)
+            )
+            summary["runtime_contract_replayable"] = (
+                self._container_runtime_contract_is_replayable(attrs)
+            )
+            (
+                summary["single_network_mode_replayable"],
+                summary["distributed_network_mode_replayable"],
+            ) = self._container_network_modes_are_replayable(attrs)
+            (
+                summary["single_host_options_replayable"],
+                summary["distributed_host_options_replayable"],
+            ) = self._container_topology_options_are_replayable(attrs)
             summary["resource_constraints_replayable"] = (
                 self._container_resources_are_replayable(attrs)
             )

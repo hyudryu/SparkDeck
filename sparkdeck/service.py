@@ -3912,6 +3912,13 @@ class SparkDeckService:
             )
         settings = dict(container.get("load_settings") or {})
         if container.get("direct_start") and settings.get(
+            "_shell_wrapper_unsupported"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command uses an unsupported shell wrapper"
+            )
+        if container.get("direct_start") and settings.get(
             "_shell_path_expansion"
         ) is True:
             raise ValueError(
@@ -4002,6 +4009,22 @@ class SparkDeckService:
             )
         if (
             container.get("direct_start")
+            and container.get("read_only_rootfs_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "read-only root filesystem contract cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("runtime_contract_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "Docker process or security contract cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
             and container.get("resource_constraints_replayable") is not True
         ):
             raise ValueError(
@@ -4032,6 +4055,30 @@ class SparkDeckService:
             launch_settings = None
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("node_ids must not contain duplicates")
+        if (
+            container.get("direct_start")
+            and not self._direct_start_network_mode_is_replayable(
+                container, len(node_ids),
+            )
+        ):
+            topology = "single-host" if len(node_ids) == 1 else "distributed"
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                f"Docker network mode does not match Manager's {topology} "
+                "launch contract"
+            )
+        if (
+            container.get("direct_start")
+            and not self._direct_start_host_options_are_replayable(
+                container, len(node_ids),
+            )
+        ):
+            topology = "single-host" if len(node_ids) == 1 else "distributed"
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                f"Docker device or ulimit settings do not match Manager's "
+                f"{topology} launch contract"
+            )
         flexible_node_count = (
             bool(layout.get("flexible_node_count")) if direct_recovery else False
         )
@@ -4219,7 +4266,8 @@ class SparkDeckService:
             return None
         settings = container.get("load_settings") or {}
         if (
-            settings.get("_shell_path_expansion") is True
+            settings.get("_shell_wrapper_unsupported") is True
+            or settings.get("_shell_path_expansion") is True
             or settings.get("_shell_brace_expansion") is True
             or settings.get("_shell_ansi_c_quoting") is True
         ):
@@ -4295,6 +4343,56 @@ class SparkDeckService:
                 and not has_explicit_hosts
             ),
         }
+
+    @staticmethod
+    def _direct_start_network_mode_is_replayable(
+        container: dict[str, Any], node_count: int,
+    ) -> bool:
+        """Match the source network mode to the selected managed topology."""
+        capability = (
+            "single_network_mode_replayable"
+            if node_count == 1
+            else "distributed_network_mode_replayable"
+        )
+        return container.get(capability) is True
+
+    @staticmethod
+    def _direct_start_host_options_are_replayable(
+        container: dict[str, Any], node_count: int,
+    ) -> bool:
+        """Match ulimits and explicit devices to the managed topology."""
+        capability = (
+            "single_host_options_replayable"
+            if node_count == 1
+            else "distributed_host_options_replayable"
+        )
+        return container.get(capability) is True
+
+    @classmethod
+    def _direct_start_topology_is_replayable(
+        cls, container: dict[str, Any], node_count: int,
+    ) -> bool:
+        return (
+            cls._direct_start_network_mode_is_replayable(container, node_count)
+            and cls._direct_start_host_options_are_replayable(container, node_count)
+        )
+
+    @classmethod
+    def _direct_start_has_replayable_network_topology(
+        cls, container: dict[str, Any], layout: dict[str, Any],
+    ) -> bool:
+        """Whether at least one inferred layout preserves Docker topology."""
+        if layout.get("flexible_node_count") is True:
+            return (
+                cls._direct_start_topology_is_replayable(container, 1)
+                or cls._direct_start_topology_is_replayable(container, 2)
+            )
+        required = layout.get("required_node_count")
+        if not isinstance(required, int) or isinstance(required, bool):
+            return False
+        return cls._direct_start_topology_is_replayable(
+            container, required,
+        )
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
@@ -5822,6 +5920,11 @@ class SparkDeckService:
             and container.get("working_dir_replayable") is True
             and container.get("gpu_requests_replayable") is True
             and container.get("ipc_mode_replayable") is True
+            and container.get("read_only_rootfs_replayable") is True
+            and container.get("runtime_contract_replayable") is True
+            and self._direct_start_has_replayable_network_topology(
+                container, direct_recovery[1],
+            )
             and container.get("resource_constraints_replayable") is True
             and container.get("image_replayable") is True
         )

@@ -20,6 +20,7 @@ class FakeContainer:
         self.labels = config.get("Labels") or {}
         self.ports = {}
         self.attrs = {
+            "Id": cid,
             "Config": copy.deepcopy(config),
             "HostConfig": copy.deepcopy(host_config),
             "Created": "2026-08-05T00:00:00Z",
@@ -305,26 +306,74 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
     def _direct_portability_summary(
         self, device_requests, resolved_image_id, *,
         image_user="", container_user="", image_working_dir="",
-        container_working_dir="", ipc_mode="host", resource_overrides=None,
+        container_working_dir="", ipc_mode="host", network_mode="default",
+        read_only_rootfs=False, image_config_overrides=None,
+        container_config_overrides=None, resource_overrides=None,
+        daemon_info_overrides=None,
     ):
         source_image_id = "sha256:source-image"
+        image_config = {
+            "Env": [], "Labels": {}, "User": image_user,
+            "WorkingDir": image_working_dir,
+        }
+        image_config.update(image_config_overrides or {})
         image = SimpleNamespace(
             id=resolved_image_id,
             attrs={
                 "Id": resolved_image_id,
-                "Config": {
-                    "Env": [], "Labels": {}, "User": image_user,
-                    "WorkingDir": image_working_dir,
-                },
+                "Config": image_config,
             },
         )
+        daemon_info = {
+            "DefaultRuntime": "runc", "LoggingDriver": "json-file",
+            "CgroupVersion": "2",
+        }
+        daemon_info.update(daemon_info_overrides or {})
         self.manager.client = SimpleNamespace(
             images=SimpleNamespace(get=mock.Mock(return_value=image)),
+            info=mock.Mock(return_value=daemon_info),
         )
         self.manager.settings = {"shm_size": "16g"}
         host_config = {
             "DeviceRequests": device_requests,
             "IpcMode": ipc_mode,
+            "NetworkMode": network_mode,
+            "ReadonlyRootfs": read_only_rootfs,
+            "Ulimits": None,
+            "Devices": None,
+            "Privileged": False,
+            "AutoRemove": False,
+            "PublishAllPorts": False,
+            "PortBindings": (
+                {} if network_mode == "host" else
+                {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}]}
+            ),
+            "CapAdd": None,
+            "CapDrop": None,
+            "SecurityOpt": None,
+            "GroupAdd": None,
+            "ExtraHosts": None,
+            "Dns": None,
+            "DnsOptions": None,
+            "DnsSearch": None,
+            "Links": None,
+            "VolumesFrom": None,
+            "LxcConf": None,
+            "Sysctls": None,
+            "Tmpfs": None,
+            "PidMode": "",
+            "UsernsMode": "",
+            "UTSMode": "",
+            "CgroupnsMode": "private",
+            "OomScoreAdj": 0,
+            "Isolation": "",
+            "VolumeDriver": "",
+            "Init": False,
+            "Runtime": "runc",
+            "LogConfig": {"Type": "json-file", "Config": {}},
+            "RestartPolicy": {
+                "Name": "unless-stopped", "MaximumRetryCount": 0,
+            },
             "Memory": 0,
             "MemoryReservation": 0,
             "MemorySwap": 0,
@@ -340,22 +389,41 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         }
         host_config.update(resource_overrides or {})
         containers = FakeContainers()
+        container_config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": ["vllm", "serve"],
+            "Cmd": ["org/model", "--max-num-seqs", "8"],
+            "Env": [],
+            "User": container_user,
+            "WorkingDir": container_working_dir,
+            "Hostname": "portable-con",
+            "Domainname": "",
+            "StopTimeout": None,
+            "Tty": False,
+            "OpenStdin": False,
+            "StdinOnce": False,
+            "Labels": {"io.sparkdeck.direct-start": "1"},
+        }
+        container_config.update(container_config_overrides or {})
         container = FakeContainer(
             containers,
             "portable-container-id",
             "portable-vllm",
-            {
-                "Image": "example/vllm:latest",
-                "Entrypoint": ["vllm", "serve"],
-                "Cmd": ["org/model", "--max-num-seqs", "8"],
-                "Env": [],
-                "User": container_user,
-                "WorkingDir": container_working_dir,
-                "Labels": {"io.sparkdeck.direct-start": "1"},
-            },
+            container_config,
             host_config,
         )
         container.attrs["Image"] = source_image_id
+        network_name = "bridge" if network_mode in {"default", "bridge"} else network_mode
+        container.attrs["NetworkSettings"] = {
+            "Networks": {
+                network_name: {
+                    "IPAMConfig": None,
+                    "Links": None,
+                    "Aliases": None,
+                    "DriverOpts": None,
+                },
+            },
+        }
         return self.manager._container_summary(container)
 
     def test_direct_summary_accepts_matching_all_gpu_and_image_contract(self):
@@ -369,10 +437,41 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(summary["gpu_requests_replayable"])
         self.assertTrue(summary["ipc_mode_replayable"])
+        self.assertTrue(summary["read_only_rootfs_replayable"])
+        self.assertTrue(summary["runtime_contract_replayable"])
+        self.assertTrue(summary["single_network_mode_replayable"])
+        self.assertFalse(summary["distributed_network_mode_replayable"])
+        self.assertTrue(summary["single_host_options_replayable"])
+        self.assertFalse(summary["distributed_host_options_replayable"])
         self.assertTrue(summary["image_replayable"])
         self.assertTrue(summary["user_replayable"])
         self.assertTrue(summary["working_dir_replayable"])
         self.assertTrue(summary["resource_constraints_replayable"])
+
+    def test_image_default_bash_env_keeps_shell_promotion_read_only(self):
+        environment = ["BASH_ENV=/opt/runtime/init.sh"]
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image",
+            image_config_overrides={"Env": environment},
+            container_config_overrides={
+                "Entrypoint": ["/bin/bash"],
+                "Cmd": [
+                    "--noprofile", "-lc",
+                    "exec vllm serve org/model --max-num-seqs 8",
+                ],
+                "Env": environment,
+            },
+        )
+
+        self.assertTrue(summary["environment_replayable"])
+        self.assertTrue(
+            summary["load_settings"]["_shell_wrapper_unsupported"],
+        )
 
     def test_direct_summary_rejects_non_default_resource_constraints(self):
         gpu_request = [{
@@ -429,6 +528,213 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         }], "sha256:source-image", ipc_mode="private")
 
         self.assertFalse(summary["ipc_mode_replayable"])
+
+    def test_direct_summary_rejects_read_only_root_filesystem(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", read_only_rootfs=True)
+
+        self.assertFalse(summary["read_only_rootfs_replayable"])
+
+    def test_direct_summary_classifies_managed_network_modes(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+
+        host = self._direct_portability_summary(
+            gpu_request, "sha256:source-image", network_mode="host",
+        )
+        custom = self._direct_portability_summary(
+            gpu_request, "sha256:source-image", network_mode="model-net",
+        )
+
+        self.assertFalse(host["single_network_mode_replayable"])
+        self.assertTrue(host["distributed_network_mode_replayable"])
+        self.assertFalse(custom["single_network_mode_replayable"])
+        self.assertFalse(custom["distributed_network_mode_replayable"])
+
+    def test_direct_summary_network_and_rootfs_inspection_fail_closed(self):
+        self.assertEqual(
+            self.manager._container_network_modes_are_replayable({
+                "HostConfig": {"NetworkMode": None},
+            }),
+            (False, False),
+        )
+        self.assertFalse(
+            self.manager._container_read_only_rootfs_is_replayable({
+                "HostConfig": {},
+            })
+        )
+
+    def test_direct_summary_rejects_extra_network_contract(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        cases = (
+            {"PublishAllPorts": True},
+            {"PortBindings": {
+                "9000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "19000"}],
+            }},
+            {"PortBindings": {
+                "8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18000"}],
+            }},
+            {"PortBindings": {"8000/tcp": [
+                {"HostIp": "0.0.0.0", "HostPort": "18000"},
+                {"HostIp": "::", "HostPort": "18001"},
+            ]}},
+            {"PortBindings": {
+                "8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}],
+                "9000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "19000"}],
+            }},
+        )
+
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    resource_overrides=overrides,
+                )
+                self.assertFalse(summary["single_network_mode_replayable"])
+
+        summary = self._direct_portability_summary(
+            gpu_request, "sha256:source-image",
+        )
+        summary_attrs = {
+            "HostConfig": {
+                "NetworkMode": "default", "PublishAllPorts": False,
+                "PortBindings": {
+                    "8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18000"}],
+                },
+            },
+            "NetworkSettings": {"Networks": {
+                "bridge": {
+                    "Aliases": ["custom-alias"], "IPAMConfig": None,
+                    "Links": None, "DriverOpts": None,
+                },
+            }},
+        }
+        self.assertEqual(
+            self.manager._container_network_modes_are_replayable(summary_attrs),
+            (False, False),
+        )
+
+    def test_direct_summary_rejects_unreplayed_process_and_security_options(self):
+        gpu_request = [{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }]
+        host_cases = {
+            "Privileged": True,
+            "CapAdd": ["SYS_ADMIN"],
+            "SecurityOpt": ["seccomp=unconfined"],
+            "PidMode": "host",
+            "Runtime": "nvidia",
+            "OomScoreAdj": -500,
+            "Dns": ["1.1.1.1"],
+            "Tmpfs": {"/run": "rw"},
+            "LxcConf": [{"Key": "lxc.apparmor.profile", "Value": "unconfined"}],
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+        }
+        for field, value in host_cases.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    resource_overrides={field: value},
+                )
+                self.assertFalse(summary["runtime_contract_replayable"])
+
+        config_cases = {
+            "Healthcheck": {"Test": ["CMD", "false"]},
+            "StopSignal": "SIGKILL",
+            "StopTimeout": 10,
+            "Tty": True,
+            "OpenStdin": True,
+            "Hostname": "custom-hostname",
+        }
+        for field, value in config_cases.items():
+            with self.subTest(field=field):
+                summary = self._direct_portability_summary(
+                    gpu_request, "sha256:source-image",
+                    container_config_overrides={field: value},
+                )
+                self.assertFalse(summary["runtime_contract_replayable"])
+
+    def test_cgroup_v1_daemon_default_is_replayable(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "", "Count": -1, "DeviceIDs": None,
+            "Capabilities": [["gpu"]], "Options": {},
+        }], "sha256:source-image",
+            resource_overrides={"CgroupnsMode": "host"},
+            daemon_info_overrides={"CgroupVersion": "1"},
+        )
+
+        self.assertTrue(summary["runtime_contract_replayable"])
+
+    def test_direct_summary_accepts_inherited_health_and_stop_signal(self):
+        inherited = {
+            "Healthcheck": {"Test": ["CMD", "true"]},
+            "StopSignal": "SIGUSR1",
+        }
+        summary = self._direct_portability_summary(
+            [{
+                "Driver": "", "Count": -1, "DeviceIDs": None,
+                "Capabilities": [["gpu"]], "Options": {},
+            }],
+            "sha256:source-image",
+            image_config_overrides=inherited,
+            container_config_overrides=inherited,
+        )
+
+        self.assertTrue(summary["runtime_contract_replayable"])
+
+    def test_direct_summary_classifies_topology_ulimits_and_devices(self):
+        empty = {"HostConfig": {"Ulimits": None, "Devices": None}}
+        distributed = {"HostConfig": {
+            "Ulimits": [{"Name": "memlock", "Soft": -1, "Hard": -1}],
+            "Devices": None,
+        }}
+        stack = {"HostConfig": {
+            "Ulimits": [
+                {"Name": "memlock", "Soft": -1, "Hard": -1},
+                {"Name": "stack", "Soft": 67108864, "Hard": 67108864},
+            ],
+            "Devices": None,
+        }}
+
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(empty),
+            (True, False),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(distributed),
+            (False, True),
+        )
+        self.assertEqual(
+            self.manager._container_topology_options_are_replayable(stack),
+            (False, False),
+        )
+
+    def test_distributed_topology_requires_managed_infiniband_mapping(self):
+        attrs = {"HostConfig": {
+            "Ulimits": [{"Name": "memlock", "Soft": -1, "Hard": -1}],
+            "Devices": [{
+                "PathOnHost": "/dev/infiniband",
+                "PathInContainer": "/dev/infiniband",
+                "CgroupPermissions": "rwm",
+            }],
+        }}
+        with mock.patch("manager.Path") as path:
+            path.return_value.exists.return_value = True
+            self.assertEqual(
+                self.manager._container_topology_options_are_replayable(attrs),
+                (False, True),
+            )
 
     def test_direct_summary_rejects_container_user_override(self):
         summary = self._direct_portability_summary([{
@@ -1259,6 +1565,72 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(settings["editable"])
         self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_bash_extglob_option_does_not_hide_path_expansion(self):
+        model = "example/Model"
+        command = [
+            "/bin/bash", "-O", "extglob", "-lc",
+            f"exec vllm serve {model} "
+            "--chat-template /templates/@(chat|base).jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertTrue(settings["_shell_path_expansion"])
+
+    def test_non_bash_shell_wrapper_is_marked_unsupported(self):
+        model = "example/Model"
+        for shell in ("/bin/zsh", "/bin/ksh", "/usr/bin/fish"):
+            with self.subTest(shell=shell):
+                command = [
+                    shell, "-lc",
+                    f"exec vllm serve {model} "
+                    "--chat-template /templates/{chat,base}.jinja",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_wrapper_unsupported"])
+
+    def test_bash_shell_wrapper_is_within_replay_contract(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/bin/bash", "--noprofile", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertNotIn("_shell_wrapper_unsupported", settings)
+
+    def test_login_bash_without_noprofile_is_not_replayable(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/bin/bash", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertTrue(settings["_shell_wrapper_unsupported"])
+
+    def test_custom_executable_named_bash_is_not_trusted(self):
+        model = "example/Model"
+        settings = self.manager._container_load_settings(
+            [
+                "/opt/custom/bash", "-lc",
+                f"exec vllm serve {model} --max-num-seqs 8",
+            ],
+            "vllm", model,
+        )
+
+        self.assertTrue(settings["_shell_wrapper_unsupported"])
 
     def test_literal_braces_and_parameter_expansion_remain_portable(self):
         model = "example/Model"

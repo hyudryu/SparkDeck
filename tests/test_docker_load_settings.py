@@ -550,6 +550,216 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "enabled",
         )
 
+    def test_shell_template_argv_command_is_read_only(self):
+        model = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+        command = [
+            "vllm", "serve", model,
+            "${REVISION_ARGS}",
+            "--served-model-name", "deepseek-v4-flash-vision-exp",
+            "${API_KEY_ARGS[@]}",
+            "--max-cudagraph-capture-size", "$(( 6 * (6 + 1) ))",
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertFalse(settings["editable"])
+
+    def test_environment_backed_speculative_reference_stays_editable(self):
+        model = "example/Model"
+        command = [
+            "vllm", "serve", model,
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+            "--enable-prefix-caching",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+
+    def test_shell_wrapped_template_command_stays_editable(self):
+        script = (
+            "exec vllm serve example/Model "
+            '--speculative-config "${SPECULATIVE_CONFIG}" --max-num-seqs 8'
+        )
+        command = ["/bin/bash", "-lc", script]
+
+        settings = self.manager._container_load_settings(command, "vllm", "example/Model")
+
+        self.assertTrue(settings["editable"])
+
+    async def test_update_resolves_environment_backed_speculative_reference(self):
+        name = "external-vllm"
+        model = "example/Model"
+        resolved = '{"method":"dspark","num_speculative_tokens":6}'
+        command = [
+            "vllm", "serve", model, "--host", "0.0.0.0", "--port", "8000",
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+            "--max-num-seqs", "8",
+        ]
+        config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
+            "Env": [f"SPECULATIVE_CONFIG={resolved}", "NCCL_DEBUG=INFO"],
+            "Labels": {"vllm-model": model},
+        }
+        host_config = {"NetworkMode": "host"}
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, host_config
+        )
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            result = await self.manager.update_container_settings(
+                name,
+                {
+                    **self.manager._container_load_settings(command, "vllm", model),
+                    "max_concurrency": 4,
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        replacement_cmd = api.created_config["Cmd"]
+        self.assertEqual(
+            self.manager._cli_option(replacement_cmd, {"--speculative-config"}),
+            resolved,
+        )
+        self.assertEqual(
+            self.manager._cli_option(replacement_cmd, {"--max-num-seqs"}), "4",
+        )
+        self.assertIn(f"SPECULATIVE_CONFIG={resolved}", api.created_config["Env"])
+
+    async def test_update_rejects_unresolvable_speculative_reference(self):
+        name = "external-vllm"
+        model = "example/Model"
+        command = [
+            "vllm", "serve", model, "--host", "0.0.0.0", "--port", "8000",
+            "--speculative-config", "${SPECULATIVE_CONFIG}",
+        ]
+        config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
+            "Env": ["NCCL_DEBUG=INFO"],
+            "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {"NetworkMode": "host"}
+        )
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaises(ValueError):
+                await self.manager.update_container_settings(
+                    name,
+                    self.manager._container_load_settings(command, "vllm", model),
+                )
+        self.assertIsNone(api.created_config)
+
+    async def test_update_keeps_shell_speculative_reference_for_runtime_expansion(self):
+        name = "external-vllm"
+        script = (
+            "exec vllm serve example/Model --host 0.0.0.0 --port 8000 "
+            "--speculative-config '${SPECULATIVE_CONFIG}' --max-num-seqs 8"
+        )
+        command = ["/bin/bash", "-lc", script]
+        config = {
+            "Image": "example/vllm:latest",
+            "Cmd": list(command),
+            "Env": ["SPECULATIVE_CONFIG={}", "NCCL_DEBUG=INFO"],
+            "Labels": {"vllm-model": "example/Model"},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {"NetworkMode": "host"}
+        )
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            result = await self.manager.update_container_settings(
+                name,
+                {
+                    **self.manager._container_load_settings(command, "vllm", "example/Model"),
+                    "max_concurrency": 4,
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        replacement_script = api.created_config["Cmd"][-1]
+        # A shell-wrapped container expands the reference at runtime; the
+        # recreate must keep it untouched instead of freezing a literal.
+        self.assertIn("'${SPECULATIVE_CONFIG}'", replacement_script)
+        self.assertIn("--max-num-seqs 4", replacement_script)
+        self.assertIn("SPECULATIVE_CONFIG={}", ",".join(api.created_config["Env"]))
+
+    async def test_update_rejects_shell_template_argv_command(self):
+        name = "external-vllm"
+        model = "example/Model"
+        command = [
+            "vllm", "serve", model,
+            "${REVISION_ARGS}",
+            "--served-model-name", "example-model",
+        ]
+        config = {
+            "Image": "example/vllm:latest",
+            "Entrypoint": command[:2],
+            "Cmd": command[2:],
+            "Env": [],
+            "Labels": {"vllm-model": model},
+        }
+        containers = FakeContainers()
+        original = FakeContainer(
+            containers, "original-container-id", name, config, {"NetworkMode": "host"}
+        )
+        containers.add(original)
+        api = FakeAPI(containers)
+        self.manager.client = SimpleNamespace(containers=containers, api=api)
+        self.manager.lock = asyncio.Lock()
+        self.manager._container_summary = lambda container: {
+            "name": container.name, "status": container.status
+        }
+
+        inline_thread = mock.AsyncMock(
+            side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
+        )
+        with mock.patch("manager.asyncio.to_thread", inline_thread):
+            with self.assertRaises(ValueError):
+                await self.manager.update_container_settings(
+                    name,
+                    self.manager._container_load_settings(command, "vllm", model),
+                )
+        self.assertIsNone(api.created_config)
+
     def test_sglang_settings_use_engine_specific_flags(self):
         model = "example/SGLang-Model"
         command = [

@@ -40,8 +40,17 @@ class SparkDeckStoreTests(unittest.TestCase):
     def test_community_tp_contract_defaults_tp1_and_bounds_explicit_values(self):
         self.assertEqual(community_tensor_parallel_size({}), 1)
         self.assertEqual(community_tensor_parallel_size({
+            "tensor_parallel_size": None,
+        }), 1)
+        self.assertEqual(community_tensor_parallel_size({
             "tensor_parallel_size": "4",
         }), 4)
+        self.assertEqual(community_tensor_parallel_size({
+            "tensor_parallel_size": 4.0,
+        }), 4)
+        self.assertIsNone(community_tensor_parallel_size({
+            "tensor_parallel_size": 1.5,
+        }))
         self.assertIsNone(community_tensor_parallel_size({
             "tensor_parallel_size": True,
         }))
@@ -442,10 +451,25 @@ class SparkDeckStoreTests(unittest.TestCase):
             base, id="legacy-tp4",
             configuration={"tensor_parallel_size": 4},
         ), consent["generation"])
+        self.store.add_benchmark_if_consented(replace(
+            base, id="legacy-fractional",
+            configuration={"tensor_parallel_size": 2},
+        ), consent["generation"])
         with self.store._connection:
             self.store._connection.execute(
+                "UPDATE benchmark_samples SET configuration_json = ?, "
+                "community_tensor_parallel_size = NULL WHERE id = ?",
+                ('{"tensor_parallel_size": null}', "legacy-tp1"),
+            )
+            self.store._connection.execute(
+                "UPDATE benchmark_samples SET configuration_json = ?, "
+                "community_tensor_parallel_size = NULL WHERE id = ?",
+                ('{"tensor_parallel_size": 1.5}', "legacy-fractional"),
+            )
+            self.store._connection.execute(
                 "UPDATE benchmark_samples "
-                "SET community_tensor_parallel_size = NULL"
+                "SET community_tensor_parallel_size = NULL WHERE id = ?",
+                ("legacy-tp4",),
             )
 
         database = self.store.path
@@ -453,12 +477,22 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store = SparkDeckStore(database)
 
         rows = self.store._connection.execute(
-            "SELECT id, community_tensor_parallel_size "
+            "SELECT id, community_tensor_parallel_size, eligible "
             "FROM benchmark_samples ORDER BY id"
         ).fetchall()
         self.assertEqual(
-            [(row["id"], row["community_tensor_parallel_size"]) for row in rows],
-            [("legacy-tp1", 1), ("legacy-tp4", 4)],
+            [
+                (
+                    row["id"], row["community_tensor_parallel_size"],
+                    row["eligible"],
+                )
+                for row in rows
+            ],
+            [
+                ("legacy-fractional", None, 0),
+                ("legacy-tp1", 1, 1),
+                ("legacy-tp4", 4, 1),
+            ],
         )
         index_sql = self.store._connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "

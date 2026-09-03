@@ -1513,10 +1513,25 @@ def _community_prompt_bucket(value: Any) -> int | None:
 
 def community_tensor_parallel_size(configuration: dict[str, Any]) -> int | None:
     """Normalize the TP cohort; omitted settings mean the runtime default TP1."""
-    if "tensor_parallel_size" not in configuration:
+    raw_value = configuration.get("tensor_parallel_size")
+    if raw_value is None:
         return 1
-    parsed = _positive_integer(configuration.get("tensor_parallel_size"))
-    return parsed if parsed is not None and parsed <= 1024 else None
+    if isinstance(raw_value, bool):
+        return None
+    if isinstance(raw_value, int):
+        parsed = raw_value
+    elif isinstance(raw_value, float):
+        if not math.isfinite(raw_value) or not raw_value.is_integer():
+            return None
+        parsed = int(raw_value)
+    elif isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text or not text.lstrip("+-").isdigit():
+            return None
+        parsed = int(text)
+    else:
+        return None
+    return parsed if 0 < parsed <= 1024 else None
 
 
 def _community_tensor_parallel_size_json(value: Any) -> int | None:

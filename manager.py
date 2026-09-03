@@ -270,6 +270,10 @@ STOP_COMMAND_LABEL = "io.sparkdeck.stop-command"
 # Hook-backed containers can name the KEY=VALUE env file their external
 # start/stop scripts regenerate from, making settings edits file writes.
 ENV_FILE_LABEL = "io.sparkdeck.env-file"
+# Set by SparkDeck when a hook-backed external container is adopted into the
+# normal command editor. It records that future starts still target this exact
+# local Docker container even after the executable hook labels are removed.
+DIRECT_START_LABEL = "io.sparkdeck.direct-start"
 
 # Containers created by earlier releases remain discoverable and manageable.
 LEGACY_LABELS = {
@@ -10734,6 +10738,9 @@ class Manager:
             image_ref, ENV_FILE_LABEL, env_file,
         ):
             summary["settings_env_file"] = env_file
+        summary["direct_start"] = (
+            str(labels.get(DIRECT_START_LABEL) or "").strip() == "1"
+        )
         if is_atlas_serving:
             summary["source"] = "atlas-serving"
         return summary
@@ -11935,6 +11942,7 @@ class Manager:
                 replacement_labels = dict(create_config.get("Labels") or {})
                 for key in (START_COMMAND_LABEL, STOP_COMMAND_LABEL, ENV_FILE_LABEL):
                     replacement_labels.pop(key, None)
+                replacement_labels[DIRECT_START_LABEL] = "1"
                 create_config["Labels"] = replacement_labels
             if requested_environment is not None:
                 existing_environment: dict[str, str] = {}

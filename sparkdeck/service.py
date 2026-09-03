@@ -1787,7 +1787,7 @@ class SparkDeckService:
                 gpu_memory_utilization = discovered_settings.get("gpu_memory_utilization")
             image = image or discovered_image
             environment = discovered_settings.get("environment") or environment
-        return {
+        detail = {
             **public,
             "settings": public_settings,
             "editable": editable,
@@ -1804,6 +1804,11 @@ class SparkDeckService:
             "image": image,
             "environment": environment or {},
         }
+        if discovered_editable and isinstance(
+            discovered_settings.get("command_flags"), str
+        ):
+            detail["command_flags"] = discovered_settings["command_flags"]
+        return detail
 
     @staticmethod
     def _settings_env_payload(path: str) -> dict[str, Any]:
@@ -1837,8 +1842,15 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Update a stopped manager-backed deployment by its public record ID."""
         if str(deployment_id).startswith("container:"):
-            container = await self._resolve_discovered_container(deployment_id)
-            return await self._update_discovered_deployment(container, changes)
+            # Serialize settings takeover with start/stop. The external hook
+            # itself can outlive its HTTP action, so reject an active task
+            # while holding the same lock used to create lifecycle tasks.
+            async with self._deployment_lifecycle_lock(deployment_id):
+                container = await self._resolve_discovered_container(deployment_id)
+                self._reject_external_lifecycle_in_flight(
+                    str(container.get("name") or "")
+                )
+                return await self._update_discovered_deployment(container, changes)
         # Listing first performs the normal manager/store reconciliation, so a
         # settings save cannot target a manager deployment ID that was replaced
         # by an earlier relaunch.
@@ -1923,7 +1935,7 @@ class SparkDeckService:
             raise ValueError("edit the cluster deployment instead of one member")
 
         allowed = {
-            "extra_args", "launch_controls", "environment",
+            "extra_args", "command_flags", "launch_controls", "environment",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction",
         }
@@ -1936,6 +1948,17 @@ class SparkDeckService:
             )
 
         engine = str(settings.get("engine") or self._container_runtime(container))
+        raw_command_flags = changes.get("command_flags")
+        if raw_command_flags is not None:
+            if not isinstance(raw_command_flags, str):
+                raise ValueError("command_flags must be a string")
+            if len(raw_command_flags) > 65536:
+                raise ValueError("command flags must be 65536 characters or fewer")
+            try:
+                raw_args = shlex.split(raw_command_flags)
+            except ValueError as exc:
+                raise ValueError("command flags have invalid shell quoting") from exc
+            self._reject_sensitive_launch_args(raw_args)
         args = changes.get("extra_args", settings.get("extra_args") or [])
         if not isinstance(args, list) or any(not isinstance(item, str) for item in args):
             raise ValueError("extra_args must be an array of strings")
@@ -1998,8 +2021,63 @@ class SparkDeckService:
                 else settings.get("gpu_memory_utilization")
             )
 
+        command_flags = shlex.join(command_args)
+        if raw_command_flags is not None:
+            # The raw field is authoritative for a shell-wrapped container.
+            # Patch only controls changed in the structured editor so shell
+            # arithmetic, expansion, quoting, and unrelated formatting remain
+            # untouched. `merged_args` supplies the normalized value for the
+            # speculative JSON option without reconstructing the whole string.
+            command_flags = raw_command_flags
+            submitted = submitted_controls or {}
+            option_controls = (
+                ("context_window", {"--max-model-len", "--max-model-length"}),
+                ("max_concurrency", {"--max-num-seqs"}),
+                ("tensor_parallel_size", {"--tensor-parallel-size", "-tp"}),
+                ("pipeline_parallel_size", {"--pipeline-parallel-size", "-pp"}),
+                ("kv_cache_dtype", {"--kv-cache-dtype"}),
+                ("max_cudagraph_capture_size", {"--max-cudagraph-capture-size"}),
+                ("max_num_batched_tokens", {"--max-num-batched-tokens"}),
+            )
+            if engine == "sglang":
+                option_controls = (
+                    ("context_window", {"--context-length"}),
+                    ("max_concurrency", {"--max-running-requests"}),
+                    ("kv_cache_dtype", {"--kv-cache-dtype"}),
+                )
+                if (
+                    "sg_tp_size" in changes
+                    and changes.get("sg_tp_size") != settings.get("tensor_parallel_size")
+                ):
+                    command_flags = self.manager._replace_command_option(
+                        command_flags, {"--tp-size"},
+                        self.manager._validated_sg_scalar(
+                            "sg_tp_size", changes.get("sg_tp_size")
+                        ),
+                    )
+            for key, names in option_controls:
+                if key in submitted and submitted.get(key) != current_controls.get(key):
+                    command_flags = self.manager._replace_command_option(
+                        command_flags, names, controls.get(key),
+                    )
+            speculative_keys = {
+                "speculative_method", "draft_sample_method",
+                "dspark_num_speculative_tokens",
+            }
+            if engine == "vllm" and any(
+                key in submitted and submitted.get(key) != current_controls.get(key)
+                for key in speculative_keys
+            ):
+                speculative_value = self.manager._cli_option(
+                    merged_args, {"--speculative-config"}
+                )
+                command_flags = self.manager._replace_command_option(
+                    command_flags, {"--speculative-config"},
+                    shlex.quote(speculative_value) if speculative_value else None,
+                )
+
         replacement = {
-            "command_flags": shlex.join(command_args),
+            "command_flags": command_flags,
             "context_window": controls.get("context_window"),
             "max_concurrency": controls.get("max_concurrency"),
             "kv_cache_dtype": controls.get("kv_cache_dtype"),
@@ -3890,6 +3968,7 @@ class SparkDeckService:
             has_lifecycle_hook = bool(
                 str(discovered.get("start_command") or "").strip()
                 or str(discovered.get("stop_command") or "").strip()
+                or discovered.get("direct_start")
             )
             if has_lifecycle_hook and not promote:
                 # A hook-backed deployment always starts on the nodes owned by
@@ -5198,6 +5277,7 @@ class SparkDeckService:
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
                 and not str(container.get("stop_command") or "").strip()
+                and not container.get("direct_start")
             ),
             "controllable": True,
             "logs_available": True,
@@ -5221,6 +5301,7 @@ class SparkDeckService:
         result["has_settings_env_file"] = bool(
             str(container.get("settings_env_file") or "").strip()
         )
+        result["direct_start"] = bool(container.get("direct_start"))
         last_deployed_at = _container_last_deployed_at(container)
         if last_deployed_at is not None:
             result["last_deployed_at"] = last_deployed_at

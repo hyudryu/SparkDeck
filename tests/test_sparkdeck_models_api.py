@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -481,6 +482,11 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             "load_settings": {
                 "engine": "vllm", "editable": True,
                 "extra_args": ["--enable-prefix-caching"],
+                "command_flags": (
+                    '--enable-prefix-caching '
+                    '--max-cudagraph-capture-size "$(( 6 * (${TOKENS:-5} + 1) ))" '
+                    '--speculative-config "${SPECULATIVE_CONFIG}"'
+                ),
                 "context_window": 65536, "max_concurrency": 8,
                 "thinking_mode": "default", "gpu_memory_utilization": 0.85,
                 "environment": {"NCCL_DEBUG": "INFO"},
@@ -498,7 +504,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.put(
                 "/api/v1/deployments/container:vllm-dspark/settings",
                 json={
-                    "extra_args": ["--enable-prefix-caching"],
+                    "command_flags": container["load_settings"]["command_flags"],
                     "launch_controls": {
                         "context_window": 131072,
                         "max_concurrency": 4,
@@ -518,7 +524,11 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["command_flags"],
+            container["load_settings"]["command_flags"],
+        )
         self.assertTrue(update.await_args.kwargs["detach_external_lifecycle"])
         replacement = update.await_args.args[1]
         self.assertEqual(replacement["context_window"], 131072)
@@ -529,6 +539,40 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-tp 2", flags)
         self.assertIn("-pp 1", flags)
         self.assertIn("--max-num-batched-tokens 8192", flags)
+        self.assertIn('$(( 6 * (${TOKENS:-5} + 1) ))', flags)
+        self.assertIn('"${SPECULATIVE_CONFIG}"', flags)
+
+    async def test_settings_takeover_rejects_running_lifecycle_hook(self):
+        container = {
+            "name": "vllm-dspark", "start_command": "/opt/stack/start.sh",
+            "load_settings": {"engine": "vllm", "editable": True},
+        }
+        blocker = asyncio.Event()
+        task = asyncio.create_task(blocker.wait())
+        server.sparkdeck._external_lifecycle_tasks["vllm-dspark"] = {
+            "action": "start", "task": task,
+        }
+        update = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    server.sparkdeck, "_resolve_discovered_container",
+                    AsyncMock(return_value=container),
+                ),
+                patch.object(server.manager, "update_container_settings", update),
+            ):
+                response = await self.client.put(
+                    "/api/v1/deployments/container:vllm-dspark/settings",
+                    json={"extra_args": [], "launch_controls": {}},
+                )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("start command is already running", response.json()["detail"])
+            update.assert_not_awaited()
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            server.sparkdeck._external_lifecycle_tasks.pop("vllm-dspark", None)
 
     async def test_discovered_vllm_settings_create_and_inline_speculative_environment(self):
         card = {
@@ -1266,6 +1310,32 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "external-stack", explicit=True, managed=False,
             )
             self.assertEqual(result["status"], "running")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_adopted_direct_start_ignores_node_picker_and_stays_local(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "load_settings": {"tensor_parallel_size": 2},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            result = await service.deployment_action(
+                "container:external-stack", "start",
+                node_ids=["local", "worker-1"],
+            )
+
+            manager.start_container.assert_awaited_once_with(
+                "external-stack", explicit=True, managed=False,
+            )
+            manager.create_deployment.assert_not_awaited()
+            self.assertEqual(result["status"], "running")
+            self.assertFalse(
+                service._discovered_deployment(
+                    container, "vllm", "org/model",
+                )["promotable"]
+            )
             await manager.http.aclose()
             await service.close()
 

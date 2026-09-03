@@ -655,6 +655,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.created_config["Entrypoint"], ["vllm", "serve"])
         self.assertEqual(api.created_config["Labels"], {
             "vllm-model": model, "keep-label": "yes",
+            "io.sparkdeck.direct-start": "1",
         })
         self.assertEqual(api.created_config["Cmd"][0], model)
         self.assertEqual(

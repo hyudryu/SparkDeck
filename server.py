@@ -2222,7 +2222,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be an object")
     allowed = {
-        "extra_args", "launch_controls",
+        "extra_args", "command_flags", "launch_controls",
         "environment",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_mem_fraction",

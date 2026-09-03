@@ -377,6 +377,7 @@ export interface WireDeployment {
   has_start_hook?: boolean
   has_stop_hook?: boolean
   has_settings_env_file?: boolean
+  direct_start?: boolean
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -387,6 +388,7 @@ interface WireDeploymentDetail extends WireDeployment {
   restart_required?: boolean
   desired_state: 'running' | 'stopped'
   extra_args: string[]
+  command_flags?: string
   launch_controls: DeploymentLaunchControls
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
@@ -446,6 +448,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     has_start_hook: item.has_start_hook,
     has_stop_hook: item.has_stop_hook,
     has_settings_env_file: item.has_settings_env_file,
+    direct_start: item.direct_start,
   }
 }
 
@@ -459,6 +462,7 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     restart_required: item.restart_required,
     desired_state: item.desired_state,
     extra_args: item.extra_args ?? [],
+    command_flags: item.command_flags,
     launch_controls: item.launch_controls ?? {},
     gpu_memory_utilization: item.gpu_memory_utilization,
     gpu_memory_gb: item.gpu_memory_gb,

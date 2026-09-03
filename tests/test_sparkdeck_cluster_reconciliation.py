@@ -92,6 +92,66 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
                 await manager.http.aclose()
 
+    async def test_creation_reserves_managed_repository_against_discovered_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "container:discovered",
+                "alias": "ORG/NEW",
+                "runtime": "vllm",
+                "kind": "external",
+                "model": {"repository": "org/discovered"},
+            }])
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "selector 'org/new' is already in use",
+                ):
+                    await service.create_deployment({
+                        "model": "org/new",
+                        "alias": "New deployment",
+                        "runtime": "vllm",
+                        "kind": "managed",
+                    })
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_creation_reserves_explicit_served_name_against_discovered_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            service.deployments = AsyncMock(return_value=[{
+                "id": "container:discovered",
+                "alias": "PUBLIC-SELECTOR",
+                "runtime": "vllm",
+                "kind": "external",
+                "model": {"repository": "org/discovered"},
+            }])
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "selector 'public-selector' is already in use",
+                ):
+                    await service.create_deployment({
+                        "model": "org/new",
+                        "alias": "New deployment",
+                        "runtime": "vllm",
+                        "kind": "managed",
+                        "settings": {
+                            "extra_args": [
+                                "--served-model-name", "public-selector",
+                            ],
+                        },
+                    })
+
+                self.assertEqual(service.store.deployments(), [])
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
     async def test_cluster_rename_persists_service_and_manager_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

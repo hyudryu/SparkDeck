@@ -9854,6 +9854,18 @@ class Manager:
                 )
                 pricing_model = row["route_target"]
                 for candidate in pricing_candidates:
+                    candidate_pricing = self._usage_member_pricing(
+                        candidate,
+                    ).get("pricing")
+                    if candidate_pricing is not None and any(
+                        rate is not None
+                        for rate in candidate_pricing.values()
+                    ):
+                        # Persisted zero rates are still an explicit pricing
+                        # decision. Prefer them over a routed source's
+                        # non-zero built-in or deployment fallback.
+                        pricing_model = candidate
+                        break
                     candidate_cost = self.calculate_cost(candidate, {
                         "input": 1, "cached": 0, "output": 1,
                     })
@@ -11227,6 +11239,57 @@ class Manager:
             return False
         return True
 
+    @staticmethod
+    def _container_gpu_requests_are_replayable(attrs: dict) -> bool:
+        """Whether Manager's all-GPU request exactly preserves inspection.
+
+        Managed launches request one default-driver device allocation with
+        ``count=-1`` and only the generic GPU capability. A restricted device
+        list, driver-specific options, or an absent request must not be
+        silently widened to every GPU during direct-start promotion.
+        """
+        requests = ((attrs.get("HostConfig") or {}).get("DeviceRequests"))
+        if not isinstance(requests, list) or len(requests) != 1:
+            return False
+        request = requests[0]
+        if not isinstance(request, dict):
+            return False
+        count = request.get("Count")
+        return (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count == -1
+            and request.get("DeviceIDs") in (None, [])
+            and request.get("Driver") in (None, "")
+            and request.get("Options") in (None, {})
+            and request.get("Capabilities") == [["gpu"]]
+        )
+
+    def _container_image_is_replayable(
+        self, attrs: dict, image_ref: str,
+    ) -> bool:
+        """Whether the launch reference still resolves to the source image.
+
+        ``Config.Image`` is commonly a mutable tag while ``attrs["Image"]``
+        is the immutable image ID used to create the container. Promotion may
+        reuse the public tag only while Docker proves it still names that same
+        image. The IDs stay local; discovery exposes only this capability bit.
+        Mutable references are intentionally not cached.
+        """
+        source_id = str(attrs.get("Image") or "").strip()
+        image_ref = str(image_ref or "").strip()
+        if not source_id or not image_ref:
+            return False
+        try:
+            image = self.client.images.get(image_ref)
+        except Exception:
+            return False
+        resolved_id = str(
+            getattr(image, "id", "")
+            or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+        ).strip()
+        return bool(resolved_id) and resolved_id.casefold() == source_id.casefold()
+
     def _container_summary(self, c) -> dict | None:
         labels = c.labels or {}
 
@@ -11423,6 +11486,12 @@ class Manager:
         if summary["direct_start"]:
             summary["environment_replayable"] = (
                 self._container_environment_is_replayable(attrs, engine_label)
+            )
+            summary["gpu_requests_replayable"] = (
+                self._container_gpu_requests_are_replayable(attrs)
+            )
+            summary["image_replayable"] = self._container_image_is_replayable(
+                attrs, image_tag,
             )
         if is_atlas_serving:
             summary["source"] = "atlas-serving"

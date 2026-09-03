@@ -23,7 +23,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -2908,7 +2908,23 @@ class SparkDeckService:
         # deadlock with reconciliation and a rename cannot claim the alias while
         # creation is between its inventory check and durable persistence.
         async with self._deployment_create_lock, self._deployment_alias_lock:
-            await self._assert_deployment_alias_available(alias, deployment_id)
+            reserved_selectors: list[str] = []
+            if kind is DeploymentKind.MANAGED:
+                # A managed runtime can be selected by its backing repository
+                # as well as any explicit --served-model-name values. Reserve
+                # those future request ids before persisting the bookmark so a
+                # friendly alias on an existing (including discovered)
+                # deployment cannot be silently shadowed when this one starts.
+                reserved_selectors.append(model)
+                resolver = getattr(self.manager, "_deployment_served_models", None)
+                if callable(resolver):
+                    reserved_selectors.extend(resolver({
+                        "model": model,
+                        "launch_settings": {**settings, "model": model},
+                    }))
+            await self._assert_deployment_alias_available(
+                alias, deployment_id, reserved_selectors=reserved_selectors,
+            )
             artifact_is_local = False
             model_is_local_path = False
             artifact_homes: list[str] | None = None
@@ -3917,6 +3933,22 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "container environment overrides cannot be reproduced"
             )
+        if (
+            container.get("direct_start")
+            and container.get("gpu_requests_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "GPU device request does not match Manager's all-GPU contract"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("image_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "image reference no longer resolves to the source image"
+            )
         if direct_recovery is not None:
             launch_settings, layout = direct_recovery
             required_nodes = layout["required_node_count"]
@@ -4658,14 +4690,31 @@ class SparkDeckService:
         await process.wait()
         return bytes(stdout_tail), bytes(stderr_tail)
 
-    def _preparable_deployment_model(
+    async def _preparable_deployment_model(
         self, deployment_id: str,
     ) -> tuple[dict[str, Any], str, str]:
-        """Resolve one managed deployment to its (record, model, revision)."""
+        """Resolve a saved or safely promotable deployment for preparation."""
         deployment = self.store.deployment(deployment_id, include_private=True)
+        if deployment is None and deployment_id.startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            deployment = self._discovered_deployment(
+                container,
+                self._container_runtime(container),
+                container.get("model") or container.get("served_model"),
+            )
+            if not (
+                deployment.get("direct_start")
+                and deployment.get("promotable") is True
+            ):
+                raise ValueError(
+                    "discovered deployment cannot prepare weights before promotion"
+                )
         if deployment is None:
             raise LookupError("deployment not found")
-        if deployment.get("kind") != DeploymentKind.MANAGED.value:
+        if (
+            deployment.get("kind") != DeploymentKind.MANAGED.value
+            and not deployment_id.startswith("container:")
+        ):
             raise ValueError("external endpoints do not use cached model weights")
         model = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
@@ -4942,7 +4991,9 @@ class SparkDeckService:
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
         """Plan per-node weight preparation for a saved deployment."""
-        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        deployment, model, revision = await self._preparable_deployment_model(
+            deployment_id,
+        )
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
@@ -4955,7 +5006,9 @@ class SparkDeckService:
         download_node_id: str | None = None,
     ) -> dict[str, Any]:
         """Queue Virtual NAS weight preparation for a saved deployment."""
-        deployment, model, revision = self._preparable_deployment_model(deployment_id)
+        deployment, model, revision = await self._preparable_deployment_model(
+            deployment_id,
+        )
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             result = await self._prepare_llama_files(
@@ -5507,9 +5560,18 @@ class SparkDeckService:
             return result
 
     async def _assert_deployment_alias_available(
-        self, alias: str, deployment_id: str,
+        self, alias: str, deployment_id: str, *,
+        reserved_selectors: Iterable[str] = (),
     ) -> None:
-        folded = alias.casefold()
+        requested: list[tuple[str, str]] = [(alias, "alias")]
+        seen = {alias.casefold()}
+        for raw_selector in reserved_selectors:
+            selector = str(raw_selector).strip()
+            folded = selector.casefold()
+            if not selector or folded in seen:
+                continue
+            seen.add(folded)
+            requested.append((selector, "selector"))
         for item in await self.deployments():
             if str(item.get("id") or "") == deployment_id:
                 continue
@@ -5520,12 +5582,28 @@ class SparkDeckService:
                 ).strip()
                 if repository:
                     public_ids.append(repository)
-            if folded in {
+            identity_occupied = {
                 str(item.get("id") or "").casefold(),
                 str(item.get("alias") or "").casefold(),
+            }
+            occupied = {
+                *identity_occupied,
                 *(str(value).casefold() for value in public_ids),
-            }:
-                raise ValueError(f"deployment alias '{alias}' is already in use")
+            }
+            for selector, label in requested:
+                # Multiple saved launch profiles may intentionally target the
+                # same repository (for example TP2 and TP4). Only the display
+                # alias must be unique across the full public namespace. A
+                # prospective served selector must not capture another
+                # deployment's stable ID or alias, which is the shadowing
+                # hazard this create-time reservation prevents.
+                selector_occupied = (
+                    occupied if label == "alias" else identity_occupied
+                )
+                if selector.casefold() in selector_occupied:
+                    raise ValueError(
+                        f"deployment {label} '{selector}' is already in use"
+                    )
 
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
@@ -5614,6 +5692,8 @@ class SparkDeckService:
             and container.get("mounts_replayable") is True
             and container.get("launch_prefix_replayable") is True
             and container.get("environment_replayable") is True
+            and container.get("gpu_requests_replayable") is True
+            and container.get("image_replayable") is True
         )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster

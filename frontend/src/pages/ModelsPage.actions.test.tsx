@@ -32,6 +32,42 @@ const modelCache = {
   ],
 }
 
+const preparationResponse = (
+  modelId: string,
+  nodeList = nodes,
+  missingNodeIds: string[] = [],
+) => {
+  const missing = new Set(missingNodeIds)
+  const selectable = nodeList.filter((node) => node.online !== false)
+  const targets = selectable.map((node) => ({
+    node_id: node.id,
+    node_name: node.name,
+    eligible: missing.has(node.id),
+    reason: null,
+    has_required_weights: !missing.has(node.id),
+    has_model_cache: !missing.has(node.id),
+    download_eligible: false,
+    transfer_after_download_eligible: false,
+  }))
+  return new Response(JSON.stringify({
+    enabled: true,
+    model_id: modelId,
+    revision: 'main',
+    source: missing.size ? { node_id: 'local', node_name: 'Controller' } : null,
+    sources: [],
+    download: null,
+    download_error: null,
+    targets,
+    node_ids: selectable.map((node) => node.id),
+    eligible: true,
+    action: missing.size ? 'transfer' : 'ready',
+    download_node_id: null,
+    download_node_ids: [],
+    transfer_target_node_ids: missingNodeIds,
+    reason: null,
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+}
+
 beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
   fetchMock.mockClear()
@@ -485,6 +521,7 @@ describe('models page running actions', () => {
       if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) return preparationResponse(external.model.repository)
       return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     renderPage()
@@ -504,6 +541,64 @@ describe('models page running actions', () => {
       ))
       expect(JSON.parse(String(start?.[1]?.body))).toEqual({
         node_ids: ['local', 'worker-1'],
+        promote: true,
+      })
+    })
+  })
+
+  it('prepares a cache-empty node before promoting an offline direct start', async () => {
+    const user = userEvent.setup()
+    const external = {
+      id: 'container:vision-offline', alias: 'Vision Offline TP2', runtime: 'vllm', kind: 'external',
+      model: { repository: 'deepseek-ai/DeepSeek-V4-Flash-Vision-Exp' },
+      status: 'stopped', desired_state: 'stopped', direct_start: true,
+      settings: {
+        tensor_parallel_size: 2,
+        environment: { HF_HUB_OFFLINE: '1' },
+      },
+      deployment_mode: 'sharded', required_node_count: 2,
+      managed: false, controllable: true, promotable: true,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [external] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) {
+        return preparationResponse(external.model.repository, nodes, ['worker-2'])
+      }
+      if (path.endsWith('/prepare') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ workflow_id: null, job_ids: [], jobs: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: /Start Vision Offline TP2/ })
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled())
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 4/ }))
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+
+    const confirmation = await screen.findByRole('dialog', { name: 'Prepare model weights?' })
+    expect(confirmation).toHaveTextContent('Node 3')
+    await user.click(within(confirmation).getByRole('button', { name: 'Transfer & launch' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path, request]) => (
+      String(path).endsWith('/deployments/container%3Avision-offline/prepare')
+      && request?.method === 'POST'
+    ))).toBe(true))
+    await waitFor(() => {
+      const start = fetchMock.mock.calls.find(([path, request]) => (
+        String(path).endsWith('/deployments/container%3Avision-offline/start')
+        && request?.method === 'POST'
+      ))
+      expect(JSON.parse(String(start?.[1]?.body))).toEqual({
+        node_ids: ['local', 'worker-2'],
         promote: true,
       })
     })
@@ -531,6 +626,7 @@ describe('models page running actions', () => {
       if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) return preparationResponse(external.model.repository, oneGpuNodes)
       return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     renderPage()
@@ -566,6 +662,7 @@ describe('models page running actions', () => {
       if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/prepare/preflight')) return preparationResponse(external.model.repository, gpuRichNodes)
       return new Response(JSON.stringify(external), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     renderPage()

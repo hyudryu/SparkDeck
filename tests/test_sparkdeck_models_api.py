@@ -1402,6 +1402,13 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.create_deployment = AsyncMock()
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
+            self.recipe_model_preparation_preflight = AsyncMock(return_value={
+                "eligible": True, "action": "ready", "targets": [],
+            })
+            self.queue_recipe_model_preparation = AsyncMock(return_value={
+                "workflow_id": None, "job_ids": [], "jobs": [],
+                "plan": {"eligible": True, "action": "ready"},
+            })
 
         @staticmethod
         def _has_unresolvable_shell_tokens(args):
@@ -1475,6 +1482,8 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             # summary unless a test explicitly supplies the opposite.
             container.setdefault("launch_prefix_replayable", True)
             container.setdefault("environment_replayable", True)
+            container.setdefault("gpu_requests_replayable", True)
+            container.setdefault("image_replayable", True)
         manager = self.FakeManager()
         manager.list_containers.return_value = [container]
         return SparkDeckService(manager, Path(directory)), manager
@@ -2028,6 +2037,37 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_direct_start_promotion_can_prepare_selected_node_weights(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "load_settings": {
+                "command_flags": "--max-num-seqs 8",
+                "environment": {"HF_HUB_OFFLINE": "1"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            plan = await service.deployment_preparation_preflight(
+                "container:external-stack", ["remote-1"],
+            )
+            prepared = await service.deployment_prepare(
+                "container:external-stack", ["remote-1"],
+            )
+
+            self.assertTrue(plan["eligible"])
+            self.assertEqual(prepared["jobs"], [])
+            manager.recipe_model_preparation_preflight.assert_awaited_once_with(
+                "org/model", "main", ["remote-1"],
+            )
+            manager.queue_recipe_model_preparation.assert_awaited_once_with(
+                "org/model", "main", ["remote-1"],
+            )
+            await manager.http.aclose()
+            await service.close()
+
     async def test_entrypoint_wrapper_blocks_direct_start_promotion(self):
         container = {
             "name": "external-stack", "model": "org/model", "engine": "vllm",
@@ -2069,6 +2109,58 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 container, "vllm", "org/model",
             )
             with self.assertRaisesRegex(ValueError, "environment overrides"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_restricted_gpu_request_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "gpu_requests_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "GPU device request"):
+                await service.deployment_action(
+                    "container:external-stack", "start",
+                    node_ids=["local"], promote=True,
+                )
+
+            self.assertFalse(card["promotable"])
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_repointed_image_blocks_direct_start_promotion(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "mounts_replayable": True,
+            "image_replayable": False,
+            "load_settings": {"command_flags": "--max-num-seqs 8"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            with self.assertRaisesRegex(ValueError, "source image"):
                 await service.deployment_action(
                     "container:external-stack", "start",
                     node_ids=["local"], promote=True,

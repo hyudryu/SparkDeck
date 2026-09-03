@@ -2081,6 +2081,41 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(member["deployment_id"], "deployment-master")
         self.assertEqual(member["pricing"]["output_cost_per_1m"], 4.0)
 
+    def test_routed_row_honors_explicit_all_zero_destination_pricing(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "claude-opus-4": {
+                "input": 1_000_000, "cached": 0, "output": 1_000_000,
+            },
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {"claude-opus-4": "org/free-model"}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.deployments = [{
+            "id": "deployment-free",
+            "model": "org/free-model",
+            "pricing_model_key": "org/free-model",
+            "launch_settings": {
+                "input_cost_per_1m": 0.0,
+                "cache_cost_per_1m": 0.0,
+                "output_cost_per_1m": 0.0,
+            },
+        }]
+
+        row = instance.usage_rows()[0]
+        member = row["members"][0]
+
+        self.assertEqual(row["pricing_model"], "org/free-model")
+        self.assertEqual(row["total_cost"], 0.0)
+        self.assertEqual(member["deployment_id"], "deployment-free")
+        self.assertEqual(member["pricing"], {
+            "input_cost_per_1m": 0.0,
+            "cache_cost_per_1m": 0.0,
+            "output_cost_per_1m": 0.0,
+        })
+
     def test_routed_row_exposes_one_pricing_editor_on_destination(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

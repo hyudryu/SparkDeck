@@ -258,6 +258,71 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             summary["load_settings"]["environment"], {"NCCL_DEBUG": "INFO"},
         )
 
+    def _direct_portability_summary(self, device_requests, resolved_image_id):
+        source_image_id = "sha256:source-image"
+        image = SimpleNamespace(
+            id=resolved_image_id,
+            attrs={
+                "Id": resolved_image_id,
+                "Config": {"Env": [], "Labels": {}},
+            },
+        )
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(get=mock.Mock(return_value=image)),
+        )
+        containers = FakeContainers()
+        container = FakeContainer(
+            containers,
+            "portable-container-id",
+            "portable-vllm",
+            {
+                "Image": "example/vllm:latest",
+                "Entrypoint": ["vllm", "serve"],
+                "Cmd": ["org/model", "--max-num-seqs", "8"],
+                "Env": [],
+                "Labels": {"io.sparkdeck.direct-start": "1"},
+            },
+            {"DeviceRequests": device_requests},
+        )
+        container.attrs["Image"] = source_image_id
+        return self.manager._container_summary(container)
+
+    def test_direct_summary_accepts_matching_all_gpu_and_image_contract(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image")
+
+        self.assertTrue(summary["gpu_requests_replayable"])
+        self.assertTrue(summary["image_replayable"])
+
+    def test_direct_summary_rejects_restricted_gpu_device_ids(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": 0,
+            "DeviceIDs": ["2", "3"],
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image")
+
+        self.assertFalse(summary["gpu_requests_replayable"])
+        self.assertTrue(summary["image_replayable"])
+
+    def test_direct_summary_rejects_repointed_mutable_image_tag(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:new-image")
+
+        self.assertTrue(summary["gpu_requests_replayable"])
+        self.assertFalse(summary["image_replayable"])
+
     def test_recovered_launch_preserves_discovered_runtime_environment(self):
         recovered = self.manager._recovered_deployment_launch_settings(
             {

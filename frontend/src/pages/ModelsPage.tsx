@@ -435,8 +435,11 @@ export function ModelsPage() {
   // example by free disk space on the model-cache volume).
   const startPreflight = useResource(
     (signal) => {
-      if (!startSelection || startSelection.deployment.status !== 'saved') {
-        throw new Error('No saved deployment selected')
+      if (!startSelection || !(
+        startSelection.deployment.status === 'saved'
+        || (startSelection.deployment.direct_start && canPromoteDiscovered(startSelection.deployment))
+      )) {
+        throw new Error('No preparable deployment selected')
       }
       const selectableIds = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
       if (!selectableIds.length) throw new Error('No selectable nodes')
@@ -445,7 +448,10 @@ export function ModelsPage() {
     [startSelection?.deployment.id],
     Boolean(
       startSelection
-      && startSelection.deployment.status === 'saved'
+      && (
+        startSelection.deployment.status === 'saved'
+        || (startSelection.deployment.direct_start && canPromoteDiscovered(startSelection.deployment))
+      )
       && !isControllerArtifact(startSelection.deployment)
       && nodes.data?.length,
     ),
@@ -1231,14 +1237,20 @@ export function ModelsPage() {
     if (!startSelection) return
     const { deployment, nodeIds } = startSelection
     const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
+    const preparesWeights = (
+      deployment.status === 'saved'
+      || Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
+    ) && !isControllerArtifact(deployment)
     setBusy(deployment.id)
     setStartError(undefined)
     setStartNotice(undefined)
     try {
-      if (deployment.status === 'saved' && !isControllerArtifact(deployment)) {
-        // First launch of a saved deployment: route missing weights to the
-        // selected nodes through Virtual NAS before starting. Controller-local
-        // artifacts never go through preparation; the node holds them already.
+      if (preparesWeights) {
+        // Route missing weights to every selected node before a saved launch
+        // or direct-start promotion. This is mandatory for offline runtimes;
+        // otherwise selecting a cache-empty worker would create a deployment
+        // that can never load its model. Controller-local artifacts never go
+        // through preparation because the controller already holds them.
         const plan = await api.deployments.preparePreflight(deployment.id, nodeIds)
         if (!plan.eligible) {
           throw new Error(plan.reason || 'The selected nodes cannot be prepared for launch')
@@ -2173,10 +2185,11 @@ export function ModelsPage() {
         const required = deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
         const adoptingDirect = Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
+        const preparableLaunch = savedLaunch || adoptingDirect
         const converting = canPromoteDiscovered(deployment) && !adoptingDirect
         const controllerArtifact = isControllerArtifact(deployment)
         const weighted = deploymentWeightedNodes(deployment)
-        const plan = savedLaunch && !controllerArtifact ? startPreflight.data : undefined
+        const plan = preparableLaunch && !controllerArtifact ? startPreflight.data : undefined
         const planTargets = new Map((plan?.targets ?? []).map((target) => [target.node_id, target]))
         // Nodes without weights stay launchable whenever any of their own
         // preparation paths (transfer, Hugging Face download, or transfer
@@ -2184,11 +2197,13 @@ export function ModelsPage() {
         // independently, so one unrelated node out of cache space never
         // blocks a viable subset.
         const prepEligible = new Set((plan?.targets ?? [])
-          .filter((target) => !weighted.has(target.node_id)
-            && (target.eligible || target.download_eligible || target.transfer_after_download_eligible))
+          .filter((target) => target.has_required_weights
+            || target.eligible
+            || target.download_eligible
+            || target.transfer_after_download_eligible)
           .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
-          .filter((node) => !deployment.managed || weighted.has(node.id) || prepEligible.has(node.id))
+          .filter((node) => !preparableLaunch || weighted.has(node.id) || prepEligible.has(node.id))
           .map((node) => node.id)
         const unavailableReasons = Object.fromEntries((nodes.data ?? [])
           .filter((node) => !allowedIds.includes(node.id)).map((node) => {
@@ -2202,7 +2217,7 @@ export function ModelsPage() {
                   ?? target?.transfer_after_download_reason
                   ?? 'Model weights not cached and the node cannot receive them']
           }))
-        const weightWarnings = savedLaunch ? Object.fromEntries((nodes.data ?? [])
+        const weightWarnings = preparableLaunch ? Object.fromEntries((nodes.data ?? [])
           .filter((node) => allowedIds.includes(node.id)
             && !(planTargets.get(node.id)?.has_required_weights ?? weighted.has(node.id)))
           .map((node) => [node.id, 'Weights need to be transferred before launch'])) : undefined
@@ -2217,11 +2232,13 @@ export function ModelsPage() {
           ? validDirectParallelSelection(deployment, selectedNodes)
           : nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-        const planReady = !savedLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
+        const planReady = !preparableLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
         const ready = directLifecycle || (!nodes.loading && !nodes.error && planReady && exactCount && allEligible)
-        const needsPrep = savedLaunch && !controllerArtifact && nodeIds.some((id) => !weighted.has(id))
+        const needsPrep = preparableLaunch && !controllerArtifact && nodeIds.some((id) => (
+          !(planTargets.get(id)?.has_required_weights ?? weighted.has(id))
+        ))
         const transferTargets = nodeIds
-          .filter((id) => !weighted.has(id))
+          .filter((id) => !(planTargets.get(id)?.has_required_weights ?? weighted.has(id)))
           .map((id) => nodes.data?.find((node) => node.id === id)?.name ?? id)
         const transferNotice = needsPrep && plan?.action === 'transfer' && plan.source && transferTargets.length
           ? `Weights will be transferred from ${plan.source.node_name} to ${transferTargets.join(', ')} via Virtual NAS before launch.`
@@ -2252,14 +2269,14 @@ export function ModelsPage() {
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
             {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
             {!directLifecycle && !controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
-            {!directLifecycle && savedLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
+            {!directLifecycle && preparableLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
-              loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (savedLaunch && startPreflight.loading)))}
+              loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
               error={nodes.error}
-              onRetry={() => { nodes.reload(); modelCache.reload(); if (savedLaunch) startPreflight.reload() }}
+              onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}
               multiple={flexibleParallel || required > 1}
               disabled={startBusy}
               allowedIds={allowedIds}
@@ -2268,7 +2285,7 @@ export function ModelsPage() {
               localLabel={localLabel}
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
-              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${flexibleParallel ? 'GPU ranks are divided evenly across the selected nodes.' : layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
+              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : adoptingDirect ? `Choose where to adopt this runtime. SparkDeck verifies or prepares ${deployment.model_id} on every selected node before promotion.` : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${flexibleParallel ? 'GPU ranks are divided evenly across the selected nodes.' : layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />}
             {!directLifecycle && needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
               <select

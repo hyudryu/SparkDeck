@@ -726,6 +726,40 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already in use", response.json()["detail"])
         rename.assert_not_awaited()
 
+    async def test_rename_discovered_container_rejects_public_model_id_conflict(self):
+        card = {
+            "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "org/model"},
+            "status": "stopped", "settings": {},
+        }
+        other = {
+            "id": "managed-1", "alias": "Different alias", "runtime": "vllm",
+            "kind": "managed", "model": {"repository": "org/other"},
+            "served_models": ["org/other", "public-vision-model"],
+            "status": "running", "settings": {},
+        }
+        rename = AsyncMock()
+        with (
+            patch.object(
+                server.sparkdeck, "deployments",
+                AsyncMock(return_value=[card, other]),
+            ),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value={"name": "vllm-dspark"}),
+            ),
+            patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
+            patch.object(server.manager, "update_container_alias", rename),
+        ):
+            response = await self.client.patch(
+                "/api/v1/deployments/container:vllm-dspark",
+                json={"alias": "PUBLIC-VISION-MODEL"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("already in use", response.json()["detail"])
+        rename.assert_not_awaited()
+
     async def test_rename_discovered_container_rejects_cluster_member(self):
         rename = AsyncMock()
         with (
@@ -1315,6 +1349,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
                 "extra_args": recovered_args,
             }
 
+        @staticmethod
+        def recipe_deployment_contract(recipe):
+            return server.manager.recipe_deployment_contract(recipe)
+
     class FakeStream:
         def __init__(self, chunks=()):
             self._chunks = list(chunks)
@@ -1488,7 +1526,10 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             "managed": False, "status": "exited", "direct_start": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
-                "command_flags": "--max-num-seqs 8 --enable-prefix-caching",
+                "command_flags": (
+                    "--tensor-parallel-size 2 --pipeline-parallel-size 2 "
+                    "--max-num-seqs 8 --enable-prefix-caching"
+                ),
             },
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -1499,19 +1540,84 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             ):
                 result = await service.deployment_action(
                     "container:external-stack", "start",
-                    node_ids=["local", "worker-1"],
+                    node_ids=["local", "worker-1", "worker-2", "worker-3"],
                 )
 
             promoted.assert_awaited_once_with(
-                unittest.mock.ANY, container, ["local", "worker-1"],
+                unittest.mock.ANY, container,
+                ["local", "worker-1", "worker-2", "worker-3"],
             )
             manager.start_container.assert_not_awaited()
             self.assertEqual(result["id"], "managed")
-            self.assertTrue(
-                service._discovered_deployment(
-                    container, "vllm", "org/model",
-                )["promotable"]
+            card = service._discovered_deployment(
+                container, "vllm", "org/model",
             )
+            self.assertTrue(card["promotable"])
+            self.assertEqual(card["deployment_mode"], "sharded")
+            self.assertEqual(card["required_node_count"], 4)
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_direct_start_rejects_selection_smaller_than_recovered_tp_pp(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "load_settings": {
+                "tensor_parallel_size": 2,
+                "command_flags": (
+                    "--tensor-parallel-size 2 --pipeline-parallel-size 2"
+                ),
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires exactly 4 node"):
+                await service._promote_discovered_deployment(
+                    deployment, container, ["local", "worker-1"],
+                )
+
+            manager.create_deployment.assert_not_awaited()
+            manager.start_container.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_direct_start_promotion_carries_recovered_tp_pp_contract(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "direct_start": True,
+            "load_settings": {
+                "tensor_parallel_size": 2,
+                "command_flags": (
+                    "--tensor-parallel-size 2 --pipeline-parallel-size 2 "
+                    "--enable-prefix-caching"
+                ),
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            deployment = service._discovered_deployment(
+                container, "vllm", "org/model",
+            )
+            manager.create_deployment.return_value = {
+                "id": "managed-cluster", "launch_settings": {},
+            }
+            adopted = Mock(return_value={"id": "managed", "status": "starting"})
+            selected = ["local", "worker-1", "worker-2", "worker-3"]
+
+            with patch.object(service, "_adopt_manager_replacement", adopted):
+                result = await service._promote_discovered_deployment(
+                    deployment, container, selected,
+                )
+
+            launch = manager.create_deployment.await_args.args[0]
+            self.assertEqual(launch["deployment_mode"], "sharded")
+            self.assertEqual(launch["node_ids"], selected)
+            self.assertIn("--pipeline-parallel-size", launch["extra_args"])
+            self.assertEqual(result["id"], "managed")
             await manager.http.aclose()
             await service.close()
 
@@ -1552,7 +1658,9 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             "managed": False, "status": "exited", "direct_start": True,
             "load_settings": {
                 "tensor_parallel_size": 2,
-                "command_flags": "--flag '$(resolve-value)'",
+                "command_flags": (
+                    "--tensor-parallel-size 2 --flag '$(resolve-value)'"
+                ),
             },
         }
         with tempfile.TemporaryDirectory() as directory:

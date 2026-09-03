@@ -490,9 +490,15 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             self.manager.container_aliases_path = Path(directory) / "container_aliases.json"
             self.manager.container_aliases = {}
 
-            result = await self.manager.update_container_alias(name, "Fast benchmark")
+            real_to_thread = asyncio.to_thread
+            with mock.patch(
+                "manager.asyncio.to_thread",
+                new=mock.AsyncMock(side_effect=real_to_thread),
+            ) as to_thread:
+                result = await self.manager.update_container_alias(name, "Fast benchmark")
 
             self.assertEqual(result["alias"], "Fast benchmark")
+            to_thread.assert_awaited_once_with(containers.get, name)
             self.assertEqual(container.name, name)
             self.assertEqual(
                 json.loads(self.manager.container_aliases_path.read_text()),
@@ -589,6 +595,47 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
         settings = self.manager._container_load_settings(command, "vllm", model)
 
         self.assertTrue(settings["editable"])
+
+    def test_embedded_shell_expansion_and_operators_are_read_only(self):
+        model = "example/Model"
+        unsafe_values = (
+            "model-${SUFFIX}",
+            "prefix-$REVISION",
+            "$(revision-command)",
+            "`revision-command`",
+            "value;next-command",
+            "value&&next-command",
+            "value|next-command",
+            ">server.log",
+        )
+
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                command = [
+                    "vllm", "serve", model,
+                    "--served-model-name", value,
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertFalse(settings["editable"])
+
+    def test_short_speculative_environment_reference_is_read_only(self):
+        model = "example/Model"
+        for option_args in (
+            ["-sc", "${SPECULATIVE_CONFIG}"],
+            ["-sc=${SPECULATIVE_CONFIG}"],
+        ):
+            with self.subTest(option_args=option_args):
+                command = ["vllm", "serve", model, *option_args]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertFalse(settings["editable"])
 
     def test_shell_wrapped_template_command_stays_editable(self):
         script = (

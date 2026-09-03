@@ -3867,16 +3867,36 @@ class SparkDeckService:
             )
         settings = dict(container.get("load_settings") or {})
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
-        try:
-            tensor_parallel = max(1, int(settings.get("tensor_parallel_size") or 1))
-        except (TypeError, ValueError):
-            tensor_parallel = 1
+        direct_recovery = (
+            self._direct_start_launch_contract(container, runtime, str(
+                settings.get("model") or container.get("model") or ""
+            ))
+            if container.get("direct_start") else None
+        )
+        if container.get("direct_start") and direct_recovery is None:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch topology could not be recovered"
+            )
+        if direct_recovery is not None:
+            launch_settings, layout = direct_recovery
+            required_nodes = layout["required_node_count"]
+            deployment_mode = layout["deployment_mode"]
+        else:
+            try:
+                tensor_parallel = max(
+                    1, int(settings.get("tensor_parallel_size") or 1),
+                )
+            except (TypeError, ValueError):
+                tensor_parallel = 1
+            required_nodes = tensor_parallel
+            deployment_mode = "sharded" if tensor_parallel > 1 else "single"
+            launch_settings = None
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("node_ids must not contain duplicates")
-        if len(node_ids) != tensor_parallel:
+        if len(node_ids) != required_nodes:
             raise ValueError(
-                f"tensor parallel size {tensor_parallel} requires exactly "
-                f"{tensor_parallel} node(s)"
+                f"this deployment requires exactly {required_nodes} node(s)"
             )
         self._reject_sensitive_launch_args(settings.get("extra_args"))
         if settings.get("editable") is False:
@@ -3895,17 +3915,22 @@ class SparkDeckService:
                 "controller-local model paths can only run on the controller node"
             )
 
-        recover = getattr(self.manager, "_recovered_deployment_launch_settings", None)
-        if not callable(recover):
-            raise RuntimeError("discovered deployment cannot be promoted on this controller")
-        launch_settings = recover({
-            "name": deployment.get("alias"),
-            "model": launch_model,
-            "engine": runtime,
-            "mode": "sharded" if tensor_parallel > 1 else "single",
-            "node_ids": list(node_ids),
-            "api_port": container.get("port"),
-        }, container)
+        if launch_settings is None:
+            recover = getattr(
+                self.manager, "_recovered_deployment_launch_settings", None,
+            )
+            if not callable(recover):
+                raise RuntimeError(
+                    "discovered deployment cannot be promoted on this controller"
+                )
+            launch_settings = recover({
+                "name": deployment.get("alias"),
+                "model": launch_model,
+                "engine": runtime,
+                "mode": deployment_mode,
+                "node_ids": list(node_ids),
+                "api_port": container.get("port"),
+            }, container)
         if container.get("direct_start") and not self._recovered_launch_is_portable(
             launch_settings,
         ):
@@ -3920,7 +3945,7 @@ class SparkDeckService:
             "engine": runtime,
             "image": container.get("image"),
             "environment": settings.get("environment") or {},
-            "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
+            "deployment_mode": deployment_mode,
             "node_ids": list(node_ids),
             # This stable reverse link identifies a partially-created Manager
             # record if launch or SQLite adoption fails and must be rolled back.
@@ -3985,36 +4010,49 @@ class SparkDeckService:
         except (TypeError, ValueError):
             return False
 
-    def _direct_start_is_portable(
+    def _direct_start_launch_contract(
         self, container: dict[str, Any], runtime: str, model: str,
-    ) -> bool:
-        """Fail closed when direct-start recovery would lose shell semantics."""
-        if not container.get("direct_start"):
-            return True
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Recover a direct start and infer its exec-form topology safely."""
         recover = getattr(
             self.manager, "_recovered_deployment_launch_settings", None,
         )
-        if not callable(recover):
-            return False
+        contract_fn = getattr(self.manager, "recipe_deployment_contract", None)
+        if not callable(recover) or not callable(contract_fn):
+            return None
         settings = container.get("load_settings") or {}
-        try:
-            tensor_parallel = max(
-                1, int(settings.get("tensor_parallel_size") or 1),
-            )
-        except (TypeError, ValueError):
-            tensor_parallel = 1
         try:
             launch_settings = recover({
                 "name": container.get("alias") or container.get("served_model") or model,
                 "model": settings.get("model") or model,
                 "engine": runtime,
-                "mode": "sharded" if tensor_parallel > 1 else "single",
+                "mode": "single",
                 "node_ids": [LOCAL_NODE_ID],
                 "api_port": container.get("port"),
             }, container)
-        except (TypeError, ValueError):
-            return False
-        return self._recovered_launch_is_portable(launch_settings)
+            if not isinstance(launch_settings, dict):
+                return None
+            contract = contract_fn({
+                **launch_settings,
+                # Direct containers have no persisted SparkDeck topology. Let
+                # Manager infer sharding from the recovered TP/PP argv.
+                "deployment_mode": None,
+                "node_ids": [LOCAL_NODE_ID],
+            })
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(contract, dict) or contract.get("supported") is False:
+            return None
+        mode = contract.get("deployment_mode")
+        required = contract.get("required_node_count")
+        if mode not in {"single", "sharded", "replicated"} or (
+            not isinstance(required, int) or isinstance(required, bool) or required < 1
+        ):
+            return None
+        return launch_settings, {
+            "deployment_mode": mode,
+            "required_node_count": required,
+        }
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
@@ -4061,17 +4099,15 @@ class SparkDeckService:
                 # Start into a managed-conversion request.
                 node_ids = None
             else:
-                tensor_parallel = deployment.get("settings", {}).get(
-                    "tensor_parallel_size", 1,
-                )
                 try:
-                    required_nodes = max(1, int(tensor_parallel or 1))
+                    required_nodes = max(
+                        1, int(deployment.get("required_node_count") or 1),
+                    )
                 except (TypeError, ValueError):
                     required_nodes = 1
                 if len(node_ids) != required_nodes:
                     raise ValueError(
-                        f"tensor parallel size {required_nodes} requires exactly "
-                        f"{required_nodes} node(s)"
+                        f"this deployment requires exactly {required_nodes} node(s)"
                     )
                 if promote or required_nodes > 1 or node_ids != ["local"]:
                     return await self._promote_discovered_deployment(
@@ -5359,9 +5395,11 @@ class SparkDeckService:
                 for item in await self.deployments():
                     if str(item.get("id") or "") == deployment_id:
                         continue
+                    public_ids = self._deployment_public_model_ids(item)
                     if folded in {
                         str(item.get("id") or "").casefold(),
                         str(item.get("alias") or "").casefold(),
+                        *(str(value).casefold() for value in public_ids),
                     }:
                         raise ValueError(
                             f"deployment alias '{alias}' is already in use"
@@ -5427,6 +5465,14 @@ class SparkDeckService:
         settings = self._safe_configuration(container.get("load_settings") or {})
         if settings.get("context_length") is None and settings.get("context_window") is not None:
             settings["context_length"] = settings["context_window"]
+        direct_recovery = (
+            self._direct_start_launch_contract(container, runtime, model)
+            if container.get("direct_start") else None
+        )
+        direct_portable = bool(
+            direct_recovery
+            and self._recovered_launch_is_portable(direct_recovery[0])
+        )
         result = {
             # Synthetic IDs intentionally key by container name. A cluster
             # deployment ID may be shared by several ranks and cannot identify
@@ -5449,7 +5495,7 @@ class SparkDeckService:
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
                 and not str(container.get("stop_command") or "").strip()
-                and self._direct_start_is_portable(container, runtime, model)
+                and (not container.get("direct_start") or direct_portable)
             ),
             "controllable": True,
             "logs_available": True,
@@ -5487,6 +5533,8 @@ class SparkDeckService:
             "deployment_mode": "sharded" if tensor_parallel > 1 else "single",
             "required_node_count": tensor_parallel,
         })
+        if direct_recovery is not None:
+            result.update(direct_recovery[1])
         if status == "starting" and phase:
             result.update({
                 "launch_phase": str(phase.get("phase") or "starting"),

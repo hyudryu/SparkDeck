@@ -3701,7 +3701,7 @@ class Manager:
 
     async def update_container_alias(self, name: str, alias: Any) -> dict:
         try:
-            self.client.containers.get(name)
+            await asyncio.to_thread(self.client.containers.get, name)
         except Exception as exc:
             raise ValueError("container not found") from exc
         normalized = self._normalized_alias(alias)
@@ -4628,7 +4628,11 @@ class Manager:
         environment-backed ``--speculative-config`` reference is exempt: the
         controller resolves it from the recreated container environment.
         """
-        speculative_names = {"--speculative-config", "-sc"}
+        # Only the long form is exempt because
+        # _resolve_environment_backed_speculative_args resolves that spelling.
+        # Fail closed for ``-sc ${NAME}`` until the full parsing/editing path
+        # supports the alias too.
+        speculative_names = {"--speculative-config"}
         index = 0
         while index < len(args):
             token = str(args[index])
@@ -4663,7 +4667,15 @@ class Manager:
         exempt it there explicitly.
         """
         value = str(value or "")
-        return value.startswith("$") or "`" in value or "[@" in value
+        return bool(re.search(
+            # Parameter/command/arithmetic expansion may be embedded in an
+            # otherwise literal-looking value (for example model-${SUFFIX}).
+            # The remaining characters are shell control/redirection
+            # operators that shlex round-tripping would incorrectly turn into
+            # plain Docker argv.
+            r"\$(?:\{|\(|[A-Za-z0-9_@*#?!$-])|`|\\(?:\r\n|\n)|[;&|<>]",
+            value,
+        ))
 
     @staticmethod
     def _shell_vllm_command(script: str):

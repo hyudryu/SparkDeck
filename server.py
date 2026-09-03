@@ -836,6 +836,19 @@ async def agent_pull_image(req: Request):
         raise HTTPException(502, str(exc)[:500]) from exc
 
 
+@app.post("/api/agent/images/identity")
+async def agent_image_identity(req: Request):
+    _require_agent(req)
+    body = await req.json()
+    image = str(body.get("image") or "").strip()
+    if not image:
+        raise HTTPException(400, "image is required")
+    try:
+        return {"id": await manager.resolve_image_identity(image)}
+    except Exception as exc:
+        raise HTTPException(404, str(exc)[:500]) from exc
+
+
 @app.get("/api/agent/images")
 async def agent_images(req: Request):
     _require_agent(req)

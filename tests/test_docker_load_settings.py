@@ -302,13 +302,18 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             summary["load_settings"]["environment"], {"NCCL_DEBUG": "INFO"},
         )
 
-    def _direct_portability_summary(self, device_requests, resolved_image_id):
+    def _direct_portability_summary(
+        self, device_requests, resolved_image_id, *,
+        image_user="", container_user="",
+    ):
         source_image_id = "sha256:source-image"
         image = SimpleNamespace(
             id=resolved_image_id,
             attrs={
                 "Id": resolved_image_id,
-                "Config": {"Env": [], "Labels": {}},
+                "Config": {
+                    "Env": [], "Labels": {}, "User": image_user,
+                },
             },
         )
         self.manager.client = SimpleNamespace(
@@ -324,6 +329,7 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
                 "Entrypoint": ["vllm", "serve"],
                 "Cmd": ["org/model", "--max-num-seqs", "8"],
                 "Env": [],
+                "User": container_user,
                 "Labels": {"io.sparkdeck.direct-start": "1"},
             },
             {"DeviceRequests": device_requests},
@@ -342,6 +348,44 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(summary["gpu_requests_replayable"])
         self.assertTrue(summary["image_replayable"])
+        self.assertTrue(summary["user_replayable"])
+
+    def test_direct_summary_rejects_container_user_override(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", container_user="1000:1000")
+
+        self.assertFalse(summary["user_replayable"])
+
+    def test_direct_summary_accepts_inherited_image_user(self):
+        summary = self._direct_portability_summary([{
+            "Driver": "",
+            "Count": -1,
+            "DeviceIDs": None,
+            "Capabilities": [["gpu"]],
+            "Options": {},
+        }], "sha256:source-image", image_user="1000:1000",
+            container_user="1000:1000")
+
+        self.assertTrue(summary["user_replayable"])
+
+    def test_container_user_replayability_fails_closed_without_image_config(self):
+        self.manager.client = SimpleNamespace(
+            images=SimpleNamespace(
+                get=mock.Mock(side_effect=RuntimeError("image unavailable")),
+            ),
+        )
+
+        replayable = self.manager._container_user_is_replayable({
+            "Image": "sha256:source-image",
+            "Config": {"User": ""},
+        })
+
+        self.assertFalse(replayable)
 
     def test_direct_summary_rejects_restricted_gpu_device_ids(self):
         summary = self._direct_portability_summary([{
@@ -1016,6 +1060,62 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(settings["editable"])
                 self.assertNotIn("_shell_path_expansion", settings)
+
+    def test_shell_wrapped_brace_expansion_is_marked_nonportable(self):
+        model = "example/Model"
+        for value in (
+            "/templates/{chat,base}.jinja",
+            "/templates/template-{1..4}.jinja",
+            "/templates/template-{d..a..2}.jinja",
+            "${CHAT_TEMPLATE:-/templates/{chat,base}.jinja}",
+            "${CHAT_TEMPLATE:-/templates/{1..4}.jinja}",
+        ):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertTrue(settings["_shell_brace_expansion"])
+
+    def test_literal_braces_and_parameter_expansion_remain_portable(self):
+        model = "example/Model"
+        for value in (
+            "'/templates/{chat,base}.jinja'",
+            '"/templates/{chat,base}.jinja"',
+            r"/templates/\{chat,base\}.jinja",
+            "/templates/{literal}.jinja",
+            "${CHAT_TEMPLATE}",
+        ):
+            with self.subTest(value=value):
+                command = [
+                    "/bin/bash", "-lc",
+                    f"exec vllm serve {model} --chat-template {value}",
+                ]
+
+                settings = self.manager._container_load_settings(
+                    command, "vllm", model,
+                )
+
+                self.assertTrue(settings["editable"])
+                self.assertNotIn("_shell_brace_expansion", settings)
+
+    def test_plain_sh_brace_literals_remain_portable(self):
+        model = "example/Model"
+        command = [
+            "/bin/sh", "-c",
+            f"exec vllm serve {model} --chat-template /templates/{{chat,base}}.jinja",
+        ]
+
+        settings = self.manager._container_load_settings(command, "vllm", model)
+
+        self.assertTrue(settings["editable"])
+        self.assertNotIn("_shell_brace_expansion", settings)
 
     def test_shell_wrapped_command_boundary_is_read_only(self):
         model = "example/Model"

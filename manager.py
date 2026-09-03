@@ -4996,6 +4996,79 @@ class Manager:
             index += 1
         return False
 
+    @staticmethod
+    def _has_unquoted_bash_brace_expansion(value: str) -> bool:
+        """Return whether Bash would expand an unquoted brace expression."""
+        text = str(value or "")
+        quote: str | None = None
+        brace_stack: list[dict[str, object]] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == "\\" and index + 1 < len(text):
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if char.isspace() or char in ";|&()<>":
+                brace_stack.clear()
+                index += 1
+                continue
+            if char == "{":
+                # ``${...}`` is parameter expansion, not brace expansion. Keep
+                # it on the stack so commas inside it cannot make an enclosing
+                # ordinary brace look expandable.
+                dollar_escaped = False
+                if index > 0 and text[index - 1] == "$":
+                    slash_count = 0
+                    cursor = index - 2
+                    while cursor >= 0 and text[cursor] == "\\":
+                        slash_count += 1
+                        cursor -= 1
+                    dollar_escaped = slash_count % 2 == 1
+                parameter_open = (
+                    index > 0
+                    and text[index - 1] == "$"
+                    and not dollar_escaped
+                )
+                brace_stack.append({
+                    "kind": "parameter" if parameter_open else "brace",
+                    "start": index,
+                    "comma": False,
+                })
+            elif char == "," and brace_stack:
+                if brace_stack[-1]["kind"] == "brace":
+                    brace_stack[-1]["comma"] = True
+            elif char == "}" and brace_stack:
+                candidate = brace_stack.pop()
+                if candidate["kind"] == "brace":
+                    if candidate["comma"]:
+                        return True
+                    body = text[int(candidate["start"]) + 1:index]
+                    if re.fullmatch(
+                        r"(?:-?\d+|[A-Za-z])\.\."
+                        r"(?:-?\d+|[A-Za-z])(?:\.\.-?\d+)?",
+                        body,
+                    ):
+                        return True
+            index += 1
+        return False
+
     @classmethod
     def _vllm_exec_prefix_is_replayable(cls, cmd: list[str]) -> bool:
         """Whether a managed launch reproduces the command before ``serve``."""
@@ -5121,6 +5194,7 @@ class Manager:
         shell_command_boundary = False
         shell_comment = False
         shell_path_expansion = False
+        shell_brace_expansion = False
         if engine == "vllm" and len(cmd) >= 3 and cmd[-2] in {"-c", "-lc"}:
             match = self._shell_vllm_command(cmd[-1])
             if match:
@@ -5134,6 +5208,13 @@ class Manager:
                 )
                 shell_path_expansion = self._has_unquoted_shell_path_expansion(
                     match.group("model") + match.group("flags")
+                )
+                shell = cmd[-3].replace("\\", "/").rsplit("/", 1)[-1]
+                shell_brace_expansion = (
+                    shell == "bash"
+                    and self._has_unquoted_bash_brace_expansion(
+                        match.group("model") + match.group("flags")
+                    )
                 )
                 try:
                     analysis_cmd = [
@@ -5268,6 +5349,8 @@ class Manager:
             # Internal promotion guard. SparkDeck's public settings sanitizer
             # intentionally does not include private keys.
             settings["_shell_path_expansion"] = True
+        if shell_brace_expansion:
+            settings["_shell_brace_expansion"] = True
         return settings
 
     async def _create_member(self, node_id: str, payload: dict) -> dict:
@@ -11347,6 +11430,32 @@ class Manager:
             return False
         return True
 
+    def _container_user_is_replayable(self, attrs: dict) -> bool:
+        """Whether managed recreation preserves the container user.
+
+        Managed launches do not set Docker's ``User`` override, so they run
+        as the immutable image default. A direct-start container is portable
+        only when its effective configured user exactly matches that default.
+        Fail closed when the image cannot be inspected or either value has an
+        unexpected type rather than silently changing runtime privileges.
+        """
+        image_ref = str(attrs.get("Image") or "").strip()
+        if not image_ref:
+            return False
+        image_config = self._inspected_image_config(image_ref)
+        if image_config is None:
+            return False
+
+        current = (attrs.get("Config") or {}).get("User", "")
+        default = image_config.get("User", "")
+        current = "" if current is None else current
+        default = "" if default is None else default
+        return (
+            isinstance(current, str)
+            and isinstance(default, str)
+            and current == default
+        )
+
     @staticmethod
     def _container_gpu_requests_are_replayable(attrs: dict) -> bool:
         """Whether Manager's all-GPU request exactly preserves inspection.
@@ -11598,6 +11707,9 @@ class Manager:
         if summary["direct_start"]:
             summary["environment_replayable"] = (
                 self._container_environment_is_replayable(attrs, engine_label)
+            )
+            summary["user_replayable"] = (
+                self._container_user_is_replayable(attrs)
             )
             summary["gpu_requests_replayable"] = (
                 self._container_gpu_requests_are_replayable(attrs)
@@ -13122,6 +13234,86 @@ class Manager:
         self._images_cache = await asyncio.to_thread(_do)
         self._images_ts = now
         return self._images_cache
+
+    async def resolve_image_identity(self, image_ref: str) -> str:
+        """Resolve one Docker reference to its immutable local image ID."""
+        image_ref = str(image_ref or "").strip()
+        if not image_ref:
+            raise ValueError("image reference is required")
+
+        def _resolve() -> str:
+            image = self.client.images.get(image_ref)
+            image_id = str(
+                getattr(image, "id", "")
+                or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+            ).strip()
+            if not image_id:
+                raise RuntimeError("Docker returned an image without an immutable ID")
+            return image_id
+
+        return await asyncio.to_thread(_resolve)
+
+    async def pin_container_image_on_nodes(
+        self, container_name: str, image_ref: str, node_ids: list[str],
+    ) -> str:
+        """Validate a discovered container's image on every target and pin it.
+
+        A mutable tag is safe to recover only while it still resolves to the
+        exact image used by the source container. Every selected node must
+        already have that immutable image ID; managed launch then receives the
+        ID itself, so a tag repoint cannot produce mixed runtime code.
+        """
+        container_name = str(container_name or "").strip()
+        image_ref = str(image_ref or "").strip()
+        if not container_name or not image_ref:
+            raise ValueError("source container and image reference are required")
+
+        def _source_identity() -> str:
+            container = self.client.containers.get(container_name)
+            source_id = str((container.attrs or {}).get("Image") or "").strip()
+            if not source_id:
+                raise ValueError("source container has no immutable image identity")
+            image = self.client.images.get(image_ref)
+            resolved_id = str(
+                getattr(image, "id", "")
+                or ((getattr(image, "attrs", None) or {}).get("Id") or "")
+            ).strip()
+            if not resolved_id or resolved_id.casefold() != source_id.casefold():
+                raise ValueError(
+                    "source image reference no longer resolves to the "
+                    "discovered container image"
+                )
+            return source_id
+
+        source_id = await asyncio.to_thread(_source_identity)
+        selected = await self.selected_cluster_nodes(node_ids)
+
+        async def resolve(node: dict) -> str:
+            if node["id"] == LOCAL_NODE_ID:
+                return await self.resolve_image_identity(source_id)
+            payload = await self.node_registry.request(
+                node["id"], "POST", "/api/agent/images/identity",
+                json_body={"image": source_id}, timeout=30,
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError("node returned an invalid image identity")
+            return str(payload.get("id") or "").strip()
+
+        resolved = await asyncio.gather(
+            *(resolve(node) for node in selected), return_exceptions=True,
+        )
+        mismatched = []
+        for node, result in zip(selected, resolved):
+            if isinstance(result, Exception) or (
+                not result or result.casefold() != source_id.casefold()
+            ):
+                mismatched.append(str(node.get("name") or node["id"]))
+        if mismatched:
+            raise ValueError(
+                "source image identity is unavailable on selected node(s): "
+                + ", ".join(mismatched)
+            )
+        return source_id
 
     async def cluster_image_inventory(self) -> dict:
         """Return image/container inventory from each enabled cluster node."""

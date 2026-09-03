@@ -3897,6 +3897,13 @@ class SparkDeckService:
                 "discovered deployment cannot be promoted safely because its "
                 "launch command depends on shell pathname expansion"
             )
+        if container.get("direct_start") and settings.get(
+            "_shell_brace_expansion"
+        ) is True:
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "launch command depends on Bash brace expansion"
+            )
         runtime = str(deployment.get("runtime") or container.get("engine") or "vllm")
         direct_recovery = (
             self._direct_start_launch_contract(container, runtime, str(
@@ -3932,6 +3939,14 @@ class SparkDeckService:
             raise ValueError(
                 "discovered deployment cannot be promoted safely because its "
                 "container environment overrides cannot be reproduced"
+            )
+        if (
+            container.get("direct_start")
+            and container.get("user_replayable") is not True
+        ):
+            raise ValueError(
+                "discovered deployment cannot be promoted safely because its "
+                "container user override cannot be reproduced"
             )
         if (
             container.get("direct_start")
@@ -4007,6 +4022,19 @@ class SparkDeckService:
                 "controller-local model paths can only run on the controller node"
             )
 
+        launch_image = container.get("image")
+        if direct_recovery is not None:
+            pin_image = getattr(
+                self.manager, "pin_container_image_on_nodes", None,
+            )
+            if not callable(pin_image):
+                raise RuntimeError(
+                    "discovered deployment cannot validate its image on selected nodes"
+                )
+            launch_image = await pin_image(
+                str(container.get("name") or ""), str(launch_image or ""), node_ids,
+            )
+
         if launch_settings is None:
             recover = getattr(
                 self.manager, "_recovered_deployment_launch_settings", None,
@@ -4035,7 +4063,7 @@ class SparkDeckService:
             "deployment_name": deployment.get("alias"),
             "model": launch_model,
             "engine": runtime,
-            "image": container.get("image"),
+            "image": launch_image,
             "environment": settings.get("environment") or {},
             "deployment_mode": deployment_mode,
             "node_ids": list(node_ids),
@@ -4137,7 +4165,10 @@ class SparkDeckService:
         if not callable(recover) or not callable(contract_fn):
             return None
         settings = container.get("load_settings") or {}
-        if settings.get("_shell_path_expansion") is True:
+        if (
+            settings.get("_shell_path_expansion") is True
+            or settings.get("_shell_brace_expansion") is True
+        ):
             return None
         try:
             launch_settings = recover({
@@ -5696,6 +5727,7 @@ class SparkDeckService:
             and container.get("mounts_replayable") is True
             and container.get("launch_prefix_replayable") is True
             and container.get("environment_replayable") is True
+            and container.get("user_replayable") is True
             and container.get("gpu_requests_replayable") is True
             and container.get("image_replayable") is True
         )

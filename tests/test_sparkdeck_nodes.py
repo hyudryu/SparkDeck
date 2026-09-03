@@ -69,6 +69,69 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.manager.pull_image_result.assert_not_awaited()
 
 
+class ImageIdentityPinningTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.manager = Manager.__new__(Manager)
+        self.nodes = [
+            node("local", "Coordinator", local=True),
+            node("remote-1", "Worker"),
+        ]
+        self.manager.cluster_nodes = AsyncMock(return_value=self.nodes)
+        self.manager.client = Mock()
+        self.manager.node_registry = Mock()
+        self.manager.node_registry.request = AsyncMock()
+        self.source_id = "sha256:" + "a" * 64
+        source = Mock()
+        source.attrs = {"Image": self.source_id}
+        self.manager.client.containers.get.return_value = source
+
+    async def test_pins_source_identity_after_validating_every_selected_node(self):
+        image = Mock()
+        image.id = self.source_id
+        self.manager.client.images.get.return_value = image
+        self.manager.node_registry.request.return_value = {"id": self.source_id}
+
+        pinned = await self.manager.pin_container_image_on_nodes(
+            "external-stack", "example/vllm:latest", ["local", "remote-1"],
+        )
+
+        self.assertEqual(pinned, self.source_id)
+        self.manager.client.containers.get.assert_called_once_with("external-stack")
+        self.assertEqual(
+            [call.args[0] for call in self.manager.client.images.get.call_args_list],
+            ["example/vllm:latest", self.source_id],
+        )
+        self.manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "POST", "/api/agent/images/identity",
+            json_body={"image": self.source_id}, timeout=30,
+        )
+
+    async def test_rejects_remote_node_with_different_image_identity(self):
+        image = Mock()
+        image.id = self.source_id
+        self.manager.client.images.get.return_value = image
+        self.manager.node_registry.request.return_value = {
+            "id": "sha256:" + "b" * 64,
+        }
+
+        with self.assertRaisesRegex(ValueError, "selected node.*Worker"):
+            await self.manager.pin_container_image_on_nodes(
+                "external-stack", "example/vllm:latest", ["remote-1"],
+            )
+
+    async def test_rejects_controller_tag_repoint_before_node_validation(self):
+        repointed = Mock()
+        repointed.id = "sha256:" + "b" * 64
+        self.manager.client.images.get.return_value = repointed
+
+        with self.assertRaisesRegex(ValueError, "no longer resolves"):
+            await self.manager.pin_container_image_on_nodes(
+                "external-stack", "example/vllm:latest", ["remote-1"],
+            )
+
+        self.manager.node_registry.request.assert_not_awaited()
+
+
 class NodeRenameTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_rename_is_normalized_and_persisted(self):
         with tempfile.TemporaryDirectory() as directory:

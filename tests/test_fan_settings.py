@@ -229,6 +229,16 @@ class FanSettingsTests(unittest.TestCase):
         self.assertEqual(result["sensor"], "cpu")
         self.assertGreater(result["expires_at"], now)
 
+        self.assertIsNone(Manager._cluster_temperature_override([{
+            "id": "future",
+            "name": "future-clock",
+            "online": True,
+            "stats": {
+                "ts": now + manager_module.FAN_STATE_MAX_FUTURE_SKEW_SECONDS + 0.1,
+                "cpu_temp_c": 100.0,
+            },
+        }], now=now))
+
     def test_fan_control_updates_preserve_independent_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fancontroller" / "control.json"
@@ -254,6 +264,34 @@ class FanSettingsTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()), {
                 "temperature_override": override,
             })
+
+    def test_authenticated_temperature_override_is_validated_and_normalized(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._read_fan_state = lambda: {"mode": "curve"}
+        instance._set_fan_temperature_override = mock.Mock()
+        override = {
+            "temperature_c": 78,
+            "source": "vllm-cluster-max",
+            "sensor": "gpu:0",
+            "node_id": "worker-2",
+            "node_name": "Hot node",
+            "observed_at": 1_000,
+            "expires_at": 1_012,
+        }
+
+        with mock.patch.object(manager_module.time, "time", return_value=2_000.0):
+            self.assertEqual(
+                instance.set_fan_temperature_override(override), {"applied": True},
+            )
+        instance._set_fan_temperature_override.assert_called_once_with({
+            **override,
+            "temperature_c": 78.0,
+            "observed_at": 1_000.0,
+            "expires_at": 2_012.0,
+        })
+
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            instance.set_fan_temperature_override({**override, "extra": True})
 
 
 class FanControlClusterTests(unittest.IsolatedAsyncioTestCase):
@@ -332,6 +370,124 @@ class FanControlClusterTests(unittest.IsolatedAsyncioTestCase):
         instance.node_registry.request.assert_awaited_once_with(
             "worker-1", "PATCH", "/api/agent/fan-control/max-speed",
             json_body={"enabled": True},
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_cluster_temperature_is_pushed_to_remote_fan_controller(self) -> None:
+        instance = Manager.__new__(Manager)
+        remote_fan = self.live_fan(1_000.0)
+        instance.settings = {"cluster_node_name": "Controller"}
+        instance.get_stats = mock.AsyncMock(return_value={
+            "ts": 1_000.0,
+            "cpu_temp_c": 45.0,
+            "gpus": [{"temp_c": 50.0}],
+            "fan": None,
+        })
+        instance.node_registry = mock.Mock()
+        instance.node_registry.nodes = [{"id": "worker-1"}, {"id": "worker-2"}]
+        instance.node_registry.probe = mock.AsyncMock(side_effect=[
+            {
+                "id": "worker-1",
+                "name": "Fan worker",
+                "online": True,
+                "capabilities": [manager_module.FAN_TEMPERATURE_OVERRIDE_CAPABILITY],
+                "stats": {
+                    "ts": 1_000.0,
+                    "cpu_temp_c": 55.0,
+                    "gpus": [{"temp_c": 60.0}],
+                    "fan": remote_fan,
+                },
+            },
+            {
+                "id": "worker-2",
+                "name": "Hot worker",
+                "online": True,
+                "stats": {
+                    "ts": 1_000.0,
+                    "cpu_temp_c": 72.0,
+                    "gpus": [{"temp_c": 81.0}],
+                    "fan": None,
+                },
+            },
+        ])
+        instance.node_registry.request = mock.AsyncMock(return_value={"applied": True})
+        instance._record_remote_temperature_sample = mock.Mock()
+        instance._set_fan_temperature_override = mock.Mock()
+
+        with mock.patch.object(manager_module.time, "time", return_value=1_001.0):
+            await instance._fan_cluster_temperature_tick()
+
+        instance._set_fan_temperature_override.assert_not_called()
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "PATCH", "/api/agent/fan-control/temperature-override",
+            json_body={"temperature_override": {
+                "temperature_c": 81.0,
+                "source": "vllm-cluster-max",
+                "sensor": "gpu:0",
+                "node_id": "worker-2",
+                "node_name": "Hot worker",
+                "observed_at": 1_000.0,
+                "expires_at": 1_013.0,
+            }},
+            timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_cluster_temperature_still_updates_local_fan_controller(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"cluster_node_name": "Controller"}
+        instance.get_stats = mock.AsyncMock(return_value={
+            "ts": 1_000.0,
+            "cpu_temp_c": 68.0,
+            "gpus": [{"temp_c": 74.0}],
+            "fan": self.live_fan(1_000.0),
+        })
+        instance.node_registry = mock.Mock()
+        instance.node_registry.nodes = []
+        instance._set_fan_temperature_override = mock.Mock()
+
+        with mock.patch.object(manager_module.time, "time", return_value=1_001.0):
+            await instance._fan_cluster_temperature_tick()
+
+        instance._set_fan_temperature_override.assert_called_once_with({
+            "temperature_c": 74.0,
+            "source": "vllm-cluster-max",
+            "sensor": "gpu:0",
+            "node_id": "local",
+            "node_name": "Controller",
+            "observed_at": 1_000.0,
+            "expires_at": 1_013.0,
+        })
+        instance.node_registry.request.assert_not_called()
+
+    async def test_cluster_temperature_clears_remote_override_without_fresh_samples(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.settings = {"cluster_node_name": "Controller"}
+        instance.get_stats = mock.AsyncMock(return_value={
+            "ts": 900.0, "cpu_temp_c": 90.0, "gpus": [], "fan": None,
+        })
+        instance.node_registry = mock.Mock()
+        instance.node_registry.nodes = [{"id": "worker-1"}]
+        instance.node_registry.probe = mock.AsyncMock(return_value={
+            "id": "worker-1",
+            "name": "Fan worker",
+            "online": True,
+            "capabilities": [manager_module.FAN_TEMPERATURE_OVERRIDE_CAPABILITY],
+            "stats": {
+                "ts": 900.0,
+                "cpu_temp_c": 95.0,
+                "gpus": [],
+                "fan": self.live_fan(1_000.0),
+            },
+        })
+        instance.node_registry.request = mock.AsyncMock(return_value={"applied": True})
+        instance._record_remote_temperature_sample = mock.Mock()
+
+        with mock.patch.object(manager_module.time, "time", return_value=1_001.0):
+            await instance._fan_cluster_temperature_tick()
+
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "PATCH", "/api/agent/fan-control/temperature-override",
+            json_body={"temperature_override": None},
             timeout=manager_module.FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
         )
 

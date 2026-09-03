@@ -170,6 +170,48 @@ class FanControlApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accepted.status_code, 200)
         update.assert_called_once_with(False)
 
+    async def test_agent_temperature_override_requires_auth_and_exact_payload(self) -> None:
+        override = {
+            "temperature_c": 81.0,
+            "source": "vllm-cluster-max",
+            "sensor": "gpu:0",
+            "node_id": "worker-1",
+            "node_name": "Hot worker",
+            "observed_at": 1_000.0,
+            "expires_at": 1_012.0,
+        }
+        update = Mock(return_value={"applied": True})
+        with patch.object(
+            server.manager.agent_credentials, "authorize_controller", return_value=False,
+        ):
+            unauthorized = await self.client.patch(
+                "/api/agent/fan-control/temperature-override",
+                json={"temperature_override": override},
+            )
+        with (
+            patch.object(
+                server.manager.agent_credentials,
+                "authorize_controller",
+                return_value=True,
+            ),
+            patch.object(server.manager, "set_fan_temperature_override", update),
+        ):
+            invalid = await self.client.patch(
+                "/api/agent/fan-control/temperature-override",
+                headers={"authorization": "Bearer paired"},
+                json={"temperature_override": override, "extra": True},
+            )
+            accepted = await self.client.patch(
+                "/api/agent/fan-control/temperature-override",
+                headers={"authorization": "Bearer paired"},
+                json={"temperature_override": override},
+            )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(accepted.status_code, 200)
+        update.assert_called_once_with(override)
+
     async def test_agent_settings_update_requires_auth_and_forwards_exact_fields(self) -> None:
         curve = {
             "curve_points": [[30, 20], [60, 55]],

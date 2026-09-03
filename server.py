@@ -744,6 +744,22 @@ async def agent_set_fan_max_speed(req: Request):
         raise HTTPException(500, f"could not update FanController: {exc}") from exc
 
 
+@app.patch("/api/agent/fan-control/temperature-override")
+async def agent_set_fan_temperature_override(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"temperature_override"}:
+            raise ValueError("request body must contain only temperature_override")
+        return manager.set_fan_temperature_override(body["temperature_override"])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FanSettingsConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not update FanController: {exc}") from exc
+
+
 @app.patch("/api/agent/fan-control/settings")
 async def agent_update_fan_settings(req: Request):
     _require_agent(req)

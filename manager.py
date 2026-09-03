@@ -328,6 +328,7 @@ FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS = 15.0
 FAN_STATE_MAX_AGE_SECONDS = 30.0
 FAN_STATE_MAX_FUTURE_SKEW_SECONDS = 5.0
 FAN_CONTROL_AGENT_TIMEOUT_SECONDS = 5.0
+FAN_TEMPERATURE_OVERRIDE_CAPABILITY = "fan-temperature-override-v1"
 
 # Remote controller calls must cover each worker-side RouterOS request phase
 # plus agent transport/serialization overhead. An overview has three phases
@@ -1072,6 +1073,7 @@ class Manager:
                 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
+                FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -7036,8 +7038,10 @@ class Manager:
             if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
                 continue
             observed_at = float(observed_at)
+            age = current_time - observed_at
             if (not math.isfinite(observed_at)
-                    or current_time - observed_at > FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS):
+                    or age < -FAN_STATE_MAX_FUTURE_SKEW_SECONDS
+                    or age > FAN_TEMPERATURE_MAX_SAMPLE_AGE_SECONDS):
                 continue
             samples: list[tuple[float, str]] = []
 
@@ -7074,10 +7078,52 @@ class Manager:
         else:
             self._update_fan_control({"temperature_override": override})
 
-    async def _fan_cluster_temperature_tick(self) -> None:
-        # Only the controller attached to a live FanController should publish.
+    def set_fan_temperature_override(self, override: Any) -> dict:
+        """Apply a controller-authenticated cluster temperature locally."""
         if self._read_fan_state() is None:
-            return
+            raise FanSettingsConflict("FanController state is unavailable")
+        if override is None:
+            self._set_fan_temperature_override(None)
+            return {"applied": True}
+        if not isinstance(override, dict):
+            raise ValueError("temperature_override must be an object or null")
+        expected = {
+            "temperature_c", "source", "sensor", "node_id", "node_name",
+            "observed_at", "expires_at",
+        }
+        if set(override) != expected:
+            raise ValueError("temperature_override has invalid fields")
+
+        def number(key: str) -> float:
+            value = override.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"temperature_override.{key} must be a number")
+            result = float(value)
+            if not math.isfinite(result):
+                raise ValueError(f"temperature_override.{key} must be finite")
+            return result
+
+        temperature_c = number("temperature_c")
+        if not -40 <= temperature_c <= 150:
+            raise ValueError("temperature_override.temperature_c is out of range")
+        observed_at = number("observed_at")
+        number("expires_at")
+        normalized: dict[str, Any] = {
+            "temperature_c": temperature_c,
+            "observed_at": observed_at,
+            # Expiry is a worker-local safety lease. Do not trust or reuse the
+            # controller's absolute clock when the fan daemon evaluates it.
+            "expires_at": time.time() + FAN_TEMPERATURE_OVERRIDE_TTL_SECONDS,
+        }
+        for key in ("source", "sensor", "node_id", "node_name"):
+            value = override.get(key)
+            if not isinstance(value, str) or not value or len(value) > 200:
+                raise ValueError(f"temperature_override.{key} must be a non-empty string")
+            normalized[key] = value
+        self._set_fan_temperature_override(normalized)
+        return {"applied": True}
+
+    async def _fan_cluster_temperature_tick(self) -> None:
         local_stats = await self.get_stats()
         nodes = [{
             "id": LOCAL_NODE_ID,
@@ -7093,9 +7139,33 @@ class Manager:
         for node in nodes:
             if node.get("id") != LOCAL_NODE_ID:
                 self._record_remote_temperature_sample(node)
-        self._set_fan_temperature_override(
-            self._cluster_temperature_override(nodes),
+        override = self._cluster_temperature_override(nodes)
+
+        async def publish(node: dict) -> None:
+            if self._sanitize_fan_state((node.get("stats") or {}).get("fan")) is None:
+                return
+            node_id = str(node.get("id") or "")
+            if node_id == LOCAL_NODE_ID:
+                self._set_fan_temperature_override(override)
+                return
+            if FAN_TEMPERATURE_OVERRIDE_CAPABILITY not in (
+                node.get("capabilities") or []
+            ):
+                return
+            await self.node_registry.request(
+                node_id, "PATCH", "/api/agent/fan-control/temperature-override",
+                json_body={"temperature_override": override},
+                timeout=FAN_CONTROL_AGENT_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(publish(node) for node in nodes), return_exceptions=True,
         )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise RuntimeError(
+                f"could not update {len(failures)} FanController node(s): {failures[0]}"
+            )
 
     async def _fan_cluster_monitor_loop(self) -> None:
         while True:

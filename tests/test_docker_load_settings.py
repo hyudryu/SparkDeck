@@ -707,18 +707,20 @@ class DockerLoadSettingsTests(unittest.IsolatedAsyncioTestCase):
             "Devices": None,
         }}
 
-        self.assertEqual(
-            self.manager._container_topology_options_are_replayable(empty),
-            (True, False),
-        )
-        self.assertEqual(
-            self.manager._container_topology_options_are_replayable(distributed),
-            (False, True),
-        )
-        self.assertEqual(
-            self.manager._container_topology_options_are_replayable(stack),
-            (False, False),
-        )
+        with mock.patch("manager.Path") as path:
+            path.return_value.exists.return_value = False
+            self.assertEqual(
+                self.manager._container_topology_options_are_replayable(empty),
+                (True, False),
+            )
+            self.assertEqual(
+                self.manager._container_topology_options_are_replayable(distributed),
+                (False, True),
+            )
+            self.assertEqual(
+                self.manager._container_topology_options_are_replayable(stack),
+                (False, False),
+            )
 
     def test_distributed_topology_requires_managed_infiniband_mapping(self):
         attrs = {"HostConfig": {

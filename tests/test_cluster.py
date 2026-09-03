@@ -3353,25 +3353,27 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             instance._cli_option(preview["flags"], {"--dtype"}), "bfloat16",
         )
 
-    def test_unrelated_controls_do_not_repair_missing_speculative_environment(
+    def test_submitted_empty_controls_remove_missing_speculative_environment(
         self,
     ) -> None:
         instance = Manager.__new__(Manager)
 
-        with self.assertRaisesRegex(
-            ValueError, "references undefined environment variable SPECULATIVE_CONFIG",
-        ):
-            instance._apply_deployment_launch_controls(
-                ["--speculative-config", "${SPECULATIVE_CONFIG}"],
-                "vllm",
-                {
-                    "context_window": 65536,
-                    "speculative_method": None,
-                    "draft_sample_method": None,
-                    "dspark_num_speculative_tokens": None,
-                },
-                {},
-            )
+        updated = instance._apply_deployment_launch_controls(
+            ["--speculative-config", "${SPECULATIVE_CONFIG}"],
+            "vllm",
+            {
+                "context_window": 65536,
+                "speculative_method": None,
+                "draft_sample_method": None,
+                "dspark_num_speculative_tokens": None,
+            },
+            {},
+        )
+
+        self.assertNotIn("--speculative-config", updated)
+        self.assertEqual(
+            instance._cli_option(updated, {"--max-model-len"}), "65536",
+        )
 
     def test_launch_controls_reject_invalid_environment_backed_speculative_config(
         self,

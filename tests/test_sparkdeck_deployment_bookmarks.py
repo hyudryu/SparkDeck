@@ -154,6 +154,48 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(private["container_name"])
         self.assertIsNone(private.get("_base_url"))
 
+    async def test_clone_discovered_container_as_editable_stopped_bookmark(self):
+        self.manager.list_containers.return_value = [{
+            "name": "deepseek-v4", "alias": "DeepSeek V4",
+            "model": "org/deepseek-v4", "engine": "vllm",
+            "image": "example/dspark:pinned", "variant": "fp8",
+            "served_model": "deepseek-v4", "port": 8002,
+            "load_settings": {
+                "editable": True,
+                "extra_args": [
+                    "--enable-prefix-caching",
+                    "--speculative-config", "${SPECULATIVE_CONFIG}",
+                ],
+                "environment": {
+                    "NCCL_DEBUG": "WARN",
+                    "SPECULATIVE_CONFIG": (
+                        '{"method":"dspark","num_speculative_tokens":6}'
+                    ),
+                },
+                "context_window": 1048576,
+                "max_concurrency": 6,
+                "tensor_parallel_size": 4,
+            },
+        }]
+
+        cloned = await self.service.clone_deployment("container:deepseek-v4")
+
+        self.assertEqual(cloned["alias"], "(Copy) DeepSeek V4")
+        self.assertEqual(cloned["kind"], "managed")
+        self.assertEqual(cloned["status"], "saved")
+        self.assertEqual(cloned["desired_state"], "stopped")
+        self.assertEqual(cloned["model"]["repository"], "org/deepseek-v4")
+        self.assertEqual(cloned["settings"]["image"], "example/dspark:pinned")
+        self.assertEqual(cloned["settings"]["node_ids"], [])
+        self.assertEqual(cloned["settings"]["deployment_mode"], "sharded")
+        self.assertEqual(cloned["settings"]["tensor_parallel_size"], 4)
+        self.assertEqual(
+            cloned["settings"]["environment"]["SPECULATIVE_CONFIG"],
+            '{"method":"dspark","num_speculative_tokens":6}',
+        )
+        self.assertNotIn("source_container_name", cloned["settings"])
+        self.assertEqual(cloned["required_node_count"], 4)
+
     async def test_clone_uses_current_manager_argv_instead_of_stale_controls(self):
         current_args = [
             "--max-model-len", "400000",

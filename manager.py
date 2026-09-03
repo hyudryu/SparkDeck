@@ -4093,19 +4093,17 @@ class Manager:
                     current_tokens, {"--speculative-config"}
                 )
                 environment_key = self._environment_reference(raw_speculative)
-                submitted_speculative_value = any(
-                    controls.get(key) not in (None, "")
-                    for key in speculative_keys
-                )
                 if (
                     environment_key
                     and environment is not None
                     and environment_key not in environment
-                    and submitted_speculative_value
                 ):
-                    # The structured controls are sufficient to create a new
-                    # environment-backed config. Do not reject the missing
-                    # value before those submitted controls can populate it.
+                    # The editor submits the complete speculative control set.
+                    # Treat a dangling environment reference as an empty config:
+                    # populated controls recreate the value, while an all-empty
+                    # set removes the unusable flag. Either outcome lets an
+                    # unrelated settings edit repair an older container whose
+                    # referenced variable was never persisted.
                     speculative = {}
                 else:
                     speculative, environment_key = self._speculative_config(

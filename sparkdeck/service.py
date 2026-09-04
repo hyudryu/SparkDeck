@@ -23,7 +23,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
@@ -2502,16 +2502,7 @@ class SparkDeckService:
             and len(effective_nodes) < 2
         ):
             raise ValueError("sharded deployment requires at least two nodes")
-        model_repository = str(
-            (stored.get("model") or {}).get("repository") or ""
-        ).strip()
-        await self._assert_deployment_alias_available(
-            alias,
-            stored["id"],
-            reserved_selectors=self._managed_deployment_reserved_selectors(
-                model_repository, settings,
-            ),
-        )
+        await self._assert_deployment_alias_available(alias, stored["id"])
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
                 stored["id"], self._local_configuration(settings), alias,
@@ -2933,19 +2924,22 @@ class SparkDeckService:
         # deadlock with reconciliation and a rename cannot claim the alias while
         # creation is between its inventory check and durable persistence.
         async with self._deployment_create_lock, self._deployment_alias_lock:
-            reserved_selectors: list[str] = []
-            if kind is DeploymentKind.MANAGED:
-                # A managed runtime can be selected by its backing repository
-                # as well as any explicit --served-model-name values. Reserve
-                # those future request ids before persisting the bookmark so a
-                # friendly alias on an existing (including discovered)
-                # deployment cannot be silently shadowed when this one starts.
-                reserved_selectors.extend(
-                    self._managed_deployment_reserved_selectors(model, settings)
-                )
-            await self._assert_deployment_alias_available(
-                alias, deployment_id, reserved_selectors=reserved_selectors,
-            )
+            # Multiple profiles of one model are routine (TP2 and TP4, for
+            # example), so records may share repository and served selectors;
+            # start-time arbitration rejects conflicting live launches. Only
+            # the display alias must be unique, and a taken alias is resolved
+            # by suffixing instead of failing the request.
+            alias = await self._next_available_deployment_alias(alias)
+            await self._assert_deployment_alias_available(alias, deployment_id)
+            if launch:
+                # Create-with-launch is a start: its request ids must not
+                # collide with an already live deployment. The guard and the
+                # launch registrations below share this critical section, so
+                # a concurrent start cannot slip between them.
+                await self._assert_deployment_start_selectors({
+                    "id": deployment_id, "alias": alias, "kind": kind.value,
+                    "model": {"repository": model}, "settings": settings,
+                })
             artifact_is_local = False
             model_is_local_path = False
             artifact_homes: list[str] | None = None
@@ -3152,7 +3146,7 @@ class SparkDeckService:
             # that this controller may own a managed workload.
             deployment.container_name = cleanup_name
             launch_complete = asyncio.Event()
-            self._deployment_launches[deployment_id] = launch_complete
+            self._deployment_launches.setdefault(deployment_id, launch_complete)
             try:
                 self.store.add_deployment(deployment, None, None)
                 try:
@@ -3345,7 +3339,9 @@ class SparkDeckService:
         cleanup_name = safe_container_name(record.alias, deployment_id)
         record.container_name = cleanup_name
         launch_complete = asyncio.Event()
-        self._deployment_launches[deployment_id] = launch_complete
+        # deployment_action registered the in-flight marker before calling
+        # this launch; reuse it so waiters hold the same event object.
+        self._deployment_launches.setdefault(deployment_id, launch_complete)
         try:
             launched = await launch_managed_container(
                 self.manager, adapter, deployment_id, record.alias, model,
@@ -3491,7 +3487,7 @@ class SparkDeckService:
         """Persist a public card, then continue the slow launch in background."""
         launch_complete = asyncio.Event()
         self.store.add_deployment(deployment, None, None)
-        self._deployment_launches[deployment.id] = launch_complete
+        self._deployment_launches.setdefault(deployment.id, launch_complete)
         persisted = asyncio.get_running_loop().create_future()
 
         def consume_persisted_error(future: asyncio.Future) -> None:
@@ -3867,9 +3863,26 @@ class SparkDeckService:
                 raise RuntimeError(
                     "deployment launch is still in progress; wait for container creation"
                 )
-            return await self._deployment_action_locked(
-                deployment_id, action, node_ids, additional_node_ids, promote,
-            )
+            if action != "start":
+                return await self._deployment_action_locked(
+                    deployment_id, action, node_ids, additional_node_ids, promote,
+                )
+            # Selector arbitration and the in-flight registration are one
+            # step: the guard reads other records' live selectors, so a
+            # concurrent start could otherwise slip between check and
+            # registration and publish a duplicate model id. The registration
+            # also lets deletion wait for the launch to settle.
+            async with self._deployment_alias_lock:
+                await self._assert_start_action_selectors(deployment_id)
+                self._deployment_launches.setdefault(
+                    deployment_id, asyncio.Event(),
+                )
+            try:
+                return await self._deployment_action_locked(
+                    deployment_id, action, node_ids, additional_node_ids, promote,
+                )
+            finally:
+                self._deployment_launches.pop(deployment_id, None)
 
     @asynccontextmanager
     async def _deployment_lifecycle_lock(
@@ -5799,51 +5812,123 @@ class SparkDeckService:
         return selectors
 
     async def _assert_deployment_alias_available(
-        self, alias: str, deployment_id: str, *,
-        reserved_selectors: Iterable[str] = (),
+        self, alias: str, deployment_id: str,
     ) -> None:
-        requested: list[tuple[str, str]] = [(alias, "alias")]
-        seen = {alias.casefold()}
-        for raw_selector in reserved_selectors:
-            selector = str(raw_selector).strip()
-            folded = selector.casefold()
-            if not selector or folded in seen:
-                continue
-            seen.add(folded)
-            requested.append((selector, "selector"))
+        """Display aliases stay unique across the whole deployment catalog.
+
+        Repository and served selectors are deliberately not checked here:
+        multiple records may target the same model, and conflicts between
+        live launches are rejected by ``_assert_deployment_start_selectors``
+        when a start is requested.
+        """
+        folded = alias.casefold()
         for item in await self.deployments():
             if str(item.get("id") or "") == deployment_id:
                 continue
-            public_ids = self._deployment_public_model_ids(item)
-            if item.get("status") == "saved":
-                repository = str(
-                    (item.get("model") or {}).get("repository") or ""
-                ).strip()
-                if repository:
-                    public_ids.append(repository)
             identity_occupied = {
                 str(item.get("id") or "").casefold(),
                 str(item.get("alias") or "").casefold(),
             }
+            if folded in identity_occupied:
+                raise ValueError(f"deployment alias '{alias}' is already in use")
+
+    async def _next_available_deployment_alias(self, base: str) -> str:
+        """Return ``base``, suffixed -2, -3, ... until the alias is free.
+
+        Creation never fails on a taken alias: multiple profiles of one
+        model are routine, and the display alias is the only namespace
+        creation must keep unique.
+        """
+        occupied: set[str] = set()
+        for item in await self.deployments():
+            occupied.add(str(item.get("id") or "").strip().casefold())
+            occupied.add(str(item.get("alias") or "").strip().casefold())
+        base = base.strip()
+        if base.casefold() not in occupied:
+            return base
+        for index in range(2, 101):
+            candidate = f"{base}-{index}"
+            if candidate.casefold() not in occupied:
+                return candidate
+        return f"{base}-{uuid.uuid4().hex[:8]}"
+
+    async def _assert_start_action_selectors(self, deployment_id: str) -> None:
+        """Resolve the record a start action targets, then arbitrate selectors."""
+        stored = self.store.deployment(deployment_id, include_private=True)
+        if not stored and deployment_id.startswith("container:"):
+            container = await self._resolve_discovered_container(deployment_id)
+            stored = self._discovered_deployment(
+                container,
+                self._container_runtime(container),
+                container.get("model") or container.get("served_model"),
+            )
+        if stored:
+            await self._assert_deployment_start_selectors(stored)
+
+    async def _assert_deployment_start_selectors(
+        self, deployment: dict[str, Any],
+    ) -> None:
+        """Reject a launch whose request ids are already published live.
+
+        Records may share repository and served selectors while saved or
+        stopped; the conflict only matters once two launches would answer at
+        the same time and a bare model id could no longer be routed
+        unambiguously. External endpoints are skipped: SparkDeck does not
+        launch them and cannot derive their served names.
+        """
+        if str(deployment.get("kind") or "") != DeploymentKind.MANAGED.value:
+            return
+        requested: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        candidates: list[tuple[str, str]] = [
+            (str(deployment.get("alias") or ""), "alias"),
+            *(
+                (str(item), "selector")
+                for item in self._managed_deployment_reserved_selectors(
+                    str((deployment.get("model") or {}).get("repository") or ""),
+                    dict(deployment.get("settings") or {}),
+                )
+            ),
+        ]
+        for selector, label in candidates:
+            folded = selector.strip().casefold()
+            if not selector.strip() or folded in seen:
+                continue
+            seen.add(folded)
+            requested.append((selector.strip(), label))
+        if not requested:
+            return
+        for item in await self.deployments():
+            item_id = str(item.get("id") or "")
+            if item_id == str(deployment.get("id")):
+                continue
+            if (
+                item_id not in self._deployment_launches
+                and str(item.get("status") or "") not in {"running", "starting"}
+                and str(item.get("desired_state") or "") != "running"
+            ):
+                continue
+            item_alias = str(item.get("alias") or "")
+            public_ids = self._deployment_public_model_ids(item)
+            if public_ids == ([item_alias] if item_alias else []):
+                # A live record without configured served names publishes its
+                # repository id (the runtime default request id) alongside
+                # its alias.
+                repository = str(
+                    (item.get("model") or {}).get("repository") or ""
+                ).strip()
+                if repository:
+                    public_ids = [*public_ids, repository]
             occupied = {
-                *identity_occupied,
+                item_alias.casefold(),
                 *(str(value).casefold() for value in public_ids),
             }
             for selector, label in requested:
-                # Multiple saved launch profiles may intentionally target the
-                # same repository (for example TP2 and TP4). Only the display
-                # alias must be unique across the full public namespace. A
-                # prospective served selector must still respect the public
-                # ids owned by live and discovered deployments; the exemption
-                # applies only between saved profiles that have not launched.
-                selector_occupied = (
-                    identity_occupied
-                    if label == "selector" and item.get("status") == "saved"
-                    else occupied
-                )
-                if selector.casefold() in selector_occupied:
+                if selector.casefold() in occupied:
                     raise ValueError(
-                        f"deployment {label} '{selector}' is already in use"
+                        f"deployment {label} '{selector}' is already served by "
+                        f"running deployment '{item.get('alias')}'; stop it "
+                        "first or choose a different served model name"
                     )
 
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:

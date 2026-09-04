@@ -743,7 +743,7 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already in use", response.json()["detail"])
         rename.assert_not_awaited()
 
-    async def test_rename_discovered_container_rejects_saved_repository_conflict(self):
+    async def test_rename_discovered_container_may_share_saved_repository(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
             "kind": "external", "model": {"repository": "org/model"},
@@ -770,16 +770,18 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.sparkdeck, "_owning_cluster_deployment", Mock(return_value=None)),
             patch.object(server.manager, "update_container_alias", rename),
         ):
+            # Records coexist: the display alias may adopt a repository a
+            # saved profile targets. The saved profile's start is what gets
+            # arbitrated against live deployments.
             response = await self.client.patch(
                 "/api/v1/deployments/container:vllm-dspark",
                 json={"alias": "ORG/FUTURE-MODEL"},
             )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("already in use", response.json()["detail"])
-        rename.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        rename.assert_awaited_once_with("vllm-dspark", "ORG/FUTURE-MODEL")
 
-    async def test_rename_discovered_container_rejects_saved_served_name_conflict(self):
+    async def test_rename_discovered_container_may_share_saved_served_name(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
             "kind": "external", "model": {"repository": "org/model"},
@@ -811,11 +813,10 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
                 json={"alias": "FUTURE-PUBLIC-NAME"},
             )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("already in use", response.json()["detail"])
-        rename.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        rename.assert_awaited_once_with("vllm-dspark", "FUTURE-PUBLIC-NAME")
 
-    async def test_rename_discovered_container_rejects_public_model_id_conflict(self):
+    async def test_rename_discovered_container_may_share_live_public_model_id(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",
             "kind": "external", "model": {"repository": "org/model"},
@@ -845,9 +846,8 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
                 json={"alias": "PUBLIC-VISION-MODEL"},
             )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("already in use", response.json()["detail"])
-        rename.assert_not_awaited()
+        self.assertEqual(response.status_code, 200)
+        rename.assert_awaited_once_with("vllm-dspark", "PUBLIC-VISION-MODEL")
 
     async def test_rename_discovered_container_rejects_cluster_member(self):
         rename = AsyncMock()

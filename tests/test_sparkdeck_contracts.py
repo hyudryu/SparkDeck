@@ -246,26 +246,23 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
                 "settings": {"artifact": "~/absent.gguf"},
             })
 
-    async def test_duplicate_alias_is_rejected_before_gguf_preparation(self):
+    async def test_duplicate_alias_is_suffixed_before_gguf_preparation(self):
         self.service.store.add_deployment(Deployment(
             id="existing", alias="duplicate", runtime=RuntimeKind.LLAMA_CPP,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/existing"),
         ))
         prepare = AsyncMock()
 
-        with (
-            patch.object(
-                self.service, "_prepare_public_gguf_artifact", prepare,
-            ),
-            self.assertRaisesRegex(ValueError, "alias 'duplicate' is already in use"),
-        ):
-            await self.service.create_deployment({
+        with patch.object(self.service, "_prepare_public_gguf_artifact", prepare):
+            created = await self.service.create_deployment({
                 "model": "org/model", "alias": "duplicate",
                 "runtime": "llama.cpp",
                 "settings": {"artifact": "model.gguf"},
             })
 
         prepare.assert_not_awaited()
+        self.assertEqual(created["alias"], "duplicate-2")
+        self.assertIsNotNone(self.service.store.deployment("duplicate-2"))
 
     async def test_absolute_local_gguf_remains_local(self):
         artifact = Path(self.temp.name) / "local.gguf"

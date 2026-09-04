@@ -122,6 +122,34 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress["launch_phase"], "stopping")
         self.assertEqual(progress["launch_message"], "Stopping deployment")
 
+    def test_transition_status_message_surfaces_on_launch_progress(self):
+        deployment = {
+            "status": "starting",
+            "status_message": (
+                "Recreating containers: their environment no longer matches "
+                "the saved launch settings (rank-0)"
+            ),
+            "members": [
+                {"rank": 0, "phase": {"phase": "queued", "message": "Waiting"}},
+            ],
+        }
+        progress = _deployment_launch_progress(deployment)
+        self.assertEqual(progress["launch_phase"], "starting")
+        self.assertIn("Recreating containers", progress["launch_message"])
+
+        # A message on a card in any other state must not mask member phases.
+        deployment["status"] = "running"
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_phase"], "queued",
+        )
+
+        # Recovery keeps its honest phase name while explaining the wait.
+        deployment["status"] = "recovering"
+        self.assertEqual(
+            _deployment_launch_progress(deployment)["launch_phase"],
+            "recovering",
+        )
+
     async def test_discovered_legacy_managed_container_is_actionable(self):
         self.manager.list_containers.return_value = [{
             "name": "legacy-model", "model": "org/model", "engine": "vllm",

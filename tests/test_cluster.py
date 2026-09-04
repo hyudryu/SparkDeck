@@ -4493,6 +4493,248 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(launched[0]["port"], 8000)
             self.assertEqual([d["id"] for d in instance.deployments], ["deployment-new"])
 
+    async def test_starting_deployment_with_drifted_environment_recreates_ranks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Drifted cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "members": [{"node_id": "local", "container_name": "old-r0"}],
+                "launch_settings": {
+                    "deployment_name": "Drifted cluster",
+                    "model": "example/Model",
+                    "engine": "vllm",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": [],
+                    "environment": {"VLLM_CACHE_ROOT": "/cache/vllm"},
+                    "port": 8000,
+                },
+            }
+            instance.deployments = [old]
+            removed = []
+            launched = []
+
+            async def member_action(member, action):
+                removed.append((member["container_name"], action))
+                return {"ok": True}
+
+            async def create_deployment(body):
+                launched.append(body)
+                replacement = {
+                    "id": "deployment-new", "status": "starting", "members": [],
+                }
+                instance.deployments.append(replacement)
+                return replacement
+
+            instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
+            instance.create_deployment = create_deployment
+            instance._deployment_environment_drift = mock.AsyncMock(return_value={
+                "old-r0": ["missing:VLLM_CACHE_ROOT"],
+            })
+
+            result = await instance.deployment_action("deployment-old", "start")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(removed, [("old-r0", "remove")])
+            self.assertEqual(len(launched), 1)
+            self.assertEqual(
+                instance._deployment_environment_drift.await_count, 1,
+            )
+            self.assertIn("old-r0", old["status_message"] or "")
+            self.assertIn(
+                "Recreated containers", result["deployment"]["status_message"],
+            )
+            self.assertEqual(
+                [d["id"] for d in instance.deployments], ["deployment-new"],
+            )
+
+    async def test_starting_deployment_skips_recreation_when_environment_matches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-1",
+                "name": "Stable cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "members": [{"node_id": "local", "container_name": "rank-0"}],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                    "environment": {"VLLM_CACHE_ROOT": "/cache/vllm"},
+                },
+            }
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+            instance._deployment_environment_drift = mock.AsyncMock(return_value=None)
+
+            result = await instance.deployment_action("deployment-1", "start")
+
+            self.assertTrue(result["ok"])
+            instance._member_action.assert_awaited_once_with(
+                deployment["members"][0], "start",
+            )
+            instance.create_deployment.assert_not_awaited()
+            self.assertEqual(deployment["status"], "starting")
+            self.assertIsNone(deployment.get("status_message"))
+
+    async def test_environment_drift_degrades_to_plain_start_when_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            deployment = {
+                "id": "deployment-1",
+                "name": "Offline cluster",
+                "model": "example/Model",
+                "engine": "vllm",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "members": [{"node_id": "local", "container_name": "rank-0"}],
+                "launch_settings": {
+                    "model": "example/Model", "engine": "vllm",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [],
+                    "environment": {"VLLM_CACHE_ROOT": "/cache/vllm"},
+                },
+            }
+            instance.deployments = [deployment]
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock()
+            instance._deployment_environment_drift = mock.AsyncMock(
+                side_effect=RuntimeError("docker unavailable"),
+            )
+
+            result = await instance.deployment_action("deployment-1", "start")
+
+            self.assertTrue(result["ok"])
+            instance._member_action.assert_awaited_once_with(
+                deployment["members"][0], "start",
+            )
+            instance.create_deployment.assert_not_awaited()
+
+    async def test_deployment_environment_drift_aggregates_member_reports(self) -> None:
+        instance = Manager.__new__(Manager)
+        deployment = {
+            "id": "deployment-1",
+            "engine": "vllm",
+            "members": [
+                {"node_id": "local", "container_name": "rank-0"},
+                {"node_id": "worker-1", "container_name": "rank-1"},
+            ],
+            "launch_settings": {
+                "engine": "vllm",
+                "environment": {"VLLM_CACHE_ROOT": "/cache/vllm"},
+            },
+        }
+
+        async def local_drift(name, expected):
+            self.assertEqual(expected, {"VLLM_CACHE_ROOT": "/cache/vllm"})
+            return {"ok": False, "missing": ["VLLM_CACHE_ROOT"], "changed": []}
+
+        instance.container_environment_drift = local_drift
+        instance.node_registry = mock.Mock()
+        instance.node_registry.request = mock.AsyncMock(
+            return_value={"ok": True, "missing": [], "changed": []}
+        )
+
+        drifted = await instance._deployment_environment_drift(deployment)
+
+        self.assertEqual(drifted, {"rank-0": ["missing:VLLM_CACHE_ROOT"]})
+        instance.node_registry.request.assert_awaited_once_with(
+            "worker-1", "POST",
+            "/api/agent/containers/rank-1/environment/check",
+            json_body={"environment": {"VLLM_CACHE_ROOT": "/cache/vllm"}},
+            timeout=60,
+        )
+
+        # One unreachable member degrades the whole check so start keeps its
+        # plain docker-start behavior.
+        instance.node_registry.request = mock.AsyncMock(
+            side_effect=RuntimeError("node offline"),
+        )
+        self.assertIsNone(await instance._deployment_environment_drift(deployment))
+
+    async def test_deployment_environment_drift_ignores_non_vllm_and_empty_settings(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        for deployment in (
+            {"engine": "sglang", "members": [], "launch_settings": {
+                "engine": "sglang", "environment": {"ANY": "1"},
+            }},
+            {"engine": "vllm", "members": [], "launch_settings": {
+                "engine": "vllm", "environment": {},
+            }},
+            {"engine": "vllm", "members": [], "launch_settings": None},
+        ):
+            self.assertIsNone(
+                await instance._deployment_environment_drift(deployment),
+            )
+
+    async def test_container_environment_drift_compares_only_expected_names(
+        self,
+    ) -> None:
+        instance = Manager.__new__(Manager)
+        container = mock.Mock()
+        container.attrs = {
+            "Config": {"Env": ["VLLM_CACHE_ROOT=/cache/vllm", "PATH=/usr/bin"]},
+        }
+        instance.client = mock.Mock()
+        instance.client.containers.get.return_value = container
+
+        self.assertEqual(
+            await instance.container_environment_drift(
+                "rank-0", {"VLLM_CACHE_ROOT": "/cache/vllm"},
+            ),
+            {"ok": True, "missing": [], "changed": []},
+        )
+        self.assertEqual(
+            await instance.container_environment_drift(
+                "rank-0",
+                {"VLLM_CACHE_ROOT": "/cache/vllm", "NCCL_NET": "IB"},
+            ),
+            {"ok": False, "missing": ["NCCL_NET"], "changed": []},
+        )
+        self.assertEqual(
+            await instance.container_environment_drift(
+                "rank-0",
+                {"VLLM_CACHE_ROOT": "/other", "NCCL_NET": "IB"},
+            ),
+            {"ok": False, "missing": ["NCCL_NET"], "changed": ["VLLM_CACHE_ROOT"]},
+        )
+        instance.client.containers.get.assert_called_with("rank-0")
+
+        with self.assertRaisesRegex(ValueError, "environment must be an object"):
+            await instance.container_environment_drift("rank-0", {"A": 1})
+        instance.client.containers.get.side_effect = docker.errors.NotFound(
+            "gone"
+        )
+        with self.assertRaisesRegex(ValueError, "not found"):
+            await instance.container_environment_drift(
+                "rank-0", {"VLLM_CACHE_ROOT": "/cache/vllm"},
+            )
+
     async def test_sanitized_malformed_deployment_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

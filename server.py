@@ -1389,6 +1389,18 @@ async def agent_stop_container(name: str, req: Request, explicit: bool = False):
     return await manager.stop_container(name, explicit=explicit)
 
 
+@app.post("/api/agent/containers/{name}/environment/check")
+async def agent_check_container_environment(name: str, req: Request):
+    await _require_managed_agent_container(name, req)
+    body = await req.json()
+    try:
+        return await manager.container_environment_drift(
+            name, body.get("environment"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.delete("/api/agent/containers/{name}")
 async def agent_remove_container(name: str, req: Request):
     _require_agent(req)

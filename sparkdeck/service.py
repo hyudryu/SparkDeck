@@ -7187,6 +7187,16 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
             "launch_phase": "stopping",
             "launch_message": "Stopping deployment",
         }
+    status = str(deployment.get("status") or "").strip()
+    status_message = str(deployment.get("status_message") or "").strip()
+    if status_message and status in {"launching", "starting", "recovering"}:
+        # A transition message (recreating containers whose environment
+        # drifted, resuming an interrupted launch) explains the card state
+        # better than the per-rank phases it supersedes.
+        return {
+            "launch_phase": "recovering" if status == "recovering" else "starting",
+            "launch_message": status_message,
+        }
     members = [
         member for member in (deployment.get("members") or [])
         if isinstance(member, dict)

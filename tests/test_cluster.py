@@ -1100,16 +1100,32 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         instance._rebuild_synced_token_usage()
         return instance
 
-    def test_distributed_network_environment_matches_selected_rdma_port(self) -> None:
+    @staticmethod
+    def _write_infiniband_port_states(root: Path, devices: dict[str, str]) -> Path:
+        """Build a fake ``/sys/class/infiniband`` tree with port-1 state files.
+
+        ``devices`` maps HCA name to kernel sysfs state text, e.g.
+        ``"4: ACTIVE"`` or ``"1: DOWN"``. Returns ``root`` so callers can pass
+        it as ``sys_class_infiniband``.
+        """
+        for name, state in devices.items():
+            port = root / name / "ports" / "1"
+            port.mkdir(parents=True)
+            (port / "state").write_text(f"{state}\n", encoding="ascii")
+        return root
+
+    def test_distributed_network_environment_lists_all_active_hcas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            infiniband = (
-                root / "enp1s0f1np1" / "device" / "infiniband"
-            )
-            (infiniband / "rocep1s0f1").mkdir(parents=True)
+            # Uncabled twins (DOWN) are omitted; both ACTIVE RoCE twins are listed.
+            infiniband = self._write_infiniband_port_states(Path(directory), {
+                "rocep1s0f0": "1: DOWN",
+                "roceP2p1s0f0": "1: DOWN",
+                "rocep1s0f1": "4: ACTIVE",
+                "roceP2p1s0f1": "4: ACTIVE",
+            })
 
             environment = Manager._distributed_network_environment(
-                "enp1s0f1np1", root,
+                "enp1s0f1np1", infiniband,
             )
 
         self.assertEqual(environment, {
@@ -1118,12 +1134,13 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "NCCL_IB_GID_INDEX": None,
             "NCCL_NET": "IB",
             "NCCL_IB_DISABLE": "0",
-            "NCCL_IB_HCA": "rocep1s0f1",
-            "UCX_NET_DEVICES": "rocep1s0f1:1",
+            "NCCL_IB_HCA": "rocep1s0f1,roceP2p1s0f1",
+            "UCX_NET_DEVICES": "rocep1s0f1:1,roceP2p1s0f1:1",
         })
 
     def test_distributed_network_environment_overrides_stale_rdma_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            # Empty sysfs tree: no ACTIVE HCAs, so RDMA defaults must be cleared.
             environment = Manager._distributed_network_environment(
                 "eth0", Path(directory),
             )
@@ -1132,6 +1149,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(environment["NCCL_IB_DISABLE"], "1")
         self.assertEqual(environment["NCCL_IB_HCA"], "")
         self.assertEqual(environment["UCX_NET_DEVICES"], "")
+        self.assertEqual(environment["NCCL_SOCKET_IFNAME"], "eth0")
+        self.assertEqual(environment["GLOO_SOCKET_IFNAME"], "eth0")
+        self.assertIsNone(environment["NCCL_IB_GID_INDEX"])
 
     def test_usage_alias_is_persisted_and_can_be_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

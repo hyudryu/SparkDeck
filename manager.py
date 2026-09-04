@@ -1016,15 +1016,56 @@ class Manager:
         return interfaces
 
     @staticmethod
+    def _active_infiniband_hcas(
+        sys_class_infiniband: Path = Path("/sys/class/infiniband"),
+    ) -> list[str]:
+        """Return InfiniBand devices whose port 1 is ACTIVE.
+
+        DGX Spark ConnectX-7 presents each physical QSFP as two PCI functions
+        ("RoCE twins"). An Ethernet interface's ``device/infiniband`` directory
+        contains only one twin; the sibling is a separate PCI function. NCCL
+        needs every ACTIVE HCA in ``NCCL_IB_HCA`` to use the full link, so this
+        walks ``/sys/class/infiniband`` instead. Uncabled twins stay DOWN and
+        are omitted.
+        """
+        try:
+            devices = [
+                path for path in sys_class_infiniband.iterdir() if path.is_dir()
+            ]
+        except OSError:
+            return []
+        hcas: list[str] = []
+        for device in devices:
+            state_file = device / "ports" / "1" / "state"
+            try:
+                raw = state_file.read_text(encoding="ascii").strip()
+            except OSError:
+                continue
+            # Kernel sysfs format is "4: ACTIVE" (IB_PORT_ACTIVE). Match either
+            # token so a bare "4" or "ACTIVE" still counts.
+            code = raw.split(":", 1)[0].strip()
+            label = raw.rsplit(":", 1)[-1].strip()
+            if code == "4" or label == "ACTIVE":
+                hcas.append(device.name)
+        return sorted(hcas, key=str.casefold)
+
+    @classmethod
     def _distributed_network_environment(
+        cls,
         interface: str,
-        sys_class_net: Path = Path("/sys/class/net"),
+        sys_class_infiniband: Path = Path("/sys/class/infiniband"),
     ) -> dict[str, str]:
         """Build one consistent NCCL/Gloo/UCX transport configuration.
 
+        Socket bootstrap follows ``interface``. Collective RDMA traffic uses
+        every InfiniBand device with an ACTIVE port 1, not only the HCA under
+        that Ethernet interface, so both ConnectX-7 RoCE twins can participate.
+        If none are ACTIVE, NCCL falls back to Socket and RDMA device lists
+        are cleared so image-baked defaults cannot leak through.
+
         Container images may contain host-specific RDMA defaults. Always
-        replace them using the interface selected for this cluster member so
-        socket bootstrap and collective traffic cannot target different ports.
+        replace them so socket bootstrap and collective traffic cannot target
+        different ports.
 
         Images (e.g. the Aiden sparkrun builds) also bake in a hard-coded
         NCCL_IB_GID_INDEX that only matches the build host's GID table. With
@@ -1040,11 +1081,7 @@ class Manager:
             # IPv4 RoCEv2 GID dynamically.
             "NCCL_IB_GID_INDEX": None,
         }
-        infiniband_dir = sys_class_net / interface / "device" / "infiniband"
-        try:
-            hcas = sorted(path.name for path in infiniband_dir.iterdir())
-        except OSError:
-            hcas = []
+        hcas = cls._active_infiniband_hcas(sys_class_infiniband)
         if hcas:
             environment.update({
                 "NCCL_NET": "IB",

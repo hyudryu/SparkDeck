@@ -66,7 +66,7 @@ class FakeManager:
 
 
 class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_creation_rejects_discovered_public_selector(self):
+    async def test_creation_shares_discovered_selector_until_start(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             service = SparkDeckService(manager, Path(directory))
@@ -75,24 +75,33 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 "alias": "Discovered display name",
                 "runtime": "vllm",
                 "kind": "external",
+                "status": "running",
                 "model": {"repository": "org/discovered"},
                 "served_models": ["public-selector"],
             }])
             try:
-                with self.assertRaisesRegex(ValueError, "already in use"):
-                    await service.create_deployment({
-                        "model": "org/new",
-                        "alias": "PUBLIC-SELECTOR",
-                        "runtime": "vllm",
-                        "kind": "managed",
-                    })
+                # Records coexist: a display alias may adopt a selector a
+                # live discovered deployment publishes.
+                created = await service.create_deployment({
+                    "model": "org/new",
+                    "alias": "PUBLIC-SELECTOR",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                })
+                self.assertEqual(created["alias"], "PUBLIC-SELECTOR")
 
-                self.assertEqual(service.store.deployments(), [])
+                # The conflict surfaces when the record tries to start.
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "alias 'PUBLIC-SELECTOR' is already served by running",
+                ):
+                    await service.deployment_action(created["id"], "start")
+                self.assertEqual(len(service.store.deployments()), 1)
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_creation_reserves_managed_repository_against_discovered_alias(self):
+    async def test_start_rejects_repository_shared_with_discovered_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             service = SparkDeckService(manager, Path(directory))
@@ -101,25 +110,28 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 "alias": "ORG/NEW",
                 "runtime": "vllm",
                 "kind": "external",
+                "status": "running",
                 "model": {"repository": "org/discovered"},
             }])
             try:
-                with self.assertRaisesRegex(
-                    ValueError, "selector 'org/new' is already in use",
-                ):
-                    await service.create_deployment({
-                        "model": "org/new",
-                        "alias": "New deployment",
-                        "runtime": "vllm",
-                        "kind": "managed",
-                    })
+                created = await service.create_deployment({
+                    "model": "org/new",
+                    "alias": "New deployment",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                })
+                self.assertEqual(len(service.store.deployments()), 1)
 
-                self.assertEqual(service.store.deployments(), [])
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "selector 'org/new' is already served by running",
+                ):
+                    await service.deployment_action(created["id"], "start")
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_creation_reserves_explicit_served_name_against_discovered_alias(self):
+    async def test_start_rejects_served_name_shared_with_discovered_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._deployment_served_models = Manager._deployment_served_models
@@ -129,30 +141,33 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 "alias": "PUBLIC-SELECTOR",
                 "runtime": "vllm",
                 "kind": "external",
+                "status": "running",
                 "model": {"repository": "org/discovered"},
             }])
             try:
-                with self.assertRaisesRegex(
-                    ValueError, "selector 'public-selector' is already in use",
-                ):
-                    await service.create_deployment({
-                        "model": "org/new",
-                        "alias": "New deployment",
-                        "runtime": "vllm",
-                        "kind": "managed",
-                        "settings": {
-                            "extra_args": [
-                                "--served-model-name", "public-selector",
-                            ],
-                        },
-                    })
+                created = await service.create_deployment({
+                    "model": "org/new",
+                    "alias": "New deployment",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                    "settings": {
+                        "extra_args": [
+                            "--served-model-name", "public-selector",
+                        ],
+                    },
+                })
+                self.assertEqual(len(service.store.deployments()), 1)
 
-                self.assertEqual(service.store.deployments(), [])
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "selector 'public-selector' is already served by running",
+                ):
+                    await service.deployment_action(created["id"], "start")
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_creation_reserves_managed_selectors_against_live_public_ids(self):
+    async def test_start_rejects_selectors_owned_by_live_public_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._deployment_served_models = Manager._deployment_served_models
@@ -167,31 +182,38 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 "served_models": ["org/new", "vision-public"],
             }])
             try:
-                cases = (
-                    ({"model": "org/new"}, "selector 'org/new'"),
-                    ({
-                        "model": "org/other",
-                        "settings": {
-                            "extra_args": [
-                                "--served-model-name", "vision-public",
-                            ],
-                        },
-                    }, "selector 'vision-public'"),
-                )
-                for overrides, message in cases:
-                    with self.subTest(message=message):
-                        body = {
-                            "alias": f"New deployment {message}",
-                            "runtime": "vllm",
-                            "kind": "managed",
-                            **overrides,
-                        }
-                        with self.assertRaisesRegex(
-                            ValueError, f"{message} is already in use",
-                        ):
-                            await service.create_deployment(body)
+                # Records coexist with the live deployment that owns the
+                # selectors their launches would publish.
+                first = await service.create_deployment({
+                    "model": "org/new",
+                    "alias": "New deployment one",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                })
+                second = await service.create_deployment({
+                    "model": "org/other",
+                    "alias": "New deployment two",
+                    "runtime": "vllm",
+                    "kind": "managed",
+                    "settings": {
+                        "extra_args": [
+                            "--served-model-name", "vision-public",
+                        ],
+                    },
+                })
+                self.assertEqual(len(service.store.deployments()), 2)
 
-                self.assertEqual(service.store.deployments(), [])
+                # Neither launch may go live while the selectors are taken.
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "selector 'org/new' is already served by running",
+                ):
+                    await service.deployment_action(first["id"], "start")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "selector 'vision-public' is already served by running",
+                ):
+                    await service.deployment_action(second["id"], "start")
             finally:
                 await service.close()
                 await manager.http.aclose()
@@ -380,10 +402,13 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(inventory_calls, 1)
                 allow_persistence.set()
                 await rename
-                with self.assertRaisesRegex(ValueError, "already in use"):
-                    await asyncio.wait_for(create, timeout=1)
-                self.assertEqual(inventory_calls, 2)
-                self.assertEqual(service.store.deployments(), [])
+                # Creation waited for the alias lock, then resolved the
+                # collision with the freshly renamed discovered alias by
+                # suffixing instead of failing.
+                created = await asyncio.wait_for(create, timeout=1)
+                self.assertEqual(created["alias"], "shared NAME-2")
+                self.assertGreaterEqual(inventory_calls, 2)
+                self.assertEqual(len(service.store.deployments()), 1)
             finally:
                 allow_persistence.set()
                 await service.close()

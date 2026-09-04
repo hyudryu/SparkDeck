@@ -118,6 +118,50 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stored["container_name"])
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
 
+    async def test_create_duplicate_alias_is_suffixed(self):
+        first = await self.service.create_deployment({
+            "model": "org/model", "alias": "profile", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        second = await self.service.create_deployment({
+            "model": "org/model", "alias": "PROFILE", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+        third = await self.service.create_deployment({
+            "model": "org/model", "alias": "profile", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+
+        self.assertEqual(first["alias"], "profile")
+        self.assertEqual(second["alias"], "PROFILE-2")
+        # Aliases are unique case-insensitively, so PROFILE-2 blocks
+        # profile-2 as well.
+        self.assertEqual(third["alias"], "profile-3")
+        for alias in ("profile", "PROFILE-2", "profile-3"):
+            self.assertIsNotNone(self.service.store.deployment(alias))
+
+    async def test_create_same_model_bookmarks_coexist_with_live_deployment(self):
+        live = {
+            "id": "container:vision", "alias": "Discovered Vision",
+            "runtime": "vllm", "kind": "external", "status": "running",
+            "model": {"repository": "org/model"},
+            "served_models": ["org/model"], "settings": {},
+        }
+        with patch.object(
+            self.service, "deployments",
+            AsyncMock(return_value=[live]),
+        ):
+            created = await self.service.create_deployment({
+                "model": "org/model", "alias": "vision-exp", "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+            })
+
+        # The same model may be bookmarked while a live deployment serves it;
+        # the saved profile stays distinguishable by its alias.
+        self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["alias"], "vision-exp")
+        self.manager.create_deployment.assert_not_awaited()
+
     async def test_clone_copies_settings_as_a_stopped_bookmark_with_numbered_names(self):
         self.service.store.add_deployment(Deployment(
             id="running-1", alias="Chat model", runtime=RuntimeKind.VLLM,
@@ -1132,80 +1176,78 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(stored["settings"]["tensor_parallel_size"])
 
-    async def test_saved_update_rejects_discovered_selector_shadowing(self):
+    async def test_saved_update_may_share_discovered_selectors(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "TP2", "runtime": "vllm",
             "node_ids": ["remote-1"], "deployment_mode": "single",
         })
-        saved = (await self.service.deployments())[0]
         discovered = {
             "id": "container:vision", "alias": "Discovered Vision",
-            "runtime": "vllm", "kind": "external", "status": "stopped",
+            "runtime": "vllm", "kind": "external", "status": "running",
             "model": {"repository": "org/discovered"},
             "served_models": ["vision-public"], "settings": {},
         }
+        saved = (await self.service.deployments())[0]
 
         with patch.object(
             self.service, "deployments",
             AsyncMock(return_value=[saved, discovered]),
         ):
-            with self.assertRaisesRegex(ValueError, "already in use"):
-                await self.service.update_deployment_settings("TP2", {
-                    "alias": "VISION-PUBLIC",
-                })
-            with self.assertRaisesRegex(ValueError, "already in use"):
-                await self.service.update_deployment_settings("TP2", {
-                    "extra_args": [
-                        "--served-model-name", "discovered vision",
-                    ],
-                })
+            # Records coexist: a saved profile may adopt a selector a
+            # discovered deployment publishes. Only display aliases must stay
+            # unique; conflicts between live launches are rejected at start.
+            await self.service.update_deployment_settings("TP2", {
+                "alias": "VISION-PUBLIC",
+                "extra_args": ["--served-model-name", "org/discovered"],
+            })
 
-        stored = self.service.store.deployment("TP2", include_private=True)
+        # The patched listing is a static snapshot, so the stored record is
+        # the source of truth for the rename.
+        stored = self.service.store.deployment(
+            "VISION-PUBLIC", include_private=True,
+        )
         self.assertIsNotNone(stored)
-        self.assertNotIn("extra_args", stored["settings"])
+        self.assertEqual(
+            stored["settings"]["extra_args"],
+            ["--served-model-name", "org/discovered"],
+        )
 
-    async def test_saved_update_reserves_selectors_against_discovered_public_ids(self):
-        await self.service.create_deployment({
+    async def test_start_rejects_selector_already_live_on_running_deployment(self):
+        tp2_id = (await self.service.create_deployment({
             "model": "org/model", "alias": "TP2", "runtime": "vllm",
             "node_ids": ["remote-1"], "deployment_mode": "single",
+        }))["id"]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "TP4", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
         })
-        saved = (await self.service.deployments())[0]
-        discovered = {
-            "id": "container:vision", "alias": "Discovered Vision",
-            "runtime": "vllm", "kind": "external", "status": "stopped",
-            "model": {"repository": "org/discovered"},
+        tp2 = {
+            "id": tp2_id, "alias": "TP2", "kind": "managed",
+            "status": "running", "model": {"repository": "org/model"},
             "served_models": ["org/model"], "settings": {},
         }
 
         with patch.object(
             self.service, "deployments",
-            AsyncMock(return_value=[saved, discovered]),
+            AsyncMock(return_value=[tp2]),
         ):
             with self.assertRaisesRegex(
-                ValueError, "selector 'org/model' is already in use",
+                ValueError, "selector 'org/model' is already served by running",
             ):
-                await self.service.update_deployment_settings("TP2", {
-                    "gpu_memory_utilization": 0.8,
-                })
+                await self.service.deployment_action("TP4", "start")
+        listed = {
+            item["alias"]: item for item in await self.service.deployments()
+        }
+        self.assertEqual(listed["TP4"]["status"], "saved")
 
-        discovered["served_models"] = ["vision-public"]
+        # Once the other profile stops, the same selector may launch.
         with patch.object(
             self.service, "deployments",
-            AsyncMock(return_value=[saved, discovered]),
+            AsyncMock(return_value=[{**tp2, "status": "stopped"}]),
         ):
-            with self.assertRaisesRegex(
-                ValueError, "selector 'vision-public' is already in use",
-            ):
-                await self.service.update_deployment_settings("TP2", {
-                    "extra_args": [
-                        "--served-model-name", "vision-public",
-                    ],
-                })
-
-        stored = self.service.store.deployment("TP2", include_private=True)
-        self.assertIsNotNone(stored)
-        self.assertNotIn("gpu_memory_utilization", stored["settings"])
-        self.assertNotIn("extra_args", stored["settings"])
+            started = await self.service.deployment_action("TP4", "start")
+        self.assertEqual(started["status"], "starting")
+        self.manager.create_deployment.assert_awaited()
 
     async def test_saved_selector_updates_serialize_and_allow_same_repo_profiles(self):
         for alias in ("TP2", "TP4"):

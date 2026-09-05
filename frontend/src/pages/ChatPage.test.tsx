@@ -18,6 +18,24 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+const pngFile = (name: string) => new File(
+  [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+  name,
+  { type: 'image/png' },
+)
+
+const mp4File = (name: string) => new File(
+  [new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32])],
+  name,
+  { type: 'video/mp4' },
+)
+
+const dropOnComposer = (container: HTMLElement, files: File[]) => {
+  fireEvent.drop(container.querySelector('.composer')!, {
+    dataTransfer: { types: ['Files'], files },
+  })
+}
+
 describe('ChatPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -106,8 +124,7 @@ describe('ChatPage', () => {
       })
       .mockResolvedValueOnce({
         message: { role: 'assistant', content: 'Recovered' },
-        reasoning: '',
-        metrics: {},
+        reasoning: '', metrics: {},
       })
     const user = userEvent.setup()
     render(<ChatPage />)
@@ -174,11 +191,11 @@ describe('ChatPage', () => {
     const user = userEvent.setup()
     render(<ChatPage />)
 
-    const picker = await screen.findByLabelText('Choose image files')
+    const picker = await screen.findByLabelText('Choose image or video files')
     const first = new File(['RIFF\x00\x00\x00\x00WEBP'], 'first.webp', { type: 'image/webp' })
     const removed = new File([new Uint8Array([0xff, 0xd8, 0xff, 0xdb])], 'remove.jpg', { type: 'image/jpeg' })
     await user.upload(picker, [first, removed])
-    const attachments = await screen.findByLabelText('Attached images')
+    const attachments = await screen.findByLabelText('Attached media')
     expect(within(attachments).getByText('first.webp')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Remove remove.jpg' }))
     expect(within(attachments).queryByText('remove.jpg')).not.toBeInTheDocument()
@@ -210,16 +227,11 @@ describe('ChatPage', () => {
   it('serializes overlapping attachment reads without dropping either image', async () => {
     render(<ChatPage />)
 
-    const picker = await screen.findByLabelText('Choose image files')
-    const png = (name: string) => new File(
-      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
-      name,
-      { type: 'image/png' },
-    )
-    fireEvent.change(picker, { target: { files: [png('first.png')] } })
-    fireEvent.change(picker, { target: { files: [png('second.png')] } })
+    const picker = await screen.findByLabelText('Choose image or video files')
+    fireEvent.change(picker, { target: { files: [pngFile('first.png')] } })
+    fireEvent.change(picker, { target: { files: [pngFile('second.png')] } })
 
-    const attachments = await screen.findByLabelText('Attached images')
+    const attachments = await screen.findByLabelText('Attached media')
     expect(await within(attachments).findByText('first.png')).toBeInTheDocument()
     expect(await within(attachments).findByText('second.png')).toBeInTheDocument()
   })
@@ -233,12 +245,9 @@ describe('ChatPage', () => {
 
     const composer = await screen.findByRole('textbox', { name: 'Message' })
     fireEvent.change(composer, { target: { value: 'Send immediately' } })
-    const image = new File(
-      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
-      'late.png',
-      { type: 'image/png' },
-    )
-    fireEvent.change(screen.getByLabelText('Choose image files'), { target: { files: [image] } })
+    fireEvent.change(screen.getByLabelText('Choose image or video files'), {
+      target: { files: [pngFile('late.png')] },
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
     await screen.findByText('Done')
@@ -252,16 +261,11 @@ describe('ChatPage', () => {
     const user = userEvent.setup()
     render(<ChatPage />)
 
-    const picker = await screen.findByLabelText('Choose image files')
-    const png = (name: string) => new File(
-      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
-      name,
-      { type: 'image/png' },
-    )
-    await user.upload(picker, png('remove.png'))
+    const picker = await screen.findByLabelText('Choose image or video files')
+    await user.upload(picker, pngFile('remove.png'))
     await screen.findByText('remove.png')
 
-    fireEvent.change(picker, { target: { files: [png('pending.png')] } })
+    fireEvent.change(picker, { target: { files: [pngFile('pending.png')] } })
     fireEvent.click(screen.getByRole('button', { name: 'Remove remove.png' }))
 
     expect(screen.queryByText('remove.png')).not.toBeInTheDocument()
@@ -272,13 +276,8 @@ describe('ChatPage', () => {
     const user = userEvent.setup()
     render(<ChatPage />)
 
-    const picker = await screen.findByLabelText('Choose image files')
-    const png = (name: string) => new File(
-      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
-      name,
-      { type: 'image/png' },
-    )
-    await user.upload(picker, [png('existing-1.png'), png('existing-2.png'), png('existing-3.png')])
+    const picker = await screen.findByLabelText('Choose image or video files')
+    await user.upload(picker, [pngFile('existing-1.png'), pngFile('existing-2.png'), pngFile('existing-3.png')])
     await screen.findByText('existing-3.png')
 
     const pendingReads: Array<() => void> = []
@@ -296,7 +295,7 @@ describe('ChatPage', () => {
     }
     vi.stubGlobal('FileReader', DeferredFileReader)
 
-    fireEvent.change(picker, { target: { files: [png('new-1.png'), png('new-2.png')] } })
+    fireEvent.change(picker, { target: { files: [pngFile('new-1.png'), pngFile('new-2.png')] } })
     await waitFor(() => expect(pendingReads).toHaveLength(1))
     fireEvent.click(screen.getByRole('button', { name: 'Remove existing-1.png' }))
     act(() => pendingReads[0]?.())
@@ -320,22 +319,133 @@ describe('ChatPage', () => {
         items: [{ kind: 'file', type: 'image/svg+xml', getAsFile: () => svg }],
       },
     })
-    expect(await screen.findByRole('alert')).toHaveTextContent('not a PNG, JPEG, WebP, or GIF')
+    expect(await screen.findByRole('alert')).toHaveTextContent('not a supported image or video')
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
 
-    await user.upload(screen.getByLabelText('Choose image files'), new File(
+    await user.upload(screen.getByLabelText('Choose image or video files'), new File(
       ['not really an image'], 'spoofed.png', { type: 'image/png' },
     ))
     expect(await screen.findByRole('alert')).toHaveTextContent('does not contain valid PNG image data')
 
-    const picker = screen.getByLabelText('Choose image files')
-    const files = Array.from({ length: 5 }, (_, index) => new File(
-      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
-      `image-${index}.png`,
-      { type: 'image/png' },
-    ))
+    const picker = screen.getByLabelText('Choose image or video files')
+    const files = Array.from({ length: 5 }, (_, index) => pngFile(`image-${index}.png`))
     await user.upload(picker, files)
     expect(await screen.findByRole('alert')).toHaveTextContent('up to 4 images')
-    expect(within(screen.getByLabelText('Attached images')).getAllByRole('button', { name: /^Remove / })).toHaveLength(4)
+    expect(within(screen.getByLabelText('Attached media')).getAllByRole('button', { name: /^Remove / })).toHaveLength(4)
+  })
+
+  it('attaches a dropped image and sends it as an image_url part', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'I see it.' },
+      reasoning: '', metrics: {},
+    })
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    dropOnComposer(container, [pngFile('dropped.png')])
+
+    expect(await screen.findByText('dropped.png')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    await user.type(composer, 'What is this?')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('I see it.')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is this?' },
+        { type: 'image_url', image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) } },
+      ],
+    }])
+    expect(screen.getByRole('img', { name: 'Attached dropped.png' })).toBeInTheDocument()
+  })
+
+  it('attaches a dropped video and sends it as a video_url part', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'A short clip.' },
+      reasoning: '', metrics: {},
+    })
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    dropOnComposer(container, [mp4File('demo.mp4')])
+
+    expect(await screen.findByText('demo.mp4')).toBeInTheDocument()
+    expect(container.querySelector('.composer-attachment video')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    await user.type(composer, 'Describe the clip')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('A short clip.')
+    expect(container.querySelector('.user-message-media video[aria-label="Attached demo.mp4"]')).toBeInTheDocument()
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe the clip' },
+        { type: 'video_url', video_url: { url: expect.stringMatching(/^data:video\/mp4;base64,/) } },
+      ],
+    }])
+  })
+
+  it('shows the drop hint while files are dragged over the composer', async () => {
+    const { container } = render(<ChatPage />)
+    const composer = container.querySelector('.composer')!
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    fireEvent.dragEnter(composer, { dataTransfer: { types: ['Files'] } })
+    expect(screen.getByText('Drop images or videos to attach')).toBeInTheDocument()
+
+    fireEvent.dragLeave(composer, { dataTransfer: { types: ['Files'] } })
+    expect(screen.queryByText('Drop images or videos to attach')).not.toBeInTheDocument()
+  })
+
+  it('ignores drags that do not carry files', async () => {
+    const { container } = render(<ChatPage />)
+    const composer = container.querySelector('.composer')!
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    fireEvent.dragEnter(composer, { dataTransfer: { types: ['text/plain'] } })
+    expect(screen.queryByText('Drop images or videos to attach')).not.toBeInTheDocument()
+  })
+
+  it('rejects dropped files that are not supported media', async () => {
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    dropOnComposer(container, [new File(['%PDF-1.4'], 'notes.pdf', { type: 'application/pdf' })])
+    expect(await screen.findByRole('alert')).toHaveTextContent('not a supported image or video')
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
+
+    dropOnComposer(container, [new File(['plain text'], 'fake.mp4', { type: 'video/mp4' })])
+    expect(await screen.findByRole('alert')).toHaveTextContent('does not contain valid MP4 video data')
+  })
+
+  it('enforces per-kind attachment counts across a mixed dropped batch', async () => {
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    dropOnComposer(container, [
+      pngFile('a.png'), pngFile('b.png'), pngFile('c.png'), pngFile('d.png'), pngFile('e.png'),
+      mp4File('one.mp4'), mp4File('two.mp4'), mp4File('three.mp4'),
+    ])
+
+    const attachments = await screen.findByLabelText('Attached media')
+    await waitFor(() => expect(within(attachments).getAllByRole('button', { name: /^Remove / })).toHaveLength(6))
+    expect(within(attachments).queryByText('e.png')).not.toBeInTheDocument()
+    expect(within(attachments).queryByText('three.mp4')).not.toBeInTheDocument()
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('up to 4 images')
+    expect(alert).toHaveTextContent('up to 2 videos')
+  })
+
+  it('rejects a dropped video above the per-video size limit', async () => {
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    const bytes = new Uint8Array(16 * 1024 * 1024 + 1)
+    bytes.set([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70], 0)
+    dropOnComposer(container, [new File([bytes], 'large.mp4', { type: 'video/mp4' })])
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('exceeds the 16 MB per-video limit')
   })
 })

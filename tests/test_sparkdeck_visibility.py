@@ -449,11 +449,11 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(with_invalid.status_code, 400)
         self.assertEqual(with_invalid_additional.status_code, 400)
         self.assertEqual(invalid_utf8.status_code, 400)
-        action.assert_any_await("dep-1", "start", None, None, False)
-        action.assert_any_await("dep-1", "start", ["local", "node-2"], None, False)
-        action.assert_any_await("dep-1", "start", None, ["node-3"], False)
+        action.assert_any_await("dep-1", "start", None, None, False, None)
+        action.assert_any_await("dep-1", "start", ["local", "node-2"], None, False, None)
+        action.assert_any_await("dep-1", "start", None, ["node-3"], False, None)
         action.assert_any_await(
-            "container:external", "start", ["local"], None, True,
+            "container:external", "start", ["local"], None, True, None,
         )
 
     async def test_legacy_recipe_defaults_are_visible_and_launch_through_sparkdeck(self):

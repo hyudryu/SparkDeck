@@ -153,6 +153,52 @@ describe('models page vLLM deployment targets', () => {
           tensor_parallel_size: 2,
         },
       })
+      // The grouped topology must not leak into sharded payloads.
+      expect(payload.settings).not.toHaveProperty('instances')
+    })
+  })
+
+  it('supports grouped sharded layouts and submits the instance count', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('running')
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+
+    await user.type(screen.getByLabelText('Display name'), 'Grouped TP')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/grouped-model')
+
+    const controller = screen.getByRole('checkbox', { name: /Controller/ })
+    const node3 = screen.getByRole('checkbox', { name: /Node 3/ })
+    const node4 = screen.getByRole('checkbox', { name: /Node 4/ })
+    const node2 = screen.getByRole('checkbox', { name: /Node 2/ })
+    await user.click(node3)
+    await user.click(node4)
+    await user.click(node2)
+    await user.selectOptions(screen.getByLabelText(/Deployment layout/), 'grouped_sharded')
+
+    // Four selected nodes default to two independent TP2 engine groups.
+    expect(controller).toBeChecked()
+    expect(screen.getByLabelText(/Instances/)).toHaveValue(2)
+    expect(screen.getByLabelText(/Tensor parallel size/)).toHaveValue(2)
+    expect(screen.getByLabelText(/Tensor parallel size/)).toHaveProperty('readOnly', false)
+
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input) === '/api/v1/deployments' && init?.method === 'POST'
+      ))
+      expect(call).toBeDefined()
+      const payload = JSON.parse(String(call?.[1]?.body))
+      expect(payload).toMatchObject({
+        alias: 'Grouped TP',
+        deployment_mode: 'grouped_sharded',
+        settings: {
+          instances: 2,
+          tensor_parallel_size: 2,
+        },
+      })
     })
   })
 })

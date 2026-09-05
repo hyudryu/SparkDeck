@@ -895,6 +895,47 @@ class DeploymentSettingsContractTests(unittest.IsolatedAsyncioTestCase):
             "never-persist-this", str(self.manager.deployments[0]),
         )
 
+    async def test_update_model_retargets_manager_and_store_identity(self):
+        detail = await self.service.update_deployment_settings("record-1", {
+            "model": "drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit",
+            "extra_args": [
+                "--revision", "abc123",
+                "--max-model-len", "32768",
+                "--enable-prefix-caching",
+            ],
+        })
+
+        manager_deployment = self.manager.deployments[0]
+        self.assertEqual(
+            manager_deployment["model"],
+            "drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit",
+        )
+        self.assertEqual(
+            manager_deployment["launch_settings"]["model"],
+            "drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit",
+        )
+        self.assertTrue(manager_deployment["settings_dirty"])
+        stored = self.service.store.deployment("record-1")
+        self.assertEqual(
+            stored["model"]["repository"],
+            "drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit",
+        )
+        self.assertEqual(stored["model"]["revision"], "abc123")
+        self.assertEqual(
+            detail["model"]["repository"],
+            "drowzeys/keys-DeepSeekV4Flash-Vision-EXP-ablit",
+        )
+
+    async def test_update_rejects_blank_model(self):
+        with self.assertRaisesRegex(ValueError, "model must be a non-empty string"):
+            await self.service.update_deployment_settings("record-1", {
+                "model": "   ",
+            })
+
+        self.assertEqual(self.manager.deployments[0]["model"], "org/model")
+        stored = self.service.store.deployment("record-1")
+        self.assertEqual(stored["model"]["repository"], "org/model")
+
     async def test_manager_stopped_state_repairs_store_and_blocks_proxy(self):
         self.service.store.update_desired_state("record-1", "running")
 

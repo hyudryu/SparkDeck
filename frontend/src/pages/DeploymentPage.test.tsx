@@ -504,6 +504,48 @@ describe('deployment object page', () => {
     const mutationCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')
     expect(mutationCalls).toEqual([])
   })
+
+  it('submits an edited model and drops pinned --revision flags from the runtime flags', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    const runtimeFlags = (await screen.findByText('Runtime flags'))
+      .closest('label')?.querySelector('textarea') as HTMLTextAreaElement
+    await user.clear(runtimeFlags)
+    await user.type(runtimeFlags, '--revision abc123 --enable-prefix-caching')
+    const modelInput = (await screen.findByText('Model weights'))
+      .closest('label')?.querySelector('input') as HTMLInputElement
+    await user.clear(modelInput)
+    await user.type(modelInput, 'org/abliterated')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(
+      fetchMock.mock.calls.some(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT'),
+    ).toBe(true))
+    const put = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT')
+    const body = JSON.parse(String(put?.[1]?.body))
+    expect(body.model).toBe('org/abliterated')
+    expect(body.extra_args).toEqual(['--enable-prefix-caching'])
+  })
+
+  it('hides the model weights field for llama.cpp deployments', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        ...detail,
+        runtime: 'llama.cpp',
+        settings: { artifact: 'model-F16.gguf', parallel_slots: 1, gpu_layers: 99 },
+        launch_controls: {},
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Reasoning server')
+    expect(screen.queryByLabelText('Model weights')).toBeNull()
+  })
 })
 
 describe('env-file backed deployment page', () => {

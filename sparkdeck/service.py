@@ -1928,13 +1928,33 @@ class SparkDeckService:
             "environment",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction",
+            "model",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+        if "model" in changes:
+            model_id = changes["model"]
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise ValueError("model must be a non-empty string")
+            changes = {**changes, "model": model_id.strip()}
 
         updated = self.manager.update_deployment_settings(manager_id, changes)
         launch_settings = updated.get("launch_settings") or {}
+        # Manager owns the launch contract; mirror its (possibly revised)
+        # model identity into the store so weight preparation and the models
+        # page follow the edited repository instead of the original one.
+        model = dict(stored.get("model") or {})
+        persisted_model = {
+            "repository": str(
+                launch_settings.get("model") or model.get("repository") or ""
+            ),
+            "revision": self._persisted_revision(launch_settings),
+            "artifact": model.get("artifact"),
+            "quantization": model.get("quantization"),
+        }
+        if persisted_model != model:
+            self.store.update_deployment_model(stored["id"], persisted_model)
         controls = self.manager._deployment_launch_controls(launch_settings)
         contract = self.manager.recipe_deployment_contract(launch_settings)
         safe_args = self.manager._without_sensitive_cli_credentials(
@@ -2255,10 +2275,16 @@ class SparkDeckService:
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
             "environment", "instances",
+            "model",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
+        if "model" in changes and (
+            not isinstance(changes.get("model"), str)
+            or not changes["model"].strip()
+        ):
+            raise ValueError("model must be a non-empty string")
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
@@ -2547,6 +2573,14 @@ class SparkDeckService:
             model["quantization"] = settings.get("quantization")
         if "artifact" in changes:
             model["artifact"] = settings.get("artifact")
+        if "model" in changes:
+            new_model = str(changes.get("model") or "").strip()
+            if not new_model:
+                raise ValueError("model must be a non-empty string")
+            if new_model != model.get("repository"):
+                model["repository"] = new_model
+                # A different repository invalidates the pinned revision.
+                model["revision"] = None
         if model != (stored.get("model") or {}):
             self.store.update_deployment_model(stored["id"], model)
         return await self.deployment_detail(stored["id"])

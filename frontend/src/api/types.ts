@@ -217,6 +217,7 @@ export interface EnvFileDeploymentUpdateInput {
 }
 
 export interface DeploymentUpdateInput {
+  model?: string
   extra_args?: string[]
   command_flags?: string
   environment?: Record<string, string>

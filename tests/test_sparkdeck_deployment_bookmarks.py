@@ -655,6 +655,32 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["context_length"], 16384)
         self.assertEqual(stored["settings"]["node_ids"], ["remote-1"])
 
+    async def test_saved_bookmark_model_change_resets_pinned_revision(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+        })
+        self.service.store.update_deployment_model("bookmark", {
+            "repository": "org/model", "revision": "rev-1",
+            "artifact": None, "quantization": None,
+        })
+
+        detail = await self.service.update_deployment_settings("bookmark", {
+            "model": "org/other",
+        })
+
+        self.assertEqual(detail["model"]["repository"], "org/other")
+        stored = self.service.store.deployment("bookmark")
+        self.assertEqual(stored["model"]["repository"], "org/other")
+        self.assertIsNone(stored["model"]["revision"])
+
+        with self.assertRaisesRegex(ValueError, "model must be a non-empty string"):
+            await self.service.update_deployment_settings("bookmark", {
+                "model": " ",
+            })
+        stored = self.service.store.deployment("bookmark")
+        self.assertEqual(stored["model"]["repository"], "org/other")
+
     async def test_vllm_environment_round_trips_and_launches_on_every_rank(self):
         environment = {
             "HF_HUB_OFFLINE": "1",

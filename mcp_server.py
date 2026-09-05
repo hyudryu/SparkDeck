@@ -1002,11 +1002,14 @@ def build_server(
         token array, non-secret string ``environment`` values, structured
         ``launch_controls`` (for example ``context_window``,
         ``max_concurrency``, tensor/pipeline parallel size, KV cache dtype,
-        thinking mode, or speculative decoding controls), and supported vLLM
-        or SGLang memory fields. Stop a running deployment first, update it,
-        then start it to apply the new settings. Unknown fields, secrets, and
-        unsafe flags are rejected by SparkDeck. Deployments not created by this
-        MCP server require ``allow_unowned=true``.
+        thinking mode, or speculative decoding controls), supported vLLM
+        or SGLang memory fields, and the weights repository via ``model``
+        (a Hugging Face repo id; drop any pinned ``--revision`` flag from
+        ``extra_args`` when switching repositories). Stop a running
+        deployment first, update it, then start it to apply the new
+        settings. Unknown fields, secrets, and unsafe flags are rejected by
+        SparkDeck. Deployments not created by this MCP server require
+        ``allow_unowned=true``.
         """
         return await client.update_deployment_configuration(
             deployment_id, changes, require_owned=not allow_unowned,

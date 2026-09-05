@@ -71,10 +71,37 @@ const flagValue = (args: string[], names: string[]) => {
   return undefined
 }
 
-type Editor = Record<keyof DeploymentLaunchControls | 'alias' | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
+// Deployments whose saved launch contract can retarget the weights repo:
+// manager-backed vLLM/SGLang. llama.cpp picks weights through GGUF
+// artifacts, and discovered containers own their model via the runtime
+// command.
+const canEditModel = (detail: DeploymentDetail) => (
+  detail.runtime !== 'llama.cpp' && !detail.id.startsWith('container:')
+)
+
+// A --revision pinned to the previous repository is almost certainly wrong
+// for the new one, so the matching pin is dropped when the model changes and
+// the new repository resolves its default revision. A pin the user typed for
+// the new repository is left alone.
+function dropRevisionFlags(flagsText: string, staleRevision: string): string {
+  const args = splitFlags(flagsText)
+  const kept: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === '--revision' && args[index + 1] === staleRevision) {
+      index += 1
+      continue
+    }
+    if (args[index] === `--revision=${staleRevision}`) continue
+    kept.push(args[index])
+  }
+  return kept.map(quoteArg).join(' ')
+}
+
+type Editor = Record<keyof DeploymentLaunchControls | 'alias' | 'model' | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
   alias: detail.alias,
+  model: detail.model_id,
   context_window: detail.launch_controls.context_window?.toString() ?? '',
   max_concurrency: detail.launch_controls.max_concurrency?.toString() ?? '',
   tensor_parallel_size: detail.launch_controls.tensor_parallel_size?.toString()
@@ -261,9 +288,10 @@ const SPECULATIVE_METHODS = ['dspark', 'dflash', 'draft_model', 'eagle3', 'mtp',
 const DRAFT_SAMPLE_METHODS = ['greedy', 'probabilistic']
 const TRANSITIONAL_DEPLOYMENT_STATUSES = new Set(['launching', 'starting', 'stopping'])
 
-function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias = false): DeploymentUpdateInput & { alias?: string } {
+function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias = false, includeModel = false): DeploymentUpdateInput & { alias?: string } {
   return {
     ...(includeAlias ? { alias: editor.alias.trim() } : {}),
+    ...(includeModel ? { model: editor.model.trim() } : {}),
     ...(preserveCommandFlags
       ? { command_flags: editor.extra_args }
       : { extra_args: splitFlags(editor.extra_args) }),
@@ -367,6 +395,25 @@ export function DeploymentPage() {
 
   const set = (key: keyof Editor, value: string) => setEditor((current) => current ? { ...current, [key]: value } : current)
 
+  // Changing the model also clears the previous repository's pinned
+  // --revision; if the flags are mid-edit (unmatched quote) the text is left
+  // untouched rather than blocking the keystroke.
+  const setModel = (value: string) => setEditor((current) => {
+    if (!current) return current
+    if (savedEditor && value.trim() === savedEditor.model.trim()) return { ...current, model: value }
+    const staleRevision = resource.data?.model_revision
+    if (!staleRevision) return { ...current, model: value }
+    try {
+      return {
+        ...current,
+        model: value,
+        extra_args: dropRevisionFlags(current.extra_args, staleRevision),
+      }
+    } catch {
+      return { ...current, model: value }
+    }
+  })
+
   const persist = async () => {
     if (!editor || !savedEditor) throw new Error('Deployment settings are not loaded')
     const detail = resource.data
@@ -394,7 +441,12 @@ export function DeploymentPage() {
     }
     const updated = await api.deployments.update(
       deploymentId,
-      updateInput(editor, detail?.command_flags !== undefined, detail?.status === 'saved'),
+      updateInput(
+        editor,
+        detail?.command_flags !== undefined,
+        detail?.status === 'saved',
+        detail ? canEditModel(detail) : false,
+      ),
     )
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
@@ -554,6 +606,7 @@ export function DeploymentPage() {
         {notice && <p className="muted wide-field" role="status">{notice}</p>}
         {detail.status === 'saved' && <label className="field"><span>Deployment name</span><input required disabled={disabled} value={editor.alias} onChange={(event) => set('alias', event.target.value)} /></label>}
         {envFileMode && <label className="field"><span>Served model name</span><input disabled={disabled} value={servedName} onChange={(event) => setServedName(event.target.value)} /></label>}
+        {!envFileMode && canEditModel(detail) && <label className="field wide-field"><span>Model weights</span><input required disabled={disabled} value={editor.model} onChange={(event) => setModel(event.target.value)} /><small>Hugging Face repository id. Changing it drops the previous repository's pinned --revision so the new repository resolves its default; add a new pin in the flags editor if needed, and adjust the served model name if clients depend on it.</small></label>}
         <label className="field"><span>Context window</span><input disabled={envControlDisabled('context_window')} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} />{envControlHint('context_window')}</label>
         <label className="field"><span>Max concurrency</span><input disabled={envControlDisabled('max_concurrency')} type="number" min="1" value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} />{envControlHint('max_concurrency')}</label>
         {detail.runtime !== 'llama.cpp' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={envControlDisabled('kv_cache_dtype')} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} />{envControlHint('kv_cache_dtype')}</label>}

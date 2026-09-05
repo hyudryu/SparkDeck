@@ -61,6 +61,11 @@ from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 logger = logging.getLogger(__name__)
 
+# Deployment layouts accepted wherever a saved ``deployment_mode`` is
+# validated. Manager owns the launch-side checks; this copy keeps the saved
+# bookmark validation dependency-free from Manager's import graph.
+_MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -2247,7 +2252,7 @@ class SparkDeckService:
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
-            "environment",
+            "environment", "instances",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -2266,6 +2271,7 @@ class SparkDeckService:
             settings["image"] = image
         integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
+            "instances",
         )
         for field in integer_fields:
             if field not in changes:
@@ -2452,9 +2458,10 @@ class SparkDeckService:
             settings["node_ids"] = node_ids
         if "deployment_mode" in changes:
             mode = changes.get("deployment_mode")
-            if mode is not None and mode not in {"single", "replicated", "sharded"}:
+            if mode is not None and mode not in _MODE_ALLOWLIST:
                 raise ValueError(
-                    "deployment_mode must be single, sharded, or replicated"
+                    "deployment_mode must be single, sharded, replicated, "
+                    "or grouped_sharded"
                 )
             settings["deployment_mode"] = mode
         # Validate the effective combination: locality of the final artifact
@@ -2486,7 +2493,7 @@ class SparkDeckService:
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
-            settings.get("deployment_mode") == "sharded"
+            settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
         ):
             raise ValueError(
                 "llama.cpp deployments support single and replicated layouts, not sharded"
@@ -2502,6 +2509,15 @@ class SparkDeckService:
             and len(effective_nodes) < 2
         ):
             raise ValueError("sharded deployment requires at least two nodes")
+        if (
+            contract["deployment_mode"] == "grouped_sharded"
+            and effective_nodes
+            and len(effective_nodes) != contract["required_node_count"]
+        ):
+            raise ValueError(
+                "grouped_sharded deployment requires exactly "
+                f"{contract['required_node_count']} node(s)"
+            )
         await self._assert_deployment_alias_available(alias, stored["id"])
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
@@ -2784,6 +2800,26 @@ class SparkDeckService:
                 )
             else:
                 count = max(2, len(node_ids))
+        elif mode == "grouped_sharded":
+            controls = settings.get("launch_controls")
+            if not isinstance(controls, dict):
+                controls = {}
+
+            def _positive_count(value: Any) -> int:
+                return (
+                    value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    and value > 0
+                    else 1
+                )
+
+            tensor = _positive_count(controls.get("tensor_parallel_size"))
+            if tensor == 1:
+                tensor = _positive_count(settings.get("tensor_parallel_size"))
+            instances = _positive_count(settings.get("instances"))
+            # The saved topology must be exactly N*T nodes: instances complete
+            # tensor-parallel groups with no spare or missing hosts.
+            count = max(2, tensor * instances)
         elif mode == "replicated":
             count = max(2, len(node_ids))
         else:
@@ -3045,11 +3081,26 @@ class SparkDeckService:
                 mode = deployment_mode or (
                     "replicated" if len(requested_node_ids) > 1 else "single"
                 )
+                if mode not in _MODE_ALLOWLIST:
+                    raise ValueError(
+                        "deployment_mode must be single, sharded, replicated, "
+                        "or grouped_sharded"
+                    )
                 if mode == "single" and len(requested_node_ids) != 1:
                     raise ValueError("single deployment requires exactly one node")
-                if mode == "sharded" and runtime is RuntimeKind.LLAMA_CPP:
+                if mode in {"sharded", "grouped_sharded"} and (
+                    runtime is RuntimeKind.LLAMA_CPP
+                ):
                     raise ValueError(
                         "llama.cpp deployments support single and replicated layouts, not sharded"
+                    )
+                if mode == "grouped_sharded":
+                    # Reject an unlaunchable topology at save time; Manager's
+                    # preflight re-checks authoritatively at launch.
+                    from manager import _grouped_sharded_topology
+
+                    _, _ = _grouped_sharded_topology(
+                        settings, len(requested_node_ids),
                     )
                 if not launch:
                     # A saved deployment is a launch bookmark: persist the

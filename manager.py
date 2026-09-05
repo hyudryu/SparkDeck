@@ -135,6 +135,36 @@ PERSISTED_RECIPE_ARGS_ERROR = (
 PERSISTED_DEPLOYMENT_ARGS_ERROR = (
     "unsupported persisted launch_settings.extra_args: expected an array of strings"
 )
+# Deployment layouts accepted everywhere a ``deployment_mode`` is validated.
+# ``grouped_sharded`` runs N independent sharded engine groups (each a
+# tensor-parallel-sized node group) behind one served name.
+_MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+
+
+def _grouped_sharded_topology(body: dict, node_count: int) -> tuple[int, int]:
+    """Validate and return the (tensor_parallel_size, instances) pair.
+
+    A grouped-sharded deployment owns exactly ``instances * tensor_parallel_size``
+    nodes, partitioned consecutively into per-instance tensor-parallel groups,
+    and every group needs at least two ranks to be a sharded engine at all.
+    """
+    try:
+        tensor_parallel = max(1, int(body.get("tensor_parallel_size") or 1))
+    except (TypeError, ValueError):
+        tensor_parallel = 1
+    try:
+        instances = max(1, int(body.get("instances") or 1))
+    except (TypeError, ValueError):
+        instances = 1
+    if tensor_parallel < 2:
+        raise ValueError("grouped_sharded requires tensor_parallel_size >= 2")
+    required = tensor_parallel * instances
+    if node_count != required:
+        raise ValueError(
+            f"grouped_sharded requires {instances} instance(s) of "
+            f"TP{tensor_parallel} = {required} node(s), got {node_count}"
+        )
+    return tensor_parallel, instances
 
 
 class _RetryingDockerClient:
@@ -3830,7 +3860,7 @@ class Manager:
         )
         if engine == "vllm":
             extra_args = cls._with_vllm_prompt_token_details(extra_args)
-        return {
+        launch_settings = {
             "deployment_name": body.get("deployment_name") or body.get("name"),
             "model": body.get("model") or "",
             "engine": engine,
@@ -3868,6 +3898,14 @@ class Manager:
                 body.get("output_cost_per_1m"), "output_cost_per_1m"
             ),
         }
+        if launch_settings["deployment_mode"] == "grouped_sharded":
+            # The grouped topology cannot be re-derived from argv alone: the
+            # tensor-parallel size is per group, not the whole world size.
+            launch_settings["tensor_parallel_size"] = body.get(
+                "tensor_parallel_size"
+            )
+            launch_settings["instances"] = body.get("instances")
+        return launch_settings
 
     @staticmethod
     def _normalize_runtime_environment(value: Any, engine: str = "vllm") -> dict[str, str]:
@@ -4425,8 +4463,13 @@ class Manager:
         if settings["engine"] not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         mode = settings["deployment_mode"]
-        if mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
+        if mode == "grouped_sharded":
+            _, _ = _grouped_sharded_topology(settings, len(settings["node_ids"]))
         if mode == "single":
             settings["node_ids"] = settings["node_ids"][:1] or [LOCAL_NODE_ID]
         elif len(settings["node_ids"]) < 2:
@@ -6162,15 +6205,25 @@ class Manager:
                 body["environment"],
             )
         mode = body.get("deployment_mode") or "single"
-        if mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
-        if mode == "sharded" and engine == "llama.cpp":
+        if mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
+        if engine == "llama.cpp" and mode in {"sharded", "grouped_sharded"}:
             # llama.cpp has no cross-node tensor pipeline; every selected node
             # runs its own complete replica instead.
             raise ValueError(
-                "llama.cpp deployments support single and replicated layouts, not sharded"
+                "llama.cpp deployments support single and replicated layouts, "
+                "not sharded"
             )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
+        if mode == "grouped_sharded":
+            grouped_tp, grouped_instances = _grouped_sharded_topology(
+                body, len(node_ids)
+            )
+            body["tensor_parallel_size"] = grouped_tp
+            body["instances"] = grouped_instances
         if mode == "single":
             node_ids = node_ids[:1] or [LOCAL_NODE_ID]
         elif len(node_ids) < 2:
@@ -6268,6 +6321,28 @@ class Manager:
                         f"layout requires {ranks_per_node} GPU(s) per node; "
                         f"not enough devices on: {', '.join(gpu_short)}"
                     )
+        if mode == "grouped_sharded" and engine == "sglang":
+            # Each group is a complete TP<tensor_parallel_size> engine: the
+            # per-group world size is the tensor-parallel size, one rank per
+            # selected node.
+            body["sg_tp_size"] = grouped_tp
+        if mode == "grouped_sharded":
+            gpu_short = []
+            for nid in node_ids:
+                gpus = (available[nid].get("stats") or {}).get("gpus")
+                if gpus is None:
+                    continue
+                usable = [
+                    gpu for gpu in gpus
+                    if not (isinstance(gpu, dict) and gpu.get("error"))
+                ]
+                if not usable:
+                    gpu_short.append(available[nid].get("name", nid))
+            if gpu_short:
+                raise ValueError(
+                    "grouped_sharded requires one GPU per node; no usable "
+                    f"devices on: {', '.join(gpu_short)}"
+                )
         requested_port = body.get("port")
         local_port = requested_port
         if LOCAL_NODE_ID in node_ids and local_port is not None:
@@ -6297,7 +6372,7 @@ class Manager:
             fabrics[node_id] = self._inferred_fabric(
                 node, requested_ip, requested_interface
             )
-            if mode == "sharded" and not fabrics[node_id][0]:
+            if mode in {"sharded", "grouped_sharded"} and not fabrics[node_id][0]:
                 raise ValueError(
                     f"could not determine fabric IP for {node.get('name', node_id)}"
                 )
@@ -10805,6 +10880,18 @@ class Manager:
                 required_nodes = parallel_nodes
             else:
                 required_nodes = max(2, saved_count)
+        elif mode == "grouped_sharded":
+            try:
+                instances = max(1, int(recipe.get("instances") or 1))
+            except (TypeError, ValueError):
+                instances = 1
+            if tensor_parallel < 2:
+                required_nodes = 1
+                mode_error = "grouped_sharded requires tensor_parallel_size >= 2"
+            else:
+                # One tensor-parallel engine group per instance; the saved
+                # node set must be exactly the full N*T topology.
+                required_nodes = parallel_nodes * instances
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.
@@ -10817,7 +10904,7 @@ class Manager:
             invalid_mode = f"unsupported persisted deployment mode: {mode}"
             mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
         model_revision = self._cli_option(args, {"--revision"})
-        return {
+        contract = {
             "required_node_count": required_nodes,
             "deployment_mode": mode,
             "tensor_parallel_size": tensor_parallel,
@@ -10826,6 +10913,9 @@ class Manager:
             "supported": mode_error is None,
             "error": mode_error,
         }
+        if mode == "grouped_sharded":
+            contract["instances"] = instances
+        return contract
 
     def _load_recipes(self) -> list[dict]:
         if self.recipes_path.exists():
@@ -10925,6 +11015,8 @@ class Manager:
         launch_controls: dict | None = None,
         force_new: bool = False,
         replace_launch_inputs: bool = False,
+        instances: int | None = None,
+        tensor_parallel_size: int | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if not model:
@@ -10939,13 +11031,21 @@ class Manager:
         )
         sg_mem_fraction = self._validated_sg_scalar("sg_mem_fraction", sg_mem_fraction)
         deployment_mode = deployment_mode or "single"
-        if deployment_mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if deployment_mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
         node_ids = self._normalize_recipe_node_ids(node_ids)
         if deployment_mode == "single":
             node_ids = node_ids[:1]
         elif len(node_ids) < 2:
             raise ValueError(f"{deployment_mode} deployment requires at least two nodes")
+        if deployment_mode == "grouped_sharded":
+            _, _ = _grouped_sharded_topology(
+                {"tensor_parallel_size": tensor_parallel_size, "instances": instances},
+                len(node_ids),
+            )
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")
@@ -11015,6 +11115,12 @@ class Manager:
                         r["sg_mem_fraction"] = sg_mem_fraction
                     r["deployment_mode"] = deployment_mode or "single"
                     r["node_ids"] = list(node_ids or [LOCAL_NODE_ID])
+                    if deployment_mode == "grouped_sharded":
+                        r["instances"] = instances
+                        r["tensor_parallel_size"] = tensor_parallel_size
+                    else:
+                        r.pop("instances", None)
+                        r.pop("tensor_parallel_size", None)
                     self._save_recipes()
                     return r
             recipe = {
@@ -11037,6 +11143,9 @@ class Manager:
                 "node_ids": list(node_ids or [LOCAL_NODE_ID]),
                 "created_at": time.time(),
             }
+            if deployment_mode == "grouped_sharded":
+                recipe["instances"] = instances
+                recipe["tensor_parallel_size"] = tensor_parallel_size
             self.recipes.append(recipe)
             self._save_recipes()
             return recipe
@@ -11060,7 +11169,7 @@ class Manager:
             "gpu_memory_utilization", "gpu_memory_gb", "sg_tp_size",
             "sg_context_length", "sg_max_running_requests", "sg_mem_fraction",
             "sg_image", "deployment_mode", "node_ids", "launch_controls",
-            "environment",
+            "environment", "instances", "tensor_parallel_size",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -11087,13 +11196,18 @@ class Manager:
                 merged.get("environment"), engine,
             )
             mode = merged.get("deployment_mode") or "single"
-            if mode not in {"single", "sharded", "replicated"}:
-                raise ValueError("deployment_mode must be single, sharded, or replicated")
+            if mode not in _MODE_ALLOWLIST:
+                raise ValueError(
+                    "deployment_mode must be single, sharded, replicated, "
+                    "or grouped_sharded"
+                )
             nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":
                 nodes = nodes[:1]
             elif len(nodes) < 2:
                 raise ValueError(f"{mode} deployment requires at least two nodes")
+            if mode == "grouped_sharded":
+                _, _ = _grouped_sharded_topology(merged, len(nodes))
             controls = changes.get("launch_controls")
             if controls is not None:
                 if not isinstance(controls, dict):

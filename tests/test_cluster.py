@@ -2957,7 +2957,11 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             result = await instance.deployment_action("stale-deployment", "remove")
 
-            self.assertEqual(result, {"ok": True, "errors": []})
+            # Action results report the deployment's status alongside the
+            # removal outcome (the deployment was in the "error" state here).
+            self.assertEqual(
+                result, {"ok": True, "errors": [], "status": "error"},
+            )
             self.assertEqual(instance.deployments, [])
             self.assertEqual(json.loads(instance.deployments_path.read_text()), [])
 

@@ -231,5 +231,75 @@ class GroupedShardedMemberBuildTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+def grouped_member(group: int, rank: int, status: str = "running") -> dict:
+    return {
+        "instance_id": group,
+        "rank": rank,
+        "node_id": f"node-{group}-{rank}",
+        "node_name": f"Node {group}-{rank}",
+        "container_name": f"cluster-d1-r{group * 2 + rank}-model",
+        "status": status,
+    }
+
+
+def grouped_deployment() -> dict:
+    return {
+        "id": "d1",
+        "mode": "grouped_sharded",
+        "members": [
+            grouped_member(0, 0), grouped_member(0, 1),
+            grouped_member(1, 0), grouped_member(1, 1),
+        ],
+    }
+
+
+class GroupedShardedRoutingTests(unittest.TestCase):
+    def test_route_order_only_considers_group_coordinators(self) -> None:
+        manager = Manager.__new__(Manager)
+        order = manager._cluster_route_order(grouped_deployment())
+        self.assertEqual(
+            [member["container_name"] for member in order],
+            ["cluster-d1-r0-model", "cluster-d1-r2-model"],
+        )
+
+    def test_route_order_round_robins_across_coordinators(self) -> None:
+        manager = Manager.__new__(Manager)
+        deployment = grouped_deployment()
+        first = manager._cluster_route_order(deployment)[0]
+        second = manager._cluster_route_order(deployment)[0]
+        self.assertNotEqual(
+            first["container_name"], second["container_name"],
+            "an idle grouped cluster must alternate between group coordinators",
+        )
+
+    def test_route_order_excludes_stopped_groups(self) -> None:
+        manager = Manager.__new__(Manager)
+        deployment = grouped_deployment()
+        deployment["members"][2]["status"] = "stopped"
+        deployment["members"][3]["status"] = "stopped"
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual(
+            [member["container_name"] for member in order],
+            ["cluster-d1-r0-model"],
+        )
+
+    def test_route_order_error_group_is_excluded(self) -> None:
+        manager = Manager.__new__(Manager)
+        deployment = grouped_deployment()
+        deployment["members"][0]["status"] = "error"
+        deployment["members"][1]["status"] = "error"
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual(
+            [member["container_name"] for member in order],
+            ["cluster-d1-r2-model"],
+        )
+
+    def test_sharded_members_do_not_collide_with_instance_keys(self) -> None:
+        # instance_id 0 must key per instance, not fall through to the
+        # container-name identity (``0 or default`` is falsy in Python).
+        key = Manager._cluster_member_key("d1", grouped_member(0, 0))
+        self.assertEqual(key, "d1:instance:0")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5653,6 +5653,12 @@ class Manager:
     # ----- replicated-deployment load balancing -----
     @staticmethod
     def _cluster_member_key(deployment_id: str, member: dict) -> str:
+        instance = member.get("instance_id")
+        if instance is not None:
+            # Grouped-sharded load is carried per engine group: only the
+            # rank-0 coordinator of a group ever serves, so balance counts
+            # whole instances rather than individual ranks.
+            return f"{deployment_id}:instance:{instance}"
         identity = member.get("container_name") or member.get("node_id") or ""
         return f"{deployment_id}:{identity}"
 
@@ -5679,7 +5685,9 @@ class Manager:
         loads = self._cluster_member_loads()
         loads[key] = max(0, loads.get(key, 0) - 1)
 
-    def _balanced_cluster_member(self, deployment: dict) -> dict:
+    def _balanced_cluster_member(
+        self, deployment: dict, candidates: list[dict] | None = None,
+    ) -> dict:
         """Pick the least-loaded replica, rotating among equals.
 
         A replica's load is counted from selection until its response (or
@@ -5687,7 +5695,10 @@ class Manager:
         Round-robin tie-breaking keeps an idle cluster alternating instead of
         funneling every request to rank 0.
         """
-        members = self._cluster_members_sorted(deployment)
+        members = (
+            candidates if candidates is not None
+            else self._cluster_members_sorted(deployment)
+        )
         deployment_id = str(deployment.get("id") or "")
         loads = [
             self._cluster_member_active(deployment_id, member)
@@ -5704,15 +5715,40 @@ class Manager:
         rotation[deployment_id] = rotation.get(deployment_id, 0) + 1
         return tied[index]
 
+    def _grouped_coordinators(self, deployment: dict) -> list[dict]:
+        """Rank-0 coordinator of each started engine group, group order."""
+        by_instance: dict[int, dict] = {}
+        for member in self._cluster_members_sorted(deployment):
+            if int(member.get("rank") or 0) != 0:
+                continue
+            if str(member.get("status") or "") in {"stopped", "error"}:
+                continue
+            instance = int(member.get("instance_id") or 0)
+            by_instance.setdefault(instance, member)
+        return [by_instance[key] for key in sorted(by_instance)]
+
     def _cluster_route_order(self, deployment: dict) -> list[dict]:
         """Members to try for one request, best candidate first.
 
         Replicated deployments balance across every member, and the failover
         candidates follow in least-loaded order so an outage shifts work to
         the least busy replicas first. Sharded ranks form a single engine,
-        so only the rank-0 coordinator may serve a request.
+        so only the rank-0 coordinator may serve a request. Grouped-sharded
+        deployments balance across the running engine groups: each group's
+        rank-0 coordinator carries the group's requests, and stopped or
+        failed groups drop out of the candidate set.
         """
         members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") == "grouped_sharded":
+            coordinators = self._grouped_coordinators(deployment)
+            if not coordinators:
+                return members[:1]
+            chosen = self._balanced_cluster_member(deployment, coordinators)
+            rest = [m for m in coordinators if m is not chosen]
+            rest.sort(key=lambda m: self._cluster_member_active(
+                str(deployment.get("id") or ""), m,
+            ))
+            return [chosen, *rest]
         if deployment.get("mode") != "replicated" or len(members) < 2:
             return members[:1]
         deployment_id = str(deployment.get("id") or "")

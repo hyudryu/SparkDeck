@@ -301,5 +301,147 @@ class GroupedShardedRoutingTests(unittest.TestCase):
         self.assertEqual(key, "d1:instance:0")
 
 
+class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def lifecycle_manager(self) -> tuple[Manager, dict, list]:
+        deployment = {
+            **grouped_deployment(),
+            "desired_state": "running",
+            "status": "running",
+            "instances": 2,
+        }
+        for member in deployment["members"]:
+            member["status"] = "running"
+        instance = Manager.__new__(Manager)
+        instance.deployments = [deployment]
+        instance._save_deployments = lambda: None
+        actions = []
+
+        async def member_action(member, action, *, log_tail=300):
+            actions.append((member["instance_id"], action))
+            member["status"] = "starting" if action == "start" else "stopped"
+            return {"ok": True}
+
+        instance._member_action = member_action
+        return instance, deployment, actions
+
+    async def test_per_instance_stop_derives_degraded_state(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        result = await instance.deployment_action("d1", "stop", instance=1)
+        self.assertTrue(result["ok"])
+        # Only the targeted group's ranks are stopped.
+        self.assertEqual(actions, [(1, "stop"), (1, "stop")])
+        self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
+        self.assertEqual(deployment["members"][3]["desired_state"], "stopped")
+        # Untargeted groups stay expected-running for the health monitor.
+        self.assertEqual(deployment["members"][0]["desired_state"], "running")
+        self.assertEqual(deployment["desired_state"], "running")
+        self.assertEqual(deployment["status"], "degraded")
+
+    async def test_per_instance_start_of_stopped_group_is_degraded(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment["desired_state"] = "stopped"
+        deployment["status"] = "stopped"
+        for member in deployment["members"]:
+            member["status"] = "stopped"
+        result = await instance.deployment_action("d1", "start", instance=0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(actions, [(0, "start"), (0, "start")])
+        self.assertEqual(deployment["members"][0]["desired_state"], "running")
+        self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
+        self.assertEqual(deployment["desired_state"], "running")
+        self.assertEqual(deployment["status"], "degraded")
+
+    async def test_full_stop_unchanged_by_grouped_mode(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        await instance.deployment_action("d1", "stop")
+        self.assertEqual(actions, [(0, "stop"), (0, "stop"), (1, "stop"), (1, "stop")])
+        self.assertEqual(deployment["desired_state"], "stopped")
+        self.assertEqual(deployment["status"], "stopped")
+
+    async def test_per_instance_action_rejects_unknown_instance(self) -> None:
+        instance, _, _ = self.lifecycle_manager()
+        with self.assertRaisesRegex(ValueError, "instance"):
+            await instance.deployment_action("d1", "stop", instance=5)
+
+    async def test_health_ignores_targeted_stopped_group(self) -> None:
+        instance, deployment, _ = self.lifecycle_manager()
+        await instance.deployment_action("d1", "stop", instance=1)
+
+        def nodes_with_group1_gone():
+            return [
+                {
+                    "id": f"node-{group}-{rank}", "online": True,
+                    "docker_ready": True,
+                    "containers": (
+                        [{"name": member["container_name"], "status": "running"}]
+                        if member.get("desired_state") != "stopped"
+                        else []
+                    ),
+                }
+                for member in deployment["members"]
+                for group, rank in [(member["instance_id"], member["rank"])]
+            ]
+
+        self.assertIsNone(instance._cluster_health_issue(
+            deployment, nodes_with_group1_gone(),
+        ))
+        # The same missing containers on an expected-running group are a
+        # recoverable split.
+        nodes = nodes_with_group1_gone()
+        for member in deployment["members"]:
+            member.pop("desired_state", None)
+        issue = instance._cluster_health_issue(deployment, nodes)
+        self.assertIsNotNone(issue)
+        self.assertIn("instance 1", issue)
+
+
+class GroupedShardedRecipeContractTests(unittest.TestCase):
+    def test_contract_reads_persisted_grouped_topology(self) -> None:
+        # A grouped recipe persists the per-group TP and instance count as
+        # standalone fields, not as a whole-world argv flag.
+        instance = Manager.__new__(Manager)
+        contract = instance.recipe_deployment_contract({
+            "engine": "vllm",
+            "deployment_mode": "grouped_sharded",
+            "instances": 2,
+            "tensor_parallel_size": 2,
+            "node_ids": ["local", "remote-1", "remote-2", "remote-3"],
+        })
+        self.assertTrue(contract["supported"])
+        self.assertEqual(contract["deployment_mode"], "grouped_sharded")
+        self.assertEqual(contract["required_node_count"], 4)
+        self.assertEqual(contract["instances"], 2)
+        self.assertEqual(contract["tensor_parallel_size"], 2)
+
+    def test_contract_rejects_grouped_topology_below_two_ranks(self) -> None:
+        instance = Manager.__new__(Manager)
+        contract = instance.recipe_deployment_contract({
+            "engine": "vllm",
+            "deployment_mode": "grouped_sharded",
+            "instances": 4,
+            "tensor_parallel_size": 1,
+            "node_ids": ["local"],
+        })
+        self.assertFalse(contract["supported"])
+        self.assertIn("tensor_parallel_size >= 2", contract["error"])
+
+
+class GroupedShardedInstanceValidationTests(unittest.TestCase):
+    def test_target_instance_rejects_bools_and_fractions(self) -> None:
+        deployment = {**grouped_deployment(), "instances": 2}
+        with self.assertRaises(ValueError):
+            Manager._grouped_target_instance(deployment, "stop", True)
+        with self.assertRaises(ValueError):
+            Manager._grouped_target_instance(deployment, "stop", 1.5)
+
+    def test_topology_helper_rejects_fractional_fields(self) -> None:
+        from manager import _grouped_sharded_topology
+
+        with self.assertRaises(ValueError):
+            _grouped_sharded_topology(
+                {"tensor_parallel_size": 2.5, "instances": 2}, 5,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

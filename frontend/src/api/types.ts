@@ -68,6 +68,7 @@ export interface DeploymentSettings {
   image?: string
   context_length?: number
   tensor_parallel_size?: number
+  instances?: number
   data_parallel_size?: number
   pipeline_parallel_size?: number
   gpu_layers?: number
@@ -82,6 +83,14 @@ export interface DeploymentSettings {
   environment?: Record<string, string>
   port?: number
   extra_args?: string[]
+}
+
+// One independent engine group of a grouped-sharded deployment.
+export interface DeploymentInstance {
+  instance_id: number
+  status: string
+  desired_state: 'running' | 'stopped'
+  node_names: string[]
 }
 
 export interface Deployment {
@@ -102,6 +111,7 @@ export interface Deployment {
   environment?: Record<string, string>
   settings: DeploymentSettings
   deployment_mode?: string
+  instances?: DeploymentInstance[]
   required_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
@@ -229,6 +239,7 @@ export interface SavedDeploymentUpdateInput {
   image?: string | null
   context_length?: number | null
   tensor_parallel_size?: number | null
+  instances?: number | null
   parallel_slots?: number | null
   gpu_layers?: number | null
   quantization?: string | null
@@ -237,7 +248,7 @@ export interface SavedDeploymentUpdateInput {
   environment?: Record<string, string>
   gpu_memory_utilization?: number | null
   node_ids?: string[]
-  deployment_mode?: 'single' | 'replicated' | 'sharded' | null
+  deployment_mode?: 'single' | 'replicated' | 'sharded' | 'grouped_sharded' | null
 }
 
 export interface CreateDeploymentInput {
@@ -249,7 +260,7 @@ export interface CreateDeploymentInput {
   managed: boolean
   settings: DeploymentSettings
   node_ids?: string[]
-  deployment_mode?: 'single' | 'replicated' | 'sharded'
+  deployment_mode?: 'single' | 'replicated' | 'sharded' | 'grouped_sharded'
 }
 
 export interface NodeSummary {

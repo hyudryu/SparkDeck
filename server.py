@@ -2474,6 +2474,14 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             "mem_fraction_static": recipe.get("sg_mem_fraction"),
             "image": recipe.get("sg_image") or recipe.get("image"),
         })
+    if contract["deployment_mode"] == "grouped_sharded":
+        # The grouped topology is per group, not a whole-world argv flag: the
+        # launch body must carry both scalars so preflight can partition the
+        # selected nodes into instance groups.
+        settings.update({
+            "tensor_parallel_size": contract["tensor_parallel_size"],
+            "instances": contract["instances"],
+        })
     try:
         return await sparkdeck.create_deployment({
             "model": recipe.get("model"),
@@ -3111,8 +3119,14 @@ async def v1_deployment_action(deployment_id: str, action: str, req: Request):
         promote = body.get("promote", False)
         if not isinstance(promote, bool):
             raise ValueError("promote must be a boolean")
+        instance = body.get("instance")
+        if instance is not None and (
+            not isinstance(instance, int) or isinstance(instance, bool)
+        ):
+            raise ValueError("instance must be an integer")
         return await sparkdeck.deployment_action(
             deployment_id, action, node_ids, additional_node_ids, promote,
+            instance,
         )
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "request body must be valid JSON")

@@ -355,6 +355,7 @@ export interface WireDeployment {
   node_ids?: string[]
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
+  instances?: Deployment['instances']
   required_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
@@ -433,6 +434,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
       artifact: item.settings?.artifact || item.model.artifact,
     },
     deployment_mode: item.deployment_mode,
+    instances: item.instances,
     required_node_count: item.required_node_count,
     parallel_rank_count: item.parallel_rank_count,
     flexible_node_count: item.flexible_node_count,
@@ -614,7 +616,7 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[], promote = false) => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[], promote = false, instance?: number) => {
       if (action === 'remove') {
         return request<void>(
           `/api/v1/deployments/${encodeURIComponent(id)}`,
@@ -624,7 +626,9 @@ export const api = {
       }
       const payload = action === 'start' && additionalNodeIds?.length
         ? { additional_node_ids: additionalNodeIds }
-        : action === 'start' && nodeIds?.length ? { node_ids: nodeIds, promote: promote || undefined } : undefined
+        : action === 'start' && nodeIds?.length ? { node_ids: nodeIds, promote: promote || undefined } : instance !== undefined
+          ? { instance }
+          : undefined
       const data = await request<WireDeployment>(`/api/v1/deployments/${encodeURIComponent(id)}/${action}`, {
         method: 'POST',
         body: payload ? JSON.stringify(payload) : undefined,

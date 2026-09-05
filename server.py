@@ -41,6 +41,7 @@ from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
     RequestBodyTooLarge,
+    inference_request_limit_message,
     read_limited_json,
 )
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
@@ -3926,7 +3927,9 @@ async def _inference_json(
             MAX_INFERENCE_REQUEST_BYTES if max_bytes is None else max_bytes,
         )
     except RequestBodyTooLarge as exc:
-        raise HTTPException(413, "inference request exceeds the 32 MB limit") from exc
+        raise HTTPException(
+            413, inference_request_limit_message(MAX_INFERENCE_REQUEST_BYTES),
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
 

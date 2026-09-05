@@ -438,14 +438,26 @@ describe('ChatPage', () => {
     expect(alert).toHaveTextContent('up to 2 videos')
   })
 
-  it('rejects a dropped video above the per-video size limit', async () => {
+  it('attaches a dropped video of any size and sends it as a video_url part', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Got the clip.' },
+      reasoning: '', metrics: {},
+    })
     const { container } = render(<ChatPage />)
     await screen.findByRole('textbox', { name: 'Message' })
 
-    const bytes = new Uint8Array(16 * 1024 * 1024 + 1)
+    // Well above the former 16 MB per-video cap; size must no longer matter.
+    const bytes = new Uint8Array(17 * 1024 * 1024)
     bytes.set([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70], 0)
     dropOnComposer(container, [new File([bytes], 'large.mp4', { type: 'video/mp4' })])
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('exceeds the 16 MB per-video limit')
+    expect(await screen.findByText('large.mp4')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('Got the clip.')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
+      role: 'user',
+      content: [{ type: 'video_url', video_url: { url: expect.stringMatching(/^data:video\/mp4;base64,/) } }],
+    }])
   })
 })

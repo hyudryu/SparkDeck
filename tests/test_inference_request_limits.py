@@ -8,6 +8,7 @@ import server
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     RequestBodyTooLarge,
+    inference_request_limit_message,
     read_limited_json,
     read_limited_request_body,
 )
@@ -112,7 +113,10 @@ class InferenceRequestEndpointTests(unittest.IsolatedAsyncioTestCase):
             })
 
         self.assertEqual(response.status_code, 413)
-        self.assertEqual(response.json()["detail"], "inference request exceeds the 32 MB limit")
+        self.assertEqual(
+            response.json()["detail"],
+            inference_request_limit_message(128),
+        )
         proxy.assert_not_awaited()
 
     async def test_agent_limit_reserves_space_for_cluster_routing_envelope(self):

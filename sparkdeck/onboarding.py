@@ -26,6 +26,7 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_private_
 from sparkdeck.request_limits import (
     MAX_INFERENCE_REQUEST_BYTES,
     RequestBodyTooLarge,
+    inference_request_limit_message,
     is_inference_request_path,
     read_limited_request_body,
 )
@@ -827,7 +828,7 @@ async def forward_management_request(
             )
         except RequestBodyTooLarge:
             return JSONResponse(
-                {"detail": "inference request exceeds the 32 MB limit"},
+                {"detail": inference_request_limit_message(MAX_INFERENCE_REQUEST_BYTES)},
                 status_code=413,
             )
 

@@ -3,7 +3,10 @@
 import json
 from typing import Any
 
-MAX_INFERENCE_REQUEST_BYTES = 32 * 1024 * 1024
+# Chat attachments (images, videos) are inlined as base64 data URLs, inflating
+# by a third on top of the raw bytes. The limit only bounds buffering; the
+# browser's data-URL string ceiling keeps any single attachment well under it.
+MAX_INFERENCE_REQUEST_BYTES = 512 * 1024 * 1024
 # Cluster routing adds a few trusted private fields after the public request has
 # passed the limit. Give authenticated agent requests enough headroom for that
 # envelope without increasing the client-facing payload allowance.
@@ -12,6 +15,10 @@ MAX_CLUSTER_ROUTING_ENVELOPE_BYTES = 64 * 1024
 
 class RequestBodyTooLarge(ValueError):
     """Raised before an inference request can exceed the buffering limit."""
+
+
+def inference_request_limit_message(max_bytes: int) -> str:
+    return f"inference request exceeds the {max_bytes / (1024 * 1024):.0f} MB limit"
 
 
 def is_inference_request_path(path: str) -> bool:

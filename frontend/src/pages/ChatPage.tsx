@@ -38,9 +38,6 @@ const IMAGE_TYPE_LABELS: Record<string, string> = { 'image/png': 'PNG', 'image/j
 const VIDEO_TYPE_LABELS: Record<string, string> = { 'video/mp4': 'MP4', 'video/webm': 'WebM', 'video/quicktime': 'MOV' }
 const MAX_IMAGES_PER_MESSAGE = 4
 const MAX_VIDEOS_PER_MESSAGE = 2
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024
-const MAX_VIDEO_BYTES = 16 * 1024 * 1024
-const MAX_CONVERSATION_MEDIA_BYTES = 20 * 1024 * 1024
 
 const formatMediaSize = (bytes: number) => bytes < 1024 * 1024
   ? `${Math.max(1, Math.round(bytes / 1024))} KB`
@@ -175,10 +172,6 @@ export function ChatPage() {
       if (invocationEpoch !== attachmentMutationEpochRef.current) return
       const additions: ChatMediaAttachment[] = []
       const failures: string[] = []
-      const historyBytes = messages.reduce(
-        (total, message) => total + (message.media?.reduce((sum, item) => sum + item.size, 0) ?? 0),
-        0,
-      )
       for (const file of files) {
         const currentMedia = [...attachmentsRef.current, ...additions]
         const kind = mediaKind(file)
@@ -192,15 +185,6 @@ export function ChatPage() {
             ? `You can attach up to ${MAX_VIDEOS_PER_MESSAGE} videos per message.`
             : `You can attach up to ${MAX_IMAGES_PER_MESSAGE} images per message.`
           if (!failures.includes(message)) failures.push(message)
-          continue
-        }
-        const maxBytes = kind === 'video' ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES
-        if (file.size > maxBytes) {
-          failures.push(`${file.name || 'File'} exceeds the ${maxBytes / (1024 * 1024)} MB per-${kind} limit.`)
-          continue
-        }
-        if (historyBytes + currentMedia.reduce((total, item) => total + item.size, 0) + file.size > MAX_CONVERSATION_MEDIA_BYTES) {
-          failures.push('Media exceeds the 20 MB conversation limit. Clear the chat to attach more.')
           continue
         }
         try {

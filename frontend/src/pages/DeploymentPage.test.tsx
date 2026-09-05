@@ -505,14 +505,14 @@ describe('deployment object page', () => {
     expect(mutationCalls).toEqual([])
   })
 
-  it('submits an edited model and drops pinned --revision flags from the runtime flags', async () => {
+  it('submits an edited model, drops the stale --revision pin, and keeps a new one', async () => {
     const user = userEvent.setup()
     renderPage()
 
     const runtimeFlags = (await screen.findByText('Runtime flags'))
       .closest('label')?.querySelector('textarea') as HTMLTextAreaElement
     await user.clear(runtimeFlags)
-    await user.type(runtimeFlags, '--revision abc123 --enable-prefix-caching')
+    await user.type(runtimeFlags, '--revision rev-123 --revision abc123 --enable-prefix-caching')
     const modelInput = (await screen.findByText('Model weights'))
       .closest('label')?.querySelector('input') as HTMLInputElement
     await user.clear(modelInput)
@@ -525,7 +525,7 @@ describe('deployment object page', () => {
     const put = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT')
     const body = JSON.parse(String(put?.[1]?.body))
     expect(body.model).toBe('org/abliterated')
-    expect(body.extra_args).toEqual(['--enable-prefix-caching'])
+    expect(body.extra_args).toEqual(['--revision', 'abc123', '--enable-prefix-caching'])
   })
 
   it('hides the model weights field for llama.cpp deployments', async () => {

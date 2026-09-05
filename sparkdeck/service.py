@@ -1926,14 +1926,11 @@ class SparkDeckService:
         unknown = sorted(set(changes) - allowed)
         if unknown:
             raise ValueError(f"unsupported field(s): {', '.join(unknown)}")
-        if "model" in changes and (
-            not isinstance(changes.get("model"), str)
-            or not changes["model"].strip()
-        ):
-            raise ValueError("model must be a non-empty string")
-        changes = {**changes, **({
-            "model": changes["model"].strip(),
-        } if "model" in changes else {})}
+        if "model" in changes:
+            model_id = changes["model"]
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise ValueError("model must be a non-empty string")
+            changes = {**changes, "model": model_id.strip()}
 
         updated = self.manager.update_deployment_settings(manager_id, changes)
         launch_settings = updated.get("launch_settings") or {}

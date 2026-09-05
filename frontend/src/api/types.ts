@@ -676,7 +676,14 @@ export interface ChatImageContentPart {
   }
 }
 
-export type ChatMessageContent = string | Array<ChatTextContentPart | ChatImageContentPart>
+export interface ChatVideoContentPart {
+  type: 'video_url'
+  video_url: {
+    url: string
+  }
+}
+
+export type ChatMessageContent = string | Array<ChatTextContentPart | ChatImageContentPart | ChatVideoContentPart>
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'

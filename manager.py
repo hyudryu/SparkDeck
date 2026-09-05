@@ -6942,6 +6942,62 @@ class Manager:
             errors = self._member_action_errors(results, "remove")
             return {"ok": not errors, "errors": errors}
 
+    async def _deployment_environment_drift(
+        self, deployment: dict,
+    ) -> dict[str, list[str]] | None:
+        """Return per-container launch-environment drift, or None.
+
+        The saved launch environment is the source of truth for what the
+        ranks should carry. Drift appears when containers were created by an
+        older build whose environment handling differs, or when saved
+        settings changed without the dirty flag. Confirmation requires every
+        member to answer: an unavailable node, an older agent without the
+        check route, or an unreadable container degrades the whole check to
+        None so start keeps its plain docker-start behavior instead of
+        blocking on monitoring infrastructure.
+        """
+        settings = deployment.get("launch_settings")
+        if not isinstance(settings, dict):
+            return None
+        engine = str(deployment.get("engine") or settings.get("engine") or "vllm")
+        try:
+            desired = normalize_runtime_environment(
+                settings.get("environment"), engine,
+            )
+        except ValueError:
+            return None
+        if not desired:
+            return None
+        drifted: dict[str, list[str]] = {}
+        for member in deployment.get("members") or []:
+            if not isinstance(member, dict):
+                continue
+            container_name = member.get("container_name")
+            node_id = member.get("node_id")
+            if not container_name or not node_id:
+                continue
+            try:
+                if node_id == LOCAL_NODE_ID:
+                    report = await self.container_environment_drift(
+                        str(container_name), desired,
+                    )
+                else:
+                    report = await self.node_registry.request(
+                        node_id, "POST",
+                        "/api/agent/containers/"
+                        f"{quote(str(container_name), safe='')}/environment/check",
+                        json_body={"environment": desired}, timeout=60,
+                    )
+            except Exception:
+                return None
+            if not isinstance(report, dict) or report.get("ok"):
+                continue
+            drifted[str(container_name)] = [
+                *(f"missing:{item}" for item in report.get("missing") or []),
+                *(f"changed:{item}" for item in report.get("changed") or []),
+            ]
+        return drifted or None
+
     async def deployment_action(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -7060,6 +7116,28 @@ class Manager:
         # any argv-affecting setting change) means removing the old ranks and
         # relaunching the deployment through the fully validated path.
         relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
+        environment_drift: dict[str, list[str]] | None = None
+        if action == "start" and not relaunch and deployment.get("members"):
+            # A container bakes its environment at create time. When the saved
+            # launch environment no longer matches what the existing ranks
+            # carry, docker start would silently run stale variables: recreate
+            # the ranks through the same validated relaunch path instead.
+            try:
+                environment_drift = await self._deployment_environment_drift(
+                    deployment,
+                )
+            except Exception:
+                # An unexpected inspection failure must never block a start.
+                environment_drift = None
+            if environment_drift:
+                relaunch = True
+                drifted = ", ".join(sorted(environment_drift))
+                deployment["status"] = "starting"
+                deployment["status_message"] = (
+                    "Recreating containers: their environment no longer "
+                    f"matches the saved launch settings ({drifted})"
+                )
+                self._save_deployments()
         if relaunch:
             launch_body = dict(deployment.get("launch_settings") or {})
             launch_body["recipe_id"] = deployment.get("recipe_id")
@@ -7094,6 +7172,8 @@ class Manager:
             if remove_errors:
                 deployment["status"] = "stopped"
                 deployment["error"] = "; ".join(remove_errors)
+                if environment_drift:
+                    deployment["status_message"] = None
                 self._save_deployments()
                 return {"ok": False, "errors": remove_errors}
 
@@ -7107,8 +7187,14 @@ class Manager:
                 # retried. create_deployment also leaves its failed attempt
                 # visible with the node-specific diagnostic.
                 deployment["status"] = "stopped"
+                if environment_drift:
+                    deployment["status_message"] = None
                 self._save_deployments()
                 raise
+            if environment_drift:
+                replacement["status_message"] = (
+                    "Recreated containers to apply the updated environment"
+                )
             self.deployments = [
                 item for item in self.deployments if item.get("id") != deployment_id
             ]
@@ -14077,6 +14163,50 @@ class Manager:
             container.start()
         await asyncio.to_thread(_do)
         return {"ok": True}
+
+    async def container_environment_drift(
+        self, name: str, expected: Any,
+    ) -> dict:
+        """Compare a container's baked environment against expected values.
+
+        Docker cannot change a created container's environment, so a start
+        that finds drift must recreate the container instead. Only names
+        present in ``expected`` are compared: image-inherited and
+        node-injected variables (NCCL transport, HF credentials) are the
+        container's own business. Values are never echoed back because Docker
+        inspection can expose application credentials.
+        """
+        if not isinstance(expected, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in expected.items()
+        ):
+            raise ValueError("environment must be an object of string values")
+
+        def _read() -> dict[str, str]:
+            container = self.client.containers.get(name)
+            container.reload()
+            config = (container.attrs or {}).get("Config") or {}
+            actual: dict[str, str] = {}
+            for entry in config.get("Env") or []:
+                if isinstance(entry, str) and "=" in entry:
+                    key, value = entry.split("=", 1)
+                    actual[key] = value
+            return actual
+
+        try:
+            actual = await asyncio.to_thread(_read)
+        except docker.errors.NotFound as exc:
+            raise ValueError(f"container {name} not found") from exc
+        missing = sorted(key for key in expected if key not in actual)
+        changed = sorted(
+            key for key, value in expected.items()
+            if key in actual and actual[key] != value
+        )
+        return {
+            "ok": not missing and not changed,
+            "missing": missing,
+            "changed": changed,
+        }
 
     @staticmethod
     def _replace_command_option(

@@ -372,10 +372,12 @@ describe('ChatPage', () => {
     dropOnComposer(container, [mp4File('demo.mp4')])
 
     expect(await screen.findByText('demo.mp4')).toBeInTheDocument()
+    expect(container.querySelector('.composer-attachment video')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
     await user.type(composer, 'Describe the clip')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
     await screen.findByText('A short clip.')
+    expect(container.querySelector('.user-message-media video[aria-label="Attached demo.mp4"]')).toBeInTheDocument()
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{
       role: 'user',
       content: [

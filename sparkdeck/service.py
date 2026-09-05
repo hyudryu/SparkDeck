@@ -61,6 +61,11 @@ from .virtual_nas import LOCAL_NODE_ID, download_required_free_bytes
 
 logger = logging.getLogger(__name__)
 
+# Deployment layouts accepted wherever a saved ``deployment_mode`` is
+# validated. Manager owns the launch-side checks; this copy keeps the saved
+# bookmark validation dependency-free from Manager's import graph.
+_MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -1101,6 +1106,8 @@ class SparkDeckService:
             if cluster.get("error"):
                 stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
+            if cluster.get("mode") == "grouped_sharded":
+                stored["instances"] = _grouped_instance_summary(cluster)
             served_models = cluster.get("served_models")
             if isinstance(served_models, list):
                 stored["served_models"] = list(served_models)
@@ -2247,7 +2254,7 @@ class SparkDeckService:
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
-            "environment",
+            "environment", "instances",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -2266,6 +2273,7 @@ class SparkDeckService:
             settings["image"] = image
         integer_fields = (
             "context_length", "tensor_parallel_size", "parallel_slots",
+            "instances",
         )
         for field in integer_fields:
             if field not in changes:
@@ -2452,9 +2460,10 @@ class SparkDeckService:
             settings["node_ids"] = node_ids
         if "deployment_mode" in changes:
             mode = changes.get("deployment_mode")
-            if mode is not None and mode not in {"single", "replicated", "sharded"}:
+            if mode is not None and mode not in _MODE_ALLOWLIST:
                 raise ValueError(
-                    "deployment_mode must be single, sharded, or replicated"
+                    "deployment_mode must be single, sharded, replicated, "
+                    "or grouped_sharded"
                 )
             settings["deployment_mode"] = mode
         # Validate the effective combination: locality of the final artifact
@@ -2486,7 +2495,7 @@ class SparkDeckService:
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
-            settings.get("deployment_mode") == "sharded"
+            settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
         ):
             raise ValueError(
                 "llama.cpp deployments support single and replicated layouts, not sharded"
@@ -2502,6 +2511,25 @@ class SparkDeckService:
             and len(effective_nodes) < 2
         ):
             raise ValueError("sharded deployment requires at least two nodes")
+        if (
+            contract["deployment_mode"] == "grouped_sharded"
+            and effective_nodes
+            and len(effective_nodes) != contract["required_node_count"]
+        ):
+            raise ValueError(
+                "grouped_sharded deployment requires exactly "
+                f"{contract['required_node_count']} node(s)"
+            )
+        if contract["deployment_mode"] == "grouped_sharded":
+            saved_tensor = settings.get("tensor_parallel_size")
+            if (
+                isinstance(saved_tensor, int)
+                and not isinstance(saved_tensor, bool)
+                and saved_tensor < 2
+            ):
+                raise ValueError(
+                    "grouped_sharded requires tensor_parallel_size >= 2"
+                )
         await self._assert_deployment_alias_available(alias, stored["id"])
         if alias != stored.get("alias"):
             self.store.update_saved_deployment_settings(
@@ -2784,6 +2812,26 @@ class SparkDeckService:
                 )
             else:
                 count = max(2, len(node_ids))
+        elif mode == "grouped_sharded":
+            controls = settings.get("launch_controls")
+            if not isinstance(controls, dict):
+                controls = {}
+
+            def _positive_count(value: Any) -> int:
+                return (
+                    value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    and value > 0
+                    else 1
+                )
+
+            tensor = _positive_count(controls.get("tensor_parallel_size"))
+            if tensor == 1:
+                tensor = _positive_count(settings.get("tensor_parallel_size"))
+            instances = _positive_count(settings.get("instances"))
+            # The saved topology must be exactly N*T nodes: instances complete
+            # tensor-parallel groups with no spare or missing hosts.
+            count = max(2, tensor * instances)
         elif mode == "replicated":
             count = max(2, len(node_ids))
         else:
@@ -3045,11 +3093,26 @@ class SparkDeckService:
                 mode = deployment_mode or (
                     "replicated" if len(requested_node_ids) > 1 else "single"
                 )
+                if mode not in _MODE_ALLOWLIST:
+                    raise ValueError(
+                        "deployment_mode must be single, sharded, replicated, "
+                        "or grouped_sharded"
+                    )
                 if mode == "single" and len(requested_node_ids) != 1:
                     raise ValueError("single deployment requires exactly one node")
-                if mode == "sharded" and runtime is RuntimeKind.LLAMA_CPP:
+                if mode in {"sharded", "grouped_sharded"} and (
+                    runtime is RuntimeKind.LLAMA_CPP
+                ):
                     raise ValueError(
                         "llama.cpp deployments support single and replicated layouts, not sharded"
+                    )
+                if mode == "grouped_sharded":
+                    # Reject an unlaunchable topology at save time; Manager's
+                    # preflight re-checks authoritatively at launch.
+                    from manager import _grouped_sharded_topology
+
+                    _, _ = _grouped_sharded_topology(
+                        settings, len(requested_node_ids),
                     )
                 if not launch:
                     # A saved deployment is a launch bookmark: persist the
@@ -3856,6 +3919,7 @@ class SparkDeckService:
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
         promote: bool = False,
+        instance: int | None = None,
     ) -> dict[str, Any]:
         async with self._deployment_lifecycle_lock(deployment_id):
             launch_task = self._deployment_launch_tasks.get(deployment_id)
@@ -3865,7 +3929,8 @@ class SparkDeckService:
                 )
             if action != "start":
                 return await self._deployment_action_locked(
-                    deployment_id, action, node_ids, additional_node_ids, promote,
+                    deployment_id, action, node_ids, additional_node_ids,
+                    promote, instance,
                 )
             # Selector arbitration and the in-flight registration are one
             # step: the guard reads other records' live selectors, so a
@@ -3879,7 +3944,8 @@ class SparkDeckService:
                 )
             try:
                 return await self._deployment_action_locked(
-                    deployment_id, action, node_ids, additional_node_ids, promote,
+                    deployment_id, action, node_ids, additional_node_ids,
+                    promote, instance,
                 )
             finally:
                 self._deployment_launches.pop(deployment_id, None)
@@ -4429,6 +4495,7 @@ class SparkDeckService:
         node_ids: list[str] | None = None,
         additional_node_ids: list[str] | None = None,
         promote: bool = False,
+        instance: int | None = None,
     ) -> dict[str, Any]:
         deployment = self.store.deployment(deployment_id, include_private=True)
         discovered = None
@@ -4506,10 +4573,10 @@ class SparkDeckService:
                     "this deployment starts on its existing node"
                 )
             contract = self._layout_contract(launch_settings)
-            if contract.get("deployment_mode") == "sharded":
+            if contract.get("deployment_mode") in {"sharded", "grouped_sharded"}:
                 raise ValueError(
-                    "sharded deployments cannot launch on additional nodes; "
-                    "their tensor-parallel layout is fixed"
+                    f"{contract.get('deployment_mode')} deployments cannot launch "
+                    "on additional nodes; their tensor-parallel layout is fixed"
                 )
             current_nodes = (owner or linked or {}).get("node_ids")
             if not isinstance(current_nodes, list) or not current_nodes:
@@ -4546,20 +4613,36 @@ class SparkDeckService:
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
             await self._validate_start_selection(deployment, node_ids, launch_settings)
-        if discovered is None and action == "stop":
+        if instance is not None and (node_ids is not None or additional_node_ids):
+            # A per-instance grouped-sharded action addresses one engine
+            # group; a node selection relocates the whole deployment. The
+            # combination is ambiguous and silently dropping either would
+            # surprise the caller.
+            raise ValueError(
+                "instance cannot be combined with a node selection"
+            )
+        if discovered is None and action == "stop" and instance is None:
             # Persist intent before the first container call. A failed or
             # partially completed stop must still prevent queued inference or
-            # health traffic from waking the deployment again.
+            # health traffic from waking the deployment again. A per-instance
+            # grouped-sharded stop does not own the deployment's intent.
             self.store.update_desired_state(deployment_id, "stopped")
         if manager_id:
             if node_ids is None:
-                result = await self.manager.deployment_action(manager_id, action)
+                if instance is not None:
+                    result = await self.manager.deployment_action(
+                        manager_id, action, instance=instance,
+                    )
+                else:
+                    result = await self.manager.deployment_action(manager_id, action)
             elif relaunch_mode:
                 result = await self.manager.deployment_action(
                     manager_id, action, node_ids, relaunch_mode,
                 )
             else:
-                result = await self.manager.deployment_action(manager_id, action, node_ids)
+                result = await self.manager.deployment_action(
+                    manager_id, action, node_ids,
+                )
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
             replacement = result.get("deployment") if isinstance(result, dict) else None
@@ -4576,9 +4659,18 @@ class SparkDeckService:
                     f"http://127.0.0.1:{int(replacement['api_port'])}",
                 )
             if action == "start":
+                # A per-instance grouped-sharded start also wakes the
+                # deployment's stored intent: the group serves inference, so
+                # a persisted stop must not keep the alias blocked at the
+                # proxy.
                 self.store.update_desired_state(deployment_id, "running")
             current = self.store.deployment(deployment_id) or deployment
-            current["status"] = "running" if action == "start" else "stopped"
+            if instance is not None and result.get("status"):
+                # A per-instance grouped-sharded action reports the derived
+                # status (running/degraded) instead of a whole-record flip.
+                current["status"] = str(result["status"])
+            else:
+                current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
             return current
         if owner:
@@ -4594,7 +4686,12 @@ class SparkDeckService:
                 else:
                     result = await self.manager.deployment_action(owner["id"], action, node_ids)
             else:
-                result = await self.manager.deployment_action(owner["id"], action)
+                if instance is not None:
+                    result = await self.manager.deployment_action(
+                        owner["id"], action, instance=instance,
+                    )
+                else:
+                    result = await self.manager.deployment_action(owner["id"], action)
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
             replacement = result.get("deployment") if isinstance(result, dict) else None
@@ -7166,9 +7263,53 @@ def _deployment_status(value: Any) -> str:
         return "stopped"
     if status == "stopping":
         return "stopping"
-    if status in ("error", "unhealthy", "degraded"):
+    if status == "degraded":
+        # A grouped-sharded deployment with a deliberately stopped group is
+        # partially serving, not failed; the card must say so.
+        return "degraded"
+    if status in ("error", "unhealthy"):
         return "error"
     return "unknown"
+
+
+def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-engine-group state for a grouped-sharded deployment card.
+
+    One entry per instance group so the UI can render per-instance Start and
+    Stop controls without receiving raw per-rank member rows.
+    """
+    groups: dict[int, dict[str, Any]] = {}
+    for member in cluster.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        try:
+            group_id = int(member.get("instance_id") or 0)
+        except (TypeError, ValueError):
+            group_id = 0
+        entry = groups.setdefault(group_id, {
+            "instance_id": group_id,
+            "statuses": [],
+            "desired_state": "running",
+            "node_names": [],
+        })
+        entry["node_names"].append(
+            str(member.get("node_name") or member.get("node_id") or ""),
+        )
+        entry["statuses"].append(str(member.get("status") or "queued"))
+        if str(member.get("desired_state") or "running") == "stopped":
+            entry["desired_state"] = "stopped"
+    for entry in groups.values():
+        states = entry.pop("statuses")
+        if "error" in states:
+            entry["status"] = "error"
+        elif states and all(state == "stopped" for state in states):
+            entry["status"] = "stopped"
+        elif states and all(state in {"running", "ready"} for state in states):
+            entry["status"] = "running"
+        else:
+            entry["status"] = "starting"
+        entry["node_names"].sort()
+    return [groups[key] for key in sorted(groups)]
 
 
 def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:

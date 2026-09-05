@@ -93,6 +93,7 @@ const isControllerArtifact = (deployment: Deployment) => (
 // (parallel instances). Every picker states which one it means.
 const layoutLegend = (mode: string | undefined, nodeCount: number) => {
   if (mode === 'sharded') return 'Target nodes · tensor parallelism (one model split across nodes)'
+  if (mode === 'grouped_sharded') return 'Target nodes · grouped sharded (independent TP groups behind one name)'
   if (mode === 'replicated' || nodeCount > 1) return 'Target nodes · parallel instances (a full model copy per node)'
   return 'Target node · single instance'
 }
@@ -100,6 +101,9 @@ const layoutLegend = (mode: string | undefined, nodeCount: number) => {
 const layoutHelp = (mode: string | undefined) => {
   if (mode === 'sharded') {
     return 'Tensor parallelism: the selected nodes cooperate on one model, so the node count and tensor parallel size must match.'
+  }
+  if (mode === 'grouped_sharded') {
+    return 'Grouped sharded: the selection splits into independent TP-sized engine groups that share the served name and load-balance, so the node count must equal instances × tensor parallel size.'
   }
   if (mode === 'replicated') {
     return 'Parallel instances: every selected node runs its own complete copy of the model.'
@@ -658,7 +662,10 @@ export function ModelsPage() {
         ? shardedCandidates
         : available.length ? available : fallback ? [fallback.id] : []
       const sharded = requestedSharded && nodeIds.length > 1
-      const deploymentMode = sharded && nodeIds.length > 1 ? 'sharded' : nodeIds.length > 1 ? 'replicated' : 'single'
+      const grouped = current.deployment_mode === 'grouped_sharded' && nodeIds.length > 1
+      const deploymentMode = grouped
+        ? 'grouped_sharded'
+        : sharded && nodeIds.length > 1 ? 'sharded' : nodeIds.length > 1 ? 'replicated' : 'single'
       catalogShardedLayout.current = false
       return {
         ...current,
@@ -666,7 +673,10 @@ export function ModelsPage() {
         deployment_mode: deploymentMode,
         settings: current.runtime === 'llama.cpp' ? current.settings : {
           ...current.settings,
-          tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds.length : 1,
+          tensor_parallel_size: deploymentMode === 'sharded'
+            ? nodeIds.length
+            : deploymentMode === 'grouped_sharded' ? current.settings.tensor_parallel_size ?? 1 : 1,
+          instances: deploymentMode === 'grouped_sharded' ? current.settings.instances : undefined,
         },
       }
     })
@@ -717,10 +727,14 @@ export function ModelsPage() {
 
   const selectionReady = !nodes.loading && !nodes.error && (form.node_ids?.length ?? 0) > 0
     && (form.node_ids ?? []).every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-    && (form.deployment_mode !== 'sharded' || (
-      (form.node_ids?.length ?? 0) > 1
-      && form.settings.tensor_parallel_size === (form.node_ids?.length ?? 0)
-    ))
+    && (form.deployment_mode === 'grouped_sharded'
+      ? (form.settings.tensor_parallel_size ?? 1) >= 2
+        && (form.settings.instances ?? 1) >= 1
+        && (form.settings.tensor_parallel_size ?? 1) * (form.settings.instances ?? 1) === (form.node_ids?.length ?? 0)
+      : form.deployment_mode !== 'sharded' || (
+        (form.node_ids?.length ?? 0) > 1
+        && form.settings.tensor_parallel_size === (form.node_ids?.length ?? 0)
+      ))
   const localLabel = onboarding.data?.role === 'worker' ? 'Controller' : 'This device'
 
   // Models already present on any node's Virtual NAS cache, for the
@@ -1019,28 +1033,57 @@ export function ModelsPage() {
   }
 
   const updateNodeSelection = (selectedIds: string[]) => setForm((current) => {
+    const grouped = current.deployment_mode === 'grouped_sharded'
     const sharded = current.deployment_mode === 'sharded'
     const nodeIds = selectedIds
-    const deploymentMode = nodeIds.length > 1 ? (sharded ? 'sharded' : 'replicated') : 'single'
+    const deploymentMode = nodeIds.length > 1
+      ? (grouped ? 'grouped_sharded' : sharded ? 'sharded' : 'replicated')
+      : 'single'
     return {
       ...current,
       node_ids: nodeIds,
       deployment_mode: deploymentMode,
       settings: current.runtime === 'llama.cpp' ? current.settings : {
         ...current.settings,
-        tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds.length : 1,
+        tensor_parallel_size: deploymentMode === 'sharded'
+          ? nodeIds.length
+          : deploymentMode === 'grouped_sharded' ? current.settings.tensor_parallel_size ?? 1 : 1,
+        // Keep the N*T product true when the selection moves: re-derive the
+        // instance count from the new node count and the per-group TP.
+        instances: deploymentMode === 'grouped_sharded'
+          ? Math.max(1, Math.floor(nodeIds.length / Math.max(1, current.settings.tensor_parallel_size ?? 1)))
+          : undefined,
       },
     }
   })
 
-  const updateDeploymentMode = (mode: 'replicated' | 'sharded') => setForm((current) => {
+  const updateDeploymentMode = (mode: 'replicated' | 'sharded' | 'grouped_sharded') => setForm((current) => {
     const selectedIds = current.node_ids ?? []
     const nodeIds = selectedIds
+    if (mode === 'grouped_sharded') {
+      // Split the selection into as many groups as the smallest usable
+      // tensor-parallel size allows (4 nodes default to two TP2 engines);
+      // an already-chosen TP>1 carries over as the per-group size.
+      const savedTensor = current.settings.tensor_parallel_size ?? 0
+      const tensor = savedTensor > 1 && savedTensor <= nodeIds.length
+        ? savedTensor
+        : 2
+      return {
+        ...current,
+        node_ids: nodeIds,
+        deployment_mode: mode,
+        settings: {
+          ...current.settings,
+          tensor_parallel_size: tensor,
+          instances: Math.max(1, Math.floor(nodeIds.length / tensor)),
+        },
+      }
+    }
     return {
       ...current,
       node_ids: nodeIds,
       deployment_mode: mode,
-      settings: { ...current.settings, tensor_parallel_size: mode === 'sharded' ? nodeIds.length : 1 },
+      settings: { ...current.settings, tensor_parallel_size: mode === 'sharded' ? nodeIds.length : 1, instances: undefined },
     }
   })
 
@@ -1107,6 +1150,11 @@ export function ModelsPage() {
       if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
         settings.gpu_memory_utilization = utilization
       }
+      if (form.deployment_mode === 'grouped_sharded') {
+        settings.instances = form.settings.instances ?? 1
+      } else {
+        delete settings.instances
+      }
       if (editing) {
         // Saved deployments are editable bookmarks: the same form updates the
         // recorded runtime settings and node preferences without launching.
@@ -1117,6 +1165,7 @@ export function ModelsPage() {
           image: form.runtime === 'vllm' ? settings.image ?? null : undefined,
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
+          instances: form.deployment_mode === 'grouped_sharded' ? settings.instances ?? null : null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,
           quantization: settings.quantization ?? null,
@@ -2463,7 +2512,8 @@ export function ModelsPage() {
                 help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.deployment_mode === 'grouped_sharded' && <label className="field"><span>Instances (independent engine groups)</span><input type="number" min="1" value={form.settings.instances ?? 1} onChange={(event) => setForm({ ...form, settings: { ...form.settings, instances: Math.max(1, Number(event.target.value) || 1) } })} />{(form.settings.tensor_parallel_size ?? 1) * (form.settings.instances ?? 1) !== (form.node_ids?.length ?? 0) && <small className="form-error" role="status">{form.node_ids?.length ?? 0} selected nodes cannot split into {form.settings.instances ?? 1} TP{form.settings.tensor_parallel_size ?? 1} group(s); pick {form.settings.instances ?? 1} × {form.settings.tensor_parallel_size ?? 1} nodes or adjust the counts.</small>}<small>Each instance runs on {form.settings.tensor_parallel_size ?? 2} of the selected nodes; the selection must equal instances × tensor parallel size.</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
                   contextLengthTouched.current = true
@@ -2472,7 +2522,17 @@ export function ModelsPage() {
                 {form.runtime === 'llama.cpp' ? (
                   <label className="field"><span>Parallel slots</span><input type="number" min="1" value={form.settings.parallel_slots} onChange={(event) => setForm({ ...form, settings: { ...form.settings, parallel_slots: Number(event.target.value) } })} /></label>
                 ) : (
-                  <label className="field"><span>Tensor parallel size</span><input type="number" min="1" readOnly={form.deployment_mode === 'sharded'} value={form.settings.tensor_parallel_size} onChange={(event) => setForm({ ...form, settings: { ...form.settings, tensor_parallel_size: Number(event.target.value) } })} />{form.deployment_mode === 'sharded' && <small>Derived from the {form.node_ids?.length ?? 0} selected nodes.</small>}</label>
+                  <label className="field"><span>Tensor parallel size</span><input type="number" min="1" readOnly={form.deployment_mode === 'sharded'} value={form.settings.tensor_parallel_size} onChange={(event) => setForm((current) => {
+                    const tensor = Number(event.target.value)
+                    return { ...current, settings: {
+                      ...current.settings,
+                      tensor_parallel_size: tensor,
+                      // Grouped mode keeps instances × TP equal to the node count.
+                      instances: current.deployment_mode === 'grouped_sharded'
+                        ? Math.max(1, Math.floor((current.node_ids?.length ?? 0) / Math.max(1, tensor)))
+                        : current.settings.instances,
+                    } }
+                  })} />{form.deployment_mode === 'sharded' && <small>Derived from the {form.node_ids?.length ?? 0} selected nodes.</small>}{form.deployment_mode === 'grouped_sharded' && <small>Tensor parallel size per instance group; the instance count follows the selected nodes.</small>}</label>
                 )}
               </div>
               {form.managed && <>

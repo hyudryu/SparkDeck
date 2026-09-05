@@ -68,7 +68,72 @@ function renderPage() {
   </Routes></MemoryRouter>)
 }
 
+const groupedDetail = {
+  ...detail,
+  status: 'degraded', editable: false, controllable: true,
+  deployment_mode: 'grouped_sharded',
+  required_node_count: 4,
+  node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+  instances: [
+    { instance_id: 0, status: 'running', desired_state: 'running', node_names: ['Controller', 'Node 4'] },
+    { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_names: ['Node 2', 'Node 3'] },
+  ],
+}
+
 describe('deployment object page', () => {
+  it('starts one grouped-sharded engine group without touching the others', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1/start' && init?.method === 'POST') {
+        return new Response(JSON.stringify(groupedDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(groupedDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    expect(await screen.findByText('Instance 0')).toBeInTheDocument()
+    expect(screen.getByText('Instance 1')).toBeInTheDocument()
+    // The running group offers Stop; the stopped group offers Start.
+    expect(screen.getByRole('button', { name: 'Stop group' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Start group' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input, init]) => (
+        String(input) === '/api/v1/deployments/dep-1/start' && init?.method === 'POST'
+      ))
+      expect(call).toBeDefined()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ instance: 1 })
+    })
+  })
+
+  it('requires the full instances × TP node count to run a stopped grouped deployment', async () => {
+    const user = userEvent.setup()
+    const stoppedGrouped = {
+      ...groupedDetail,
+      status: 'stopped', editable: false, controllable: true,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(stoppedGrouped), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Instance 0')
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+
+    // TP2 x 2 instances needs all four nodes, not the TP value.
+    expect(await screen.findByRole('dialog', { name: 'Start Reasoning server' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start on 4 nodes' })).toBeInTheDocument()
+  })
+
   it('polls the detail while a stop is in flight and updates once stopped', async () => {
     let detailRequests = 0
     fetchMock.mockImplementation(async (input, init) => {

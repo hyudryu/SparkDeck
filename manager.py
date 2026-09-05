@@ -135,6 +135,47 @@ PERSISTED_RECIPE_ARGS_ERROR = (
 PERSISTED_DEPLOYMENT_ARGS_ERROR = (
     "unsupported persisted launch_settings.extra_args: expected an array of strings"
 )
+# Deployment layouts accepted everywhere a ``deployment_mode`` is validated.
+# ``grouped_sharded`` runs N independent sharded engine groups (each a
+# tensor-parallel-sized node group) behind one served name.
+_MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+# Member-label modes that run one rank of a distributed engine: host
+# networking, fabric environment, and per-rank VRAM fitting all apply.
+_SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
+
+
+def _grouped_sharded_topology(body: dict, node_count: int) -> tuple[int, int]:
+    """Validate and return the (tensor_parallel_size, instances) pair.
+
+    A grouped-sharded deployment owns exactly ``instances * tensor_parallel_size``
+    nodes, partitioned consecutively into per-instance tensor-parallel groups,
+    and every group needs at least two ranks to be a sharded engine at all.
+    """
+    def _positive_int_field(key: str) -> int | None:
+        value = body.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a positive integer")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a positive integer")
+        if not number.is_integer() or number < 1:
+            raise ValueError(f"{key} must be a positive integer")
+        return int(number)
+
+    tensor_parallel = _positive_int_field("tensor_parallel_size") or 1
+    instances = _positive_int_field("instances") or 1
+    if tensor_parallel < 2:
+        raise ValueError("grouped_sharded requires tensor_parallel_size >= 2")
+    required = tensor_parallel * instances
+    if node_count != required:
+        raise ValueError(
+            f"grouped_sharded requires {instances} instance(s) of "
+            f"TP{tensor_parallel} = {required} node(s), got {node_count}"
+        )
+    return tensor_parallel, instances
 
 
 class _RetryingDockerClient:
@@ -3830,7 +3871,7 @@ class Manager:
         )
         if engine == "vllm":
             extra_args = cls._with_vllm_prompt_token_details(extra_args)
-        return {
+        launch_settings = {
             "deployment_name": body.get("deployment_name") or body.get("name"),
             "model": body.get("model") or "",
             "engine": engine,
@@ -3868,6 +3909,14 @@ class Manager:
                 body.get("output_cost_per_1m"), "output_cost_per_1m"
             ),
         }
+        if launch_settings["deployment_mode"] == "grouped_sharded":
+            # The grouped topology cannot be re-derived from argv alone: the
+            # tensor-parallel size is per group, not the whole world size.
+            launch_settings["tensor_parallel_size"] = body.get(
+                "tensor_parallel_size"
+            )
+            launch_settings["instances"] = body.get("instances")
+        return launch_settings
 
     @staticmethod
     def _normalize_runtime_environment(value: Any, engine: str = "vllm") -> dict[str, str]:
@@ -4425,8 +4474,13 @@ class Manager:
         if settings["engine"] not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         mode = settings["deployment_mode"]
-        if mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
+        if mode == "grouped_sharded":
+            _, _ = _grouped_sharded_topology(settings, len(settings["node_ids"]))
         if mode == "single":
             settings["node_ids"] = settings["node_ids"][:1] or [LOCAL_NODE_ID]
         elif len(settings["node_ids"]) < 2:
@@ -5610,6 +5664,12 @@ class Manager:
     # ----- replicated-deployment load balancing -----
     @staticmethod
     def _cluster_member_key(deployment_id: str, member: dict) -> str:
+        instance = member.get("instance_id")
+        if instance is not None:
+            # Grouped-sharded load is carried per engine group: only the
+            # rank-0 coordinator of a group ever serves, so balance counts
+            # whole instances rather than individual ranks.
+            return f"{deployment_id}:instance:{instance}"
         identity = member.get("container_name") or member.get("node_id") or ""
         return f"{deployment_id}:{identity}"
 
@@ -5636,7 +5696,9 @@ class Manager:
         loads = self._cluster_member_loads()
         loads[key] = max(0, loads.get(key, 0) - 1)
 
-    def _balanced_cluster_member(self, deployment: dict) -> dict:
+    def _balanced_cluster_member(
+        self, deployment: dict, candidates: list[dict] | None = None,
+    ) -> dict:
         """Pick the least-loaded replica, rotating among equals.
 
         A replica's load is counted from selection until its response (or
@@ -5644,7 +5706,10 @@ class Manager:
         Round-robin tie-breaking keeps an idle cluster alternating instead of
         funneling every request to rank 0.
         """
-        members = self._cluster_members_sorted(deployment)
+        members = (
+            candidates if candidates is not None
+            else self._cluster_members_sorted(deployment)
+        )
         deployment_id = str(deployment.get("id") or "")
         loads = [
             self._cluster_member_active(deployment_id, member)
@@ -5661,15 +5726,42 @@ class Manager:
         rotation[deployment_id] = rotation.get(deployment_id, 0) + 1
         return tied[index]
 
+    def _grouped_coordinators(self, deployment: dict) -> list[dict]:
+        """Rank-0 coordinator of each started engine group, group order."""
+        by_instance: dict[int, dict] = {}
+        for member in self._cluster_members_sorted(deployment):
+            if int(member.get("rank") or 0) != 0:
+                continue
+            if str(member.get("desired_state") or "") == "stopped":
+                continue
+            if str(member.get("status") or "") in {"stopped", "error"}:
+                continue
+            instance = int(member.get("instance_id") or 0)
+            by_instance.setdefault(instance, member)
+        return [by_instance[key] for key in sorted(by_instance)]
+
     def _cluster_route_order(self, deployment: dict) -> list[dict]:
         """Members to try for one request, best candidate first.
 
         Replicated deployments balance across every member, and the failover
         candidates follow in least-loaded order so an outage shifts work to
         the least busy replicas first. Sharded ranks form a single engine,
-        so only the rank-0 coordinator may serve a request.
+        so only the rank-0 coordinator may serve a request. Grouped-sharded
+        deployments balance across the running engine groups: each group's
+        rank-0 coordinator carries the group's requests, and stopped or
+        failed groups drop out of the candidate set.
         """
         members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") == "grouped_sharded":
+            coordinators = self._grouped_coordinators(deployment)
+            if not coordinators:
+                return members[:1]
+            chosen = self._balanced_cluster_member(deployment, coordinators)
+            rest = [m for m in coordinators if m is not chosen]
+            rest.sort(key=lambda m: self._cluster_member_active(
+                str(deployment.get("id") or ""), m,
+            ))
+            return [chosen, *rest]
         if deployment.get("mode") != "replicated" or len(members) < 2:
             return members[:1]
         deployment_id = str(deployment.get("id") or "")
@@ -5972,6 +6064,12 @@ class Manager:
         current = self._deployment(deployment_id)
         if current and current.get("desired_state") == "stopped":
             raise RuntimeError("deployment is stopped; start it before sending inference requests")
+        if str(member.get("desired_state") or "") == "stopped":
+            # A per-instance grouped-sharded stop races the route snapshot:
+            # the member is unavailable rather than broken, so fail over.
+            raise ClusterReplicaUnavailable(
+                "engine group is stopped; start it or route to a running group"
+            )
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)
         stream_owns_member = False
@@ -6090,10 +6188,22 @@ class Manager:
         """Check member readiness through authenticated agents.
 
         A replicated deployment stays healthy while any replica can serve;
-        other modes still depend on their rank-0 primary.
+        grouped-sharded deployments while any running group's coordinator can
+        serve; other modes still depend on their rank-0 primary.
         """
         deployment, primary = self._cluster_primary_member(deployment_id)
         members = self._cluster_members_sorted(deployment)
+        if deployment.get("mode") == "grouped_sharded":
+            coordinators = self._grouped_coordinators(deployment)
+            if not coordinators:
+                return await self._cluster_member_health(
+                    deployment_id, primary, model,
+                )
+            results = await asyncio.gather(*(
+                self._cluster_member_health(deployment_id, member, model)
+                for member in coordinators
+            ), return_exceptions=True)
+            return any(result is True for result in results)
         if deployment.get("mode") != "replicated" or len(members) < 2:
             return await self._cluster_member_health(
                 deployment_id, primary, model,
@@ -6162,15 +6272,25 @@ class Manager:
                 body["environment"],
             )
         mode = body.get("deployment_mode") or "single"
-        if mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
-        if mode == "sharded" and engine == "llama.cpp":
+        if mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
+        if engine == "llama.cpp" and mode in {"sharded", "grouped_sharded"}:
             # llama.cpp has no cross-node tensor pipeline; every selected node
             # runs its own complete replica instead.
             raise ValueError(
-                "llama.cpp deployments support single and replicated layouts, not sharded"
+                "llama.cpp deployments support single and replicated layouts, "
+                "not sharded"
             )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
+        if mode == "grouped_sharded":
+            grouped_tp, grouped_instances = _grouped_sharded_topology(
+                body, len(node_ids)
+            )
+            body["tensor_parallel_size"] = grouped_tp
+            body["instances"] = grouped_instances
         if mode == "single":
             node_ids = node_ids[:1] or [LOCAL_NODE_ID]
         elif len(node_ids) < 2:
@@ -6268,6 +6388,28 @@ class Manager:
                         f"layout requires {ranks_per_node} GPU(s) per node; "
                         f"not enough devices on: {', '.join(gpu_short)}"
                     )
+        if mode == "grouped_sharded" and engine == "sglang":
+            # Each group is a complete TP<tensor_parallel_size> engine: the
+            # per-group world size is the tensor-parallel size, one rank per
+            # selected node.
+            body["sg_tp_size"] = grouped_tp
+        if mode == "grouped_sharded":
+            gpu_short = []
+            for nid in node_ids:
+                gpus = (available[nid].get("stats") or {}).get("gpus")
+                if gpus is None:
+                    continue
+                usable = [
+                    gpu for gpu in gpus
+                    if not (isinstance(gpu, dict) and gpu.get("error"))
+                ]
+                if not usable:
+                    gpu_short.append(available[nid].get("name", nid))
+            if gpu_short:
+                raise ValueError(
+                    "grouped_sharded requires one GPU per node; no usable "
+                    f"devices on: {', '.join(gpu_short)}"
+                )
         requested_port = body.get("port")
         local_port = requested_port
         if LOCAL_NODE_ID in node_ids and local_port is not None:
@@ -6297,7 +6439,7 @@ class Manager:
             fabrics[node_id] = self._inferred_fabric(
                 node, requested_ip, requested_interface
             )
-            if mode == "sharded" and not fabrics[node_id][0]:
+            if mode in {"sharded", "grouped_sharded"} and not fabrics[node_id][0]:
                 raise ValueError(
                     f"could not determine fabric IP for {node.get('name', node_id)}"
                 )
@@ -6375,6 +6517,102 @@ class Manager:
                 accepted.cancel()
             raise
 
+    def _build_grouped_sharded_members(
+        self, *, deployment_id: str, engine: str, base: dict,
+        node_ids: list[str], available: dict,
+        fabrics: dict[str, tuple[str | None, str | None]],
+        local_port: int | None, tensor_parallel_size: int, instances: int,
+    ) -> tuple[list, list[dict]]:
+        """Build one independent sharded engine group per instance.
+
+        Group ``g`` owns ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own
+        coordinator (the group's first node) and master port, so every group
+        is a complete tensor-parallel engine behind the shared served name.
+        """
+        tasks: list = []
+        member_specs: list[dict] = []
+        safe_model = re.sub(
+            r"[^a-zA-Z0-9_.-]+", "-", str(base.get("model") or ""),
+        ).strip("-").lower()
+        for group in range(instances):
+            group_nodes = node_ids[
+                group * tensor_parallel_size:(group + 1) * tensor_parallel_size
+            ]
+            group_master_ip = fabrics[group_nodes[0]][0]
+            group_master_port = 29501 + group
+            for local_rank, node_id in enumerate(group_nodes):
+                node = available[node_id]
+                member_port = local_port if node_id == LOCAL_NODE_ID else None
+                fabric_ip, fabric_interface = fabrics[node_id]
+                global_rank = group * tensor_parallel_size + local_rank
+                name = f"cluster-{deployment_id}-r{global_rank}-{safe_model[:36]}"
+                payload = dict(base)
+                payload.update({
+                    "port": member_port,
+                    "name": name,
+                    "cluster_member": {
+                        "deployment_id": deployment_id,
+                        "node_id": node_id,
+                        "rank": local_rank,
+                        "instance_id": group,
+                        "nnodes": tensor_parallel_size,
+                        "mode": "grouped_sharded",
+                        "serve_port": member_port,
+                        "fabric_ip": fabric_ip,
+                        "fabric_interface": fabric_interface,
+                    },
+                })
+                if engine == "vllm":
+                    vllm_args = self._without_cli_options(
+                        payload["extra_args"],
+                        {"--distributed-executor-backend", "--nnodes", "--node-rank",
+                         "--master-addr", "--master-port", "--tensor-parallel-size", "-tp",
+                         "--pipeline-parallel-size", "-pp"},
+                    )
+                    # ``--headless`` is a valueless switch, unlike the scalar
+                    # options handled above.
+                    vllm_args = [arg for arg in vllm_args if arg != "--headless"]
+                    payload["extra_args"] = vllm_args + [
+                        "--distributed-executor-backend", "mp",
+                        "--nnodes", str(tensor_parallel_size),
+                        "--node-rank", str(local_rank),
+                        "--master-addr", group_master_ip,
+                        "--master-port", str(group_master_port),
+                        "--tensor-parallel-size", str(tensor_parallel_size),
+                        "--pipeline-parallel-size", "1",
+                    ]
+                    if local_rank > 0:
+                        payload["extra_args"].append("--headless")
+                else:
+                    payload["extra_args"] = self._without_cli_options(
+                        payload["extra_args"],
+                        {"--nnodes", "--node-rank", "--dist-init-addr", "--tp-size"},
+                    ) + [
+                        "--nnodes", str(tensor_parallel_size),
+                        "--node-rank", str(local_rank),
+                        "--dist-init-addr",
+                        f"{group_master_ip}:{group_master_port}",
+                    ]
+                    # The SGLang world size is per group: every group is a
+                    # complete TP-size engine with no pipeline parallelism.
+                    payload["sg_tp_size"] = tensor_parallel_size
+                member_specs.append({
+                    "node_id": node_id,
+                    "node_name": node.get("name", node_id),
+                    "rank": local_rank,
+                    "instance_id": group,
+                    "container_name": name,
+                    "fabric_ip": fabric_ip,
+                    "port": member_port,
+                    "status": "queued",
+                    "phase": {
+                        "phase": "queued",
+                        "message": "Waiting for the node agent to begin launch",
+                    },
+                })
+                tasks.append(self._create_member(node_id, payload))
+        return tasks, member_specs
+
     async def _create_deployment(
         self, body: dict, launch_persisted: asyncio.Future | None = None,
         launch_identity: dict[str, str] | None = None,
@@ -6415,6 +6653,8 @@ class Manager:
             "automation_run_id": body.get("automation_run_id"),
             "settings_dirty": False,
         }
+        if mode == "grouped_sharded":
+            deployment["instances"] = int(body.get("instances") or 1)
         self.deployments.append(deployment)
         self._save_deployments()
 
@@ -6451,7 +6691,19 @@ class Manager:
 
         tasks = []
         member_specs = []
-        for rank, node_id in enumerate(node_ids):
+        if mode == "grouped_sharded":
+            tasks, member_specs = self._build_grouped_sharded_members(
+                deployment_id=deployment_id,
+                engine=engine,
+                base=base,
+                node_ids=node_ids,
+                available=available,
+                fabrics=fabrics,
+                local_port=local_port,
+                tensor_parallel_size=int(body.get("tensor_parallel_size") or 1),
+                instances=int(body.get("instances") or 1),
+            )
+        for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
             member_port = local_port if node_id == LOCAL_NODE_ID else None
             fabric_ip, fabric_interface = fabrics[node_id]
@@ -6618,8 +6870,12 @@ class Manager:
             None,
         )
         explicit_stop = bool(
-            action == "stop" and owner
-            and owner.get("desired_state") == "stopped"
+            action == "stop" and owner and (
+                owner.get("desired_state") == "stopped"
+                # A per-instance grouped-sharded stop keeps the deployment's
+                # intent running but must still disarm the restart policy.
+                or str(member.get("desired_state") or "") == "stopped"
+            )
         )
         if node_id == LOCAL_NODE_ID:
             if action == "start":
@@ -6690,24 +6946,84 @@ class Manager:
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
+        instance: int | None = None,
     ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
             return await self._deployment_action_locked(
-                deployment_id, action, node_ids, relaunch_mode,
+                deployment_id, action, node_ids, relaunch_mode, instance,
             )
+
+    @staticmethod
+    def _grouped_target_instance(
+        deployment: dict, action: str, instance: Any,
+    ) -> int | None:
+        """Validate a per-instance start/stop target for grouped_sharded.
+
+        Returns ``None`` when the action is deployment-wide (``instance`` not
+        given, or a mode/remove action that has no per-instance meaning).
+        """
+        if instance is None or action not in {"start", "stop"}:
+            return None
+        if deployment.get("mode") != "grouped_sharded":
+            raise ValueError(
+                "per-instance actions are only available for grouped_sharded "
+                "deployments"
+            )
+        try:
+            requested = int(instance)
+        except (TypeError, ValueError):
+            raise ValueError("instance must be an integer")
+        if isinstance(instance, bool) or requested != instance:
+            # MCP and legacy HTTP callers bypass the FastAPI body validation,
+            # so the manager boundary rejects bools and fractional values.
+            raise ValueError("instance must be an integer")
+        members = deployment.get("members") or []
+        instances = deployment.get("instances")
+        if not isinstance(instances, int) or instances < 1:
+            instances = max(
+                [int(member.get("instance_id") or 0) for member in members]
+                or [0],
+            ) + 1
+        if not 0 <= requested < instances:
+            raise ValueError(
+                f"instance must be between 0 and {instances - 1}"
+            )
+        return requested
+
+    @staticmethod
+    def _grouped_deployment_status(deployment: dict) -> str:
+        """Derive grouped-sharded status from the per-group member states."""
+        all_groups: set[int] = set()
+        running_groups: set[int] = set()
+        for member in deployment.get("members") or []:
+            group = int(member.get("instance_id") or 0)
+            all_groups.add(group)
+            if int(member.get("rank") or 0) == 0 and str(
+                member.get("status") or ""
+            ) not in {"stopped", "error"}:
+                running_groups.add(group)
+        if not running_groups:
+            return "stopped"
+        if running_groups == all_groups:
+            return "running"
+        return "degraded"
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
+        instance: int | None = None,
     ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
+        targeted_instance = self._grouped_target_instance(
+            deployment, action, instance,
+        )
         if action == "start" and (
             deployment.get("launch_settings_error")
             or PERSISTED_DEPLOYMENT_ARGS_ERROR
@@ -6722,11 +7038,18 @@ class Manager:
             not in {"vllm", "sglang", "llama.cpp"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
+        if targeted_instance is not None and action == "start" and (
+            deployment.get("settings_dirty") or node_ids
+        ):
+            raise ValueError(
+                "saved launch settings changed; start the whole deployment "
+                "to apply them"
+            )
 
         # Persist user intent before touching any member. Inference and health
         # paths consult this independently from observed container state, so a
         # request racing an explicit Stop cannot resurrect the deployment.
-        if action == "stop":
+        if action == "stop" and targeted_instance is None:
             deployment["desired_state"] = "stopped"
             # The stop can take seconds per rank; report the honest transition
             # instead of leaving the pre-stop status on the card.
@@ -6797,19 +7120,67 @@ class Manager:
                 "replaced_deployment_id": deployment_id,
             }
 
-        if action == "start":
+        if targeted_instance is not None:
+            # Record the per-group intent: the targeted group follows the
+            # action, and every other group's expectation follows its actual
+            # state — a currently stopped group stays deliberately stopped so
+            # the health monitor leaves it alone, a running group stays
+            # expected-running.
+            desired = "running" if action == "start" else "stopped"
+            for member in deployment.get("members") or []:
+                if int(member.get("instance_id") or 0) == targeted_instance:
+                    member["desired_state"] = desired
+                else:
+                    member["desired_state"] = (
+                        "stopped"
+                        if str(member.get("status") or "") in {"stopped", "error"}
+                        else "running"
+                    )
+            if action == "start":
+                # Starting one group of a stopped deployment wakes the whole
+                # deployment's inference intent.
+                deployment["desired_state"] = "running"
+            self._save_deployments()
+        elif action == "start":
             deployment["desired_state"] = "running"
+            # A deployment-wide start clears any per-instance stop marks so
+            # the health monitor expects every group to run again.
+            for member in deployment.get("members") or []:
+                member.pop("desired_state", None)
             self._save_deployments()
 
+        targeted_members = list(deployment.get("members") or [])
+        if targeted_instance is not None:
+            targeted_members = [
+                member for member in targeted_members
+                if int(member.get("instance_id") or 0) == targeted_instance
+            ]
         results = await asyncio.gather(
-            *[self._member_action(m, action) for m in deployment.get("members", [])],
+            *[self._member_action(m, action) for m in targeted_members],
             return_exceptions=True,
         )
+        if targeted_instance is not None:
+            # Record the local transition on the acted members so the derived
+            # status reflects this action without waiting for a reconcile.
+            for member, result in zip(targeted_members, results):
+                if isinstance(result, Exception):
+                    continue
+                member["status"] = "starting" if action == "start" else "stopped"
         errors = self._member_action_errors(results, action)
         if action == "remove" and not errors:
             self.deployments = [d for d in self.deployments if d.get("id") != deployment_id]
         else:
-            if errors:
+            if targeted_instance is not None:
+                if errors:
+                    # Even a failed per-instance stop leaves the other groups
+                    # serving: keep the deployment in the health monitor's
+                    # candidate set instead of the terminal "error" state.
+                    deployment["status"] = "degraded"
+                else:
+                    deployment["status"] = self._grouped_deployment_status(
+                        deployment
+                    )
+            elif errors:
                 # A partial start is still intended to be running; keep it in
                 # the health monitor's candidate set so the successful rank is
                 # stopped and the complete cluster is retried atomically.
@@ -6820,7 +7191,11 @@ class Manager:
                     deployment["last_deployed_at"] = time.time()
             deployment["error"] = "; ".join(errors) if errors else None
         self._save_deployments()
-        return {"ok": not errors, "errors": errors}
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "status": deployment.get("status"),
+        }
 
     @staticmethod
     def _container_started_epoch(value: Any) -> float | None:
@@ -7060,6 +7435,8 @@ class Manager:
             return None
 
         node_by_id = {node.get("id"): node for node in nodes}
+        if deployment.get("mode") == "grouped_sharded":
+            return self._grouped_health_issue(deployment, node_by_id)
         member_containers = []
         for member in members:
             node = node_by_id.get(member.get("node_id"))
@@ -7135,6 +7512,82 @@ class Manager:
             return None
         return None
 
+    def _grouped_expected_states(
+        self, deployment: dict, node_by_id: dict,
+    ) -> dict[int, list[tuple[dict, Any]]]:
+        """Per-group container states for groups intended to run.
+
+        Members carrying an explicit ``desired_state=stopped`` mark (a
+        per-instance stop) are skipped entirely. Returns ``None`` when a
+        member's node is unreachable — the coordinator cannot judge those
+        groups, mirroring the whole-deployment check's treatment of
+        unreachable agents.
+        """
+        expected: dict[int, list[tuple[dict, Any]]] = {}
+        for member in deployment.get("members") or []:
+            if str(member.get("desired_state") or "running") == "stopped":
+                continue
+            node = node_by_id.get(member.get("node_id"))
+            if not node or not node.get("online") or not node.get("docker_ready"):
+                return None
+            containers = {
+                container.get("name"): container
+                for container in node.get("containers") or []
+            }
+            expected.setdefault(int(member.get("instance_id") or 0), []).append(
+                (member, containers.get(member.get("container_name")))
+            )
+        return expected
+
+    def _grouped_health_issue(
+        self, deployment: dict, node_by_id: dict,
+    ) -> str | None:
+        """Describe a recoverable grouped-sharded group split, or ``None``.
+
+        Only groups intended to run must run: a deliberate per-instance stop
+        never triggers recovery, and a group still launching (queued/creating
+        agent rows) is not a failure. The whole-deployment Docker restart
+        alignment checks do not apply because independent groups legitimately
+        start at different times.
+        """
+        expected = self._grouped_expected_states(deployment, node_by_id)
+        if expected is None:
+            return None
+        for instance in sorted(expected):
+            pairs = expected[instance]
+            states = [
+                container.get("status", "unknown") if container else "missing"
+                for _, container in pairs
+            ]
+            if any(state in {"queued", "creating"} for state in states):
+                return None
+            if not all(state == "running" for state in states):
+                detail = ", ".join(
+                    f"rank {member.get('rank')}: {state}"
+                    for member, state in pairs
+                )
+                return f"instance {instance} ranks are split ({detail})"
+        return None
+
+    def _grouped_broken_instances(
+        self, deployment: dict, node_by_id: dict,
+    ) -> list[int]:
+        """Group indices whose intended-running ranks are not all running."""
+        expected = self._grouped_expected_states(deployment, node_by_id)
+        if not expected:
+            return []
+        broken = []
+        for instance in sorted(expected):
+            states = [
+                (container or {}).get("status", "missing")
+                for _, container in expected[instance]
+            ]
+            if any(state in {"queued", "creating"} for state in states):
+                continue
+            if not all(state == "running" for state in states):
+                broken.append(instance)
+        return broken
+
     async def _recover_cluster_deployment(self, deployment_id: str, issue: str) -> None:
         """Stop every rank, then start every rank as one atomic generation."""
         async with self._cluster_action_lock():
@@ -7147,6 +7600,9 @@ class Manager:
                 return
             members = list(deployment.get("members") or [])
             if len(members) < 2:
+                return
+            if deployment.get("mode") == "grouped_sharded":
+                await self._recover_grouped_instances(deployment, issue)
                 return
 
             checked_at = time.time()
@@ -7200,6 +7656,88 @@ class Manager:
                 f"[cluster-health] {deployment_id}: "
                 + (deployment.get("error") or "all ranks restarted together")
             )
+
+    async def _recover_grouped_instances(
+        self, deployment: dict, issue: str,
+    ) -> None:
+        """Stop and restart only the engine groups whose ranks are split.
+
+        Groups carrying a deliberate per-instance stop mark are never
+        restarted by recovery; they are excluded from the broken set.
+        """
+        deployment_id = str(deployment.get("id") or "")
+        deployment["status"] = "recovering"
+        deployment["health_issue"] = issue
+        deployment["health_checked_at"] = time.time()
+        self._save_deployments()
+        nodes = await self.cluster_nodes()
+        node_by_id = {node.get("id"): node for node in nodes}
+        broken = self._grouped_broken_instances(deployment, node_by_id)
+        if not broken:
+            # The reported split no longer holds (or no group is expected to
+            # run): fall back to the derived status instead of restarting.
+            deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["health_issue"] = None
+            self._save_deployments()
+            return
+        members = list(deployment.get("members") or [])
+        for instance in broken:
+            group_members = [
+                member for member in members
+                if int(member.get("instance_id") or 0) == instance
+            ]
+            print(
+                f"[cluster-health] {deployment_id}: instance {instance} ranks "
+                f"are split; restarting the group"
+            )
+            stopped = await asyncio.gather(
+                *(self._member_action(member, "stop") for member in group_members),
+                return_exceptions=True,
+            )
+            stop_errors = [
+                f"instance {instance} rank {member.get('rank')}: {result}"
+                for member, result in zip(group_members, stopped)
+                if isinstance(result, Exception)
+            ]
+            if stop_errors:
+                deployment["status"] = "degraded"
+                deployment["error"] = (
+                    "Automatic recovery could not stop the instance's ranks; "
+                    "no rank was restarted: " + "; ".join(stop_errors)
+                )
+                self._save_deployments()
+                print(f"[cluster-health] {deployment_id}: {deployment['error']}")
+                return
+            started = await asyncio.gather(
+                *(self._member_action(member, "start") for member in group_members),
+                return_exceptions=True,
+            )
+            deployment["health_restarted_at"] = time.time()
+            start_errors = [
+                f"instance {instance} rank {member.get('rank')}: {result}"
+                for member, result in zip(group_members, started)
+                if isinstance(result, Exception)
+            ]
+            if start_errors:
+                deployment["status"] = "degraded"
+                deployment["error"] = (
+                    "Automatic recovery failed to start the instance's ranks: "
+                    + "; ".join(start_errors)
+                )
+                self._save_deployments()
+                print(f"[cluster-health] {deployment_id}: {deployment['error']}")
+                return
+            for member in group_members:
+                member["status"] = "starting"
+        derived = self._grouped_deployment_status(deployment)
+        deployment["status"] = "starting" if derived == "running" else derived
+        deployment["error"] = None
+        deployment["health_issue"] = None
+        self._save_deployments()
+        print(
+            f"[cluster-health] {deployment_id}: "
+            + (deployment.get("error") or "split instance(s) restarted")
+        )
 
     async def _cluster_health_tick(self) -> None:
         candidates = [
@@ -10805,6 +11343,27 @@ class Manager:
                 required_nodes = parallel_nodes
             else:
                 required_nodes = max(2, saved_count)
+        elif mode == "grouped_sharded":
+            try:
+                instances = max(1, int(recipe.get("instances") or 1))
+            except (TypeError, ValueError):
+                instances = 1
+            if tensor_parallel < 2:
+                # A grouped recipe persists the per-group tensor-parallel size
+                # as a standalone field, not as a whole-world argv flag, so
+                # fall back to it before declaring the layout unsupported.
+                try:
+                    tensor_parallel = int(recipe.get("tensor_parallel_size") or 0)
+                except (TypeError, ValueError):
+                    tensor_parallel = 0
+                parallel_nodes = tensor_parallel * pipeline_parallel
+            if tensor_parallel < 2:
+                required_nodes = 1
+                mode_error = "grouped_sharded requires tensor_parallel_size >= 2"
+            else:
+                # One tensor-parallel engine group per instance; the saved
+                # node set must be exactly the full N*T topology.
+                required_nodes = parallel_nodes * instances
         elif persisted_mode is None and parallel_nodes > 1:
             # A legacy TP/PP recipe created before deployment modes existed is
             # a distributed launch even if its persisted mode defaulted to single.
@@ -10817,7 +11376,7 @@ class Manager:
             invalid_mode = f"unsupported persisted deployment mode: {mode}"
             mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
         model_revision = self._cli_option(args, {"--revision"})
-        return {
+        contract = {
             "required_node_count": required_nodes,
             "deployment_mode": mode,
             "tensor_parallel_size": tensor_parallel,
@@ -10826,6 +11385,9 @@ class Manager:
             "supported": mode_error is None,
             "error": mode_error,
         }
+        if mode == "grouped_sharded":
+            contract["instances"] = instances
+        return contract
 
     def _load_recipes(self) -> list[dict]:
         if self.recipes_path.exists():
@@ -10925,6 +11487,8 @@ class Manager:
         launch_controls: dict | None = None,
         force_new: bool = False,
         replace_launch_inputs: bool = False,
+        instances: int | None = None,
+        tensor_parallel_size: int | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if not model:
@@ -10939,13 +11503,21 @@ class Manager:
         )
         sg_mem_fraction = self._validated_sg_scalar("sg_mem_fraction", sg_mem_fraction)
         deployment_mode = deployment_mode or "single"
-        if deployment_mode not in {"single", "sharded", "replicated"}:
-            raise ValueError("deployment_mode must be single, sharded, or replicated")
+        if deployment_mode not in _MODE_ALLOWLIST:
+            raise ValueError(
+                "deployment_mode must be single, sharded, replicated, "
+                "or grouped_sharded"
+            )
         node_ids = self._normalize_recipe_node_ids(node_ids)
         if deployment_mode == "single":
             node_ids = node_ids[:1]
         elif len(node_ids) < 2:
             raise ValueError(f"{deployment_mode} deployment requires at least two nodes")
+        if deployment_mode == "grouped_sharded":
+            _, _ = _grouped_sharded_topology(
+                {"tensor_parallel_size": tensor_parallel_size, "instances": instances},
+                len(node_ids),
+            )
         if launch_controls is not None:
             if not isinstance(launch_controls, dict):
                 raise ValueError("launch_controls must be an object")
@@ -11015,6 +11587,12 @@ class Manager:
                         r["sg_mem_fraction"] = sg_mem_fraction
                     r["deployment_mode"] = deployment_mode or "single"
                     r["node_ids"] = list(node_ids or [LOCAL_NODE_ID])
+                    if deployment_mode == "grouped_sharded":
+                        r["instances"] = instances
+                        r["tensor_parallel_size"] = tensor_parallel_size
+                    else:
+                        r.pop("instances", None)
+                        r.pop("tensor_parallel_size", None)
                     self._save_recipes()
                     return r
             recipe = {
@@ -11037,6 +11615,9 @@ class Manager:
                 "node_ids": list(node_ids or [LOCAL_NODE_ID]),
                 "created_at": time.time(),
             }
+            if deployment_mode == "grouped_sharded":
+                recipe["instances"] = instances
+                recipe["tensor_parallel_size"] = tensor_parallel_size
             self.recipes.append(recipe)
             self._save_recipes()
             return recipe
@@ -11060,7 +11641,7 @@ class Manager:
             "gpu_memory_utilization", "gpu_memory_gb", "sg_tp_size",
             "sg_context_length", "sg_max_running_requests", "sg_mem_fraction",
             "sg_image", "deployment_mode", "node_ids", "launch_controls",
-            "environment",
+            "environment", "instances", "tensor_parallel_size",
         }
         unknown = sorted(set(changes) - allowed)
         if unknown:
@@ -11087,13 +11668,18 @@ class Manager:
                 merged.get("environment"), engine,
             )
             mode = merged.get("deployment_mode") or "single"
-            if mode not in {"single", "sharded", "replicated"}:
-                raise ValueError("deployment_mode must be single, sharded, or replicated")
+            if mode not in _MODE_ALLOWLIST:
+                raise ValueError(
+                    "deployment_mode must be single, sharded, replicated, "
+                    "or grouped_sharded"
+                )
             nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":
                 nodes = nodes[:1]
             elif len(nodes) < 2:
                 raise ValueError(f"{mode} deployment requires at least two nodes")
+            if mode == "grouped_sharded":
+                _, _ = _grouped_sharded_topology(merged, len(nodes))
             controls = changes.get("launch_controls")
             if controls is not None:
                 if not isinstance(controls, dict):
@@ -12718,7 +13304,8 @@ class Manager:
                     service_port = 0
                 if (
                     not 1 <= service_port <= 65535
-                    and _label_value(c.labels or {}, MODE_LABEL) == "sharded"
+                    and _label_value(c.labels or {}, MODE_LABEL)
+                    in _SHARDED_MEMBER_MODES
                 ):
                     command = (
                         ((c.attrs or {}).get("Config") or {}).get("Cmd") or []
@@ -12974,7 +13561,7 @@ class Manager:
         sparkdeck_deployment_id: str | None,
         shm_size: Any = None,
     ) -> dict:
-        if cluster_member and cluster_member.get("mode") == "sharded":
+        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
             raise ValueError("llama.cpp deployments cannot run sharded")
         if not llama_artifact:
             raise ValueError(
@@ -13125,7 +13712,8 @@ class Manager:
             infiniband_device
         )
         distributed_member = bool(
-            cluster_member and cluster_member.get("mode") == "sharded"
+            cluster_member
+            and cluster_member.get("mode") in _SHARDED_MEMBER_MODES
         )
         if (
             distributed_member
@@ -13473,7 +14061,7 @@ class Manager:
                 if params_b > 0:
                     need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
                     labels = c.labels or {}
-                    if _label_value(labels, MODE_LABEL) == "sharded":
+                    if _label_value(labels, MODE_LABEL) in _SHARDED_MEMBER_MODES:
                         need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
                 else:
                     need_gb = 30.0  # conservative fallback

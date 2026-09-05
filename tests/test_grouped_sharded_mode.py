@@ -135,5 +135,101 @@ class GroupedShardedModeValidationTests(unittest.IsolatedAsyncioTestCase):
             })
 
 
+class GroupedShardedMemberBuildTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vllm_members_partition_into_independent_groups(self) -> None:
+        instance = four_node_manager()
+        instance.deployments_path = None
+        captured = []
+
+        async def create_member(node_id, payload):
+            captured.append((node_id, payload))
+            return {
+                "id": f"container-{node_id}", "status": "running",
+                "model_source": "public_repository",
+            }
+
+        instance._create_member = create_member
+        instance._save_deployments = lambda: None
+
+        deployment = await instance.create_deployment({
+            "model": "org/model",
+            "engine": "vllm",
+            "deployment_mode": "grouped_sharded",
+            "tensor_parallel_size": 2,
+            "instances": 2,
+            "node_ids": ["local", "remote-1", "remote-2", "remote-3"],
+            "extra_args": ["--max-model-len", "4096", "--headless"],
+        })
+
+        self.assertEqual(deployment["status"], "starting")
+        self.assertEqual(len(captured), 4)
+        members = deployment["members"]
+        self.assertEqual([m["instance_id"] for m in members], [0, 0, 1, 1])
+        self.assertEqual([m["rank"] for m in members], [0, 1, 0, 1])
+        # Consecutive partition: the first T nodes form group 0, the next T
+        # form group 1.
+        self.assertEqual(
+            [m["node_id"] for m in members],
+            ["local", "remote-1", "remote-2", "remote-3"],
+        )
+        # Container names stay unique across groups via the global rank.
+        names = [m["container_name"] for m in members]
+        self.assertEqual(len(set(names)), 4)
+
+        # Per-group vLLM rendezvous: each group gets its own coordinator
+        # fabric IP and port, and its own TP-sized --nnodes.
+        expected_masters = ["169.254.10.1", "169.254.10.1", "169.254.10.3", "169.254.10.3"]
+        for index, (_, payload) in enumerate(captured):
+            args = payload["extra_args"]
+            group = index // 2
+            local_rank = index % 2
+            self.assertEqual(args[args.index("--nnodes") + 1], "2")
+            self.assertEqual(args[args.index("--node-rank") + 1], str(local_rank))
+            self.assertEqual(args[args.index("--master-addr") + 1], expected_masters[index])
+            self.assertEqual(
+                args[args.index("--master-port") + 1], str(29501 + group),
+            )
+            self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "2")
+            self.assertEqual(args[args.index("--pipeline-parallel-size") + 1], "1")
+            self.assertEqual("--headless" in args, local_rank > 0)
+            self.assertEqual(payload["cluster_member"]["instance_id"], group)
+            self.assertEqual(payload["cluster_member"]["nnodes"], 2)
+
+    async def test_sglang_members_use_per_group_dist_init(self) -> None:
+        instance = four_node_manager()
+        instance.deployments_path = None
+        captured = []
+
+        async def create_member(node_id, payload):
+            captured.append((node_id, payload))
+            return {
+                "id": f"container-{node_id}", "status": "running",
+                "model_source": "public_repository",
+            }
+
+        instance._create_member = create_member
+        instance._save_deployments = lambda: None
+
+        deployment = await instance.create_deployment({
+            "model": "org/model",
+            "engine": "sglang",
+            "deployment_mode": "grouped_sharded",
+            "tensor_parallel_size": 2,
+            "instances": 2,
+            "node_ids": ["local", "remote-1", "remote-2", "remote-3"],
+        })
+
+        self.assertEqual(len(captured), 4)
+        for index, (_, payload) in enumerate(captured):
+            args = payload["extra_args"]
+            group = index // 2
+            self.assertEqual(args[args.index("--dist-init-addr") + 1],
+                             f"169.254.10.{1 + group * 2}:{29501 + group}")
+            self.assertEqual(payload["sg_tp_size"], 2)
+        self.assertEqual(
+            [m["instance_id"] for m in deployment["members"]], [0, 0, 1, 1],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6450,6 +6450,102 @@ class Manager:
                 accepted.cancel()
             raise
 
+    def _build_grouped_sharded_members(
+        self, *, deployment_id: str, engine: str, base: dict,
+        node_ids: list[str], available: dict,
+        fabrics: dict[str, tuple[str | None, str | None]],
+        local_port: int | None, tensor_parallel_size: int, instances: int,
+    ) -> tuple[list, list[dict]]:
+        """Build one independent sharded engine group per instance.
+
+        Group ``g`` owns ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own
+        coordinator (the group's first node) and master port, so every group
+        is a complete tensor-parallel engine behind the shared served name.
+        """
+        tasks: list = []
+        member_specs: list[dict] = []
+        safe_model = re.sub(
+            r"[^a-zA-Z0-9_.-]+", "-", str(base.get("model") or ""),
+        ).strip("-").lower()
+        for group in range(instances):
+            group_nodes = node_ids[
+                group * tensor_parallel_size:(group + 1) * tensor_parallel_size
+            ]
+            group_master_ip = fabrics[group_nodes[0]][0]
+            group_master_port = 29501 + group
+            for local_rank, node_id in enumerate(group_nodes):
+                node = available[node_id]
+                member_port = local_port if node_id == LOCAL_NODE_ID else None
+                fabric_ip, fabric_interface = fabrics[node_id]
+                global_rank = group * tensor_parallel_size + local_rank
+                name = f"cluster-{deployment_id}-r{global_rank}-{safe_model[:36]}"
+                payload = dict(base)
+                payload.update({
+                    "port": member_port,
+                    "name": name,
+                    "cluster_member": {
+                        "deployment_id": deployment_id,
+                        "node_id": node_id,
+                        "rank": local_rank,
+                        "instance_id": group,
+                        "nnodes": tensor_parallel_size,
+                        "mode": "grouped_sharded",
+                        "serve_port": member_port,
+                        "fabric_ip": fabric_ip,
+                        "fabric_interface": fabric_interface,
+                    },
+                })
+                if engine == "vllm":
+                    vllm_args = self._without_cli_options(
+                        payload["extra_args"],
+                        {"--distributed-executor-backend", "--nnodes", "--node-rank",
+                         "--master-addr", "--master-port", "--tensor-parallel-size", "-tp",
+                         "--pipeline-parallel-size", "-pp"},
+                    )
+                    # ``--headless`` is a valueless switch, unlike the scalar
+                    # options handled above.
+                    vllm_args = [arg for arg in vllm_args if arg != "--headless"]
+                    payload["extra_args"] = vllm_args + [
+                        "--distributed-executor-backend", "mp",
+                        "--nnodes", str(tensor_parallel_size),
+                        "--node-rank", str(local_rank),
+                        "--master-addr", group_master_ip,
+                        "--master-port", str(group_master_port),
+                        "--tensor-parallel-size", str(tensor_parallel_size),
+                        "--pipeline-parallel-size", "1",
+                    ]
+                    if local_rank > 0:
+                        payload["extra_args"].append("--headless")
+                else:
+                    payload["extra_args"] = self._without_cli_options(
+                        payload["extra_args"],
+                        {"--nnodes", "--node-rank", "--dist-init-addr", "--tp-size"},
+                    ) + [
+                        "--nnodes", str(tensor_parallel_size),
+                        "--node-rank", str(local_rank),
+                        "--dist-init-addr",
+                        f"{group_master_ip}:{group_master_port}",
+                    ]
+                    # The SGLang world size is per group: every group is a
+                    # complete TP-size engine with no pipeline parallelism.
+                    payload["sg_tp_size"] = tensor_parallel_size
+                member_specs.append({
+                    "node_id": node_id,
+                    "node_name": node.get("name", node_id),
+                    "rank": local_rank,
+                    "instance_id": group,
+                    "container_name": name,
+                    "fabric_ip": fabric_ip,
+                    "port": member_port,
+                    "status": "queued",
+                    "phase": {
+                        "phase": "queued",
+                        "message": "Waiting for the node agent to begin launch",
+                    },
+                })
+                tasks.append(self._create_member(node_id, payload))
+        return tasks, member_specs
+
     async def _create_deployment(
         self, body: dict, launch_persisted: asyncio.Future | None = None,
         launch_identity: dict[str, str] | None = None,
@@ -6490,6 +6586,8 @@ class Manager:
             "automation_run_id": body.get("automation_run_id"),
             "settings_dirty": False,
         }
+        if mode == "grouped_sharded":
+            deployment["instances"] = int(body.get("instances") or 1)
         self.deployments.append(deployment)
         self._save_deployments()
 
@@ -6526,7 +6624,19 @@ class Manager:
 
         tasks = []
         member_specs = []
-        for rank, node_id in enumerate(node_ids):
+        if mode == "grouped_sharded":
+            tasks, member_specs = self._build_grouped_sharded_members(
+                deployment_id=deployment_id,
+                engine=engine,
+                base=base,
+                node_ids=node_ids,
+                available=available,
+                fabrics=fabrics,
+                local_port=local_port,
+                tensor_parallel_size=int(body.get("tensor_parallel_size") or 1),
+                instances=int(body.get("instances") or 1),
+            )
+        for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
             member_port = local_port if node_id == LOCAL_NODE_ID else None
             fabric_ip, fabric_interface = fabrics[node_id]

@@ -6315,7 +6315,7 @@ class SparkDeckService:
         all_deployments = await self.deployments()
         deployments = [
             deployment for deployment in all_deployments
-            if deployment.get("status") in ("running", "registered")
+            if self._deployment_can_serve_inference(deployment)
         ]
         public_ids = {
             deployment["id"]: self._deployment_public_model_ids(deployment)
@@ -6447,13 +6447,33 @@ class SparkDeckService:
             return exact["id"] == deployment["id"]
         return owners == {deployment["id"]}
 
+    @staticmethod
+    def _deployment_can_serve_inference(deployment: dict[str, Any]) -> bool:
+        """Keep surviving engine groups available through the public router."""
+        if deployment.get("status") in ("running", "registered"):
+            return True
+        # Overall health includes intentionally stopped groups. Inference
+        # availability only requires one running group; Manager still owns
+        # selection, admission, load balancing, and per-group stop checks.
+        return (
+            deployment.get("status") == "degraded"
+            and deployment.get("deployment_mode") == "grouped_sharded"
+            and deployment.get("desired_state") != "stopped"
+            and any(
+                instance.get("status") == "running"
+                and instance.get("desired_state") != "stopped"
+                for instance in deployment.get("instances") or []
+                if isinstance(instance, dict)
+            )
+        )
+
     async def _live_deployment_for_model_id(
         self, model_id: str,
     ) -> dict[str, Any] | None:
         """Resolve a request id to the live deployment that owns it."""
         deployments = [
             deployment for deployment in await self.deployments()
-            if deployment.get("status") in ("running", "registered")
+            if self._deployment_can_serve_inference(deployment)
         ]
         live_by_id = {deployment["id"]: deployment for deployment in deployments}
         stored_deployments = self.store.deployments(include_private=True)

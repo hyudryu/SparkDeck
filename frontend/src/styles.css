@@ -69,6 +69,14 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .sidebar { position: fixed; z-index: 30; inset: 0 auto 0 0; width: var(--sidebar-width); display: flex; flex-direction: column; padding: 18px 12px 14px; background: var(--bg-surface); border-right: 1px solid var(--border-subtle); transition: width 200ms ease, transform 200ms ease; }
 .app-stage { grid-column: 2; min-width: 0; }
 .main-content { width: 100%; min-width: 0; }
+.update-banner { display: flex; align-items: stretch; gap: 4px; padding: 0 10px 0 16px; background: var(--accent-soft); border-bottom: 1px solid var(--border-subtle); }
+.update-banner-link { display: flex; flex: 1 1 auto; align-items: center; gap: 9px; min-width: 0; padding: 8px 0; color: var(--accent); text-decoration: none; font-size: 12.5px; }
+.update-banner-link svg { flex: 0 0 auto; stroke-width: 2; }
+.update-banner-link strong { font-weight: 650; }
+.update-banner-link span { min-width: 0; color: var(--text-primary); }
+.update-banner-link:hover span, .update-banner-link:focus-visible span { text-decoration: underline; }
+.update-banner-dismiss { display: flex; align-items: center; justify-content: center; align-self: center; flex: 0 0 auto; width: 26px; height: 26px; padding: 0; color: var(--text-tertiary); border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.update-banner-dismiss:hover { color: var(--text-primary); background: var(--bg-subtle); }
 .page { max-width: 1440px; min-width: 0; margin: 0 auto; padding: 48px 32px 64px; }
 .skip-link { position: fixed; z-index: 100; top: -60px; left: 16px; padding: 10px 14px; background: var(--accent); color: white; border-radius: 8px; text-decoration: none; }
 .skip-link:focus { top: 12px; }

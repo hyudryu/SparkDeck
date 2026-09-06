@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
 import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, SystemUpdateNode } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
@@ -32,6 +32,16 @@ function SoftwareUpdatePanel() {
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState<string>()
   const active = Boolean(resource.data?.job?.active)
+  const location = useLocation()
+
+  useEffect(() => {
+    if (location.hash !== '#software-update') return
+    // The update banner deep-links here; wait a frame so the panel is
+    // mounted before scrolling.
+    requestAnimationFrame(() => {
+      document.getElementById('software-update')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [location.hash])
 
   useEffect(() => {
     if (!active || resource.loading) return
@@ -68,7 +78,7 @@ function SoftwareUpdatePanel() {
   const targetRevision = data?.target?.revision
   const upToDate = Boolean(data?.up_to_date)
   return (
-    <><Panel className="settings-section software-update-section">
+    <><Panel id="software-update" className="settings-section software-update-section">
       <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every eligible cluster node to the latest commit on the main branch. Nodes that cannot update are reported and skipped.</p></div></div>
       <div className="settings-fields">
         {resource.loading && !data && <LoadingState label="Checking for updates" />}

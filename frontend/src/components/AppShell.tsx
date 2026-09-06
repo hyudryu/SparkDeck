@@ -23,6 +23,7 @@ import {
 import { NavLink, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import { persistTheme, storedTheme } from '../theme'
+import { UpdateBanner } from './UpdateBanner'
 
 const navigation = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -294,6 +295,7 @@ export function AppShell({
       </aside>
       {drawerOpen && <button className="drawer-backdrop" onClick={() => setDrawerOpen(false)} aria-label="Close navigation" />}
       <div className="app-stage">
+        <UpdateBanner controllerAvailable={controllerAvailable} />
         <header className="mobile-appbar">
           <button ref={openerRef} className="icon-button" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen}>
             <Menu size={20} />

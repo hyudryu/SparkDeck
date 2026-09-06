@@ -353,6 +353,14 @@ INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 # deployments that have not produced a usable capacity report yet; once found,
 # the result is persisted with the deployment.
 VLLM_CAPACITY_SCAN_INTERVAL_SECONDS = 5.0
+
+# A container that exits (crash, OOM kill, engine wedge) cannot run the
+# release path for its already-granted concurrency slots, so its admission
+# counter stays saturated and every later request queues forever. The
+# reaper clears a target's slots once it has had no live container for a
+# full grace window, so ordinary stop/start restarts never trip it.
+ADMISSION_REAP_SWEEP_SECONDS = 15.0
+ADMISSION_REAP_GRACE_SECONDS = 60.0
 VLLM_GPU_KV_CACHE_RE = re.compile(
     r"GPU KV cache size:\s*([\d,]+)\s+tokens",
     re.IGNORECASE,
@@ -718,6 +726,7 @@ class Manager:
         self.lock = asyncio.Lock()
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
+        self.admission_reaper_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
         self.deployment_capacity_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
@@ -903,6 +912,7 @@ class Manager:
             ("deployment_stop_resume_task", self._resume_interrupted_stops),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
+            ("admission_reaper_task", self._admission_reaper_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
             ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
             ("fan_cluster_task", self._fan_cluster_monitor_loop),
@@ -917,7 +927,8 @@ class Manager:
         """Stop controller-only schedulers after a successful live join."""
         await self.virtual_nas.stop()
         for field in (
-            "worker_task", "idle_task", "cluster_health_task",
+            "worker_task", "idle_task", "admission_reaper_task",
+            "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
             "deployment_stop_resume_task",
@@ -959,6 +970,7 @@ class Manager:
         for t in (
             self.worker_task,
             self.idle_task,
+            self.admission_reaper_task,
             self.cluster_health_task,
             self.deployment_capacity_task,
             self.fan_cluster_task,
@@ -10516,6 +10528,131 @@ class Manager:
             self._admission_store().pop(target, None)
             getattr(self, "_nudger_slow_since", {}).pop(target, None)
 
+    @staticmethod
+    def _admission_target_matches(target: str, container: dict) -> bool:
+        """Whether an admission target id refers to this container."""
+        if target.startswith("port:"):
+            try:
+                return container.get("port") == int(target[5:])
+            except (TypeError, ValueError):
+                return False
+        return (
+            container.get("deployment_id") == target
+            or container.get("name") == target
+        )
+
+    def _fail_admission_target(self, target: str, state: dict) -> None:
+        """Fail the target's queued waiters and clear its slot accounting.
+
+        Streaming generators still holding a released grant unwind against
+        the missing entry: ``_release_inference_slot`` treats an unknown
+        target as a no-op.
+        """
+        waiters = state.get("waiters")
+        while waiters:
+            waiter = waiters.popleft()
+            future = waiter["future"]
+            if not future.done():
+                future.set_exception(LookupError(
+                    f"inference target '{target}' is no longer running; "
+                    "queued request was dropped"
+                ))
+        state["running"] = 0
+        self._admission_store().pop(target, None)
+        getattr(self, "_nudger_slow_since", {}).pop(target, None)
+
+    async def reap_stale_admission_targets(self) -> list[str]:
+        """Drop admission state whose deployment no longer has a container.
+
+        A crashed or exited container cannot release its granted concurrency
+        slots, so its admission counter stays saturated and every later
+        request queues forever behind ghost slots (stuck ``running`` counts
+        that no live stream backs). After a target has had no live container
+        for ``ADMISSION_REAP_GRACE_SECONDS``, its queued waiters are failed
+        with a clear error and its accounting is dropped. Targets matching
+        no local container belong to remote cluster members and are never
+        touched here.
+        """
+        store = self._admission_store()
+        if not store:
+            return []
+        if getattr(self, "_capacity_redeploying_models", None):
+            # A capacity-triggered replacement briefly has no container for
+            # the intended deployment; _resolve_vllm_target waits it out too.
+            return []
+        containers = await self.list_containers()
+        now = time.monotonic()
+        reaped: list[str] = []
+        for target, state in list(store.items()):
+            matches = [
+                c for c in containers
+                if self._admission_target_matches(target, c)
+            ]
+            if not matches:
+                state.pop("_dead_since", None)
+                continue
+            if any(
+                c.get("status") in ("running", "created", "restarting")
+                for c in matches
+            ):
+                state.pop("_dead_since", None)
+                continue
+            dead_since = state.setdefault("_dead_since", now)
+            if now - dead_since < ADMISSION_REAP_GRACE_SECONDS:
+                continue
+            self._fail_admission_target(target, state)
+            reaped.append(target)
+        return reaped
+
+    async def _reap_container_admission(
+        self, name: str, deployment_id: str | None = None,
+    ) -> None:
+        """Immediately release admission slots tied to a stopped container.
+
+        An explicit stop or remove is unambiguous intent, so unlike
+        ``reap_stale_admission_targets`` no grace window applies: hanging on
+        to the slots would only block new requests against a target the
+        operator just tore down.
+        """
+        store = self._admission_store()
+        if not store:
+            return
+        containers = await self.list_containers()
+        for target, state in list(store.items()):
+            if target == name or (
+                deployment_id and target == deployment_id
+            ):
+                self._fail_admission_target(target, state)
+                continue
+            matches = [
+                c for c in containers
+                if self._admission_target_matches(target, c)
+            ]
+            if matches and all(
+                c.get("status") not in ("running", "created", "restarting")
+                for c in matches
+            ):
+                # Sibling containers of the torn-down deployment are gone.
+                self._fail_admission_target(target, state)
+
+    def reset_inference_admission(self) -> dict[str, list[str]]:
+        """Fail every queued waiter and clear all admission slot counts."""
+        store = self._admission_store()
+        reset = sorted(store)
+        for target in reset:
+            self._fail_admission_target(target, store[target])
+        return {"reset": reset}
+
+    async def _admission_reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(ADMISSION_REAP_SWEEP_SECONDS)
+            try:
+                await self.reap_stale_admission_targets()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("inference admission reaper failed")
+
     async def _admit_vllm_target(
         self,
         model: str,
@@ -14671,8 +14808,13 @@ class Manager:
             if stopped is None:
                 stopped = self._explicitly_stopped_containers = set()
             stopped.add(name)
+        stopped_deployment: list[str] = []
+
         def _do():
             container = self.client.containers.get(name)
+            stopped_deployment.append(
+                _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+            )
             # Prevent Docker's restart policy from resurrecting a model that
             # the user explicitly stopped. Do this before signalling SGLang,
             # whose shutdown can end in SIGKILL under GPU memory pressure.
@@ -14691,22 +14833,44 @@ class Manager:
             await asyncio.wait_for(asyncio.to_thread(_do), timeout=30)
         except asyncio.TimeoutError:
             raise RuntimeError(f"container stop timed out after 30s")
+        try:
+            await self._reap_container_admission(
+                name, stopped_deployment[0] if stopped_deployment else None,
+            )
+        except Exception:
+            logger.exception("admission reap after stopping %s failed", name)
         return {"ok": True}
 
     async def remove_container(self, name: str) -> dict:
+        removed_deployment: list[str] = []
+
         def _do():
             ledger = getattr(self, "managed_workload_ledger", None)
             if ledger is None:
-                self.client.containers.get(name).remove(force=True)
+                container = self.client.containers.get(name)
+                removed_deployment.append(
+                    _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                )
+                container.remove(force=True)
                 return
             with ledger.locked():
                 try:
-                    self.client.containers.get(name).remove(force=True)
+                    container = self.client.containers.get(name)
+                    removed_deployment.append(
+                        _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                    )
+                    container.remove(force=True)
                 except docker.errors.NotFound:
                     ledger.release(name)
                     raise
                 ledger.release(name)
         await asyncio.to_thread(_do)
+        try:
+            await self._reap_container_admission(
+                name, removed_deployment[0] if removed_deployment else None,
+            )
+        except Exception:
+            logger.exception("admission reap after removing %s failed", name)
         getattr(self, "_explicitly_stopped_containers", set()).discard(name)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
         aliases = getattr(self, "container_aliases", {})

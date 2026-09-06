@@ -467,6 +467,12 @@ async def get_inference_queue():
     return manager.inference_admission()
 
 
+@app.post("/api/inference-queue/reset")
+async def reset_inference_queue():
+    """Clear all admission slots to recover a queue stuck on ghost slots."""
+    return manager.reset_inference_admission()
+
+
 DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
 # Stats and admission stream every tick; the slower inventories (deployments,
 # community sync, nodes) only refresh every Nth tick and repeat in between.

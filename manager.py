@@ -5837,8 +5837,10 @@ class Manager:
                 async for chunk in stream:
                     yield chunk
             finally:
-                release_once()
-                await close_async_stream(stream)
+                try:
+                    await close_async_stream(stream)
+                finally:
+                    release_once()
 
         return relay()
 
@@ -11160,10 +11162,19 @@ class Manager:
         with anyio.CancelScope(shield=True):
             try:
                 await asyncio.shield(task)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                if not asyncio.current_task().cancelling():
+                    # A transport can cancel its own cleanup without canceling
+                    # its caller. Treat that as a failed close so the reaper
+                    # still releases abandoned accounting and keeps running.
+                    raise RuntimeError("inference transport cleanup was cancelled") from exc
                 # Native task cancellation must not release capacity while
                 # the shielded transport task is still closing upstream.
-                await task
+                try:
+                    await task
+                except (Exception, asyncio.CancelledError):
+                    # A failed close must not mask the caller's cancellation.
+                    pass
                 raise
 
     async def _reap_dead_inference_owners(self) -> list[str]:
@@ -11178,11 +11189,13 @@ class Manager:
                 cancel.set()
             cleanup_stream = rec.get("cleanup_stream")
             owner = rec.get("owner_task")
+            # Streaming and non-streaming consumers both own transport
+            # cancellation until their task has finished unwinding.
+            if owner is not None and not owner.done():
+                continue
             if cleanup_stream is not None:
                 # An active consumer owns its finally block. Do not race its
                 # transport close or release its capacity ahead of cleanup.
-                if owner is not None and not owner.done():
-                    continue
                 try:
                     await self._close_inference_transport(rid)
                 except Exception:
@@ -11205,6 +11218,8 @@ class Manager:
         for target, state in list(self._admission_store().items()):
             for lease in list(state.get("leases", {}).values()):
                 if id(lease) in owned_leases:
+                    continue
+                if lease.owner is not None and not lease.owner.done():
                     continue
                 if self._inference_owner_is_dead(lease.owner, lease.cancel):
                     if lease.cancel is not None:

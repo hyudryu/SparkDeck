@@ -21,6 +21,7 @@ CONTENT = "# private patch source\nVALUE = 42\n"
 FILES = [{"target": "/opt/runtime/patch.py", "content": CONTENT}]
 HASHES = [{"target": FILES[0]["target"], "sha256": hashlib.sha256(CONTENT.encode()).hexdigest()}]
 BASE_ID = "sha256:" + "a" * 64
+BASE_IDENTITY = "runtime-v1:sha256:" + "d" * 64
 
 
 def request(nodes=None):
@@ -100,6 +101,74 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
             ("node-4", "POST"), ("node-4", "GET"), ("node-3", "POST"), ("node-3", "GET"),
         ])
         self.assertEqual(job["nodes"][1]["logs"], ["Build complete"])
+
+    async def test_remote_cross_store_builds_pin_runtime_identity_and_keep_local_ids(self):
+        ids = {"node-3": "sha256:" + "b" * 64, "node-4": BASE_ID}
+        async def remote(node_id, method, path, **kwargs):
+            self.assertEqual(method, "POST")
+            payload = kwargs["json_body"]
+            if node_id == "node-3":
+                self.assertEqual(payload["expected_base_identity"], BASE_IDENTITY)
+            else:
+                self.assertNotIn("expected_base_identity", payload)
+            self.assertNotIn("expected_base_id", payload)
+            return {"id": node_id, "status": "succeeded", "files": HASHES,
+                    "nodes": [{**result(base=ids[node_id]), "base_identity": BASE_IDENTITY}]}
+        self.manager.node_registry.request.side_effect = remote
+        job = await self.finish(await self.jobs.start(request(["node-4", "node-3"])))
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual([node["base_id"] for node in job["nodes"]], [BASE_ID, ids["node-3"]])
+        self.assertEqual([node["base_identity"] for node in job["nodes"]], [BASE_IDENTITY] * 2)
+        reloaded = ImagePatchJobs(self.manager, self.directory.name)
+        self.assertEqual([node["base_identity"] for node in reloaded.verified_images()[0]["nodes"]], [BASE_IDENTITY] * 2)
+
+    async def test_runtime_constraint_never_falls_back_to_tag_or_legacy_id(self):
+        for identity in (None, "runtime-v1:sha256:" + "e" * 64, "malformed"):
+            with self.subTest(identity=identity):
+                second = result()
+                if identity is not None:
+                    second["base_identity"] = identity
+                with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=[{**result(), "base_identity": BASE_IDENTITY}, second])):
+                    job = await self.finish(await self.jobs.start(request(["node-4", "node-3"])))
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual([node["status"] for node in job["nodes"]], ["succeeded", "failed"])
+                if identity is None:
+                    self.assertIn("Update SparkDeck on node-3", job["error"])
+
+    async def test_old_agent_rejects_new_constraint_with_update_guidance_without_retry(self):
+        async def remote(node_id, method, path, **kwargs):
+            self.assertEqual(method, "POST")
+            if node_id == "node-4":
+                return {"id": node_id, "status": "succeeded", "files": HASHES,
+                        "nodes": [{**result(), "base_identity": BASE_IDENTITY}]}
+            self.assertEqual(kwargs["json_body"]["expected_base_identity"], BASE_IDENTITY)
+            raise NodeAgentResponseError(node_id, 400, '{"detail":"Unsupported patch request fields"}')
+        self.manager.node_registry.request.side_effect = remote
+        job = await self.finish(await self.jobs.start(request(["node-4", "node-3", "node-2"])))
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("Update SparkDeck on node-3", job["error"])
+        self.assertEqual(self.manager.node_registry.request.await_count, 2)
+        self.assertNotIn("base_identity", job["nodes"][1])
+
+    async def test_legacy_first_node_keeps_exact_id_constraint_on_updated_followers(self):
+        image_ids = ["sha256:" + char * 64 for char in "bce"]
+        outputs = [result(image=image_ids[0]), {**result(image=image_ids[1]), "base_identity": BASE_IDENTITY}, result(image=image_ids[2])]
+        with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=outputs)) as remote:
+            job = await self.finish(await self.jobs.start(request(["node-4", "node-3", "node-2"])))
+        self.assertEqual(job["status"], "succeeded")
+        self.assertTrue(all("base_identity" not in node for node in job["nodes"]))
+        for call in remote.await_args_list[1:]:
+            self.assertEqual(call.args[1]["expected_base_id"], BASE_ID)
+            self.assertNotIn("expected_base_identity", call.args[1])
+        inventory = {"partial": False, "errors": [], "results": [
+            {"node": {"id": node["node_id"], "name": node["node_name"]}, "containers": [],
+             "images": [{"id": node["image_id"][:19], "full_id": node["image_id"], "tags": [job["image"]]}]}
+            for node in job["nodes"]]}
+        with patch.object(server, "image_patch_jobs", self.jobs), \
+                patch.object(server.manager, "cluster_image_inventory", AsyncMock(return_value=inventory)):
+            grouped = await server._v1_image_inventory()
+        self.assertEqual(len(grouped["items"]), 1)
+        self.assertEqual(grouped["items"][0]["node_image_ids"], dict(zip(["node-4", "node-3", "node-2"], image_ids)))
 
     async def test_remote_failure_keeps_completed_node_and_skips_remaining_nodes(self):
         with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=[result(), RuntimeError("base unavailable")])) as remote:
@@ -379,6 +448,8 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "reserved"):
             await self.jobs.start({**request(), "expected_base_id": "sha256:" + "a" * 64})
         self.assertEqual(self.jobs.list(), {"items": []})
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            await self.jobs.start({**request(), "expected_base_identity": BASE_IDENTITY})
 
     async def test_agent_build_uses_local_node_and_preserves_coordinator_base_constraint(self):
         payload = {key: value for key, value in request().items() if key != "node_ids"}

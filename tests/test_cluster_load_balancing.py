@@ -510,11 +510,39 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
                     "chat/completions", caller_ip="192.0.2.45",
                 )
                 await stream.__anext__()
-                with self.assertRaises(type(failure)):
+                # A transport cancelling its own close is a cleanup failure,
+                # not cancellation of this caller's task.
+                with self.assertRaises(RuntimeError):
                     await stream.aclose()
                 self.assertEqual(manager.active_requests(), {})
                 manager._release_inference_slot.assert_called_once()
                 self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+    async def test_local_stream_keeps_member_until_upstream_close_finishes(self):
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        manager = build_manager(replicated_deployment())
+        selected = manager.deployments[0]["members"][0]
+        manager._acquire_cluster_member("repl-1", selected)
+
+        async def source():
+            try:
+                yield "data: hello\n\n"
+            finally:
+                close_started.set()
+                await allow_close.wait()
+
+        stream = manager._tracked_cluster_stream(source(), "repl-1", selected)
+        await stream.__anext__()
+        close_task = asyncio.create_task(stream.aclose())
+        try:
+            await asyncio.wait_for(close_started.wait(), timeout=2)
+            self.assertEqual(member_loads(manager, manager.deployments[0]), [1, 0])
+        finally:
+            allow_close.set()
+            await asyncio.wait_for(close_task, timeout=2)
+
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
     async def test_local_close_failure_still_releases_member(self):
         manager = build_manager(replicated_deployment())

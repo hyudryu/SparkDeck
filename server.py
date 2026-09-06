@@ -56,6 +56,7 @@ from sparkdeck.onboarding import (
 )
 from sparkdeck.updater import CONFIRMATION, UpdateService
 from sparkdeck.image_patch_jobs import ImagePatchJobs
+from sparkdeck.image_patches import valid_base_image_identity
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
@@ -1971,7 +1972,12 @@ async def _v1_image_inventory() -> dict:
             continue
         nodes = job.get("nodes") or []
         base_ids = {node.get("base_id") for node in nodes}
-        if len(base_ids) != 1 or not all(
+        identities = [node.get("base_identity") for node in nodes]
+        same_base = (
+            all(valid_base_image_identity(identity) for identity in identities) and len(set(identities)) == 1
+            if any(identity is not None for identity in identities) else len(base_ids) == 1
+        )
+        if not same_base or not all(
             node.get("status") == "succeeded"
             and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("image_id") or ""))
             and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("base_id") or ""))
@@ -2367,6 +2373,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         # contract; which keys apply is decided per record in the service.
         "alias", "context_length", "tensor_parallel_size", "instances", "parallel_slots",
         "gpu_layers", "quantization", "artifact", "image", "node_ids", "deployment_mode",
+        "model",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:

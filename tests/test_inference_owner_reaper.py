@@ -102,11 +102,27 @@ class InferenceOwnerReaperTests(unittest.IsolatedAsyncioTestCase):
         manager._release_inference_slot(replacement)
         self.assertEqual(manager.inference_admission(), {})
 
-    async def test_explicit_disconnect_reaps_even_if_owner_task_remains_alive(self):
+    async def test_explicit_disconnect_waits_for_live_owner_without_transport(self):
         manager = self.manager(local_running=True)
-        lease, rid, cancel = await self.abandoned(manager)
-        self.assertFalse(asyncio.current_task().done())
+        ready, finish = asyncio.Event(), asyncio.Event()
+        captured = []
+
+        async def owner():
+            captured.extend(await self.abandoned(manager))
+            ready.set()
+            await finish.wait()
+
+        task = asyncio.create_task(owner())
+        await ready.wait()
+        lease, rid, cancel = captured
         cancel.set()
+        try:
+            self.assertEqual(await manager.reap_stale_admission_targets(), [])
+            self.assertIn(rid, manager._active_reqs)
+            self.assertFalse(lease.released)
+        finally:
+            finish.set()
+            await task
         self.assertEqual(await manager.reap_stale_admission_targets(), ["target"])
         self.assertNotIn(rid, manager._active_reqs)
         self.assertEqual(manager.inference_admission(), {})
@@ -251,3 +267,63 @@ class InferenceOwnerReaperTests(unittest.IsolatedAsyncioTestCase):
         release.assert_called_once()
         self.assertTrue(lease.released)
         self.assertFalse(manager._active_reqs)
+
+    async def test_cancelled_transport_close_releases_and_reaper_continues(self):
+        from types import SimpleNamespace
+        manager = self.manager()
+        release = Mock()
+        lease, rid, cancel = await self.abandoned(manager, detach=True, callback=release)
+        response = SimpleNamespace(aclose=AsyncMock(side_effect=asyncio.CancelledError))
+        manager._transfer_inference_ownership(lease, rid, owner=None, cleanup_stream=response)
+        cancel.set()
+        later_rid = await asyncio.create_task(self._unlimited_abandoned(manager))
+        with self.assertLogs("manager", level="ERROR"):
+            self.assertEqual(await manager.reap_stale_admission_targets(), ["target"])
+        response.aclose.assert_awaited_once()
+        release.assert_called_once()
+        self.assertTrue(lease.released)
+        self.assertNotIn(later_rid, manager._active_reqs)
+        self.assertFalse(manager._active_reqs)
+        self.assertEqual(await manager.reap_stale_admission_targets(), [])
+
+    async def _unlimited_abandoned(self, manager):
+        return manager._track_start("model", streaming=True)
+
+    async def test_reaper_task_cancellation_waits_for_close_and_propagates(self):
+        from types import SimpleNamespace
+        for close_cancels in (False, True):
+            with self.subTest(close_cancels=close_cancels):
+                manager = self.manager()
+                release = Mock()
+                started, finish = asyncio.Event(), asyncio.Event()
+
+                async def close():
+                    started.set()
+                    await finish.wait()
+                    if close_cancels:
+                        raise asyncio.CancelledError
+
+                lease, rid, cancel = await self.abandoned(manager, detach=True, callback=release)
+                response = SimpleNamespace(aclose=AsyncMock(side_effect=close))
+                manager._transfer_inference_ownership(lease, rid, owner=None, cleanup_stream=response)
+                cancel.set()
+                reaper = asyncio.create_task(manager.reap_stale_admission_targets())
+                await asyncio.wait_for(started.wait(), 1)
+                reaper.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(reaper.done())
+                self.assertFalse(lease.released)
+                release.assert_not_called()
+                finish.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await reaper
+                self.assertFalse(lease.released)
+                self.assertIn(rid, manager._active_reqs)
+                if close_cancels:
+                    with self.assertLogs("manager", level="ERROR"):
+                        self.assertEqual(await manager.reap_stale_admission_targets(), ["target"])
+                else:
+                    self.assertEqual(await manager.reap_stale_admission_targets(), ["target"])
+                self.assertTrue(lease.released)
+                release.assert_called_once()
+                response.aclose.assert_awaited_once()

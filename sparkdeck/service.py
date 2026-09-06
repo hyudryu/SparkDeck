@@ -7438,6 +7438,8 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
     """Flatten honest per-member launch state for deployment list cards."""
+    if deployment.get("status") == "unknown" and deployment.get("status_message") == "Docker is unavailable":
+        return {"launch_phase": "unknown", "launch_message": "Docker is unavailable"}
     if deployment.get("status") == "error" or deployment.get("error"):
         return {
             "launch_phase": "error",

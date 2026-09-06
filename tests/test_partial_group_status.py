@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from manager import Manager
+import docker
 from sparkdeck.service import _deployment_launch_progress, _grouped_instance_summary
 
 
@@ -125,6 +126,7 @@ def test_failed_group_stop_remains_degraded_during_reconciliation(tmp_path, all_
         manager = Manager(tmp_path)
         deployment = partial_deployment()
         deployment["error"] = "Failed to stop rank 0: agent disconnected"
+        deployment["members"][0]["failed_stop_error"] = deployment["error"]
         deployment["members"][0]["status"] = "running"
         if all_stopped_intent:
             for member in deployment["members"]:
@@ -143,6 +145,87 @@ def test_failed_group_stop_remains_degraded_during_reconciliation(tmp_path, all_
             assert public["status"] == "degraded"
             assert public["error"] == deployment["error"]
             assert _deployment_launch_progress(public) == {"launch_phase": "error", "launch_message": deployment["error"]}
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", ["stopped", "running", "error"])
+def test_failed_recreation_remains_expected_after_cleanup(status):
+    deployment = partial_deployment()
+    for member in deployment["members"][:2]:
+        member.update(recreate_pending=True, status=status, phase={"phase": "ready"})
+    assert Manager._grouped_deployment_status(deployment) == "degraded"
+
+
+@pytest.mark.parametrize("scenario", ["docker_unavailable", "stale_stopped", "recovery_error"])
+def test_reconciliation_preserves_infrastructure_and_fresh_intent(tmp_path, scenario):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = partial_deployment()
+        if scenario == "stale_stopped":
+            deployment["status"] = "stopped"
+        if scenario == "recovery_error":
+            deployment["error"] = "Automatic recovery could not stop ranks"
+        manager.deployments = [deployment]
+        nodes = [{"id": member["node_id"], "online": True, "status": "online", "docker_ready": True,
+                  "containers": [{"name": member["container_name"], "status": member["status"], "phase": member["phase"]}]}
+                 for member in deployment["members"]]
+        manager.list_containers = AsyncMock(return_value=nodes[2]["containers"])
+        if scenario == "docker_unavailable":
+            manager.list_containers.side_effect = docker.errors.DockerException("socket down")
+            nodes[2]["containers"] = []
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=nodes)
+        try:
+            public = (await manager.get_state())["deployments"][0]
+            if scenario == "docker_unavailable":
+                assert public["status"] == "unknown"
+                assert _deployment_launch_progress(public) == {"launch_phase": "unknown", "launch_message": "Docker is unavailable"}
+            else:
+                assert public["status"] == "running"
+                assert not public.get("error")
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
+def test_other_group_action_preserves_failed_stop_marker(tmp_path):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = partial_deployment()
+        deployment["members"][0]["failed_stop_error"] = "Node 1 did not stop"
+        manager.deployments = [deployment]
+        manager._member_action = AsyncMock(return_value={"ok": True})
+        try:
+            await manager._deployment_action_locked("partial", "stop", instance=1)
+            assert deployment["members"][0]["failed_stop_error"] == "Node 1 did not stop"
+            assert deployment["status"] == "degraded"
+            assert deployment["error"] == "Node 1 did not stop"
+            await manager._deployment_action_locked("partial", "stop", instance=0)
+            assert all(not member.get("failed_stop_error") for member in deployment["members"])
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
+def test_failed_user_stop_sets_marker_and_successful_whole_start_clears_it(tmp_path):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = partial_deployment()
+        manager.deployments = [deployment]
+        manager._member_action = AsyncMock(side_effect=[RuntimeError("Node 1 did not stop"), {"ok": True}])
+        manager._deployment_environment_drift = AsyncMock(return_value=None)
+        try:
+            result = await manager._deployment_action_locked("partial", "stop", instance=0)
+            assert not result["ok"]
+            assert deployment["members"][0]["failed_stop_error"] == "Node 1 did not stop"
+            manager._member_action = AsyncMock(return_value={"ok": True})
+            result = await manager._deployment_action_locked("partial", "start")
+            assert result["ok"]
+            assert all(not member.get("failed_stop_error") for member in deployment["members"])
+            assert deployment["error"] is None
         finally:
             await manager.http.aclose()
     asyncio.run(run())

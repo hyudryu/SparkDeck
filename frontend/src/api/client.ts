@@ -13,6 +13,8 @@ import type {
   ChatStreamUpdate,
   ChatUsage,
   ContainerImage,
+  PatchBuild,
+  CreatePatchBuildInput,
   CreateDeploymentInput,
   Deployment,
   DeploymentDetail,
@@ -873,6 +875,8 @@ export const api = {
     }),
   },
   images: {
+    patchBuilds: (signal?: AbortSignal) => request<{ items: PatchBuild[] }>('/api/v1/images/patch-builds', { signal }),
+    createPatchBuild: (input: CreatePatchBuildInput) => request<PatchBuild>('/api/v1/images/patch-builds', { method: 'POST', body: JSON.stringify(input) }),
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {
       const data = await requestWithFallback<ContainerImage[] | { items?: ContainerImage[]; images?: ContainerImage[] }>('/api/v1/images', '/api/images', {
         signal,

@@ -1177,6 +1177,7 @@ class Manager:
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
+                "patched-images-v1",
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -15621,6 +15622,7 @@ class Manager:
                 tags = img.tags or []
                 out.append({
                     "id": img.short_id,
+                    "full_id": img.id,
                     "tags": tags,
                     "size": img.attrs.get("Size", 0),
                     "created": img.attrs.get("Created"),
@@ -15761,6 +15763,7 @@ class Manager:
 
     async def remove_image_on_nodes(
         self, image_id: str, node_ids: list[str],
+        *, node_image_ids: dict[str, str] | None = None,
     ) -> dict:
         """Remove an image from every recorded owner without failing fast."""
         image_id = str(image_id or "").strip()
@@ -15769,18 +15772,25 @@ class Manager:
             raise ValueError("image ID is required")
         if not requested or any(not value for value in requested):
             raise ValueError("image owners are required")
+        if node_image_ids is not None and (
+            set(node_image_ids) != set(requested)
+            or any(not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                   for value in node_image_ids.values())
+        ):
+            raise ValueError("verified image IDs are required for every owner")
 
         available = {node["id"]: node for node in await self.cluster_nodes()}
 
         async def remove(node_id: str) -> Any:
+            local_image_id = node_image_ids[node_id] if node_image_ids is not None else image_id
             node = available.get(node_id)
             if not node:
                 raise RuntimeError("owning node is no longer registered")
             if node_id == LOCAL_NODE_ID:
-                return await self.remove_image(image_id)
+                return await self.remove_image(local_image_id)
             return await self.node_registry.request(
                 node_id, "DELETE",
-                f"/api/agent/images/{quote(image_id, safe='')}", timeout=120,
+                f"/api/agent/images/{quote(local_image_id, safe='')}", timeout=120,
             )
 
         removed = await asyncio.gather(

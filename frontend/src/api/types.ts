@@ -601,6 +601,25 @@ export interface ContainerImage {
   selected_nodes?: NodeSummary[]
 }
 
+export interface PatchBuild {
+  persistence_warning?: string
+  id: string
+  base_image: string
+  image: string
+  created_at: string
+  status: 'queued' | 'building' | 'succeeded' | 'failed'
+  files: Array<{ target: string; sha256: string }>
+  nodes: Array<{ node_id: string; node_name: string; status: 'queued' | 'building' | 'succeeded' | 'failed'; logs: string[]; error?: string; image_id?: string; base_id?: string }>
+  error?: string
+}
+
+export interface CreatePatchBuildInput {
+  base_image: string
+  image: string
+  files: Array<{ target: string; content: string }>
+  node_ids: string[]
+}
+
 export interface ImagePullResult {
   ok: boolean
   image: string

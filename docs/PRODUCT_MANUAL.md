@@ -201,6 +201,33 @@ Use it to:
 
 An image pull is not the same as a Hugging Face model download. Runtime images contain serving software; model weights are managed through Explore, Models, and Storage.
 
+### Create a patched image
+
+Choose **Create patched image**, select a base image or enter its registry reference,
+and give the result a new explicit tag such as `sparkdeck/qwen-dflash:patch-v1`.
+Select every node that will run the image. Upload a UTF-8 Python file or paste its
+contents, and enter the absolute file destination inside the container. Add more
+files if needed, then choose **Build patched image**. Limits are 16 files, 1 MiB
+per file, and 4 MiB total.
+
+SparkDeck adds or replaces these files without running the uploaded code during
+the build. Only use code you trust: it executes when the runtime imports it.
+The builder verifies each file's contents before publishing the new tag. All
+selected nodes must resolve the same base image; differing cached versions fail
+with an error instead of silently producing different runtime code. Existing
+output tags are never overwritten. Use a new tag for each patch revision.
+
+Build history shows per-node results, logs, and file hashes and survives page
+refreshes. Uploaded source is not included in history; keep your original patch
+files. If a build partly succeeds, inspect the node results before retrying with
+a new tag. A SparkDeck restart interrupts build tracking and reports that state.
+
+Once every selected node succeeds, enter the resulting tag in the deployment's
+image field under Models and select those nodes. A baked-in patch does not need
+a host runtime-file mount. Container mounts can still hide image files at their
+mount destinations. Agents can use the same workflow through
+`create_patched_image` and `list_image_patch_builds`.
+
 ## Storage
 
 Storage is SparkDeck's opt-in Virtual NAS for complete Hugging Face cache entries.

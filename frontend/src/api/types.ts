@@ -113,6 +113,8 @@ export interface Deployment {
   deployment_mode?: string
   instances?: DeploymentInstance[]
   required_node_count?: number
+  // Nodes one more engine group of a tensor-parallel deployment occupies.
+  instance_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
   single_host_topology_replayable?: boolean

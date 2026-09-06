@@ -470,6 +470,8 @@ export function ModelsPage() {
   )
   const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
   const [additionalError, setAdditionalError] = useState<string>()
+  const [addInstanceLaunch, setAddInstanceLaunch] = useState<{ deployment: Deployment; nodeIds: string[] }>()
+  const [addInstanceError, setAddInstanceError] = useState<string>()
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -1452,6 +1454,52 @@ export function ModelsPage() {
     }
   }
 
+  // Start-another-deployment grows a tensor-parallel deployment with one more
+  // independent engine group on nodes it does not occupy. Replicated layouts
+  // grow through the additional-nodes flow instead (a full copy per node).
+  const supportsAnotherInstance = (deployment: Deployment) => (
+    deployment.managed
+    && (deployment.runtime === 'vllm' || deployment.runtime === 'sglang')
+    && (deployment.deployment_mode === 'grouped_sharded'
+      || deployment.deployment_mode === 'sharded')
+    && !isControllerArtifact(deployment)
+    && (deployment.instance_node_count ?? 0) > 0
+  )
+
+  const openAddInstancePicker = (deployment: Deployment) => {
+    const required = deployment.instance_node_count ?? 0
+    const occupied = new Set(deployment.node_ids ?? [])
+    const free = (nodes.data ?? []).filter(
+      (node) => isNodeSelectable(node) && !occupied.has(node.id),
+    )
+    setAddInstanceError(undefined)
+    // Preselect the first free nodes so Confirm is one click away; every
+    // free combination stays selectable.
+    setAddInstanceLaunch({
+      deployment,
+      nodeIds: free.slice(0, required).map((node) => node.id),
+    })
+  }
+
+  const confirmAddInstance = async () => {
+    if (!addInstanceLaunch) return
+    const { deployment, nodeIds } = addInstanceLaunch
+    setBusy(deployment.id)
+    setAddInstanceError(undefined)
+    try {
+      await api.deployments.action(deployment.id, 'add_instance', nodeIds)
+      setActionNotice(`Starting another deployment of ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}. Requests load-balance across every engine group.`)
+      setAddInstanceLaunch(undefined)
+      resource.reload()
+    } catch (reason) {
+      // Render inside the dialog: the page-level alert sits behind the
+      // modal backdrop where the user cannot see it.
+      setAddInstanceError(reason instanceof Error ? reason.message : 'Could not start another deployment')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const saveRename = async () => {
     if (!renaming) return
     const alias = renaming.value.trim()
@@ -2003,7 +2051,15 @@ export function ModelsPage() {
                     {(deployment.managed || deployment.controllable) && (deployment.status === 'stopping'
                       ? <Button variant="tertiary" disabled>Stopping…</Button>
                       : deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
-                      ? (supportsAdditionalNodes(deployment)
+                      ? (supportsAnotherInstance(deployment)
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
+                            onMainAction={() => void act(deployment, 'stop')}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => openAddInstancePicker(deployment) }]}
+                          />
+                        : supportsAdditionalNodes(deployment)
                         ? <SplitButton
                             label="Stop"
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
@@ -2407,6 +2463,49 @@ export function ModelsPage() {
               help={`Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
             />
             <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
+      {addInstanceLaunch && (() => {
+        const { deployment, nodeIds } = addInstanceLaunch
+        const required = deployment.instance_node_count ?? 0
+        const occupiedIds = deployment.node_ids ?? []
+        // Occupied nodes stay visible but disabled so the picker shows where
+        // this deployment already runs; only free selectable nodes count.
+        const allowedIds = (nodes.data ?? [])
+          .filter((node) => isNodeSelectable(node) && !occupiedIds.includes(node.id))
+          .map((node) => node.id)
+        const unavailableReasons = Object.fromEntries(
+          occupiedIds.map((id) => [id, 'Already running this deployment']),
+        )
+        const addBusy = busy === deployment.id
+        const exact = nodeIds.length === required
+        const allFree = nodeIds.every((id) => allowedIds.includes(id))
+        const ready = exact && allFree && !nodes.loading && !nodes.error
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !addBusy && setAddInstanceLaunch(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-instance-title">
+            <div className="modal-heading"><div><p className="eyebrow">Start another deployment</p><h2 id="add-instance-title">Add an engine group to {deployment.alias}</h2></div><button className="icon-button" disabled={addBusy} onClick={() => setAddInstanceLaunch(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">Currently on {selectedNodeLabel(nodes.data ?? [], occupiedIds, localLabel)}. Pick exactly {required} free node{required === 1 ? '' : 's'}: the new independent engine group keeps the same served name, and requests load-balance across every group. Nodes already running this deployment are not selectable.</p>
+            {addInstanceError && <p className="form-error" role="alert">{addInstanceError}</p>}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={nodeIds}
+              onChange={(next) => setAddInstanceLaunch({ deployment, nodeIds: next })}
+              loading={nodes.loading}
+              error={nodes.error}
+              onRetry={nodes.reload}
+              multiple={required > 1}
+              disabled={addBusy}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={nodeIds[0]}
+              legend={`Another deployment · ${required} node${required === 1 ? '' : 's'}`}
+              help={`Exactly ${required} nodes form one more independent engine group of ${deployment.model_id}. The nodes running this deployment today cannot be reused.`}
+            />
+            {!exact && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+            <div className="modal-actions"><Button type="button" disabled={addBusy} onClick={() => setAddInstanceLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || addBusy} onClick={() => void confirmAddInstance()}><Play size={15} /> {addBusy ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}

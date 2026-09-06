@@ -55,6 +55,41 @@ def test_group_stop_transition_stays_stopping_as_other_ranks_exit():
     assert _grouped_instance_summary(deployment)[1]["status"] == "stopping"
 
 
+@pytest.mark.parametrize("phase", [None, "starting", "loading", "initializing"])
+def test_running_containers_wait_for_their_own_group_engine_readiness(phase):
+    deployment = split_deployment("running")
+    for member in deployment["members"]:
+        member["desired_state"] = "running"
+    primary, worker = deployment["members"][2:]
+    primary["phase"] = {"phase": phase} if phase else None
+    worker["phase"] = {"phase": "initializing"}
+
+    assert [group["status"] for group in _grouped_instance_summary(deployment)] == [
+        "running", "starting",
+    ]
+
+    primary["phase"] = {"phase": "ready"}
+    # Headless workers never expose the API; the primary's own readiness
+    # signal is sufficient while all ranks' containers remain running.
+    assert [group["status"] for group in _grouped_instance_summary(deployment)] == [
+        "running", "running",
+    ]
+
+    worker["status"] = "restarting"
+    assert _grouped_instance_summary(deployment)[1]["status"] == "starting"
+
+
+def test_ready_peer_or_worker_cannot_substitute_for_missing_primary_readiness():
+    deployment = split_deployment("running")
+    for member in deployment["members"][2:]:
+        member["desired_state"] = "running"
+        member["phase"] = {"phase": "ready"}
+    deployment["members"] = [member for member in deployment["members"]
+                             if not (member["instance_id"] == 1 and member["rank"] == 0)]
+
+    assert _grouped_instance_summary(deployment)[1]["status"] == "starting"
+
+
 def test_unexpected_peer_failure_still_surfaces_in_progress():
     deployment = split_deployment("dead")
     for member in deployment["members"][2:]:

@@ -2132,7 +2132,19 @@ export function ModelsPage() {
                     {(deployment.managed || deployment.controllable) && (deployment.status === 'stopping'
                       ? <Button variant="tertiary" disabled>Stopping…</Button>
                       : deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
-                      ? (supportsAnotherInstance(deployment)
+                      ? (deployment.deployment_mode === 'grouped_sharded' && selectableGroups(deployment, 'start').length > 0
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id}
+                            mainDisabled={Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
+                            onMainAction={() => requestStop(deployment)}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[
+                              { key: 'start-group', label: 'Start group', onSelect: () => openGroupPicker(deployment, 'start') },
+                              ...(supportsAnotherInstance(deployment) ? [{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => openAddInstancePicker(deployment) }] : []),
+                            ]}
+                          />
+                        : supportsAnotherInstance(deployment)
                         ? <SplitButton
                             label="Stop"
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
@@ -2150,9 +2162,6 @@ export function ModelsPage() {
                           />
                         : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => requestStop(deployment)}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) && !deployment.direct_start ? 'Make managed' : 'Start'}</Button>)}
-                    {deployment.deployment_mode === 'grouped_sharded' && (deployment.managed || deployment.controllable) && deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && selectableGroups(deployment, 'start').length > 0 && (
-                      <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openGroupPicker(deployment, 'start')}>Start group</Button>
-                    )}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}

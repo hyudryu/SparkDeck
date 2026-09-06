@@ -358,6 +358,41 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment["desired_state"], "stopped")
         self.assertEqual(deployment["status"], "stopped")
 
+    async def test_group_start_environment_drift_never_recreates_other_groups(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment["members"][2]["status"] = "stopped"
+        deployment["members"][3]["status"] = "stopped"
+        instance._deployment_environment_drift = mock.AsyncMock(
+            return_value={"node-1-0": ["NCCL_DEBUG"]},
+        )
+        instance.create_deployment = mock.AsyncMock()
+        with self.assertRaisesRegex(ValueError, "start the whole deployment"):
+            await instance.deployment_action("d1", "start", instance=1)
+        self.assertEqual(actions, [])
+        instance.create_deployment.assert_not_awaited()
+        self.assertEqual(deployment["members"][0]["status"], "running")
+        self.assertEqual(deployment["members"][2]["status"], "stopped")
+
+    async def test_start_one_group_after_global_stop_keeps_stale_group_stopped(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment.update(status="stopped", desired_state="stopped")
+        instance._deployment_environment_drift = mock.AsyncMock(return_value={})
+        result = await instance.deployment_action("d1", "start", instance=0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(actions, [(0, "start"), (0, "start")])
+        self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
+        self.assertEqual(deployment["status"], "degraded")
+
+    async def test_group_start_with_unchanged_environment_preserves_other_group(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment["members"][2]["status"] = "stopped"
+        deployment["members"][3]["status"] = "stopped"
+        instance._deployment_environment_drift = mock.AsyncMock(return_value={})
+        result = await instance.deployment_action("d1", "start", instance=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(actions, [(1, "start"), (1, "start")])
+        self.assertEqual(deployment["members"][0]["status"], "running")
+
     async def test_per_instance_action_rejects_unknown_instance(self) -> None:
         instance, _, _ = self.lifecycle_manager()
         with self.assertRaisesRegex(ValueError, "instance"):
@@ -396,6 +431,19 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroupedShardedRecipeContractTests(unittest.TestCase):
+    def test_stopped_cluster_overrides_stale_member_states_in_summary(self) -> None:
+        from sparkdeck.service import _grouped_instance_summary
+
+        deployment = grouped_deployment()
+        deployment.update(status="stopped", desired_state="stopped")
+        for member in deployment["members"]:
+            member.update(status="running", desired_state="running")
+        summary = _grouped_instance_summary(deployment)
+        self.assertEqual([group["status"] for group in summary], ["stopped", "stopped"])
+        self.assertEqual([group["desired_state"] for group in summary], ["stopped", "stopped"])
+        self.assertEqual(summary[0]["node_ids"], ["node-0-0", "node-0-1"])
+        self.assertEqual(summary[1]["node_ids"], ["node-1-0", "node-1-1"])
+
     def test_contract_reads_persisted_grouped_topology(self) -> None:
         # A grouped recipe persists the per-group TP and instance count as
         # standalone fields, not as a whole-world argv flag.

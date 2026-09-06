@@ -645,13 +645,13 @@ export function DeploymentPage() {
             {detail.instances.map((instance) => (
               <div key={instance.instance_id} className="credential-state">
                 <div>
-                  <strong>Instance {instance.instance_id}</strong>
+                  <strong>Group {instance.instance_id + 1}</strong>
                   <span className="muted">
-                    {instance.node_names.join(', ')} · desired {instance.desired_state}
+                    {instance.node_names.join(' + ')} · desired {detail.desired_state === 'stopped' || detail.status === 'stopped' ? 'stopped' : instance.desired_state}
                   </span>
                 </div>
                 <div className="settings-save">
-                  {instance.desired_state === 'running'
+                  {detail.desired_state !== 'stopped' && detail.status !== 'stopped' && instance.desired_state === 'running'
                     ? <Button type="button" disabled={Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)} onClick={() => void actOnInstance(instance.instance_id, 'stop')}>{busy === `instance-${instance.instance_id}` ? 'Stopping…' : 'Stop group'}</Button>
                     : <Button type="button" variant="primary" disabled={Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)} onClick={() => void actOnInstance(instance.instance_id, 'start')}>{busy === `instance-${instance.instance_id}` ? 'Starting…' : 'Start group'}</Button>}
                 </div>

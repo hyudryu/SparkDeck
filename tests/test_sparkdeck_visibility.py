@@ -456,6 +456,28 @@ class SavedConfigurationApiTests(unittest.IsolatedAsyncioTestCase):
             "container:external", "start", ["local"], None, True, None,
         )
 
+    async def test_deployment_routes_forward_group_start_and_stop(self):
+        with patch.object(
+            server.sparkdeck, "deployment_action",
+            AsyncMock(return_value={"ok": True}),
+        ) as action:
+            for operation, group in [("start", 0), ("stop", 1)]:
+                response = await self.client.post(
+                    f"/api/v1/deployments/dep-1/{operation}",
+                    json={"instance": group},
+                )
+                self.assertEqual(response.status_code, 200)
+                action.assert_awaited_with(
+                    "dep-1", operation, None, None, False, group,
+                )
+            for invalid in [True, 1.5, "1"]:
+                response = await self.client.post(
+                    "/api/v1/deployments/dep-1/stop",
+                    json={"instance": invalid},
+                )
+                self.assertEqual(response.status_code, 400)
+            self.assertEqual(action.await_count, 2)
+
     async def test_legacy_recipe_defaults_are_visible_and_launch_through_sparkdeck(self):
         recipe = {
             "id": "recipe-1", "model": "org/model",

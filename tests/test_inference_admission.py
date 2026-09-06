@@ -47,6 +47,10 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             "running": 1,
             "queued": 2,
             "oldest_wait_seconds": 0.0,
+            "deployment_id": "deployment-a",
+            "group_id": "deployment-a",
+            "instance_id": None,
+            "node_names": [],
         })
 
         instance._release_inference_slot(target)

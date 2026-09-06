@@ -3441,6 +3441,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "--pipeline-parallel-size", "1",
                 ],
                 "image": "example/vllm:test",
+                "runtime_file_mounts": [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}],
                 "launch_controls": {
                     "context_window": 131072,
                     "max_cudagraph_capture_size": 12,
@@ -3450,6 +3451,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             })
 
             self.assertTrue(updated["settings_dirty"])
+            self.assertEqual(json.loads(instance.deployments_path.read_text())[0]["launch_settings"]["runtime_file_mounts"], [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}])
             self.assertEqual(updated["name"], "Faster cluster")
             self.assertEqual(updated["launch_settings"]["port"], 8000)
             self.assertEqual(

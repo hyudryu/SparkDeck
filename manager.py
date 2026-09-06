@@ -38,6 +38,7 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
+from sparkdeck.runtime_file_mounts import normalize_runtime_file_mounts, runtime_file_volumes
 from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
@@ -3892,6 +3893,9 @@ class Manager:
             "environment": cls._normalize_runtime_environment(
                 body.get("environment"), engine,
             ),
+            "runtime_file_mounts": normalize_runtime_file_mounts(
+                body.get("runtime_file_mounts"), engine,
+            ),
             "extra_args": extra_args,
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
             "gpu_memory_gb": body.get("gpu_memory_gb"),
@@ -6259,6 +6263,9 @@ class Manager:
         engine = str(body.get("engine") or "vllm")
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        body["runtime_file_mounts"] = normalize_runtime_file_mounts(
+            body.get("runtime_file_mounts"), engine,
+        )
         body["environment"] = normalize_runtime_environment(
             body.get("environment"), engine,
         )
@@ -6696,6 +6703,7 @@ class Manager:
             "shm_size": body.get("shm_size"),
             "infiniband_device": body.get("infiniband_device"),
             "environment": body.get("environment"),
+            "runtime_file_mounts": body.get("runtime_file_mounts"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
                     list(body.get("extra_args") or [])
@@ -7180,7 +7188,7 @@ class Manager:
         body = plan["body"]
         base = {key: body.get(key) for key in (
             "model", "engine", "gpu_memory_utilization", "gpu_memory_gb",
-            "shm_size", "infiniband_device", "environment", "image", "sg_tp_size",
+            "shm_size", "infiniband_device", "environment", "runtime_file_mounts", "image", "sg_tp_size",
             "sg_context_length", "sg_max_running_requests", "sg_mem_fraction", "sg_image",
         )}
         base["hf_token"] = self._resolved_hf_token()
@@ -7731,6 +7739,7 @@ class Manager:
                 "shm_size": launch.get("shm_size"),
                 "infiniband_device": launch.get("infiniband_device"),
                 "environment": launch.get("environment"),
+                "runtime_file_mounts": launch.get("runtime_file_mounts"),
                 "extra_args": (
                     self._with_vllm_prompt_token_details(
                         list(launch.get("extra_args") or [])
@@ -14302,6 +14311,7 @@ class Manager:
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
+        runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -14319,6 +14329,7 @@ class Manager:
             model=model, port=port, engine=engine,
             gpu_memory_utilization=gpu_memory_utilization,
             gpu_memory_gb=gpu_memory_gb, environment=environment,
+            runtime_file_mounts=runtime_file_mounts,
             extra_args=extra_args,
             name=name, image=image, sg_tp_size=sg_tp_size,
             sg_context_length=sg_context_length,
@@ -14557,11 +14568,21 @@ class Manager:
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
+        runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
+        runtime_file_mounts = normalize_runtime_file_mounts(runtime_file_mounts, engine)
+        # Validate before image pulls, GPU eviction, or any Docker mutation.
+        if runtime_file_mounts:
+            runtime_file_volumes(
+                runtime_file_mounts,
+                self._build_volumes(
+                    model, self.settings["hf_cache"], image or self.settings.get("vllm_image"),
+                ),
+            )
         managed_shm_size = (
             self._normalized_shm_size(shm_size)
             or self.settings["shm_size"]
@@ -14855,6 +14876,16 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                if runtime_file_mounts:
+                    # Mount API bind mounts never create missing host paths,
+                    # even if a file disappears after validation/image pull.
+                    runtime_file_volumes(runtime_file_mounts, run_options["volumes"])
+                    run_options["mounts"] = [
+                        docker.types.Mount(
+                            target=entry["target"], source=entry["source"],
+                            type="bind", read_only=True,
+                        ) for entry in runtime_file_mounts
+                    ]
                 if runtime_environment:
                     run_options["environment"] = dict(runtime_environment)
                 hf_environment = self._container_hf_environment(hf_token)

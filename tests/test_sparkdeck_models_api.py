@@ -48,6 +48,25 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.assignment.stop()
 
+    async def test_agent_container_launch_forwards_runtime_file_mounts(self):
+        mounts = [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}]
+        create = AsyncMock(return_value={"name": "rank-1"})
+        with patch.object(server, "_require_agent"), patch.object(server.manager, "create_container", create):
+            response = await self.client.post("/api/agent/containers", json={
+                "model": "org/model", "cluster_member": {"rank": 1},
+                "runtime_file_mounts": mounts,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(create.await_args.kwargs["runtime_file_mounts"], mounts)
+
+    async def test_settings_api_accepts_runtime_file_mounts(self):
+        mounts = [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}]
+        update = AsyncMock(return_value={"runtime_file_mounts": mounts})
+        with patch.object(server.sparkdeck, "update_deployment_settings", update):
+            response = await self.client.put("/api/v1/deployments/bookmark/settings", json={"runtime_file_mounts": mounts})
+        self.assertEqual(response.status_code, 200)
+        update.assert_awaited_once_with("bookmark", {"runtime_file_mounts": mounts})
+
     async def test_recipe_detail_returns_editable_args_and_launch_controls(self):
         with patch.object(server.manager, "get_recipe", AsyncMock(return_value=dict(RECIPE))):
             response = await self.client.get("/api/v1/recipes/r1")

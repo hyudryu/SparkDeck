@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import { ArrowDownToLine, Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, NodeInventoryItem, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, NodeInventoryItem, RecipeUpdateInput, RuntimeFileMount, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
@@ -483,6 +483,7 @@ export function ModelsPage() {
   const [extraFlags, setExtraFlags] = useState('')
   const [gpuMemoryUtil, setGpuMemoryUtil] = useState('')
   const [runtimeEnvironment, setRuntimeEnvironment] = useState('')
+  const [runtimeFileMounts, setRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
@@ -1109,6 +1110,7 @@ export function ModelsPage() {
     setExtraFlags('')
     setGpuMemoryUtil('')
     setRuntimeEnvironment('')
+    setRuntimeFileMounts([])
     resetSelectionProvenance()
     setFormError(undefined)
     setCreating(true)
@@ -1120,6 +1122,7 @@ export function ModelsPage() {
     setExtraFlags((deployment.settings.extra_args ?? []).map(shellQuote).join(' '))
     setGpuMemoryUtil(deployment.settings.gpu_memory_utilization?.toString() ?? '')
     setRuntimeEnvironment(formatEnvironment(deployment.settings.environment))
+    setRuntimeFileMounts((deployment.settings.runtime_file_mounts ?? []).map((mount) => ({ ...mount })))
     setForm({
       alias: deployment.alias,
       model_id: deployment.model_id,
@@ -1153,12 +1156,19 @@ export function ModelsPage() {
     try {
       const settings = {
         ...form.settings,
+        runtime_file_mounts: form.managed && form.runtime === 'vllm'
+          ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+          : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
         environment: form.managed && form.runtime === 'vllm'
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
           : undefined,
+      }
+      if (settings.runtime_file_mounts?.some((mount) => !mount.source || !mount.target)) {
+        setLaunchArgsOpen(true)
+        throw new Error('Each runtime file mount needs a host file path and a container file path.')
       }
       const utilization = Number(gpuMemoryUtil)
       if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
@@ -1186,6 +1196,7 @@ export function ModelsPage() {
           artifact: settings.artifact ?? null,
           extra_args: settings.extra_args ?? [],
           environment: settings.environment,
+          runtime_file_mounts: settings.runtime_file_mounts,
           gpu_memory_utilization: settings.gpu_memory_utilization ?? null,
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
@@ -1203,6 +1214,7 @@ export function ModelsPage() {
       setExtraFlags('')
       setGpuMemoryUtil('')
       setRuntimeEnvironment('')
+      setRuntimeFileMounts([])
       setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
       resource.reload()
     } catch (reason) {
@@ -2731,6 +2743,16 @@ export function ModelsPage() {
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
                   {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
+                  {form.runtime === 'vllm' && <fieldset className="field runtime-file-mounts">
+                    <legend>Runtime file mounts</legend>
+                    <small>Each host file must already exist at the same path on every selected node. Files are mounted read-only inside every vLLM container. Up to 16 files.</small>
+                    {runtimeFileMounts.map((mount, index) => <div className="field-grid" key={index}>
+                      <label className="field"><span>Host file path {index + 1}</span><input required placeholder="/home/user/patches/model.py" value={mount.source} onChange={(event) => setRuntimeFileMounts((mounts) => mounts.map((item, position) => position === index ? { ...item, source: event.target.value } : item))} /></label>
+                      <label className="field"><span>Container file path {index + 1}</span><input required placeholder="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/model.py" value={mount.target} onChange={(event) => setRuntimeFileMounts((mounts) => mounts.map((item, position) => position === index ? { ...item, target: event.target.value } : item))} /></label>
+                      <Button type="button" variant="tertiary" aria-label={`Remove runtime file mount ${index + 1}`} onClick={() => setRuntimeFileMounts((mounts) => mounts.filter((_, position) => position !== index))}><Trash2 size={15} /> Remove file</Button>
+                    </div>)}
+                    <Button type="button" variant="tertiary" disabled={runtimeFileMounts.length >= 16} onClick={() => setRuntimeFileMounts((mounts) => [...mounts, { source: '', target: '' }])}><Plus size={15} /> Add runtime file</Button>
+                  </fieldset>}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
                 </div>}

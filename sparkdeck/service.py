@@ -6188,10 +6188,30 @@ class SparkDeckService:
             item_id = str(item.get("id") or "")
             if item_id == str(deployment.get("id")):
                 continue
+            instances = item.get("instances")
+            # Independent Stop leaves the parent running intent intact. Once
+            # every group has explicitly finished stopping, that stale intent
+            # must not reserve selectors. Pending recreation still owns them.
+            all_groups_stopped = (
+                item.get("deployment_mode") == "grouped_sharded"
+                and item.get("status") == "stopped"
+                and item.get("launch_phase") == "stopped"
+                and isinstance(instances, list)
+                and bool(instances)
+                and all(
+                    isinstance(instance, dict)
+                    and instance.get("status") == "stopped"
+                    and instance.get("desired_state") == "stopped"
+                    for instance in instances
+                )
+            )
             if (
                 item_id not in self._deployment_launches
                 and str(item.get("status") or "") not in {"running", "starting"}
-                and str(item.get("desired_state") or "") != "running"
+                and (
+                    str(item.get("desired_state") or "") != "running"
+                    or all_groups_stopped
+                )
             ):
                 continue
             item_alias = str(item.get("alias") or "")

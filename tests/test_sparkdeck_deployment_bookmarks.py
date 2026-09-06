@@ -1336,6 +1336,74 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["status"], "starting")
         self.manager.create_deployment.assert_awaited()
 
+    async def test_start_releases_selector_after_all_groups_explicitly_stop(self):
+        for alias in ("TP2", "TP4"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": alias, "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+            })
+        stopped = {
+            "id": "old-tp2", "alias": "TP2", "kind": "managed",
+            "status": "stopped", "desired_state": "running",
+            "deployment_mode": "grouped_sharded", "launch_phase": "stopped",
+            "model": {"repository": "org/model"},
+            "served_models": ["org/model"], "settings": {},
+            "instances": [
+                {"instance_id": index, "status": "stopped", "desired_state": "stopped"}
+                for index in (0, 1)
+            ],
+        }
+        with patch.object(
+            self.service, "deployments", AsyncMock(return_value=[stopped]),
+        ):
+            started = await self.service.deployment_action("TP4", "start")
+        self.assertEqual(started["status"], "starting")
+        self.manager.create_deployment.assert_awaited()
+
+    async def test_stopped_group_selector_remains_reserved_when_state_is_uncertain(self):
+        requested = {
+            "id": "new-tp4", "kind": "managed", "alias": "TP4",
+            "model": {"repository": "org/model"}, "settings": {},
+        }
+        stopped_group = {"status": "stopped", "desired_state": "stopped"}
+        stopped = {
+            "id": "old-tp2", "alias": "TP2", "kind": "managed",
+            "status": "stopped", "desired_state": "running",
+            "deployment_mode": "grouped_sharded", "launch_phase": "stopped",
+            "model": {"repository": "org/model"}, "settings": {},
+            "instances": [stopped_group, stopped_group],
+        }
+        cases = [
+            {"status": status}
+            for status in ("running", "starting", "stopping", "error", "unknown", "degraded")
+        ] + [
+            {"launch_phase": phase}
+            for phase in (None, "queued", "creating", "starting", "recovering", "checking_image")
+        ] + [
+            {"instances": instances}
+            for instances in (
+                None, [], [None], [{}],
+                [stopped_group, {"status": "stopped", "desired_state": "running"}],
+                [stopped_group, {"status": "running", "desired_state": "stopped"}],
+            )
+        ] + [{"deployment_mode": "sharded"}]
+        for changes in cases:
+            with self.subTest(changes=changes), patch.object(
+                self.service, "deployments",
+                AsyncMock(return_value=[{**stopped, **changes}]),
+            ):
+                with self.assertRaisesRegex(ValueError, "already served"):
+                    await self.service._assert_deployment_start_selectors(requested)
+        self.service._deployment_launches["old-tp2"] = object()
+        try:
+            with patch.object(
+                self.service, "deployments", AsyncMock(return_value=[stopped]),
+            ):
+                with self.assertRaisesRegex(ValueError, "already served"):
+                    await self.service._assert_deployment_start_selectors(requested)
+        finally:
+            self.service._deployment_launches.pop("old-tp2")
+
     async def test_saved_selector_updates_serialize_and_allow_same_repo_profiles(self):
         for alias in ("TP2", "TP4"):
             await self.service.create_deployment({

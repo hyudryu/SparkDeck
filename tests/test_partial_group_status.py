@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from manager import Manager
-from sparkdeck.service import _deployment_launch_progress
+from sparkdeck.service import _deployment_launch_progress, _grouped_instance_summary
 
 
 def partial_deployment():
@@ -41,6 +41,16 @@ def test_partial_group_loading_tracks_its_coordinator():
     assert _deployment_launch_progress(deployment) == {
         "launch_phase": "loading", "launch_message": "Loading weights",
     }
+
+
+@pytest.mark.parametrize("phase", [None, "loading", "initializing", "ready"])
+def test_running_group_count_requires_its_own_coordinator_readiness(phase):
+    deployment = partial_deployment()
+    for member in deployment["members"]:
+        member.update(status="running", desired_state="running")
+    deployment["members"][0]["phase"] = {"phase": phase}
+    summary = _grouped_instance_summary(deployment)
+    assert sum(group["status"] == "running" for group in summary) == (2 if phase == "ready" else 1)
 
 
 def test_unapplied_topology_edit_does_not_change_existing_group_health():
@@ -103,6 +113,36 @@ def test_public_inventory_reconciles_partial_health_from_active_group(tmp_path, 
             public = (await manager.get_state())["deployments"][0]
             assert public["status"] == ("running" if active_online else "degraded")
             assert _deployment_launch_progress(public)["launch_phase"] == ("ready" if active_online else "error")
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("all_stopped_intent", [False, True])
+@pytest.mark.parametrize("failed_rank_online", [False, True])
+def test_failed_group_stop_remains_degraded_during_reconciliation(tmp_path, all_stopped_intent, failed_rank_online):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = partial_deployment()
+        deployment["error"] = "Failed to stop rank 0: agent disconnected"
+        deployment["members"][0]["status"] = "running"
+        if all_stopped_intent:
+            for member in deployment["members"]:
+                member["desired_state"] = "stopped"
+        manager.deployments = [deployment]
+        nodes = [{"id": member["node_id"], "online": failed_rank_online if index == 0 else True,
+                  "status": "online", "docker_ready": True, "containers": [{
+                      "name": member["container_name"], "status": member["status"], "phase": member["phase"],
+                  }]} for index, member in enumerate(deployment["members"])]
+        manager.list_containers = AsyncMock(return_value=nodes[2]["containers"])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=nodes)
+        try:
+            public = (await manager.get_state())["deployments"][0]
+            assert public["status"] == "degraded"
+            assert public["error"] == deployment["error"]
+            assert _deployment_launch_progress(public) == {"launch_phase": "error", "launch_message": deployment["error"]}
         finally:
             await manager.http.aclose()
     asyncio.run(run())

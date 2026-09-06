@@ -7394,6 +7394,7 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             "desired_state": "running",
             "node_names": [],
             "node_ids": [],
+            "primary_ready": False,
         })
         if member.get("node_id"):
             entry["node_ids"].append(str(member["node_id"]))
@@ -7401,10 +7402,16 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             str(member.get("node_name") or member.get("node_id") or ""),
         )
         entry["statuses"].append(_deployment_status(member.get("status")))
+        if member.get("rank") == 0:
+            phase = member.get("phase")
+            entry["primary_ready"] = (
+                (phase.get("phase") if isinstance(phase, dict) else phase) == "ready"
+            )
         if str(member.get("desired_state") or "running") == "stopped":
             entry["desired_state"] = "stopped"
     for entry in groups.values():
         states = entry.pop("statuses")
+        primary_ready = entry.pop("primary_ready")
         if cluster.get("desired_state") == "stopped":
             entry["desired_state"] = "stopped"
         if cluster.get("status") == "stopped":
@@ -7418,7 +7425,11 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
         elif states and all(state == "stopped" for state in states):
             entry["status"] = "stopped"
         elif states and all(state in {"running", "ready"} for state in states):
-            entry["status"] = "running"
+            # Docker running only confirms processes exist. Each independent
+            # engine must reach its own API-ready phase before its group turns
+            # green. Headless TP workers do not expose an API, so require their
+            # containers to run, but use rank zero for engine readiness.
+            entry["status"] = "running" if primary_ready else "starting"
         else:
             entry["status"] = "starting"
         entry["node_names"].sort()

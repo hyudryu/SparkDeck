@@ -18937,7 +18937,12 @@ class Manager:
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
                 if saved.get("mode") == "grouped_sharded":
-                    if saved.get("status") == "stopping":
+                    if saved.get("status") == "degraded" and saved.get("error"):
+                        # Failed group stops already carry stopped intent,
+                        # but ranks may still be alive or unreachable. Keep
+                        # the action failure visible until explicitly retried.
+                        deployment["status"] = "degraded"
+                    elif saved.get("status") == "stopping":
                         deployment["status"] = "stopping"
                     elif saved.get("desired_state") == "stopped" or saved.get("status") == "stopped":
                         deployment["status"] = "stopped"

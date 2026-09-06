@@ -2369,6 +2369,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         # contract; which keys apply is decided per record in the service.
         "alias", "context_length", "tensor_parallel_size", "instances", "parallel_slots",
         "gpu_layers", "quantization", "artifact", "image", "node_ids", "deployment_mode",
+        "model",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:

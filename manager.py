@@ -7393,10 +7393,26 @@ class Manager:
                     "one node; start-another-deployment requires one rank per "
                     "node"
                 )
-            if mode == "sharded":
-                self._convert_sharded_deployment_to_grouped(
-                    deployment, tensor_parallel_size,
+            if mode == "sharded" and not world_tp:
+                # A vLLM sharded deployment without an explicit TP flag
+                # pipelines across the nodes (default 1 TP x N PP layout): an
+                # added TP-only group would not reproduce that engine.
+                raise ValueError(
+                    "this deployment pipelines across the selected nodes; "
+                    "start-another-deployment requires an explicit tensor "
+                    "parallel layout"
                 )
+            if deployment.get("settings_dirty"):
+                raise ValueError(
+                    "saved launch settings changed; start the deployment to "
+                    "apply them before launching another deployment"
+                )
+            if deployment.get("desired_state") == "stopped":
+                raise ValueError(
+                    "start the deployment before launching another deployment"
+                )
+            # Everything below mutates the record: every rejecting check must
+            # have run by this point.
             if len(requested) != tensor_parallel_size:
                 raise ValueError(
                     f"another TP{tensor_parallel_size} deployment requires "
@@ -7461,6 +7477,22 @@ class Manager:
                     "no usable GPUs on: " + ", ".join(gpu_short)
                 )
 
+            # All rejecting checks have passed. Snapshot the pre-conversion
+            # state so a failed launch can restore a plain sharded record
+            # exactly, then convert in memory.
+            converted = mode == "sharded"
+            pre_conversion = {
+                "mode": deployment.get("mode"),
+                "instances": deployment.get("instances"),
+                "launch_mode": launch.get("deployment_mode"),
+                "launch_tensor": launch.get("tensor_parallel_size"),
+                "launch_instances": launch.get("instances"),
+            } if converted else None
+            if converted:
+                self._convert_sharded_deployment_to_grouped(
+                    deployment, tensor_parallel_size,
+                )
+
             instance_ids = [
                 int(member.get("instance_id") or 0) for member in members
             ]
@@ -7521,6 +7553,14 @@ class Manager:
             ))
             deployment["node_ids"] = merged_nodes
             launch["node_ids"] = merged_nodes
+            # "launching" during the pull window keeps the health monitor
+            # away from the not-yet-existing containers, and if the
+            # controller dies here the startup resume path rebuilds the
+            # whole (already extended) topology coherently.
+            deployment["status"] = "launching"
+            deployment["status_message"] = (
+                f"Launching another deployment on {', '.join(requested)}"
+            )
             self._save_deployments()
 
             created = await asyncio.gather(*tasks, return_exceptions=True)
@@ -7543,11 +7583,10 @@ class Manager:
                     spec["container_id"] = result.get("id")
                     spec["port"] = result.get("port") or spec.get("port")
             if errors:
-                deployment["status"] = "degraded"
-                deployment["error"] = "; ".join(errors)
                 # Roll the failed group back: a partially created engine
                 # holds GPU memory without serving. The previous groups keep
-                # serving regardless.
+                # serving regardless, so the card returns to its derived
+                # state instead of a stale failure.
                 await asyncio.gather(
                     *[
                         self._member_action(spec, "remove")
@@ -7567,6 +7606,32 @@ class Manager:
                     if item not in requested
                 ]
                 launch["node_ids"] = list(deployment["node_ids"])
+                # A converted sharded record goes back to exactly what
+                # it was: no phantom grouped topology may survive. Keys the
+                # conversion introduced are removed, not nulled.
+                if pre_conversion is not None:
+                    deployment["mode"] = pre_conversion["mode"]
+                    launch["deployment_mode"] = pre_conversion["launch_mode"]
+                    for member in deployment["members"]:
+                        member.pop("instance_id", None)
+                    if pre_conversion["instances"] is None:
+                        deployment.pop("instances", None)
+                        launch.pop("instances", None)
+                    else:
+                        deployment["instances"] = pre_conversion["instances"]
+                        launch["instances"] = pre_conversion["launch_instances"]
+                    if pre_conversion["launch_tensor"] is None:
+                        launch.pop("tensor_parallel_size", None)
+                    else:
+                        launch["tensor_parallel_size"] = pre_conversion["launch_tensor"]
+                deployment.pop("status_message", None)
+                # With the failed group removed the remaining ranks derive
+                # the honest state (a sharded record's ranks read as one
+                # group here, which matches its health semantics).
+                deployment["status"] = self._grouped_deployment_status(
+                    deployment
+                )
+                deployment["error"] = "; ".join(errors)
                 self._save_deployments()
                 return {
                     "ok": False,
@@ -7577,6 +7642,7 @@ class Manager:
             deployment["error"] = None
             deployment["last_deployed_at"] = time.time()
             deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["status_message"] = None
             self._save_deployments()
             return {
                 "ok": True,
@@ -7914,6 +7980,11 @@ class Manager:
         expected: dict[int, list[tuple[dict, Any]]] = {}
         for member in deployment.get("members") or []:
             if str(member.get("desired_state") or "running") == "stopped":
+                continue
+            if str(member.get("status") or "") in {"queued", "creating"}:
+                # A launch still represented by a synthetic agent row is not
+                # a failed runtime (create_deployment and instance adds set
+                # this while containers are being pulled).
                 continue
             node = node_by_id.get(member.get("node_id"))
             if not node or not node.get("online") or not node.get("docker_ready"):

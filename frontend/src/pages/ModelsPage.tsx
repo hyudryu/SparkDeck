@@ -2057,7 +2057,7 @@ export function ModelsPage() {
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
                             onMainAction={() => void act(deployment, 'stop')}
                             toggleAriaLabel={`More actions for ${deployment.alias}`}
-                            items={[{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => openAddInstancePicker(deployment) }]}
+                            items={[{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => { if (busy !== deployment.id) openAddInstancePicker(deployment) } }]}
                           />
                         : supportsAdditionalNodes(deployment)
                         ? <SplitButton

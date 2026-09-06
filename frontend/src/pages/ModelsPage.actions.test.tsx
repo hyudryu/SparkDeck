@@ -1701,8 +1701,10 @@ describe('deployment group controls', () => {
     expect(screen.getByText('running', { exact: true })).toBeInTheDocument()
     expect(screen.queryByText('degraded', { exact: true })).not.toBeInTheDocument()
     expect(screen.queryByText('Starting', { exact: true })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Start group' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.getByRole('menuitem', { name: 'Start group' })).toBeEnabled()
   })
 
   it('keeps unexpected group degradation visible beside the running count', async () => {

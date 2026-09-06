@@ -1581,3 +1581,80 @@ describe('deployment creator model and quantization pickers', () => {
     expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
   })
 })
+
+
+describe('deployment group controls', () => {
+  const grouped = {
+    ...runningDeployment,
+    deployment_mode: 'grouped_sharded', required_node_count: 4,
+    settings: { tensor_parallel_size: 2, instances: 2 },
+    node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+    instances: [
+      { instance_id: 0, status: 'running', desired_state: 'running', node_names: ['Controller', 'Node 4'] },
+      { instance_id: 1, status: 'running', desired_state: 'running', node_names: ['Node 3', 'Node 2'] },
+    ],
+  }
+
+  function mockGrouped(deployment: typeof grouped) {
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [deployment] }), { headers: { 'Content-Type': 'application/json' } })
+      return original(input, init)
+    })
+  }
+
+  it('stops only the selected group and shows its nodes', async () => {
+    const user = userEvent.setup()
+    mockGrouped(grouped)
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Stop' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Stop a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2: Node 3 \+ Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Stop selected group' }))
+    await waitFor(() => {
+      const requests = fetchMock.mock.calls.filter(([path, request]) => String(path).endsWith('/dep-1/stop') && request?.method === 'POST')
+      expect(requests).toHaveLength(1)
+      expect(JSON.parse(String(requests[0][1]?.body))).toEqual({ instance: 1 })
+    })
+  })
+
+  it('starts one saved group without requiring all four nodes', async () => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status: 'stopped', desired_state: 'stopped' })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2: Node 3 \+ Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ instance: 1 })
+    })
+  })
+
+  it('starts all groups explicitly so saved settings can be applied', async () => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status: 'degraded', instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start group' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /All groups/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start all groups' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(request).toBeDefined()
+      expect(request?.[1]?.body).toBeUndefined()
+    })
+  })
+
+  it('offers restarting a stopped group while another group serves requests', async () => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status: 'degraded', instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start group' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).getAllByRole('radio')).toHaveLength(2)
+    expect(within(dialog).getByRole('radio', { name: /Group 2/ })).toBeChecked()
+  })
+})

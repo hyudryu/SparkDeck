@@ -189,7 +189,7 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
 const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'stopping'])
-const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
+const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready', 'degraded'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
 const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
 
@@ -438,6 +438,8 @@ export function ModelsPage() {
   const [logTailing, setLogTailing] = useState(false)
   const logPanelRef = useRef<HTMLDivElement>(null)
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
+  const [groupSelection, setGroupSelection] = useState<{ deployment: Deployment; action: 'start' | 'stop'; instance: number | 'all' }>()
+  const [groupError, setGroupError] = useState<string>()
   const [startError, setStartError] = useState<string>()
   const [startNotice, setStartNotice] = useState<string>()
   const [editingDeployment, setEditingDeployment] = useState<Deployment>()
@@ -1225,6 +1227,44 @@ export function ModelsPage() {
     }
   }
 
+  const selectableGroups = (deployment: Deployment, action: 'start' | 'stop') => (
+    (deployment.instances ?? []).filter((instance) => action === 'start'
+      ? deployment.desired_state === 'stopped' || deployment.status === 'stopped' || instance.desired_state === 'stopped'
+      : deployment.desired_state !== 'stopped' && deployment.status !== 'stopped' && instance.desired_state !== 'stopped')
+  )
+
+  const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
+    const groups = selectableGroups(deployment, action)
+    setGroupError(undefined)
+    setGroupSelection({ deployment, action, instance: groups[0]?.instance_id ?? 'all' })
+  }
+
+  const requestStop = (deployment: Deployment) => {
+    if (deployment.deployment_mode === 'grouped_sharded' && deployment.instances?.length) {
+      openGroupPicker(deployment, 'stop')
+    } else {
+      void act(deployment, 'stop')
+    }
+  }
+
+  const confirmGroupAction = async () => {
+    if (!groupSelection) return
+    const { deployment, action, instance } = groupSelection
+    setBusy(deployment.id)
+    setGroupError(undefined)
+    try {
+      await api.deployments.action(deployment.id, action, undefined, undefined, false,
+        instance === 'all' ? undefined : instance)
+      setGroupSelection(undefined)
+      resource.reload()
+    } catch (reason) {
+      setGroupError(reason instanceof Error ? reason.message : 'Could not update deployment group')
+      resource.reload()
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
   const cloneDeployment = async (deployment: Deployment) => {
     setBusy(deployment.id)
     setActionError(undefined)
@@ -1373,6 +1413,10 @@ export function ModelsPage() {
   }
 
   const openStartPicker = (deployment: Deployment) => {
+    if (deployment.deployment_mode === 'grouped_sharded' && deployment.instances?.length) {
+      openGroupPicker(deployment, 'start')
+      return
+    }
     if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
       setStartError(undefined)
       setStartNotice(undefined)
@@ -2055,7 +2099,7 @@ export function ModelsPage() {
                         ? <SplitButton
                             label="Stop"
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
-                            onMainAction={() => void act(deployment, 'stop')}
+                            onMainAction={() => requestStop(deployment)}
                             toggleAriaLabel={`More actions for ${deployment.alias}`}
                             items={[{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => { if (busy !== deployment.id) openAddInstancePicker(deployment) } }]}
                           />
@@ -2063,12 +2107,15 @@ export function ModelsPage() {
                         ? <SplitButton
                             label="Stop"
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
-                            onMainAction={() => void act(deployment, 'stop')}
+                            onMainAction={() => requestStop(deployment)}
                             toggleAriaLabel={`More actions for ${deployment.alias}`}
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
-                        : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
+                        : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => requestStop(deployment)}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) && !deployment.direct_start ? 'Make managed' : 'Start'}</Button>)}
+                    {deployment.deployment_mode === 'grouped_sharded' && (deployment.managed || deployment.controllable) && deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status) && selectableGroups(deployment, 'start').length > 0 && (
+                      <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openGroupPicker(deployment, 'start')}>Start group</Button>
+                    )}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
                     )}
@@ -2284,6 +2331,29 @@ export function ModelsPage() {
             </div>}
             {!exactCount && <p className="field-note" role="status">Select exactly {recipe.required_node_count} {recipe.required_node_count === 1 ? 'node' : 'nodes'} to continue.</p>}
             <div className="modal-actions"><Button type="button" disabled={recipeBusy} onClick={() => setRecipeDeployment(undefined)}>Cancel</Button><Button variant="primary" disabled={(!ready && !canPrepare) || recipeBusy} onClick={() => void (ready ? deployRecipe() : prepareRecipeWeights())}>{ready ? <Play size={15} /> : <UploadCloud size={15} />} {recipeBusy ? (busy === `recipe:${recipe.id}` ? 'Deploying…' : 'Queueing…') : ready ? `Deploy on ${recipe.required_node_count} ${recipe.required_node_count === 1 ? 'node' : 'nodes'}` : 'Prepare selected nodes'}</Button></div>
+          </section>
+        </div>
+      })()}
+
+      {groupSelection && (() => {
+        const { deployment, action, instance } = groupSelection
+        const groups = selectableGroups(deployment, action)
+        const label = action === 'stop' ? 'Stop' : 'Start'
+        const groupBusy = busy === deployment.id
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !groupBusy && setGroupSelection(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deployment-group-title">
+            <div className="modal-heading"><h2 id="deployment-group-title">{label} a group for {deployment.alias}</h2><button className="icon-button" disabled={groupBusy} onClick={() => setGroupSelection(undefined)} aria-label="Close dialog">&times;</button></div>
+            <p className="modal-description">Choose the group to {action}. Each group runs one model instance across its listed nodes.</p>
+            <fieldset className="node-selector deployment-group-picker" disabled={groupBusy}>
+              <legend>Deployment groups</legend>
+              {groups.map((group) => <label className="node-option" key={group.instance_id}>
+                <input type="radio" name="deployment-group" checked={instance === group.instance_id} onChange={() => setGroupSelection({ ...groupSelection, instance: group.instance_id })} />
+                <span><strong>Group {group.instance_id + 1}: {group.node_names.join(' + ')}</strong><small>{deployment.desired_state === 'stopped' || deployment.status === 'stopped' ? 'stopped' : group.status}</small></span>
+              </label>)}
+              {(deployment.instances?.length ?? 0) > 1 && <label className="node-option"><input type="radio" name="deployment-group" checked={instance === 'all'} onChange={() => setGroupSelection({ ...groupSelection, instance: 'all' })} /><span>All groups{action === 'start' ? ' (includes running groups and applies saved settings)' : ''}</span></label>}
+            </fieldset>
+            {groupError && <p className="form-error" role="alert">{groupError}</p>}
+            <div className="modal-actions"><Button disabled={groupBusy} onClick={() => setGroupSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={groupBusy || !groups.length} onClick={() => void confirmGroupAction()}>{groupBusy ? `${label === 'Stop' ? 'Stopping' : 'Starting'}...` : `${label} ${instance === 'all' ? 'all groups' : 'selected group'}`}</Button></div>
           </section>
         </div>
       })()}

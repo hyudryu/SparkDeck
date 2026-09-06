@@ -752,6 +752,14 @@ export interface ActiveRequestStats {
   admission_limit?: number
 }
 
+export interface ActiveRequestGroupStats extends ActiveRequestStats {
+  group_id: string
+  model: string
+  deployment_id: string | null
+  instance_id: number | null
+  node_names: string[]
+}
+
 export interface SystemStats {
   cpu_pct?: number | null
   cpu_logical_count?: number | null
@@ -759,11 +767,16 @@ export interface SystemStats {
   mem?: { total?: number; used?: number; available?: number; pct?: number }
   gpus?: GpuStats[]
   active_requests?: Record<string, ActiveRequestStats>
+  active_request_groups?: Record<string, ActiveRequestGroupStats>
   ts?: number
 }
 
 export interface AdmissionStats {
   model?: string
+  group_id?: string
+  deployment_id?: string | null
+  instance_id?: number | null
+  node_names?: string[]
   limit?: number | null
   effective_limit?: number
   running: number

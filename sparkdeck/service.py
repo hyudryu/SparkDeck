@@ -7360,7 +7360,10 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             "statuses": [],
             "desired_state": "running",
             "node_names": [],
+            "node_ids": [],
         })
+        if member.get("node_id"):
+            entry["node_ids"].append(str(member["node_id"]))
         entry["node_names"].append(
             str(member.get("node_name") or member.get("node_id") or ""),
         )
@@ -7369,7 +7372,13 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             entry["desired_state"] = "stopped"
     for entry in groups.values():
         states = entry.pop("statuses")
-        if "error" in states:
+        if cluster.get("desired_state") == "stopped":
+            entry["desired_state"] = "stopped"
+        if cluster.get("status") == "stopped":
+            entry["status"] = "stopped"
+        elif cluster.get("status") == "stopping":
+            entry["status"] = "stopping"
+        elif "error" in states:
             entry["status"] = "error"
         elif states and all(state == "stopped" for state in states):
             entry["status"] = "stopped"

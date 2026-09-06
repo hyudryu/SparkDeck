@@ -6123,11 +6123,10 @@ class Manager:
             }
             if caller_ip:
                 remote_body["_sparkdeck_caller_ip"] = caller_ip
-            request_id = (
-                self._track_start(
-                    model, deployment_id=deployment_id, caller_ip=caller_ip,
-                )
-                if caller_ip else None
+            request_id = self._track_start(
+                model, deployment_id=deployment_id, caller_ip=caller_ip,
+                container_name=member.get("container_name"),
+                streaming=bool(body.get("stream")),
             )
             if body.get("stream"):
                 try:
@@ -6171,6 +6170,10 @@ class Manager:
                     try:
                         async for line in self._aiter_lines_cancellable(response, cancel):
                             if line:
+                                thinking, output = self._sse_chunk_token_counts(line)
+                                now = time.monotonic()
+                                self._track_output(request_id, now, "thinking", thinking)
+                                self._track_output(request_id, now, "output", output)
                                 yield f"{line}\n\n"
                     finally:
                         await response.aclose()
@@ -7071,9 +7074,11 @@ class Manager:
         for member in deployment.get("members") or []:
             group = int(member.get("instance_id") or 0)
             all_groups.add(group)
-            if int(member.get("rank") or 0) == 0 and str(
-                member.get("status") or ""
-            ) not in {"stopped", "error"}:
+            if (
+                member.get("desired_state") != "stopped"
+                and int(member.get("rank") or 0) == 0
+                and str(member.get("status") or "") not in {"stopped", "error"}
+            ):
                 running_groups.add(group)
         if not running_groups:
             return "stopped"
@@ -7122,6 +7127,9 @@ class Manager:
         # request racing an explicit Stop cannot resurrect the deployment.
         if action == "stop" and targeted_instance is None:
             deployment["desired_state"] = "stopped"
+            if deployment.get("mode") == "grouped_sharded":
+                for member in deployment.get("members") or []:
+                    member["desired_state"] = "stopped"
             # The stop can take seconds per rank; report the honest transition
             # instead of leaving the pre-stop status on the card.
             deployment["status"] = "stopping"
@@ -7145,6 +7153,11 @@ class Manager:
                 # An unexpected inspection failure must never block a start.
                 environment_drift = None
             if environment_drift:
+                if targeted_instance is not None:
+                    raise ValueError(
+                        "saved launch environment changed; start the whole "
+                        "deployment to apply it"
+                    )
                 relaunch = True
                 drifted = ", ".join(sorted(environment_drift))
                 deployment["status"] = "starting"
@@ -7232,9 +7245,13 @@ class Manager:
                 if int(member.get("instance_id") or 0) == targeted_instance:
                     member["desired_state"] = desired
                 else:
+                    if deployment.get("status") == "stopped":
+                        member["status"] = "stopped"
                     member["desired_state"] = (
                         "stopped"
-                        if str(member.get("status") or "") in {"stopped", "error"}
+                        if deployment.get("desired_state") == "stopped"
+                        or member.get("desired_state") == "stopped"
+                        or str(member.get("status") or "") in {"stopped", "error"}
                         else "running"
                     )
             if action == "start":
@@ -7260,7 +7277,9 @@ class Manager:
             *[self._member_action(m, action) for m in targeted_members],
             return_exceptions=True,
         )
-        if targeted_instance is not None:
+        if targeted_instance is not None or (
+            action == "stop" and deployment.get("mode") == "grouped_sharded"
+        ):
             # Record the local transition on the acted members so the derived
             # status reflects this action without waiting for a reconcile.
             for member, result in zip(targeted_members, results):
@@ -10628,6 +10647,37 @@ class Manager:
                 pending.cancel()
 
     # ----- live request tracking (Tokens widget) -----
+    def _request_group(self, model: str, deployment_id: str | None = None,
+                       container_name: str | None = None) -> dict:
+        """Identify the selected engine, including all of its shard nodes."""
+        metadata = {"model": model, "deployment_id": deployment_id,
+                    "instance_id": None, "node_names": []}
+        for deployment in getattr(self, "deployments", []):
+            if deployment_id and deployment.get("id") != deployment_id:
+                continue
+            members = deployment.get("members") or []
+            selected = next((m for m in members
+                             if container_name and m.get("container_name") == container_name), None)
+            if selected is None:
+                continue
+            instance = selected.get("instance_id")
+            if instance is not None:
+                group = [m for m in members if m.get("instance_id") == instance]
+            elif deployment.get("mode") == "replicated":
+                group = [selected]
+            else:
+                group = members
+            metadata.update(
+                deployment_id=deployment.get("id"), instance_id=instance,
+                node_names=list(dict.fromkeys(
+                    str(m.get("node_name") or m.get("node_id") or "This node")
+                    for m in group)),
+            )
+            metadata["group_id"] = self._cluster_member_key(deployment["id"], selected)
+            return metadata
+        metadata["group_id"] = str(deployment_id or container_name or model)
+        return metadata
+
     def _track_start(
         self,
         key: str,
@@ -10636,7 +10686,11 @@ class Manager:
         nudge_event: asyncio.Event | None = None,
         deployment_id: str | None = None,
         caller_ip: str | None = None,
+        container_name: str | None = None,
     ) -> int:
+        if not hasattr(self, "_active_reqs"):
+            self._active_reqs = {}
+            self._req_seq = 0
         self._req_seq += 1
         rid = self._req_seq
         self._active_reqs[rid] = {
@@ -10652,6 +10706,7 @@ class Manager:
             "deployment_id": deployment_id,
             "caller_ip": caller_ip,
             "paused": False,
+            "group": self._request_group(key, deployment_id, container_name),
         }
         self._mark_deployment_used(deployment_id)
         return rid
@@ -10673,7 +10728,7 @@ class Manager:
             rec["total_tokens"] = rec.get("total_tokens", 0) + count
             timestamps = rec[kind]
             timestamps.extend([ts] * count)
-            cutoff = ts - self._trailing_window
+            cutoff = ts - getattr(self, "_trailing_window", 5.0)
             while timestamps and timestamps[0] < cutoff:
                 timestamps.popleft()
 
@@ -10704,22 +10759,30 @@ class Manager:
                     pass
             return
 
-    def active_requests(self) -> dict:
+    def active_request_groups(self) -> dict:
+        """Per-engine sessions and rolling rates for the dashboard."""
+        return self.active_requests(_grouped=True)
+
+    def active_requests(self, *, _grouped: bool = False) -> dict:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
         out: dict[str, dict] = {}
-        for rid, rec in list(self._active_reqs.items()):
+        for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
             # A zero-output stream selected for transparent replay stays in
             # _active_reqs so its downstream connection remains open, but it
             # has released its admission slot and is waiting in the FIFO.
             # Do not report that paused request as running.
             if rec.get("paused"):
                 continue
-            e = out.setdefault(rec["key"], {
+            group = rec.get("group") or self._request_group(rec["key"])
+            entry_key = group["group_id"] if _grouped else rec["key"]
+            e = out.setdefault(entry_key, {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
                 "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
             })
+            if _grouped:
+                e.update(group)
             e["connections"] += 1
             caller_ip = rec.get("caller_ip")
             if caller_ip:
@@ -10733,17 +10796,12 @@ class Manager:
                 e["pp_measuring"] += 1
             for kind, field in (("thinking", "thinking_tok_s"), ("output", "output_tok_s")):
                 timestamps = rec[kind]
-                cutoff = now - self._trailing_window
+                cutoff = now - getattr(self, "_trailing_window", 5.0)
                 while timestamps and timestamps[0] < cutoff:
                     timestamps.popleft()
                 if timestamps:
-                    observed = min(self._trailing_window, max(1.0, now - timestamps[0]))
+                    observed = min(getattr(self, "_trailing_window", 5.0), max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
-        # clean up per-model entries when all their streams ended
-        active_keys = {rec["key"] for rec in self._active_reqs.values()}
-        for key in list(out.keys()):
-            if key not in active_keys:
-                del out[key]
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
@@ -10753,22 +10811,26 @@ class Manager:
                 else None
             )
         admission_running: dict[str, int] = {}
-        for admission in self.inference_admission().values():
+        for target, admission in self.inference_admission().items():
             model = admission.get("model")
             if not model:
                 continue
-            e = out.setdefault(model, {
+            group = self._admission_store().get(target, {}).get("group") or self._request_group(model)
+            entry_key = group["group_id"] if _grouped else model
+            e = out.setdefault(entry_key, {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
                 "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
                 "pp_tok_s": None,
             })
+            if _grouped:
+                e.update(group)
             e["queued"] = e.get("queued", 0) + admission["queued"]
             e["admission_limit"] = admission.get(
                 "effective_limit", admission["limit"]
             )
-            admission_running[model] = (
-                admission_running.get(model, 0) + admission["running"]
+            admission_running[entry_key] = (
+                admission_running.get(entry_key, 0) + admission["running"]
             )
         # Admission owns the authoritative running count from slot grant until
         # release.  max() includes non-streaming/prefill work that has no live
@@ -10838,6 +10900,9 @@ class Manager:
         })
         state["limit"] = limit
         state["model"] = stats_key
+        state["group"] = self._request_group(
+            stats_key, container.get("deployment_id"), container.get("name"),
+        )
 
         loop = asyncio.get_running_loop()
         waiter = {
@@ -11075,6 +11140,8 @@ class Manager:
                     max(0.0, now - queued[0]["created_at"]), 1
                 ) if queued else 0.0,
             }
+            if state.get("group"):
+                snapshot.update(state["group"])
             effective_limit = state.get("effective_limit")
             if effective_limit is not None and effective_limit != state["limit"]:
                 snapshot["effective_limit"] = effective_limit
@@ -16762,7 +16829,7 @@ class Manager:
             url = f"http://localhost:{container['port']}/v1/chat/completions"
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=container.get("name"), caller_ip=caller_ip,
             )
             try:
                 r = await self._await_or_cancel(
@@ -16808,7 +16875,7 @@ class Manager:
             url = f"http://localhost:{container['port']}/v1/completions"
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=container.get("name"), caller_ip=caller_ip,
             )
             try:
                 r = await self._await_or_cancel(
@@ -17159,7 +17226,7 @@ class Manager:
                 admission_target=admission,
                 nudge_event=nudge_event,
                 deployment_id=(container or {}).get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=(container or {}).get("name"), caller_ip=caller_ip,
             )
             while True:
                 attempt_started_at = time.monotonic()
@@ -17326,6 +17393,9 @@ class Manager:
                     )
                     url = f"http://localhost:{container['port']}{endpoint}"
                     rec["key"] = key
+                    rec["group"] = self._request_group(
+                        key, container.get("deployment_id"), container.get("name"),
+                    )
                     rec["admission_target"] = admission
                     rec["paused"] = False
         except ClientAbort:
@@ -17688,7 +17758,7 @@ class Manager:
         now = time.time()
         if now - self._stats_ts < 0.8 and self._stats_cache:
             self._record_temperature_sample(self._stats_cache, now)
-            return {**self._stats_cache, "active_requests": self.active_requests()}
+            return {**self._stats_cache, "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups()}
 
         def _gather():
             cpu_clock = self._read_cpu_clock_mhz()
@@ -17711,7 +17781,7 @@ class Manager:
         self._stats_cache = stats
         self._stats_ts = now
         self._record_temperature_sample(stats, stats.get("ts", now))
-        return {**stats, "active_requests": self.active_requests()}
+        return {**stats, "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups()}
 
     def _record_temperature_sample(
         self,
@@ -18734,7 +18804,7 @@ class Manager:
             "usage_cache_estimates": copy.deepcopy(self.usage_cache_estimates),
             "usage_rows": self.usage_rows(),
             "session_token_stats": self.session_token_stats,
-            "active_requests": self.active_requests(),
+            "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups(),
             "inference_admission": self.inference_admission(),
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {

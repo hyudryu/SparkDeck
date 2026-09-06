@@ -70,7 +70,7 @@ function renderPage() {
 
 const groupedDetail = {
   ...detail,
-  status: 'degraded', editable: false, controllable: true,
+  status: 'degraded', desired_state: 'running', editable: false, controllable: true,
   deployment_mode: 'grouped_sharded',
   required_node_count: 4,
   node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
@@ -95,8 +95,8 @@ describe('deployment object page', () => {
     })
     renderPage()
 
-    expect(await screen.findByText('Instance 0')).toBeInTheDocument()
-    expect(screen.getByText('Instance 1')).toBeInTheDocument()
+    expect(await screen.findByText('Group 1')).toBeInTheDocument()
+    expect(screen.getByText('Group 2')).toBeInTheDocument()
     // The running group offers Stop; the stopped group offers Start.
     expect(screen.getByRole('button', { name: 'Stop group' })).toBeInTheDocument()
 
@@ -126,7 +126,7 @@ describe('deployment object page', () => {
     })
     renderPage()
 
-    await screen.findByText('Instance 0')
+    await screen.findByText('Group 1')
     await user.click(screen.getByRole('button', { name: 'Run' }))
 
     // TP2 x 2 instances needs all four nodes, not the TP value.

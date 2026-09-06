@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -236,14 +237,77 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(job["error"], "Docker build failed")
 
     async def test_log_callback_disk_failure_keeps_log_without_raising(self):
-        with patch.object(self.jobs, "_local", new=AsyncMock(return_value=result())):
+        gate = asyncio.Event()
+
+        async def build(*args):
+            await gate.wait()
+            return result()
+
+        with patch.object(self.jobs, "_local", side_effect=build):
             queued = await self.jobs.start(request())
+            await asyncio.sleep(0)
             node = self.jobs.jobs[0]["nodes"][0]
-            with patch.object(self.jobs, "_save", side_effect=OSError("disk full")):
+            with patch.object(self.jobs, "_write_snapshot", side_effect=OSError("disk full")):
                 self.jobs._log(node, "Verification complete")
+                self.jobs._log_flush_handle.cancel()
+                self.jobs._begin_log_flush()
+                await self.jobs._log_flush_task
+                self.assertIn("disk full", self.jobs.jobs[0]["persistence_warning"])
+            gate.set()
             job = await self.finish(queued)
         self.assertIn("Verification complete", job["nodes"][0]["logs"])
         self.assertEqual(job["status"], "succeeded")
+
+    async def test_log_burst_batches_one_write_and_serializes_off_event_loop(self):
+        node = {"node_id": "local", "logs": []}
+        self.jobs.jobs = [{"id": "job", "status": "building", "nodes": [node]}]
+        main_thread = threading.get_ident()
+        serializer_threads = []
+        original_dumps = json.dumps
+
+        def serialize(value):
+            serializer_threads.append(threading.get_ident())
+            return original_dumps(value)
+
+        with patch.object(self.jobs, "_write_snapshot", wraps=self.jobs._write_snapshot) as write, patch("sparkdeck.image_patch_jobs.json.dumps", side_effect=serialize):
+            for index in range(100):
+                self.jobs._log(node, f"line {index}")
+            write.assert_not_called()
+            self.assertEqual(len(node["logs"]), 100)
+            self.jobs._log_flush_handle.cancel()
+            self.jobs._begin_log_flush()
+            await self.jobs._log_flush_task
+            self.jobs._log_flush_task = None
+        write.assert_called_once()
+        self.assertEqual(len(serializer_threads), 1)
+        self.assertNotEqual(serializer_threads[0], main_thread)
+        persisted = json.loads(self.jobs.path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted[0]["nodes"][0]["logs"], node["logs"])
+
+    async def test_completed_build_flushes_all_burst_logs_and_cancels_pending_timer(self):
+        async def build(node, request):
+            for index in range(100):
+                self.jobs._log(node, f"line {index}")
+            return result()
+
+        with patch.object(self.jobs, "_local", side_effect=build), patch.object(self.jobs, "_write_snapshot", wraps=self.jobs._write_snapshot) as write:
+            job = await self.finish(await self.jobs.start(request()))
+        self.assertLessEqual(write.call_count, 5)
+        self.assertIsNone(self.jobs._log_flush_handle)
+        self.assertIsNone(self.jobs._log_flush_task)
+        persisted = json.loads(self.jobs.path.read_text(encoding="utf-8"))[0]
+        self.assertEqual(persisted["status"], "succeeded")
+        self.assertEqual(persisted["nodes"][0]["logs"], [f"line {index}" for index in range(100)])
+        self.assertEqual(job["status"], "succeeded")
+
+    async def test_delayed_older_snapshot_cannot_overwrite_terminal_state(self):
+        self.jobs.jobs = [{"id": "job", "status": "building", "nodes": []}]
+        older, generation = self.jobs._snapshot()
+        self.jobs.jobs[0]["status"] = "succeeded"
+        self.jobs._save()
+        await asyncio.to_thread(self.jobs._write_snapshot, older, generation)
+        persisted = json.loads(self.jobs.path.read_text(encoding="utf-8"))[0]
+        self.assertEqual(persisted["status"], "succeeded")
 
     async def test_persistent_poll_failure_stops_at_deadline_with_bounded_warnings(self):
         elapsed = [0]

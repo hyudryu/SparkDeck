@@ -100,7 +100,12 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
       setRetry((value) => value + 1)
       if (!active(build)) onBuilt()
       setOpen(false)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create patched image') }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not create patched image')
+      // The server may have accepted the build before its response was lost.
+      // Reconcile history so that build remains visible and resumes polling.
+      setRetry((value) => value + 1)
+    }
     finally { setBusy(false) }
   }
   const tags = [...new Set(images.flatMap((item) => item.tags?.length ? item.tags : item.repository ? [`${item.repository}${item.tag ? `:${item.tag}` : ''}`] : []))].filter((tag) => !tag.includes('<none>'))

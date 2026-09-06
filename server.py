@@ -1950,7 +1950,7 @@ def _v1_image_item(raw: dict, containers: list[dict]) -> dict:
         "tag": tag,
         "created_at": raw.get("created"),
         "runtimes": runtimes,
-        "in_use": raw.get("id") in used_images or any(
+        "in_use": raw.get("id") in used_images or raw.get("full_id") in used_images or any(
             image in used_images for image in tags
         ),
     }
@@ -1958,11 +1958,38 @@ def _v1_image_item(raw: dict, containers: list[dict]) -> dict:
 
 async def _v1_image_inventory() -> dict:
     inventory = await manager.cluster_image_inventory()
+    # Independent builds can have different Docker creation metadata and IDs.
+    # Only group actual immutable IDs verified by the same completed build;
+    # a tag alone never establishes identity after retagging/rebuilding.
+    verified = {}
+    for job in image_patch_jobs.verified_images():
+        if job.get("status") != "succeeded" or not job.get("files"):
+            continue
+        nodes = job.get("nodes") or []
+        base_ids = {node.get("base_id") for node in nodes}
+        if len(base_ids) != 1 or not all(
+            node.get("status") == "succeeded"
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("image_id") or ""))
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("base_id") or ""))
+            for node in nodes
+        ):
+            continue
+        for node in nodes:
+            verified.setdefault((node["node_id"], node["image_id"], job["image"]), job)
     merged: dict[str, dict] = {}
     for result in inventory["results"]:
         node = result["node"]
         for raw in result["images"]:
             item = _v1_image_item(raw, result["containers"])
+            patch_job = next((verified[(node["id"], raw.get("full_id"), tag)]
+                              for tag in raw.get("tags") or []
+                              if (node["id"], raw.get("full_id"), tag) in verified), None)
+            if patch_job:
+                item = _v1_image_item({**raw, "id": "patch-build:" + patch_job["id"],
+                                       "tags": [patch_job["image"]]}, result["containers"]) | {
+                    "in_use": item["in_use"], "full_id": None,
+                    "patch_build_id": patch_job["id"], "node_image_ids": {},
+                }
             key = str(item.get("id") or (item.get("tags") or [""])[0])
             if not key:
                 continue
@@ -1972,6 +1999,8 @@ async def _v1_image_inventory() -> dict:
             current["in_use"] = bool(current.get("in_use") or item.get("in_use"))
             current["node_ids"].append(node["id"])
             current["selected_nodes"].append(node)
+            if patch_job:
+                current["node_image_ids"][node["id"]] = raw["full_id"]
     return {
         "items": list(merged.values()),
         "partial": inventory["partial"],
@@ -2065,6 +2094,11 @@ async def v1_remove_image(image_id: str):
     if selected.get("in_use"):
         raise HTTPException(409, "image is used by a deployment")
     try:
+        if selected.get("node_image_ids"):
+            return await manager.remove_image_on_nodes(
+                image_id, selected.get("node_ids") or [],
+                node_image_ids=selected["node_image_ids"],
+            )
         return await manager.remove_image_on_nodes(image_id, selected.get("node_ids") or [])
     except ValueError as e:
         raise HTTPException(400, str(e)) from e

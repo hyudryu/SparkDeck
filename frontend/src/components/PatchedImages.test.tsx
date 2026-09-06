@@ -27,6 +27,18 @@ async function fillForm() {
 }
 
 describe('PatchedImages', () => {
+  it('recovers an accepted build from history after its response is lost', async () => {
+    const list = vi.spyOn(api.images, 'patchBuilds').mockResolvedValueOnce({ items: [] }).mockResolvedValue({ items: [build] })
+    vi.spyOn(api.images, 'createPatchBuild').mockRejectedValue(new Error('Network response lost'))
+    render(<PatchedImages images={[{ id: 'base', tags: ['example/base:v1'] }]} nodes={nodes} localLabel="This device" onBuilt={vi.fn()} />)
+    const user = await fillForm()
+    await user.click(screen.getByRole('button', { name: 'Build patched image' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Network response lost')
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2))
+    expect(await screen.findByRole('status')).toHaveTextContent('Queued')
+    expect(screen.getByText('Build history')).toBeInTheDocument()
+  })
+
   it('replaces an unavailable default node when inventory arrives', async () => {
     vi.spyOn(api.images, 'patchBuilds').mockResolvedValue({ items: [] })
     const create = vi.spyOn(api.images, 'createPatchBuild').mockResolvedValue(build)

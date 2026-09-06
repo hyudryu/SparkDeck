@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +22,11 @@ class ImagePatchJobs:
         self.manager = manager
         self.path = Path(data_dir) / "image-patch-builds.json"
         self.tasks = set()
+        self._log_flush_handle = None
+        self._log_flush_task = None
+        self._write_lock = threading.Lock()
+        self._snapshot_generation = 0
+        self._written_generation = 0
         try:
             self.jobs = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -34,13 +40,35 @@ class ImagePatchJobs:
                         node.update(status="failed", error=job["error"])
 
     def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.jobs), encoding="utf-8")
-        temporary.replace(self.path)
+        snapshot, generation = self._snapshot()
+        self._write_snapshot(snapshot, generation)
+
+    def _snapshot(self):
+        self._snapshot_generation += 1
+        return copy.deepcopy(self.jobs), self._snapshot_generation
+
+    def _write_snapshot(self, snapshot, generation):
+        with self._write_lock:
+            # A delayed background log flush must never overwrite a newer
+            # initial/terminal state saved by the event loop.
+            if generation <= self._written_generation:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(snapshot), encoding="utf-8")
+            temporary.replace(self.path)
+            self._written_generation = generation
 
     def list(self):
         return {"items": copy.deepcopy(self.jobs)}
+
+    def verified_images(self):
+        """Small provenance records for inventory, without copying build logs."""
+        return [{
+            "id": job["id"], "image": job["image"], "status": job["status"],
+            "files": job["files"],
+            "nodes": [{key: node.get(key) for key in ("node_id", "image_id", "base_id", "status")} for node in job["nodes"]],
+        } for job in self.jobs if job["status"] == "succeeded"]
 
     def _save_progress(self):
         # Once a build is accepted, a history write failure must not cancel an
@@ -49,9 +77,32 @@ class ImagePatchJobs:
         try:
             self._save()
         except OSError as exc:
-            for job in self.jobs:
-                if job["status"] in ACTIVE or job is self.jobs[0]:
-                    job["persistence_warning"] = ("Build history could not be saved: " + str(exc))[:2000]
+            self._persistence_warning(exc)
+
+    def _persistence_warning(self, exc):
+        for job in self.jobs:
+            if job["status"] in ACTIVE or job is self.jobs[0]:
+                job["persistence_warning"] = ("Build history could not be saved: " + str(exc))[:2000]
+
+    def _begin_log_flush(self):
+        self._log_flush_handle = None
+        if self._log_flush_task is not None and not self._log_flush_task.done():
+            self._schedule_log_flush()
+            return
+        self._log_flush_task = asyncio.create_task(self._flush_logs())
+
+    async def _flush_logs(self):
+        try:
+            snapshot, generation = self._snapshot()
+            await asyncio.to_thread(self._write_snapshot, snapshot, generation)
+        except OSError as exc:
+            self._persistence_warning(exc)
+
+    def _schedule_log_flush(self):
+        if self._log_flush_handle is None:
+            # The snapshot/write is outside the Docker stream callback. The
+            # callback only updates bounded in-memory logs for immediate UI use.
+            self._log_flush_handle = asyncio.get_running_loop().call_later(1, self._begin_log_flush)
 
     def get(self, job_id):
         for job in self.jobs:
@@ -111,7 +162,7 @@ class ImagePatchJobs:
 
     def _log(self, node, line):
         node["logs"] = [*node["logs"], str(line)[:2000]][-200:]
-        self._save_progress()
+        self._schedule_log_flush()
 
     async def _local(self, node, request):
         loop = asyncio.get_running_loop()
@@ -191,4 +242,10 @@ class ImagePatchJobs:
                 if node["status"] == "queued":
                     node.update(status="failed", error="Not built because an earlier node failed. Use a new tag to retry.")
         finally:
+            if self._log_flush_handle is not None:
+                self._log_flush_handle.cancel()
+                self._log_flush_handle = None
+            if self._log_flush_task is not None:
+                await self._log_flush_task
+                self._log_flush_task = None
             self._save_progress()

@@ -602,6 +602,7 @@ export interface ContainerImage {
 }
 
 export interface PatchBuild {
+  persistence_warning?: string
   id: string
   base_image: string
   image: string

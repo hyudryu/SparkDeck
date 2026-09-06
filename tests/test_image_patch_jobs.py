@@ -129,6 +129,122 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Build complete", job["nodes"][0]["logs"])
                 self.assertTrue(any("retrying the existing build" in line for line in job["nodes"][0]["logs"]))
 
+    async def test_lost_post_response_reconciles_one_worker_build_by_known_id(self):
+        with tempfile.TemporaryDirectory() as worker_dir:
+            worker = ImagePatchJobs(self.manager, worker_dir)
+
+            async def remote(node_id, method, path, **kwargs):
+                if method == "POST":
+                    await worker.start(kwargs["json_body"], agent=True)
+                    raise RuntimeError("response connection lost after acceptance")
+                return worker.get(path.rsplit("/", 1)[-1])
+
+            async def sleep(seconds):
+                await asyncio.gather(*worker.tasks)
+
+            self.manager.node_registry.request.side_effect = remote
+            with patch.object(worker, "_local", new=AsyncMock(return_value=result())) as build, patch("sparkdeck.image_patch_jobs.asyncio.sleep", side_effect=sleep):
+                job = await self.finish(await self.jobs.start(request(["node-3"])))
+            self.assertEqual(job["status"], "succeeded")
+            build.assert_awaited_once()
+            self.assertEqual(len(worker.jobs), 1)
+            calls = self.manager.node_registry.request.await_args_list
+            self.assertEqual([call.args[1] for call in calls], ["POST", "GET"])
+            self.assertEqual(calls[0].kwargs["json_body"]["job_id"], worker.jobs[0]["id"])
+
+    async def test_lost_unaccepted_post_retries_same_id_after_missing_status(self):
+        submitted = []
+
+        async def remote(node_id, method, path, **kwargs):
+            if method == "GET":
+                raise NodeAgentResponseError("worker", 404, "unknown build")
+            submitted.append(kwargs["json_body"])
+            if len(submitted) == 1:
+                raise RuntimeError("connection lost before acceptance")
+            return {"id": submitted[0]["job_id"], "status": "succeeded", "files": HASHES, "nodes": [result()]}
+
+        self.manager.node_registry.request.side_effect = remote
+        with patch("sparkdeck.image_patch_jobs.asyncio.sleep", new=AsyncMock()):
+            job = await self.finish(await self.jobs.start(request(["node-3"])))
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(submitted[0], submitted[1])
+
+    async def test_worker_idempotency_returns_same_build_but_rejects_changed_payload(self):
+        payload = {key: value for key, value in request().items() if key != "node_ids"}
+        payload["job_id"] = "a" * 32
+        with patch.object(self.jobs, "_local", new=AsyncMock(return_value=result())) as build:
+            original = await self.jobs.start(payload, agent=True)
+            duplicate = await self.jobs.start(payload, agent=True)
+            self.assertEqual(original, duplicate)
+            with self.assertRaisesRegex(ValueError, "different patch request"):
+                await self.jobs.start({**payload, "files": [{"target": "/opt/runtime/patch.py", "content": "changed"}]}, agent=True)
+            finished = await self.finish(original)
+            self.assertEqual(await self.jobs.start(payload, agent=True), finished)
+        build.assert_awaited_once()
+        self.assertEqual(len(self.jobs.jobs), 1)
+        self.assertEqual(finished["status"], "succeeded")
+
+    async def test_coordination_id_is_internal_and_validated(self):
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            await self.jobs.start({**request(), "job_id": "a" * 32})
+        for invalid in (None, "", "../file", "a" * 33):
+            with self.subTest(job_id=invalid), self.assertRaisesRegex(ValueError, "hexadecimal"):
+                await self.jobs.start({**request(), "job_id": invalid}, agent=True)
+        self.assertEqual(self.jobs.jobs, [])
+
+    async def test_unchanged_remote_polling_does_not_rewrite_history(self):
+        waiting = {"id": "job", "status": "building", "nodes": [{"logs": ["Building"]}]}
+        self.manager.node_registry.request.side_effect = [waiting, waiting, waiting, {
+            "id": "job", "status": "succeeded", "files": HASHES, "nodes": [{**result(), "logs": ["Building"]}],
+        }]
+        with patch.object(self.jobs, "_save") as save, patch("sparkdeck.image_patch_jobs.asyncio.sleep", new=AsyncMock()):
+            await self.jobs._remote({"node_id": "node-3", "logs": []}, request())
+        save.assert_called_once()
+
+    async def test_failed_initial_history_write_rolls_back_and_allows_retry(self):
+        previous = self.jobs.jobs
+        with patch.object(self.jobs, "_save", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await self.jobs.start(request())
+        self.assertIs(self.jobs.jobs, previous)
+        self.assertEqual(self.jobs.tasks, set())
+        with patch.object(self.jobs, "_local", new=AsyncMock(return_value=result())):
+            job = await self.finish(await self.jobs.start(request()))
+        self.assertEqual(job["status"], "succeeded")
+
+    async def test_history_failure_after_acceptance_does_not_mask_build_outcome(self):
+        for outcome in (result(), RuntimeError("Docker build failed")):
+            with self.subTest(outcome=outcome):
+                build = AsyncMock(side_effect=outcome) if isinstance(outcome, Exception) else AsyncMock(return_value=outcome)
+                original_save = self.jobs._save
+                saves = [0]
+
+                def save():
+                    saves[0] += 1
+                    if saves[0] == 1:
+                        original_save()
+                    else:
+                        raise OSError("disk full after acceptance")
+
+                with patch.object(self.jobs, "_save", side_effect=save), patch.object(self.jobs, "_local", new=build):
+                    job = await self.finish(await self.jobs.start(request()))
+                expected = "failed" if isinstance(outcome, Exception) else "succeeded"
+                self.assertEqual(job["status"], expected)
+                self.assertIn("disk full", job["persistence_warning"])
+                if expected == "failed":
+                    self.assertEqual(job["error"], "Docker build failed")
+
+    async def test_log_callback_disk_failure_keeps_log_without_raising(self):
+        with patch.object(self.jobs, "_local", new=AsyncMock(return_value=result())):
+            queued = await self.jobs.start(request())
+            node = self.jobs.jobs[0]["nodes"][0]
+            with patch.object(self.jobs, "_save", side_effect=OSError("disk full")):
+                self.jobs._log(node, "Verification complete")
+            job = await self.finish(queued)
+        self.assertIn("Verification complete", job["nodes"][0]["logs"])
+        self.assertEqual(job["status"], "succeeded")
+
     async def test_persistent_poll_failure_stops_at_deadline_with_bounded_warnings(self):
         elapsed = [0]
 

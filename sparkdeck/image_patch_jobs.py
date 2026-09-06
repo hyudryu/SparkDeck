@@ -3,6 +3,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -41,6 +42,17 @@ class ImagePatchJobs:
     def list(self):
         return {"items": copy.deepcopy(self.jobs)}
 
+    def _save_progress(self):
+        # Once a build is accepted, a history write failure must not cancel an
+        # already running Docker operation or turn a published image into a
+        # reported failure. Keep its actual state available in memory.
+        try:
+            self._save()
+        except OSError as exc:
+            for job in self.jobs:
+                if job["status"] in ACTIVE or job is self.jobs[0]:
+                    job["persistence_warning"] = ("Build history could not be saved: " + str(exc))[:2000]
+
     def get(self, job_id):
         for job in self.jobs:
             if job["id"] == job_id:
@@ -50,7 +62,20 @@ class ImagePatchJobs:
     async def start(self, payload, *, agent=False):
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
-        request = normalize_patch_request({k: v for k, v in payload.items() if k != "node_ids"})
+        request = normalize_patch_request({k: v for k, v in payload.items() if k not in {"node_ids", "job_id"}})
+        job_id = payload.get("job_id")
+        if "job_id" in payload:
+            if not agent:
+                raise ValueError("job_id is reserved for cluster coordination")
+            if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{32}", job_id):
+                raise ValueError("job_id must be a 32-character hexadecimal ID")
+        fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode("utf-8")).hexdigest()
+        if job_id:
+            for existing in self.jobs:
+                if existing["id"] == job_id:
+                    if existing.get("request_fingerprint") != fingerprint:
+                        raise ValueError("job_id already belongs to a different patch request")
+                    return copy.deepcopy(existing)
         if not agent and payload.get("expected_base_id"):
             raise ValueError("expected_base_id is reserved for cluster coordination")
         if agent:
@@ -66,13 +91,19 @@ class ImagePatchJobs:
         if any(j["status"] in ACTIVE for j in self.jobs):
             raise ValueError("An image patch build is already active. Wait for it to finish.")
         job = {
-            "id": uuid.uuid4().hex, "base_image": request["base_image"], "image": request["image"],
+            "id": job_id or uuid.uuid4().hex, "base_image": request["base_image"], "image": request["image"],
+            "request_fingerprint": fingerprint,
             "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued",
             "files": [{"target": f["target"], "sha256": hashlib.sha256(f["content"].encode("utf-8")).hexdigest()} for f in request["files"]],
             "nodes": [{"node_id": n["id"], "node_name": n["name"], "status": "queued", "logs": []} for n in selected],
         }
-        self.jobs = [job, *self.jobs[:99]]
-        self._save()
+        previous_jobs = self.jobs
+        self.jobs = [job, *previous_jobs[:99]]
+        try:
+            self._save()
+        except Exception:
+            self.jobs = previous_jobs
+            raise
         task = asyncio.create_task(self._run(job, request, agent=agent))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
@@ -80,7 +111,7 @@ class ImagePatchJobs:
 
     def _log(self, node, line):
         node["logs"] = [*node["logs"], str(line)[:2000]][-200:]
-        self._save()
+        self._save_progress()
 
     async def _local(self, node, request):
         loop = asyncio.get_running_loop()
@@ -93,40 +124,53 @@ class ImagePatchJobs:
 
     async def _remote(self, node, request):
         registry = self.manager.node_registry
-        remote = await registry.request(node["node_id"], "POST", "/api/agent/images/patch-builds", json_body=request, timeout=30)
-        remote_id = remote["id"]
+        remote_id = uuid.uuid4().hex
+        remote_request = {**request, "job_id": remote_id}
         deadline = time.monotonic() + 7200
         poll_warnings = []
+        remote = None
+        method = "POST"
+        accepted = False
         while True:
-            detail = remote["nodes"][0]
-            node["logs"] = [str(line)[:2000] for line in [*detail.get("logs", [])[-200:], *poll_warnings]][-200:]
-            self._save()
-            if remote["status"] == "succeeded":
-                return {"image_id": detail["image_id"], "base_id": detail["base_id"], "files": remote["files"]}
-            if remote["status"] == "failed":
-                raise RuntimeError(detail.get("error") or remote.get("error") or "Image build failed")
-            if time.monotonic() >= deadline:
-                raise RuntimeError("Timed out waiting for the build. It may still be running on this node; inspect Images before retrying.")
-            await asyncio.sleep(2)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("Timed out waiting for the build. It may still be running on this node; inspect Images before retrying.")
             try:
-                remote = await registry.request(node["node_id"], "GET", f"/api/agent/images/patch-builds/{remote_id}", timeout=min(30, remaining))
+                if method == "POST":
+                    remote = await registry.request(node["node_id"], "POST", "/api/agent/images/patch-builds", json_body=remote_request, timeout=min(30, remaining))
+                else:
+                    remote = await registry.request(node["node_id"], "GET", f"/api/agent/images/patch-builds/{remote_id}", timeout=min(30, remaining))
+                accepted = True
+                method = "GET"
             except (RuntimeError, OSError) as exc:
-                if isinstance(exc, NodeAgentResponseError) and exc.status_code < 500 and exc.status_code not in {408, 429}:
+                if method == "GET" and not accepted and isinstance(exc, NodeAgentResponseError) and exc.status_code == 404:
+                    # A lost POST response is ambiguous. Reconcile by known ID;
+                    # if absent, resubmit the same idempotent request, never a
+                    # new build that might race the first accepted POST.
+                    method = "POST"
+                elif isinstance(exc, NodeAgentResponseError) and exc.status_code < 500 and exc.status_code not in {408, 429}:
                     raise
-                # The worker owns the accepted build. Losing a status response
-                # does not mean that build failed; never submit its POST again.
-                poll_warnings = [*poll_warnings, ("Status temporarily unavailable; retrying the existing build: " + str(exc))[:2000]][-20:]
+                else:
+                    method = "GET"
+                    poll_warnings = [*poll_warnings, ("Status temporarily unavailable; retrying the existing build: " + str(exc))[:2000]][-20:]
+            detail = remote["nodes"][0] if remote else {}
+            logs = [str(line)[:2000] for line in [*detail.get("logs", [])[-200:], *poll_warnings]][-200:]
+            if logs != node["logs"]:
+                node["logs"] = logs
+                self._save_progress()
+            if remote and remote["status"] == "succeeded":
+                return {"image_id": detail["image_id"], "base_id": detail["base_id"], "files": remote["files"]}
+            if remote and remote["status"] == "failed":
+                raise RuntimeError(detail.get("error") or remote.get("error") or "Image build failed")
+            await asyncio.sleep(2)
 
     async def _run(self, job, request, *, agent):
-        job["status"] = "building"
-        self._save()
         try:
+            job["status"] = "building"
+            self._save_progress()
             for node in job["nodes"]:
                 node["status"] = "building"
-                self._save()
+                self._save_progress()
                 try:
                     result = await (self._local(node, request) if agent or node["node_id"] == "local" else self._remote(node, request))
                     if result["files"] != job["files"]:
@@ -139,7 +183,7 @@ class ImagePatchJobs:
                     node.update(status="failed", error=str(exc)[:2000])
                     raise
                 finally:
-                    self._save()
+                    self._save_progress()
             job["status"] = "succeeded"
         except Exception as exc:
             job.update(status="failed", error=str(exc)[:2000])
@@ -147,4 +191,4 @@ class ImagePatchJobs:
                 if node["status"] == "queued":
                     node.update(status="failed", error="Not built because an earlier node failed. Use a new tag to retry.")
         finally:
-            self._save()
+            self._save_progress()

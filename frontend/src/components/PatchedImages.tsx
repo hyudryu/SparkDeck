@@ -131,6 +131,7 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
       <h3>{build.image}</h3><p>From {build.base_image} · {new Date(build.created_at).toLocaleString()}</p>
       <p role="status">{build.status === 'succeeded' ? 'Succeeded — patch file hashes verified on all selected nodes.' : build.status === 'failed' ? 'Build failed. Check each node below.' : build.status === 'building' ? 'Building…' : 'Queued…'}</p>
       {build.error && <p className="inline-error">{build.error}</p>}
+      {build.persistence_warning && <p role="alert" className="inline-error">{build.persistence_warning}. Keep this page open to see the current build result.</p>}
       {build.status === 'succeeded' && <p>In Models, create or edit a deployment, enter <code>{build.image}</code> as the container image, and select these build nodes.</p>}
       <details><summary>Patch files and SHA-256 hashes</summary>{build.files.map((file) => <p key={file.target}><code>{file.target}</code><br /><code>{file.sha256}</code></p>)}</details>
       {build.nodes.map((node) => <details key={node.node_id} open={node.status === 'failed'}><summary>{node.node_name} — {node.status}</summary>{node.error && <p className="inline-error">{node.error}</p>}{node.image_id && <p>Image: <code>{node.image_id}</code></p>}<pre aria-label={`Build logs for ${node.node_name}`}>{node.logs.join('\n') || 'Waiting for build output…'}</pre></details>)}

@@ -9,7 +9,9 @@ import type {
   DeploymentUpdateInput,
   EnvFileDeploymentUpdateInput,
   EnvFileEnvironmentOp,
+  RuntimeFileMount,
 } from '../api/types'
+import { RuntimeFileMountsEditor } from '../components/RuntimeFileMountsEditor'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
@@ -77,6 +79,11 @@ const flagValue = (args: string[], names: string[]) => {
 // command.
 const canEditModel = (detail: DeploymentDetail) => (
   detail.runtime !== 'llama.cpp' && !detail.id.startsWith('container:')
+)
+
+const supportsRuntimeFileMounts = (detail: DeploymentDetail) => (
+  detail.runtime === 'vllm' && detail.managed && !detail.id.startsWith('container:')
+  && detail.edit_mode !== 'env-file' && !detail.has_start_hook && !detail.has_stop_hook
 )
 
 // A --revision pinned to the previous repository is almost certainly wrong
@@ -327,6 +334,8 @@ export function DeploymentPage() {
   const [savedEnvText, setSavedEnvText] = useState('')
   const [servedName, setServedName] = useState('')
   const [savedServedName, setSavedServedName] = useState('')
+  const [runtimeFileMounts, setRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
+  const [savedRuntimeFileMounts, setSavedRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
   const [busy, setBusy] = useState<'save' | 'run' | 'stop' | `instance-${number}`>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
@@ -347,6 +356,9 @@ export function DeploymentPage() {
       const name = servedNameFrom(resource.data)
       setServedName(name)
       setSavedServedName(name)
+      const mounts = resource.data.runtime_file_mounts ?? resource.data.settings.runtime_file_mounts ?? []
+      setRuntimeFileMounts(mounts.map((mount) => ({ ...mount })))
+      setSavedRuntimeFileMounts(mounts)
     }
   }, [resource.data])
 
@@ -439,14 +451,20 @@ export function DeploymentPage() {
         throw reason
       }
     }
+    const mountsChanged = detail && supportsRuntimeFileMounts(detail)
+      && JSON.stringify(runtimeFileMounts) !== JSON.stringify(savedRuntimeFileMounts)
+    const mounts = runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+    if (mountsChanged && mounts.some((mount) => !mount.source || !mount.target)) {
+      throw new Error('Each runtime file mount needs a host file path and a container file path.')
+    }
     const updated = await api.deployments.update(
       deploymentId,
-      updateInput(
+      { ...updateInput(
         editor,
         detail?.command_flags !== undefined,
         detail?.status === 'saved',
         detail ? canEditModel(detail) : false,
-      ),
+      ), ...(mountsChanged ? { runtime_file_mounts: mounts } : {}) },
     )
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
@@ -587,6 +605,7 @@ export function DeploymentPage() {
   const hasUnsavedChanges = (savedEditor !== undefined && editorFingerprint(editor) !== editorFingerprint(savedEditor))
     || envText !== savedEnvText
     || servedName !== savedServedName
+    || (supportsRuntimeFileMounts(detail) && JSON.stringify(runtimeFileMounts) !== JSON.stringify(savedRuntimeFileMounts))
   const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
@@ -625,6 +644,7 @@ export function DeploymentPage() {
           {!detail.id.startsWith('container:') && <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>}
           <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder="VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>
         </>}
+        {supportsRuntimeFileMounts(detail) && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} disabled={disabled} />}
         {detail.runtime === 'sglang' && !envFileMode && <>
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>

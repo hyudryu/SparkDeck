@@ -42,6 +42,7 @@ from .envfile_settings import (
     resolve_control_updates,
 )
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from .runtime_file_mounts import normalize_runtime_file_mounts
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -104,7 +105,7 @@ _LOCAL_ROUTING_KEYS = {
     "launch_controls",
     # Non-secret vLLM environment variables are local launch inputs and must
     # never be included in community benchmark configuration.
-    "environment",
+    "environment", "runtime_file_mounts",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
@@ -1832,6 +1833,9 @@ class SparkDeckService:
             "sg_mem_fraction": sg_mem_fraction,
             "image": image,
             "environment": environment or {},
+            "runtime_file_mounts": (
+                saved_settings if saved_only else (launch_settings or {})
+            ).get("runtime_file_mounts") or [],
         }
         if discovered_editable and isinstance(
             discovered_settings.get("command_flags"), str
@@ -1925,7 +1929,7 @@ class SparkDeckService:
 
         allowed = {
             "extra_args", "launch_controls",
-            "environment",
+            "environment", "runtime_file_mounts",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction",
             "model",
@@ -2274,7 +2278,7 @@ class SparkDeckService:
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
-            "environment", "instances",
+            "environment", "runtime_file_mounts", "instances",
             "model",
         }
         unknown = sorted(set(changes) - allowed)
@@ -2291,6 +2295,10 @@ class SparkDeckService:
         if "environment" in changes:
             settings["environment"] = normalize_runtime_environment(
                 changes.get("environment"), str(stored.get("runtime") or "vllm"),
+            )
+        if "runtime_file_mounts" in changes:
+            settings["runtime_file_mounts"] = normalize_runtime_file_mounts(
+                changes["runtime_file_mounts"], str(stored.get("runtime") or "vllm"),
             )
         if "image" in changes:
             image = _optional_string(changes.get("image"))
@@ -2990,6 +2998,9 @@ class SparkDeckService:
             settings["environment"] = environment
         else:
             settings.pop("environment", None)
+        settings["runtime_file_mounts"] = normalize_runtime_file_mounts(
+            settings.get("runtime_file_mounts"), runtime.value,
+        )
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")

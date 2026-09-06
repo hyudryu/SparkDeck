@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from test_grouped_sharded_mode import four_node_manager
+from sparkdeck.runtime_file_mounts import RUNTIME_FILE_MOUNTS_CAPABILITY
 
 
 class GroupRecreateTests(unittest.IsolatedAsyncioTestCase):
@@ -39,6 +40,12 @@ class GroupRecreateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_drift_recreates_selected_pair_preserving_identity_and_running_sibling(self):
         manager, deployment = self.manager()
+        nodes = await manager.cluster_nodes()
+        for node in nodes:
+            if node["id"] in {"remote-2", "remote-3"}:
+                node["capabilities"] = [RUNTIME_FILE_MOUNTS_CAPABILITY]
+        manager.cluster_nodes = AsyncMock(return_value=nodes)
+        deployment["launch_settings"]["runtime_file_mounts"] = [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}]
         sibling = copy.deepcopy(deployment["members"][:2])
         launch = copy.deepcopy(deployment["launch_settings"])
         result = await manager.deployment_action("group-test", "start", instance=1)
@@ -53,6 +60,7 @@ class GroupRecreateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["name"] for p in payloads], ["old-2", "old-3"])
         self.assertEqual([p["cluster_member"]["instance_id"] for p in payloads], [1, 1])
         self.assertTrue(all(p["environment"]["NCCL_DEBUG"] == "WARN" for p in payloads))
+        self.assertTrue(all(p["runtime_file_mounts"] == launch["runtime_file_mounts"] for p in payloads))
         self.assertTrue(all(p["port"] == 8000 for p in payloads))
         inspected = manager._deployment_environment_drift.await_args.args[0]
         self.assertEqual([m["instance_id"] for m in inspected["members"]], [1, 1])

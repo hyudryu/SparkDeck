@@ -105,6 +105,78 @@ function renderPage() {
 }
 
 describe('models page vLLM deployment targets', () => {
+  it('saves runtime file mounts on a new deployment', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
+    await user.type(screen.getByLabelText('Display name'), 'Patched model')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.click(screen.getByRole('button', { name: 'Add runtime file' }))
+    await user.type(screen.getByLabelText('Host file path 1'), '/home/user/patch.py')
+    await user.type(screen.getByLabelText('Container file path 1'), '/opt/runtime/model.py')
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === '/api/v1/deployments' && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body)).settings.runtime_file_mounts).toEqual([
+        { source: '/home/user/patch.py', target: '/opt/runtime/model.py' },
+      ])
+    })
+  })
+
+  it('loads saved file mounts, clears them from a fresh creator, and saves removal', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments' && !init?.method) {
+        return new Response(JSON.stringify({ items: [{ ...runningDeployment, status: 'saved', settings: {
+          ...runningDeployment.settings,
+          runtime_file_mounts: [{ source: '/home/user/patch.py', target: '/opt/runtime/model.py' }],
+        } }] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Edit Chat model' }))
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    expect(screen.getByLabelText('Host file path 1')).toHaveValue('/home/user/patch.py')
+    expect(screen.getByLabelText('Container file path 1')).toHaveValue('/opt/runtime/model.py')
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByRole('button', { name: 'Edit Chat model' }))
+    await user.click(screen.getByRole('button', { name: 'Remove runtime file mount 1' }))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(JSON.parse(String(request?.[1]?.body)).runtime_file_mounts).toEqual([])
+    })
+  })
+
+  it.each(['sglang', 'external'])('omits file mounts when switching to %s', async (runtime) => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
+    await user.type(screen.getByLabelText('Display name'), 'Other runtime')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.click(screen.getByRole('button', { name: 'Add runtime file' }))
+    if (runtime === 'external') {
+      await user.click(screen.getByRole('checkbox', { name: /Connect an existing endpoint/ }))
+      await user.type(screen.getByLabelText('Endpoint URL'), 'http://node:8000')
+    } else {
+      await user.selectOptions(screen.getByLabelText('Runtime'), runtime)
+    }
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === '/api/v1/deployments' && init?.method === 'POST')
+      expect(request).toBeDefined()
+      expect(JSON.parse(String(request?.[1]?.body)).settings).not.toHaveProperty('runtime_file_mounts')
+    })
+  })
+
   it('allows remote-only tensor parallelism and submits the selected vLLM image', async () => {
     const user = userEvent.setup()
     renderPage()

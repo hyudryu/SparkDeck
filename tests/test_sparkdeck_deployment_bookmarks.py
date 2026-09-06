@@ -707,6 +707,25 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         launch = self.manager.create_deployment.await_args.args[0]
         self.assertEqual(launch["environment"], updated)
 
+    async def test_runtime_file_mounts_round_trip_edit_and_launch(self):
+        mounts = [{"source": "/opt/patches/qwen3_dflash.py", "target": "/opt/vllm/qwen3_dflash.py"}]
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "mount-bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"runtime_file_mounts": mounts},
+        })
+        self.assertEqual(created["settings"]["runtime_file_mounts"], mounts)
+        detail = await self.service.deployment_detail(created["id"])
+        self.assertEqual(detail["runtime_file_mounts"], mounts)
+        updated = [{**mounts[0], "source": "/opt/patches/new.py"}]
+        detail = await self.service.update_deployment_settings(created["id"], {
+            "runtime_file_mounts": updated,
+        })
+        self.assertEqual(detail["runtime_file_mounts"], updated)
+        self.assertNotIn("runtime_file_mounts", self.service._safe_configuration(detail["settings"]))
+        await self.service.deployment_action(created["id"], "start", ["remote-1"])
+        self.assertEqual(self.manager.create_deployment.await_args.args[0]["runtime_file_mounts"], updated)
+
     async def test_runtime_environment_rejects_credentials_and_non_vllm_runtimes(self):
         with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
             await self.service.create_deployment({

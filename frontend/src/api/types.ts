@@ -64,6 +64,11 @@ export interface CatalogResponse {
   next_cursor?: string | null
 }
 
+export interface RuntimeFileMount {
+  source: string
+  target: string
+}
+
 export interface DeploymentSettings {
   image?: string
   context_length?: number
@@ -81,6 +86,7 @@ export interface DeploymentSettings {
   dtype?: string
   gpu_memory_utilization?: number
   environment?: Record<string, string>
+  runtime_file_mounts?: RuntimeFileMount[]
   port?: number
   extra_args?: string[]
 }
@@ -183,6 +189,7 @@ export interface DeploymentSettingsEnv {
 }
 
 export interface DeploymentDetail extends Deployment {
+  runtime_file_mounts?: RuntimeFileMount[]
   editable: boolean
   edit_reason?: string | null
   edit_mode?: string | null
@@ -219,6 +226,7 @@ export interface EnvFileDeploymentUpdateInput {
 }
 
 export interface DeploymentUpdateInput {
+  runtime_file_mounts?: RuntimeFileMount[]
   model?: string
   extra_args?: string[]
   command_flags?: string
@@ -249,6 +257,7 @@ export interface SavedDeploymentUpdateInput {
   artifact?: string | null
   extra_args?: string[]
   environment?: Record<string, string>
+  runtime_file_mounts?: RuntimeFileMount[]
   gpu_memory_utilization?: number | null
   node_ids?: string[]
   deployment_mode?: 'single' | 'replicated' | 'sharded' | 'grouped_sharded' | null

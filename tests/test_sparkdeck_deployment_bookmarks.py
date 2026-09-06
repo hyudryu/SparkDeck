@@ -12,6 +12,8 @@ from manager import Manager
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.service import SparkDeckService, _container_last_deployed_at
 
+CACHED_REVISION = "a" * 40
+
 
 def node(node_id: str, name: str, *, local: bool = False) -> dict:
     return {
@@ -52,7 +54,9 @@ class FakeBookmarkManager:
         self.cluster_nodes = AsyncMock(return_value=self.nodes)
         self.model_cache_inventory = AsyncMock(return_value=[
             {"id": "remote-1", "models": [
-                {"model_id": "org/model", "partial": False, "revisions": ["main"]},
+                {"model_id": "org/model", "partial": False,
+                 "revisions": [CACHED_REVISION, "main"],
+                 "revision_refs": {"main": CACHED_REVISION}},
             ]},
             {"id": "local", "models": []},
         ])
@@ -64,6 +68,9 @@ class FakeBookmarkManager:
         })
         self.queue_recipe_model_preparation = AsyncMock(return_value={
             "workflow_id": None, "job_ids": [], "jobs": [],
+        })
+        self.recipe_deployment_contract = Mock(side_effect=lambda settings: {
+            "model_revision": Manager._cli_option(settings.get("extra_args") or [], {"--revision"}),
         })
 
     async def _selected(self, node_ids):
@@ -545,11 +552,46 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launch["engine"], "vllm")
         self.assertEqual(launch["node_ids"], ["remote-1"])
         self.assertEqual(launch["deployment_mode"], "single")
-        self.assertEqual(launch["extra_args"], ["--max-model-len", "8192"])
+        self.assertEqual(launch["extra_args"], ["--revision", CACHED_REVISION, "--max-model-len", "8192"])
         self.assertEqual(started["node_ids"], ["remote-1"])
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertEqual(stored["desired_state"], "running")
         self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
+
+    async def test_gui_bookmark_start_pins_complete_snapshot_without_default_alias(self):
+        self.manager.model_cache_inventory.return_value = [{
+            "id": "remote-1", "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION], "revision_refs": {},
+            }],
+        }]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "cached-bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"context_length": 256000},
+        })
+        await self.service.deployment_action("cached-bookmark", "start", ["remote-1"])
+        body = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(Manager._cli_option(body["extra_args"], {"--revision"}), CACHED_REVISION)
+        self.assertEqual(Manager._cli_option(body["extra_args"], {"--max-model-len"}), "256000")
+        stored = self.service.store.deployment("cached-bookmark", include_private=True)
+        self.assertEqual(
+            Manager._cli_option(stored["settings"]["extra_args"], {"--revision"}),
+            CACHED_REVISION,
+        )
+
+    async def test_saved_cli_pin_missing_from_cache_rejects_before_launch(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "pinned-bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"extra_args": ["--revision", "b" * 40]},
+        })
+        before = self.service.store.deployment("pinned-bookmark", include_private=True)
+        with self.assertRaisesRegex(ValueError, "model weights are not available"):
+            await self.service.deployment_action("pinned-bookmark", "start", ["remote-1"])
+        self.manager.create_deployment.assert_not_called()
+        after = self.service.store.deployment("pinned-bookmark", include_private=True)
+        self.assertEqual(after["settings"], before["settings"])
 
     async def test_start_without_nodes_falls_back_to_saved_preferences(self):
         await self.service.create_deployment({

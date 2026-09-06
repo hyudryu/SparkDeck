@@ -7468,6 +7468,47 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
             if member.get("desired_state") != "stopped"
             or member.get("recreate_pending")
         ]
+        groups: dict[int, list[dict[str, Any]]] = {}
+        for member in members:
+            member = dict(member)
+            if member.get("node_status") in {"offline", "unreachable", "disconnected"}:
+                member["phase"] = {"phase": "unreachable", "message": "Group node is unreachable"}
+            elif member.get("error"):
+                member["phase"] = {"phase": "error", "message": str(member["error"])}
+            elif member.get("status") in {"dead", "error", "unreachable", "missing", "unknown", "exited", "stopped"}:
+                member["phase"] = {"phase": "error", "message": "An expected group rank is not running"}
+            groups.setdefault(int(member.get("instance_id") or 0), []).append(member)
+        members = []
+        def healthy_member(member: dict[str, Any]) -> bool:
+            phase = member.get("phase") or {}
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            return (
+                str(member.get("status") or "").casefold() in {"running", "ready"}
+                and not member.get("error")
+                and not member.get("recreate_pending")
+                and member.get("node_status") not in {"offline", "unreachable", "disconnected"}
+                and str(phase_name or "").casefold()
+                not in {"error", "dead", "unreachable", "missing", "unknown", "failed"}
+            )
+
+        for group in groups.values():
+            try:
+                expected_ranks = (
+                    0 if deployment.get("settings_dirty") else
+                    int((deployment.get("launch_settings") or {}).get("tensor_parallel_size") or 0)
+                )
+            except (TypeError, ValueError):
+                expected_ranks = 0
+            if expected_ranks and (
+                len(group) != expected_ranks
+                or {int(member.get("rank") or 0) for member in group} != set(range(expected_ranks))
+            ):
+                group.append({"phase": {"phase": "missing", "message": "A tensor-parallel rank is missing"}})
+            primary = next((member for member in group if int(member.get("rank") or 0) == 0), None)
+            healthy = all(healthy_member(member) for member in group)
+            # Headless ranks never report HTTP ready. Their coordinator owns
+            # progress once every rank is running without a reported failure.
+            members.extend([primary] if primary is not None and healthy else group)
     # Report the least-advanced active rank. Rank order is only a tie-breaker:
     # a queued worker must win over a rank-0 image pull, and an image pull must
     # win over another rank that has already started loading model weights.

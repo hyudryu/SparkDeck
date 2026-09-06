@@ -1603,6 +1603,24 @@ describe('deployment group controls', () => {
     })
   }
 
+  it('shows a healthy partial deployment with its running group count and controls', async () => {
+    mockGrouped({ ...grouped, instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    expect(await screen.findByText('1 of 2 groups running')).toBeInTheDocument()
+    expect(screen.getByText('running', { exact: true })).toBeInTheDocument()
+    expect(screen.queryByText('degraded', { exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByText('Starting', { exact: true })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start group' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+  })
+
+  it('keeps unexpected group degradation visible beside the running count', async () => {
+    mockGrouped({ ...grouped, status: 'degraded', instances: [grouped.instances[0], { ...grouped.instances[1], status: 'error' }] })
+    renderPage()
+    expect(await screen.findByText('1 of 2 groups running')).toBeInTheDocument()
+    expect(screen.getByText('degraded', { exact: true })).toBeInTheDocument()
+  })
+
   it('stops only the selected group and shows its nodes', async () => {
     const user = userEvent.setup()
     mockGrouped(grouped)

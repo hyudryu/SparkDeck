@@ -2100,6 +2100,11 @@ export function ModelsPage() {
                         </>
                       )}
                     </span>
+                    {deployment.deployment_mode === 'grouped_sharded' && Boolean(deployment.instances?.length) && (
+                      <small className="deployment-launch-message">
+                        {deployment.status === 'stopped' || deployment.desired_state === 'stopped' ? 0 : deployment.instances!.filter((group) => group.status === 'running' && group.desired_state !== 'stopped').length} of {deployment.instances!.length} groups running
+                      </small>
+                    )}
                     {deployment.status === 'running' && deployment.last_used_at !== undefined && (
                       <small className="deployment-launch-message">
                         {deployment.last_used_at

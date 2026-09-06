@@ -324,7 +324,7 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         instance._member_action = member_action
         return instance, deployment, actions
 
-    async def test_per_instance_stop_derives_degraded_state(self) -> None:
+    async def test_per_instance_stop_keeps_healthy_peer_running(self) -> None:
         instance, deployment, actions = self.lifecycle_manager()
         result = await instance.deployment_action("d1", "stop", instance=1)
         self.assertTrue(result["ok"])
@@ -335,9 +335,9 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # Untargeted groups stay expected-running for the health monitor.
         self.assertEqual(deployment["members"][0]["desired_state"], "running")
         self.assertEqual(deployment["desired_state"], "running")
-        self.assertEqual(deployment["status"], "degraded")
+        self.assertEqual(deployment["status"], "running")
 
-    async def test_per_instance_start_of_stopped_group_is_degraded(self) -> None:
+    async def test_per_instance_start_of_stopped_group_is_starting(self) -> None:
         instance, deployment, actions = self.lifecycle_manager()
         deployment["desired_state"] = "stopped"
         deployment["status"] = "stopped"
@@ -349,7 +349,7 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment["members"][0]["desired_state"], "running")
         self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
         self.assertEqual(deployment["desired_state"], "running")
-        self.assertEqual(deployment["status"], "degraded")
+        self.assertEqual(deployment["status"], "starting")
 
     async def test_full_stop_unchanged_by_grouped_mode(self) -> None:
         instance, deployment, actions = self.lifecycle_manager()
@@ -383,7 +383,7 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(actions, [(0, "start"), (0, "start")])
         self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
-        self.assertEqual(deployment["status"], "degraded")
+        self.assertEqual(deployment["status"], "starting")
 
     async def test_group_start_with_unchanged_environment_preserves_other_group(self) -> None:
         instance, deployment, actions = self.lifecycle_manager()
@@ -633,7 +633,7 @@ class AddInstanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment["launch_settings"]["node_ids"], [
             "local", "remote-1", "remote-2", "remote-3",
         ])
-        self.assertEqual(deployment["status"], "running")
+        self.assertEqual(deployment["status"], "starting")
 
     async def test_add_instance_rejects_nodes_the_deployment_occupies(self) -> None:
         deployment = self.running_grouped_deployment()

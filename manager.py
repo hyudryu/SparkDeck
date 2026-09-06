@@ -7127,23 +7127,59 @@ class Manager:
 
     @staticmethod
     def _grouped_deployment_status(deployment: dict) -> str:
-        """Derive grouped-sharded status from the per-group member states."""
-        all_groups: set[int] = set()
-        running_groups: set[int] = set()
+        """Compare actual ranks with the groups explicitly expected to run."""
+        groups: dict[int, list[dict]] = {}
         for member in deployment.get("members") or []:
+            if member.get("failed_stop_error"):
+                return "degraded"
             group = int(member.get("instance_id") or 0)
-            all_groups.add(group)
-            if (
+            groups.setdefault(group, []).append(member)
+        expected = [
+            members for members in groups.values()
+            if any(
                 member.get("desired_state") != "stopped"
-                and int(member.get("rank") or 0) == 0
-                and str(member.get("status") or "") not in {"stopped", "error"}
-            ):
-                running_groups.add(group)
-        if not running_groups:
+                or member.get("recreate_pending")
+                for member in members
+            )
+        ]
+        if not expected:
             return "stopped"
-        if running_groups == all_groups:
-            return "running"
-        return "degraded"
+        try:
+            expected_ranks = (
+                0 if deployment.get("settings_dirty") else
+                int((deployment.get("launch_settings") or {}).get("tensor_parallel_size") or 0)
+            )
+        except (TypeError, ValueError):
+            expected_ranks = 0
+        starting = False
+        for members in expected:
+            if expected_ranks and (
+                len(members) != expected_ranks
+                or {int(member.get("rank") or 0) for member in members} != set(range(expected_ranks))
+            ):
+                return "degraded"
+            primary = next((member for member in members if int(member.get("rank") or 0) == 0), None)
+            if primary is None:
+                return "degraded"
+            for member in members:
+                status = str(member.get("status") or "unknown").casefold()
+                if member.get("recreate_pending") and status not in {"queued", "creating", "created", "starting"}:
+                    return "degraded"
+                phase = member.get("phase") or {}
+                phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+                if status not in {"running", "ready", "queued", "creating", "created", "starting", "restarting"} or str(phase_name).casefold() in {
+                    "error", "dead", "unreachable", "missing", "unknown", "failed",
+                } or member.get("error") or member.get("node_status") in {"offline", "unreachable", "disconnected"}:
+                    return "degraded"
+                if status not in {"running", "ready"}:
+                    starting = True
+            # A headless TP worker has no HTTP readiness endpoint. Once all
+            # ranks run, only this group's coordinator establishes readiness.
+            phase = primary.get("phase") or {}
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            if phase_name and phase_name != "ready":
+                starting = True
+        return "starting" if starting else "running"
 
     @staticmethod
     def _group_launch_settings_fingerprint(deployment: dict) -> str:
@@ -7305,6 +7341,7 @@ class Manager:
         else:
             for spec in specs:
                 spec["desired_state"] = "running"
+                spec.pop("failed_stop_error", None)
                 spec.pop("recreate_pending", None)
                 spec["launch_settings_fingerprint"] = fingerprint
             deployment["desired_state"] = "running"
@@ -7538,13 +7575,16 @@ class Manager:
             return_exceptions=True,
         )
         if targeted_instance is not None or (
-            action == "stop" and deployment.get("mode") == "grouped_sharded"
+            action in {"start", "stop"} and deployment.get("mode") == "grouped_sharded"
         ):
             # Record the local transition on the acted members so the derived
             # status reflects this action without waiting for a reconcile.
             for member, result in zip(targeted_members, results):
                 if isinstance(result, Exception):
+                    if action == "stop":
+                        member["failed_stop_error"] = str(result)
                     continue
+                member.pop("failed_stop_error", None)
                 member["status"] = "starting" if action == "start" else "stopped"
         errors = self._member_action_errors(results, action)
         if action == "remove" and not errors:
@@ -7569,7 +7609,8 @@ class Manager:
                 deployment["status"] = "starting" if action == "start" else "stopped"
                 if action == "start":
                     deployment["last_deployed_at"] = time.time()
-            deployment["error"] = "; ".join(errors) if errors else None
+            pending_stop_errors = [str(member["failed_stop_error"]) for member in deployment.get("members", []) if member.get("failed_stop_error")]
+            deployment["error"] = "; ".join(dict.fromkeys([*errors, *pending_stop_errors])) or None
         self._save_deployments()
         return {
             "ok": not errors,
@@ -19025,6 +19066,26 @@ class Manager:
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif saved.get("mode") == "grouped_sharded":
+                    failed_stops = [str(member["failed_stop_error"]) for member in deployment["members"] if member.get("failed_stop_error")]
+                    if failed_stops:
+                        # Failed group stops already carry stopped intent,
+                        # but ranks may still be alive or unreachable. Keep
+                        # the action failure visible until explicitly retried.
+                        deployment["status"] = "degraded"
+                        deployment["error"] = "; ".join(failed_stops)
+                    elif saved.get("status") == "stopping":
+                        deployment["status"] = "stopping"
+                    elif saved.get("desired_state") == "stopped" or (
+                        saved.get("desired_state") != "running" and saved.get("status") == "stopped"
+                    ):
+                        deployment["status"] = "stopped"
+                    else:
+                        deployment["status"] = self._grouped_deployment_status(deployment)
+                        if deployment["status"] == "running":
+                            deployment["error"] = None
+                        if saved.get("status") == "recovering" and deployment["status"] == "degraded":
+                            deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
                     s in {"unreachable", "missing", "dead", "error"}
                     for s in member_states

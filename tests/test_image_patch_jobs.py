@@ -13,6 +13,7 @@ with patch("docker.from_env", return_value=Mock()):
     import server
 
 from sparkdeck.image_patch_jobs import CAPABILITY, ImagePatchJobs
+from cluster import NodeAgentResponseError
 
 
 CONTENT = "# private patch source\nVALUE = 42\n"
@@ -108,6 +109,61 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["nodes"][1]["error"], "base unavailable")
         self.assertIn("Not built", job["nodes"][2]["error"])
         self.assertEqual(remote.await_count, 2)
+
+    async def test_remote_poll_recovers_without_restarting_accepted_build(self):
+        for failure in (RuntimeError("could not contact worker"), NodeAgentResponseError("worker", 503, "restarting")):
+            with self.subTest(failure=failure):
+                self.manager.node_registry.request.reset_mock()
+                self.manager.node_registry.request.side_effect = [
+                    {"id": "accepted", "status": "building", "nodes": [{"logs": ["Building"]}]},
+                    failure,
+                    {"id": "accepted", "status": "succeeded", "files": HASHES,
+                     "nodes": [{**result(), "logs": ["Build complete"]}]},
+                ]
+                with patch("sparkdeck.image_patch_jobs.asyncio.sleep", new=AsyncMock()):
+                    job = await self.finish(await self.jobs.start(request(["node-3"])))
+                self.assertEqual(job["status"], "succeeded")
+                calls = self.manager.node_registry.request.await_args_list
+                self.assertEqual([call.args[1] for call in calls], ["POST", "GET", "GET"])
+                self.assertEqual(calls[1].args[2], calls[2].args[2])
+                self.assertIn("Build complete", job["nodes"][0]["logs"])
+                self.assertTrue(any("retrying the existing build" in line for line in job["nodes"][0]["logs"]))
+
+    async def test_persistent_poll_failure_stops_at_deadline_with_bounded_warnings(self):
+        elapsed = [0]
+
+        async def sleep(seconds):
+            elapsed[0] += 240
+
+        async def remote(node_id, method, path, **kwargs):
+            if method == "POST":
+                return {"id": "accepted", "status": "building", "nodes": [{"logs": ["Building"]}]}
+            raise RuntimeError("lost connection " + "x" * 3000)
+
+        self.manager.node_registry.request.side_effect = remote
+        with patch("sparkdeck.image_patch_jobs.time", new=SimpleNamespace(monotonic=lambda: elapsed[0])), patch("sparkdeck.image_patch_jobs.asyncio.sleep", side_effect=sleep):
+            job = await self.finish(await self.jobs.start(request(["node-3", "node-4"])))
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("may still be running", job["error"])
+        self.assertEqual(elapsed[0], 7200)
+        calls = self.manager.node_registry.request.await_args_list
+        self.assertEqual(sum(call.args[1] == "POST" for call in calls), 1)
+        self.assertTrue(all(call.args[0] == "node-3" for call in calls))
+        logs = job["nodes"][0]["logs"]
+        self.assertLessEqual(len(logs), 21)
+        self.assertTrue(all(len(line) <= 2000 for line in logs))
+
+    async def test_terminal_worker_failure_after_connection_recovers_is_not_retried(self):
+        self.manager.node_registry.request.side_effect = [
+            {"id": "accepted", "status": "building", "nodes": [{"logs": []}]},
+            RuntimeError("connection lost"),
+            {"id": "accepted", "status": "failed", "nodes": [{"error": "verification failed", "logs": []}]},
+        ]
+        with patch("sparkdeck.image_patch_jobs.asyncio.sleep", new=AsyncMock()):
+            job = await self.finish(await self.jobs.start(request(["node-3"])))
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "verification failed")
+        self.assertEqual(self.manager.node_registry.request.await_count, 3)
 
     async def test_mismatched_remote_base_or_patch_hash_fails_job(self):
         for mismatched in (result(base="sha256:different"), {**result(), "files": []}):

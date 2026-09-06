@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cluster import NodeAgentResponseError
 from sparkdeck.image_patches import build_patched_image, normalize_patch_request
 
 CAPABILITY = "patched-images-v1"
@@ -95,9 +96,10 @@ class ImagePatchJobs:
         remote = await registry.request(node["node_id"], "POST", "/api/agent/images/patch-builds", json_body=request, timeout=30)
         remote_id = remote["id"]
         deadline = time.monotonic() + 7200
+        poll_warnings = []
         while True:
             detail = remote["nodes"][0]
-            node["logs"] = detail.get("logs", [])[-200:]
+            node["logs"] = [str(line)[:2000] for line in [*detail.get("logs", [])[-200:], *poll_warnings]][-200:]
             self._save()
             if remote["status"] == "succeeded":
                 return {"image_id": detail["image_id"], "base_id": detail["base_id"], "files": remote["files"]}
@@ -106,7 +108,17 @@ class ImagePatchJobs:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for the build. It may still be running on this node; inspect Images before retrying.")
             await asyncio.sleep(2)
-            remote = await registry.request(node["node_id"], "GET", f"/api/agent/images/patch-builds/{remote_id}", timeout=30)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Timed out waiting for the build. It may still be running on this node; inspect Images before retrying.")
+            try:
+                remote = await registry.request(node["node_id"], "GET", f"/api/agent/images/patch-builds/{remote_id}", timeout=min(30, remaining))
+            except (RuntimeError, OSError) as exc:
+                if isinstance(exc, NodeAgentResponseError) and exc.status_code < 500 and exc.status_code not in {408, 429}:
+                    raise
+                # The worker owns the accepted build. Losing a status response
+                # does not mean that build failed; never submit its POST again.
+                poll_warnings = [*poll_warnings, ("Status temporarily unavailable; retrying the existing build: " + str(exc))[:2000]][-20:]
 
     async def _run(self, job, request, *, agent):
         job["status"] = "building"

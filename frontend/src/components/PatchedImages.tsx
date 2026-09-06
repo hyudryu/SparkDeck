@@ -27,6 +27,15 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
   const known = useRef(new Map<string, string>())
 
   useEffect(() => {
+    if (!nodes.length) return
+    setNodeIds((current) => {
+      const available = current.filter((id) => nodes.some((node) => node.id === id && isNodeSelectable(node)))
+      const fallback = nodes.find((node) => node.local && isNodeSelectable(node)) ?? nodes.find(isNodeSelectable)
+      return available.length ? available : fallback ? [fallback.id] : []
+    })
+  }, [nodes])
+
+  useEffect(() => {
     let stopped = false
     let timer: ReturnType<typeof setTimeout> | undefined
     const controller = new AbortController()
@@ -74,7 +83,7 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
     setError(undefined)
     const sizes = files.map((file) => new TextEncoder().encode(file.content).length)
     const targets = files.map((file) => file.target.trim())
-    if (files.some((file, index) => file.error || !file.content.trim() || sizes[index] > FILE_LIMIT || file.content.includes('\0'))) {
+    if (files.some((file, index) => file.error || sizes[index] > FILE_LIMIT || file.content.includes('\0'))) {
       setError('Each patch needs UTF-8 Python contents, up to 1 MiB per file. Correct any upload errors before building.'); return
     }
     if (sizes.reduce((sum, size) => sum + size, 0) > TOTAL_LIMIT) { setError('Patch contents must total no more than 4 MiB.'); return }
@@ -110,7 +119,7 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
       {files.map((file, index) => <fieldset className="patch-file" key={file.id} disabled={busy || reading > 0}><legend>Patch file {index + 1}</legend>
         <label className="field"><span>Upload Python file {index + 1}</span><input type="file" accept=".py" onChange={(event) => { void upload(file.id, event.target.files?.[0]); event.target.value = '' }} /></label>
         <label className="field"><span>Container destination {index + 1}</span><input value={file.target} onChange={(event) => changeFile(file.id, { target: event.target.value })} placeholder="/usr/local/lib/python3.12/site-packages/package/module.py" required /></label>
-        <label className="field"><span>Python contents {index + 1}</span><textarea className="mono" rows={8} value={file.content} onChange={(event) => changeFile(file.id, { content: event.target.value, error: undefined })} spellCheck={false} required /></label>
+        <label className="field"><span>Python contents {index + 1}</span><textarea className="mono" rows={8} value={file.content} onChange={(event) => changeFile(file.id, { content: event.target.value, error: undefined })} spellCheck={false} aria-describedby={`patch-empty-help-${file.id}`} /></label><small id={`patch-empty-help-${file.id}`}>May be empty, for example for a package’s __init__.py file.</small>
         {file.error && <p role="alert" className="inline-error">{file.error}</p>}
         {files.length > 1 && <Button type="button" onClick={() => setFiles((current) => current.filter((item) => item.id !== file.id))}>Remove patch file {index + 1}</Button>}
       </fieldset>)}

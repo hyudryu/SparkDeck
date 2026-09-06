@@ -27,6 +27,34 @@ async function fillForm() {
 }
 
 describe('PatchedImages', () => {
+  it('replaces an unavailable default node when inventory arrives', async () => {
+    vi.spyOn(api.images, 'patchBuilds').mockResolvedValue({ items: [] })
+    const create = vi.spyOn(api.images, 'createPatchBuild').mockResolvedValue(build)
+    const onBuilt = vi.fn()
+    const view = render(<PatchedImages images={[]} nodes={[]} localLabel="This device" onBuilt={onBuilt} />)
+    view.rerender(<PatchedImages images={[]} nodes={[{ ...nodes[0], online: false }, nodes[1]]} localLabel="This device" onBuilt={onBuilt} />)
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Create patched image' }))
+    expect(screen.getByRole('checkbox', { name: /This device/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /Node 3/ })).toBeChecked()
+    await user.type(screen.getByRole('textbox', { name: 'Base image reference' }), 'example/base:v1')
+    await user.type(screen.getByRole('textbox', { name: 'Patched image tag' }), 'sparkdeck/patched:v1')
+    await user.type(screen.getByRole('textbox', { name: 'Container destination 1' }), '/app/__init__.py')
+    await user.click(screen.getByRole('button', { name: 'Build patched image' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ node_ids: ['node-3'], files: [{ target: '/app/__init__.py', content: '' }] })))
+  })
+
+  it('accepts an uploaded empty package marker', async () => {
+    setup()
+    const create = vi.spyOn(api.images, 'createPatchBuild').mockResolvedValue(build)
+    const user = await fillForm()
+    const file = new File([], '__init__.py')
+    Object.defineProperty(file, 'arrayBuffer', { value: async () => new ArrayBuffer(0) })
+    await user.upload(screen.getByLabelText('Upload Python file 1'), file)
+    await user.click(screen.getByRole('button', { name: 'Build patched image' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ files: [{ target: '/app/patch.py', content: '' }] })))
+  })
+
   it('uploads Python text and submits only the selected node and explicit destination', async () => {
     setup()
     const create = vi.spyOn(api.images, 'createPatchBuild').mockResolvedValue(build)

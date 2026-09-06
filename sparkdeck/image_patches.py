@@ -9,7 +9,7 @@ import threading
 import uuid
 from pathlib import PurePosixPath
 
-from docker.errors import APIError, ImageNotFound, NotFound
+from docker.errors import ImageNotFound, NotFound
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 4 * MAX_FILE_BYTES
@@ -131,7 +131,7 @@ def _verify(client, image_id, files, on_log):
             container.remove(v=True, force=True)
         except NotFound:
             pass
-        except APIError:
+        except Exception:
             on_log("Warning: Docker could not remove the stopped patch verification container; cleanup may be needed.")
     return hashes
 
@@ -186,5 +186,5 @@ def build_patched_image(client, payload, on_log=lambda message: None):
                 client.images.remove(temporary_tag, noprune=True)
             except ImageNotFound:
                 pass
-            except APIError:
+            except Exception:
                 on_log(f"Warning: Docker could not remove temporary image tag {temporary_tag}; cleanup may be needed.")

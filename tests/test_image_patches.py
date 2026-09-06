@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from docker.errors import APIError, ImageNotFound
+from requests.exceptions import ConnectionError
 
 from sparkdeck.image_patches import build_patched_image, normalize_patch_request
 
@@ -152,6 +153,31 @@ class ImagePatchTests(unittest.TestCase):
             build_patched_image(client, request(), logs.append)
         built.tag.assert_not_called()
         self.assertTrue(any(line.startswith("Warning:") for line in logs))
+
+    def test_transport_cleanup_failures_preserve_success_and_original_errors(self):
+        for failure in (None, "build", "verification"):
+            with self.subTest(failure=failure):
+                client, _, built = self.fake_client()
+                client.images.remove.side_effect = ConnectionError("Docker disconnected")
+                container = client.containers.create.return_value
+                container.remove.side_effect = ConnectionError("Docker disconnected")
+                logs = []
+                if failure == "build":
+                    client.api.build.return_value = iter([{"error": "original build failure"}])
+                    with self.assertRaisesRegex(ValueError, "original build failure"):
+                        build_patched_image(client, request(), logs.append)
+                    built.tag.assert_not_called()
+                elif failure == "verification":
+                    container.get_archive.return_value = (iter([archive_bytes(b"wrong")]), {})
+                    with self.assertRaisesRegex(ValueError, "did not match"):
+                        build_patched_image(client, request(), logs.append)
+                    built.tag.assert_not_called()
+                else:
+                    result = build_patched_image(client, request(), logs.append)
+                    self.assertEqual(result["image_id"], BUILT_ID)
+                    built.tag.assert_called_once()
+                warnings = [line for line in logs if line.startswith("Warning:")]
+                self.assertEqual(len(warnings), 1 if failure == "build" else 2)
 
     def test_another_writer_claiming_tag_during_build_is_rejected(self):
         client, _, built = self.fake_client()

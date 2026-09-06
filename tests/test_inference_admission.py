@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -605,6 +606,155 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(instance.jobs["job"]["status"], "canceled")
         instance._release_inference_slot(held)
+
+
+def summary(status: str, deployment_id: str = "deployment-a") -> dict:
+    return {
+        "name": f"cluster-{deployment_id}-r0-model",
+        "deployment_id": deployment_id,
+        "status": status,
+        "port": 8000,
+    }
+
+
+class AdmissionReaperTests(unittest.IsolatedAsyncioTestCase):
+    def manager(self) -> Manager:
+        instance = Manager.__new__(Manager)
+        instance._inference_admission = {}
+        return instance
+
+    def saturated_instance(self, status: str) -> Manager:
+        instance = self.manager()
+        instance.list_containers = mock.AsyncMock(
+            return_value=[summary(status)]
+        )
+        return instance
+
+    async def test_reaper_fails_waiters_after_grace_on_exited_container(self) -> None:
+        instance = self.saturated_instance("exited")
+        held = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+        queued = asyncio.create_task(instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        ))
+        await asyncio.sleep(0)
+        instance._inference_admission["deployment-a"]["_dead_since"] = (
+            time.monotonic() - 61.0
+        )
+
+        reaped = await instance.reap_stale_admission_targets()
+
+        self.assertEqual(reaped, ["deployment-a"])
+        self.assertEqual(instance.inference_admission(), {})
+        with self.assertRaises(LookupError):
+            await queued
+        instance._release_inference_slot(held)
+
+    async def test_reaper_respects_grace_window(self) -> None:
+        instance = self.saturated_instance("exited")
+        held = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+        instance._inference_admission["deployment-a"]["_dead_since"] = (
+            time.monotonic()
+        )
+
+        reaped = await instance.reap_stale_admission_targets()
+
+        self.assertEqual(reaped, [])
+        self.assertIn("deployment-a", instance.inference_admission())
+        instance._release_inference_slot(held)
+
+    async def test_reaper_keeps_targets_with_a_live_container(self) -> None:
+        instance = self.saturated_instance("running")
+        held = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+        instance._inference_admission["deployment-a"]["_dead_since"] = (
+            time.monotonic() - 3600.0
+        )
+
+        reaped = await instance.reap_stale_admission_targets()
+
+        self.assertEqual(reaped, [])
+        self.assertIn("deployment-a", instance.inference_admission())
+        instance._release_inference_slot(held)
+
+    async def test_reaper_never_touches_targets_without_local_containers(self) -> None:
+        # A target keyed by a container this host cannot see belongs to a
+        # remote cluster member; its lifecycle is not observable locally.
+        instance = self.manager()
+        instance.list_containers = mock.AsyncMock(
+            return_value=[summary("running", deployment_id="deployment-b")]
+        )
+        held = await instance._acquire_inference_slot(
+            container(deployment_id="remote-member"), "model [test]", None,
+        )
+        instance._inference_admission["remote-member"]["_dead_since"] = (
+            time.monotonic() - 3600.0
+        )
+
+        reaped = await instance.reap_stale_admission_targets()
+
+        self.assertEqual(reaped, [])
+        self.assertIn("remote-member", instance.inference_admission())
+        instance._release_inference_slot("remote-member")
+
+    async def test_reaper_skips_while_capacity_replacement_is_in_flight(self) -> None:
+        instance = self.saturated_instance("exited")
+        instance._capacity_redeploying_models = {"model"}
+        held = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+        instance._inference_admission["deployment-a"]["_dead_since"] = (
+            time.monotonic() - 3600.0
+        )
+
+        self.assertEqual(await instance.reap_stale_admission_targets(), [])
+        self.assertIn("deployment-a", instance.inference_admission())
+        instance._release_inference_slot(held)
+
+    async def test_stopped_container_releases_admission_immediately(self) -> None:
+        instance = self.saturated_instance("exited")
+        held = await instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        )
+        queued = asyncio.create_task(instance._acquire_inference_slot(
+            container(), "model [test]", None,
+        ))
+        await asyncio.sleep(0)
+
+        await instance._reap_container_admission(
+            "cluster-deployment-a-r0-model", "deployment-a",
+        )
+
+        self.assertEqual(instance.inference_admission(), {})
+        with self.assertRaises(LookupError):
+            await queued
+        instance._release_inference_slot(held)
+
+    async def test_reset_clears_every_target(self) -> None:
+        instance = self.manager()
+        first = await instance._acquire_inference_slot(
+            container(deployment_id="a"), "model-a", None,
+        )
+        held_b = await instance._acquire_inference_slot(
+            container(deployment_id="b"), "model-b", None,
+        )
+        second = asyncio.create_task(instance._acquire_inference_slot(
+            container(deployment_id="b"), "model-b", None,
+        ))
+        await asyncio.sleep(0)
+
+        result = instance.reset_inference_admission()
+
+        self.assertEqual(result, {"reset": ["a", "b"]})
+        self.assertEqual(instance.inference_admission(), {})
+        with self.assertRaises(LookupError):
+            await second
+        instance._release_inference_slot(first)
+        instance._release_inference_slot("b")
 
 
 if __name__ == "__main__":

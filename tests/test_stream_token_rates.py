@@ -237,6 +237,7 @@ class VllmStreamUsageTests(unittest.IsolatedAsyncioTestCase):
             async def aiter_lines(self):
                 for line in lines:
                     yield line
+                raise AssertionError("terminal DONE must finish without waiting for EOF")
 
         class StreamContext:
             async def __aenter__(self):

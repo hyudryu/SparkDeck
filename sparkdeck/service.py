@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 
 from .catalog import (
@@ -43,6 +44,7 @@ from .envfile_settings import (
 )
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtime_file_mounts import normalize_runtime_file_mounts
+from .stream_cleanup import close_async_stream
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -6649,8 +6651,13 @@ class SparkDeckService:
             async for chunk in stream:
                 yield chunk
         finally:
-            self._community_observation.reset(token)
-            self._community_observation_end(observation)
+            try:
+                await close_async_stream(stream)
+            finally:
+                try:
+                    self._community_observation.reset(token)
+                finally:
+                    self._community_observation_end(observation)
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any, *,
@@ -6865,16 +6872,19 @@ class SparkDeckService:
                         parsed["model"] = deployment["alias"]
                         line = "data: " + json.dumps(parsed, separators=(",", ":"))
                 yield f"{line}\n\n"
+                if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                    break
         except BaseException as exc:
             stream_error = exc
             raise
         finally:
-            if stream_error is None:
-                await response_context.__aexit__(None, None, None)
-            else:
-                await response_context.__aexit__(
-                    type(stream_error), stream_error, stream_error.__traceback__,
-                )
+            with anyio.CancelScope(shield=True):
+                if stream_error is None:
+                    await response_context.__aexit__(None, None, None)
+                else:
+                    await response_context.__aexit__(
+                        type(stream_error), stream_error, stream_error.__traceback__,
+                    )
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
@@ -6967,12 +6977,11 @@ class SparkDeckService:
             finally:
                 if not observation_ended:
                     self._community_observation_end(observation)
-                if cancelled:
-                    close_stream = getattr(stream, "aclose", None)
-                    if close_stream is not None:
-                        await close_stream()
-                if not cancelled:
-                    await relay.put(finished)
+                try:
+                    await close_async_stream(stream)
+                finally:
+                    if not cancelled:
+                        await relay.put(finished)
 
         producer = asyncio.create_task(produce())
         try:
@@ -6985,7 +6994,8 @@ class SparkDeckService:
         finally:
             if not producer.done():
                 producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(producer, return_exceptions=True)
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
                          settings: dict[str, Any], started: float, data: dict[str, Any],

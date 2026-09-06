@@ -85,10 +85,22 @@ def test_group_admission_queue_does_not_double_count_running_tracking():
         assert manager.inference_admission()[target]["group_id"] == "split:instance:0"
         manager._track_end(rid)
         manager._release_inference_slot(target)
-        await pending
-        manager._release_inference_slot(target)
+        pending_lease = await pending
+        manager._release_inference_slot(pending_lease)
         assert manager.active_request_groups() == {}
     asyncio.run(run())
+
+
+def test_group_prompt_processing_rate_sums_concurrent_request_rates():
+    manager = grouped_manager()
+    first = manager._track_start("model", deployment_id="split", container_name="engine-1")
+    second = manager._track_start("model", deployment_id="split", container_name="engine-1")
+    manager._track_prompt_processing(first, 100, 2.0)
+    manager._track_prompt_processing(second, 60, 2.0)
+    group = manager.active_request_groups()["split:instance:0"]
+    assert group["connections"] == 2
+    assert group["pp_tok_s"] == 80.0
+    assert manager.active_requests()["model"]["pp_tok_s"] == 40.0
 
 
 def test_remote_stream_group_sessions_close_independently():

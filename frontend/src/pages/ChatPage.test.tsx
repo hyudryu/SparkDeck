@@ -325,12 +325,12 @@ describe('ChatPage', () => {
     await user.upload(screen.getByLabelText('Choose image or video files'), new File(
       ['not really an image'], 'spoofed.png', { type: 'image/png' },
     ))
-    expect(await screen.findByRole('alert')).toHaveTextContent('does not contain valid PNG image data')
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('does not contain valid PNG image data'))
 
     const picker = screen.getByLabelText('Choose image or video files')
     const files = Array.from({ length: 5 }, (_, index) => pngFile(`image-${index}.png`))
     await user.upload(picker, files)
-    expect(await screen.findByRole('alert')).toHaveTextContent('up to 4 images')
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('up to 4 images'))
     expect(within(screen.getByLabelText('Attached media')).getAllByRole('button', { name: /^Remove / })).toHaveLength(4)
   })
 

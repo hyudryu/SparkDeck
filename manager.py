@@ -1177,6 +1177,7 @@ class Manager:
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
+                "patched-images-v1",
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,

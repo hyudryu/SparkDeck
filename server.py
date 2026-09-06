@@ -54,6 +54,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.updater import CONFIRMATION, UpdateService
+from sparkdeck.image_patch_jobs import ImagePatchJobs
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
@@ -65,6 +66,7 @@ onboarding = OnboardingService(
     revoke_community_consent=sparkdeck.revoke_community_membership,
 )
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
+image_patch_jobs = ImagePatchJobs(manager, ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
@@ -827,6 +829,37 @@ async def agent_update_routeros_fan(req: Request):
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+async def _image_patch_body(req: Request):
+    try:
+        # JSON can escape each UTF-8 text byte into six bytes.
+        body = await read_limited_json(req, 25 * 1024 * 1024)
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return body
+    except RequestBodyTooLarge as exc:
+        raise HTTPException(413, "Patch upload is too large") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agent/images/patch-builds", status_code=202)
+async def agent_start_image_patch(req: Request):
+    _require_agent(req)
+    try:
+        return await image_patch_jobs.start(await _image_patch_body(req), agent=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/agent/images/patch-builds/{job_id}")
+async def agent_image_patch_status(job_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return image_patch_jobs.get(job_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/agent/images/pull")
@@ -1948,6 +1981,19 @@ async def _v1_image_inventory() -> dict:
 
 async def _v1_image_items() -> list[dict]:
     return (await _v1_image_inventory())["items"]
+
+
+@app.get("/api/v1/images/patch-builds")
+async def v1_image_patch_builds():
+    return image_patch_jobs.list()
+
+
+@app.post("/api/v1/images/patch-builds", status_code=202)
+async def v1_start_image_patch_build(req: Request):
+    try:
+        return await image_patch_jobs.start(await _image_patch_body(req))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/v1/images")

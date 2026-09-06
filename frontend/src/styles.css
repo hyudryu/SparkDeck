@@ -693,3 +693,22 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .dashboard-list-row small.deployment-group-nodes { white-space: normal; overflow-wrap: anywhere; }
 
 .deployment-group-picker .node-option strong { white-space: normal; overflow-wrap: anywhere; }
+
+.patched-images { min-width: 0; }
+.patched-images .section-heading { flex-wrap: wrap; gap: 12px; }
+.patch-editor, .patch-build { padding: 18px; min-width: 0; }
+.patch-editor form, .patch-history { display: grid; gap: 16px; min-width: 0; }
+.patch-editor p, .patch-build p { color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; }
+.patch-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.patch-fields .field:first-child { grid-column: 1 / -1; }
+.patch-file { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 14px; border: 1px solid var(--border-subtle); border-radius: 8px; }
+.patch-file legend { padding: 0 5px; font-size: 13px; font-weight: 600; }
+.patch-editor input, .patch-editor select, .patch-editor textarea { width: 100%; min-width: 0; max-width: 100%; }
+.patch-editor textarea { resize: vertical; }
+.patch-actions { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; }
+.patch-history { margin-top: 16px; }
+.patch-build h3, .patch-build code { overflow-wrap: anywhere; }
+.patch-build details { margin-top: 12px; min-width: 0; }
+.patch-build summary { cursor: pointer; overflow-wrap: anywhere; }
+.patch-build pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--bg-subtle); font-size: 12px; }
+@media (max-width: 640px) { .patch-fields { grid-template-columns: minmax(0, 1fr); } .patch-editor, .patch-build { padding: 12px; } }

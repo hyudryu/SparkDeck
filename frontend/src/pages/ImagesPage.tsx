@@ -5,6 +5,7 @@ import type { ContainerImage, NodeInventoryItem } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark } from '../components/ui'
 import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components/NodeSelector'
 import { useResource } from '../hooks/useResource'
+import { PatchedImages } from '../components/PatchedImages'
 
 function formatBytes(bytes?: number) {
   if (bytes === undefined) return 'Size unavailable'
@@ -87,6 +88,7 @@ export function ImagesPage() {
         {error && <p className="inline-error" role="alert">{error}</p>}
         {notice && <p className="inline-success" role="status">{notice}</p>}
       </Panel>
+      <PatchedImages images={resource.data ?? []} nodes={nodes.data ?? []} localLabel={localLabel} onBuilt={resource.reload} />
       <div className="section-heading"><div><h2>Cluster images</h2><p>Image availability is tracked per node.</p></div></div>
       {resource.loading && <LoadingState label="Loading images" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}

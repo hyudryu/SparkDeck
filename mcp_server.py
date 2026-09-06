@@ -963,6 +963,31 @@ def build_server(
         return await client.delete_storage_weights(node_id, model_id)
 
     @server.tool()
+    async def list_image_patch_builds() -> dict[str, Any]:
+        """List Images patch build history, per-node logs, errors and verified file hashes."""
+        return await client._request("GET", "/api/v1/images/patch-builds")
+
+    @server.tool()
+    async def create_patched_image(
+        base_image: str, image: str, files: list[dict[str, str]], node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Build a new named image by adding/replacing trusted UTF-8 files.
+
+        Uses the same builder as Images in the GUI. Each file is
+        {"target": "/absolute/container/file.py", "content": "Python source"}.
+        Upload at most 16 files, 1 MiB each and 4 MiB total. The image must use
+        a new explicit tag. No shell/build commands are accepted and uploaded
+        code is not executed during the build; Python executes when loaded by
+        the runtime. Choose every deployment node here. Poll
+        list_image_patch_builds until all selected nodes succeed, then use the
+        resulting image tag in deployment settings. Existing images are not
+        overwritten. Build history contains hashes, not uploaded source.
+        """
+        return await client._request("POST", "/api/v1/images/patch-builds", json_body={
+            "base_image": base_image, "image": image, "files": files, "node_ids": node_ids,
+        })
+
+    @server.tool()
     async def list_cluster_recipes() -> list[dict[str, Any]]:
         """List reusable cluster recipes, including their stable recipe IDs."""
         return (await client.state()).get("recipes", [])

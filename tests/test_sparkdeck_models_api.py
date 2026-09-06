@@ -67,6 +67,30 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         update.assert_awaited_once_with("bookmark", {"runtime_file_mounts": mounts})
 
+    async def test_bookmark_editor_accepts_instance_count_and_explicit_clear(self):
+        # The GUI always sends instances: null for a non-grouped bookmark.
+        # Exercise the route as well as service tests so its allowlist cannot
+        # reject otherwise valid creator-form saves.
+        for instances, mode in ((None, "sharded"), (2, "grouped_sharded")):
+            with self.subTest(instances=instances):
+                body = {
+                    "alias": "Recipe TP2", "image": "vllm/test",
+                    "context_length": 262144, "tensor_parallel_size": 2,
+                    "instances": instances, "parallel_slots": None,
+                    "gpu_layers": None, "quantization": None, "artifact": None,
+                    "extra_args": ["--max-num-seqs", "10"],
+                    "environment": {"NCCL_DEBUG": "INFO"},
+                    "runtime_file_mounts": [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}],
+                    "gpu_memory_utilization": 0.65,
+                    "node_ids": ["node-4", "node-3"] if instances is None else ["node-4", "node-3", "node-2", "local"],
+                    "deployment_mode": mode,
+                }
+                update = AsyncMock(return_value={"id": "bookmark", "settings": body})
+                with patch.object(server.sparkdeck, "update_deployment_settings", update):
+                    response = await self.client.put("/api/v1/deployments/bookmark/settings", json=body)
+                self.assertEqual(response.status_code, 200)
+                update.assert_awaited_once_with("bookmark", body)
+
     async def test_recipe_detail_returns_editable_args_and_launch_controls(self):
         with patch.object(server.manager, "get_recipe", AsyncMock(return_value=dict(RECIPE))):
             response = await self.client.get("/api/v1/recipes/r1")

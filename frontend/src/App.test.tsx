@@ -794,7 +794,7 @@ describe('model deployments', () => {
         pipeline_parallel_size: 1, node_ids: ['local', 'node-2'], extra_args_count: 2,
       }] } : path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
-        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local', 'node-2'],
+        model: { repository: 'org/model' }, status: 'stopped', settings: {}, node_ids: ['local', 'node-2'],
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
@@ -1198,8 +1198,8 @@ describe('model deployments', () => {
       }
       if (path.includes('/api/v1/deployments')) {
         deploymentListCalls += 1
-        if (deploymentListCalls === 2) return liveRefresh
-        const deployments = deploymentListCalls === 1 ? [] : [{
+        if (deploymentListCalls === 3) return liveRefresh
+        const deployments = deploymentListCalls <= 2 ? [] : [{
           id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
           model: { repository: 'org/model' }, status: 'running', settings: {},
           node_ids: ['local'], launch_phase: 'ready', launch_message: 'SGLang API ready',
@@ -1232,7 +1232,7 @@ describe('model deployments', () => {
     expect(within(deploymentRow).getByRole('button', { name: 'Stop' })).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent('Started deployment Live recipe on This device.')
 
-    await waitFor(() => expect(deploymentListCalls).toBe(2), { timeout: 3500 })
+    await waitFor(() => expect(deploymentListCalls).toBe(3), { timeout: 3500 })
     expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
     expect(screen.queryByText('Refreshing deployments…')).not.toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Live recipe' })).toBeInTheDocument()
@@ -1247,7 +1247,7 @@ describe('model deployments', () => {
     expect(within(deploymentRow).getByText('Pulling Image')).toBeInTheDocument()
     expect(await within(deploymentRow).findByText(/Last inference \d+m ago/, {}, { timeout: 3500 })).toBeInTheDocument()
     expect(within(deploymentRow).queryByText('SGLang API ready')).not.toBeInTheDocument()
-    expect(deploymentListCalls).toBeGreaterThanOrEqual(3)
+    expect(deploymentListCalls).toBeGreaterThanOrEqual(4)
   })
 
   it('keeps a live deployment row stable when a background refresh fails', async () => {
@@ -1405,6 +1405,7 @@ describe('model deployments', () => {
 
   it('keeps an accepted recipe row when removal fails before the first deployment load finishes', async () => {
     const user = userEvent.setup()
+    let deploymentListCalls = 0
     let resolveInitialList: (response: Response) => void = () => undefined
     const initialList = new Promise<Response>((resolve) => { resolveInitialList = resolve })
     fetchMock.mockImplementation(async (input, init) => {
@@ -1426,7 +1427,11 @@ describe('model deployments', () => {
           status: 500, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (path.includes('/api/v1/deployments')) return initialList
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        if (deploymentListCalls === 2) return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
+        return initialList
+      }
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{

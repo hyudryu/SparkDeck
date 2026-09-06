@@ -339,6 +339,43 @@ describe('models page llama.cpp pull targets', () => {
 })
 
 describe('models page running actions', () => {
+  it('disables nodes occupied by another group while keeping its inactive group nodes free', async () => {
+    const original = fetchMock.getMockImplementation()!
+    const target = { ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped' }
+    const occupied = { ...runningDeployment, deployment_mode: 'grouped_sharded', node_ids: ['worker-1', 'worker-2'], instances: [
+      { instance_id: 0, status: 'starting', desired_state: 'running', node_ids: ['worker-1'], node_names: ['Node 4'] },
+      { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-2'], node_names: ['Node 3'] },
+    ] }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [occupied, target] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Backup' })
+    const busyNode = within(dialog).getByRole('radio', { name: /Node 4/ })
+    expect(busyNode).toBeDisabled()
+    expect(busyNode).not.toBeChecked()
+    expect(within(dialog).getByText(/Already used by deployment Chat model/)).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeEnabled()
+  })
+
+  it('rechecks occupancy before launching when another deployment claimed a selected node', async () => {
+    const original = fetchMock.getMockImplementation()!
+    let claimed = false
+    const target = { ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped' }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [target, ...(claimed ? [runningDeployment] : [])] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Backup' })
+    claimed = true
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Already used by deployment Chat model')
+    expect(fetchMock.mock.calls.some(([path, init]) => String(path).endsWith('/target/start') && init?.method === 'POST')).toBe(false)
+  })
   it('clones a persisted deployment and shows the generated copy name', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

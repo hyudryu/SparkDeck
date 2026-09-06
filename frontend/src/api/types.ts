@@ -70,6 +70,7 @@ export interface RuntimeFileMount {
 }
 
 export interface DeploymentSettings {
+  node_ids?: string[]
   image?: string
   context_length?: number
   tensor_parallel_size?: number
@@ -93,6 +94,7 @@ export interface DeploymentSettings {
 
 // One independent engine group of a grouped-sharded deployment.
 export interface DeploymentInstance {
+  node_ids?: string[]
   instance_id: number
   status: string
   desired_state: 'running' | 'stopped'

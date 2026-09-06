@@ -419,6 +419,7 @@ class SparkDeckService:
         # two different records from claiming the same selector concurrently.
         self._deployment_alias_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
+        self._deployment_launch_node_ids: dict[str, list[str]] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
         # {"action": str, "task": asyncio.Task, "process": subprocess | None}.
@@ -1228,6 +1229,10 @@ class SparkDeckService:
                         "status": "starting",
                         "launch_phase": "queued",
                         "launch_message": "Preparing deployment launch",
+                        "node_ids": list(self._deployment_launch_node_ids.get(
+                            deployment["id"],
+                            (deployment.get("settings") or {}).get("node_ids") or [],
+                        )),
                     })
                     continue
                 settings = deployment.get("settings") or {}
@@ -4042,6 +4047,10 @@ class SparkDeckService:
                 self._deployment_launches.setdefault(
                     deployment_id, asyncio.Event(),
                 )
+                if node_ids:
+                    # Publish the requested topology before slow launch work,
+                    # without changing the saved bookmark on a failed start.
+                    self._deployment_launch_node_ids[deployment_id] = list(node_ids)
             try:
                 return await self._deployment_action_locked(
                     deployment_id, action, node_ids, additional_node_ids,
@@ -4049,6 +4058,7 @@ class SparkDeckService:
                 )
             finally:
                 self._deployment_launches.pop(deployment_id, None)
+                self._deployment_launch_node_ids.pop(deployment_id, None)
 
     @asynccontextmanager
     async def _deployment_lifecycle_lock(

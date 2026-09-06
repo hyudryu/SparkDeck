@@ -385,6 +385,50 @@ describe('models page running actions', () => {
     expect(tooltip).toHaveTextContent('Node 4')
   })
 
+  it('starts another deployment of a grouped layout on free nodes only', async () => {
+    const user = userEvent.setup()
+    const groupedRunning = {
+      ...runningDeployment,
+      alias: 'TP2 production',
+      status: 'running',
+      deployment_mode: 'grouped_sharded',
+      instance_node_count: 2,
+      required_node_count: 4,
+      node_ids: ['worker-1', 'worker-2'],
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [groupedRunning] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(groupedRunning), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('TP2 production')
+    await user.click(screen.getByRole('button', { name: 'More actions for TP2 production' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Start another deployment…' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add an engine group to TP2 production' })
+    // Nodes already running this deployment are visible but not selectable.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 3/ })).toBeDisabled()
+    expect(within(dialog).getAllByText(/Already running this deployment/).length).toBe(2)
+
+    await user.click(screen.getByRole('button', { name: 'Start on 2 nodes' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/dep-1/add_instance') && init?.method === 'POST'
+      ))
+      expect(call).toBeDefined()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ node_ids: ['local', 'worker-3'] })
+    })
+  })
+
   it('keeps the running replica while launching on an additional node', async () => {
     const user = userEvent.setup()
     renderPage()

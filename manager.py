@@ -6534,12 +6534,14 @@ class Manager:
         node_ids: list[str], available: dict,
         fabrics: dict[str, tuple[str | None, str | None]],
         local_port: int | None, tensor_parallel_size: int, instances: int,
+        first_instance: int = 0,
     ) -> tuple[list, list[dict]]:
         """Build one independent sharded engine group per instance.
 
-        Group ``g`` owns ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own
-        coordinator (the group's first node) and master port, so every group
-        is a complete tensor-parallel engine behind the shared served name.
+        Group ``g`` (counted from ``first_instance``) owns
+        ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own coordinator
+        (the group's first node) and master port, so every group is a
+        complete tensor-parallel engine behind the shared served name.
         """
         tasks: list = []
         member_specs: list[dict] = []
@@ -6547,16 +6549,17 @@ class Manager:
             r"[^a-zA-Z0-9_.-]+", "-", str(base.get("model") or ""),
         ).strip("-").lower()
         for group in range(instances):
+            instance = first_instance + group
             group_nodes = node_ids[
                 group * tensor_parallel_size:(group + 1) * tensor_parallel_size
             ]
             group_master_ip = fabrics[group_nodes[0]][0]
-            group_master_port = 29501 + group
+            group_master_port = 29501 + instance
             for local_rank, node_id in enumerate(group_nodes):
                 node = available[node_id]
                 member_port = local_port if node_id == LOCAL_NODE_ID else None
                 fabric_ip, fabric_interface = fabrics[node_id]
-                global_rank = group * tensor_parallel_size + local_rank
+                global_rank = instance * tensor_parallel_size + local_rank
                 name = f"cluster-{deployment_id}-r{global_rank}-{safe_model[:36]}"
                 payload = dict(base)
                 payload.update({
@@ -6566,7 +6569,7 @@ class Manager:
                         "deployment_id": deployment_id,
                         "node_id": node_id,
                         "rank": local_rank,
-                        "instance_id": group,
+                        "instance_id": instance,
                         "nnodes": tensor_parallel_size,
                         "mode": "grouped_sharded",
                         "serve_port": member_port,
@@ -6612,7 +6615,7 @@ class Manager:
                     "node_id": node_id,
                     "node_name": node.get("name", node_id),
                     "rank": local_rank,
-                    "instance_id": group,
+                    "instance_id": instance,
                     "container_name": name,
                     "fabric_ip": fabric_ip,
                     "port": member_port,
@@ -7295,6 +7298,359 @@ class Manager:
             "status": deployment.get("status"),
         }
 
+    def _instance_group_node_count(self, deployment: dict) -> int:
+        """Hosts per engine group for a sharded/grouped deployment."""
+        launch = deployment.get("launch_settings") or {}
+        try:
+            tensor = int(launch.get("tensor_parallel_size") or 0)
+        except (TypeError, ValueError):
+            tensor = 0
+        if tensor >= 2:
+            return tensor
+        members = deployment.get("members") or []
+        if not members:
+            return 0
+        # A sharded deployment never persisted a per-group scalar: its member
+        # count is the host count of the one group it owns.
+        return len(members)
+
+    def _convert_sharded_deployment_to_grouped(
+        self, deployment: dict, tensor_parallel_size: int,
+    ) -> None:
+        """Backfill instance identity so a sharded deployment can grow.
+
+        The running group becomes instance 0 without touching its containers:
+        only the persisted record changes (mode, per-group scalars, member
+        marks), so the next launch reproduces the same topology through the
+        grouped path.
+        """
+        for member in deployment.get("members") or []:
+            member["instance_id"] = 0
+        deployment["mode"] = "grouped_sharded"
+        deployment["instances"] = 2
+        launch = deployment.get("launch_settings") or {}
+        launch["deployment_mode"] = "grouped_sharded"
+        launch["tensor_parallel_size"] = tensor_parallel_size
+        launch["instances"] = 2
+
+    async def add_deployment_instance(
+        self, deployment_id: str, node_ids: list[str],
+    ) -> dict:
+        """Launch one more independent engine group on free nodes.
+
+        The deployment keeps its served name and identity: requests balance
+        across every started group's coordinator, and the new group must use
+        nodes the deployment does not already occupy. A plain sharded
+        deployment is converted to grouped in place (instance 0 backfilled)
+        before the new group launches.
+        """
+        async with self._cluster_action_lock():
+            deployment = self._deployment(deployment_id)
+            if not deployment:
+                raise ValueError("deployment not found")
+            mode = deployment.get("mode")
+            if mode not in {"sharded", "grouped_sharded"}:
+                raise ValueError(
+                    "start-another-deployment is only available for tensor "
+                    "parallel deployments; replicated layouts already run one "
+                    "copy per selected node"
+                )
+            engine = str(deployment.get("engine") or "vllm")
+            if engine not in {"vllm", "sglang"}:
+                raise ValueError(
+                    "start-another-deployment requires a vLLM or SGLang runtime"
+                )
+            requested = list(dict.fromkeys(str(item).strip() for item in node_ids))
+            if not requested or any(not item for item in requested):
+                raise ValueError("node_ids must contain non-empty node IDs")
+            members = deployment.get("members") or []
+            if not members:
+                raise ValueError(
+                    "start the deployment before launching another instance"
+                )
+            tensor_parallel_size = self._instance_group_node_count(deployment)
+            if tensor_parallel_size < 2:
+                raise ValueError(
+                    "cannot determine the tensor parallel node count for "
+                    "another deployment"
+                )
+            # A group with several ranks per host would need to mirror a
+            # world size the grouped builder does not reproduce; keep the
+            # one-rank-per-host layouts this action is for.
+            launch = deployment.get("launch_settings") or {}
+            args = list(launch.get("extra_args") or [])
+            world_tp = self._cli_option(
+                args, {"--tensor-parallel-size", "-tp"}, int,
+            )
+            if engine == "sglang":
+                try:
+                    world_tp = int(launch.get("sg_tp_size") or world_tp or 0)
+                except (TypeError, ValueError):
+                    world_tp = 0
+            if world_tp and world_tp != tensor_parallel_size:
+                raise ValueError(
+                    "this deployment places several tensor parallel ranks on "
+                    "one node; start-another-deployment requires one rank per "
+                    "node"
+                )
+            if mode == "sharded" and not world_tp:
+                # A vLLM sharded deployment without an explicit TP flag
+                # pipelines across the nodes (default 1 TP x N PP layout): an
+                # added TP-only group would not reproduce that engine.
+                raise ValueError(
+                    "this deployment pipelines across the selected nodes; "
+                    "start-another-deployment requires an explicit tensor "
+                    "parallel layout"
+                )
+            if deployment.get("settings_dirty"):
+                raise ValueError(
+                    "saved launch settings changed; start the deployment to "
+                    "apply them before launching another deployment"
+                )
+            if deployment.get("desired_state") == "stopped":
+                raise ValueError(
+                    "start the deployment before launching another deployment"
+                )
+            # Everything below mutates the record: every rejecting check must
+            # have run by this point.
+            if len(requested) != tensor_parallel_size:
+                raise ValueError(
+                    f"another TP{tensor_parallel_size} deployment requires "
+                    f"exactly {tensor_parallel_size} node(s), got {len(requested)}"
+                )
+            occupied = {
+                str(member.get("node_id")) for member in members
+                if member.get("node_id")
+            }
+            clash = sorted(occupied.intersection(requested))
+            if clash:
+                raise ValueError(
+                    "this deployment already runs on: " + ", ".join(clash)
+                )
+
+            available = {n["id"]: n for n in await self.cluster_nodes()}
+            missing = [nid for nid in requested if nid not in available]
+            if missing:
+                raise ValueError(f"unknown cluster node(s): {', '.join(missing)}")
+            offline = [
+                available[nid].get("name", nid) for nid in requested
+                if not available[nid].get("online")
+            ]
+            if offline:
+                raise ValueError(
+                    "cluster node(s) are offline: " + ", ".join(offline)
+                )
+            unready = [
+                available[nid].get("name", nid) for nid in requested
+                if not available[nid].get("docker_ready")
+            ]
+            if unready:
+                raise ValueError("Docker is unavailable on: " + ", ".join(unready))
+            gpu_short = []
+            fabrics: dict[str, tuple[str | None, str | None]] = {}
+            for nid in requested:
+                node = available[nid]
+                requested_ip = (
+                    self.settings.get("cluster_fabric_ip")
+                    if nid == LOCAL_NODE_ID else node.get("fabric_ip")
+                )
+                requested_interface = (
+                    self.settings.get("cluster_fabric_interface")
+                    if nid == LOCAL_NODE_ID else node.get("fabric_interface")
+                )
+                fabrics[nid] = self._inferred_fabric(
+                    node, requested_ip, requested_interface,
+                )
+                if not fabrics[nid][0]:
+                    raise ValueError(
+                        "could not determine fabric IP for "
+                        f"{node.get('name', nid)}"
+                    )
+                gpus = (node.get("stats") or {}).get("gpus")
+                if gpus is not None and not [
+                    gpu for gpu in gpus
+                    if not (isinstance(gpu, dict) and gpu.get("error"))
+                ]:
+                    gpu_short.append(node.get("name", nid))
+            if gpu_short:
+                raise ValueError(
+                    "no usable GPUs on: " + ", ".join(gpu_short)
+                )
+
+            # All rejecting checks have passed. Snapshot the pre-conversion
+            # state so a failed launch can restore a plain sharded record
+            # exactly, then convert in memory.
+            converted = mode == "sharded"
+            pre_conversion = {
+                "mode": deployment.get("mode"),
+                "instances": deployment.get("instances"),
+                "launch_mode": launch.get("deployment_mode"),
+                "launch_tensor": launch.get("tensor_parallel_size"),
+                "launch_instances": launch.get("instances"),
+            } if converted else None
+            if converted:
+                self._convert_sharded_deployment_to_grouped(
+                    deployment, tensor_parallel_size,
+                )
+
+            instance_ids = [
+                int(member.get("instance_id") or 0) for member in members
+            ]
+            next_instance = (max(instance_ids) + 1) if instance_ids else 0
+            local_port = None
+            if LOCAL_NODE_ID in requested:
+                local_port = await self._allocate_port(
+                    exclude_deployment_id=deployment_id,
+                )
+            model = str(deployment.get("model") or "")
+            base = {
+                "model": model,
+                "engine": engine,
+                "hf_token": self._resolved_hf_token(),
+                "gpu_memory_utilization": launch.get("gpu_memory_utilization"),
+                "gpu_memory_gb": launch.get("gpu_memory_gb"),
+                "shm_size": launch.get("shm_size"),
+                "infiniband_device": launch.get("infiniband_device"),
+                "environment": launch.get("environment"),
+                "extra_args": (
+                    self._with_vllm_prompt_token_details(
+                        list(launch.get("extra_args") or [])
+                    )
+                    if engine == "vllm"
+                    else list(launch.get("extra_args") or [])
+                ),
+                "image": launch.get("image"),
+                "sg_tp_size": launch.get("sg_tp_size"),
+                "sg_context_length": launch.get("sg_context_length"),
+                "sg_max_running_requests": launch.get("sg_max_running_requests"),
+                "sg_mem_fraction": launch.get("sg_mem_fraction"),
+                "sg_image": launch.get("sg_image"),
+                "llama_artifact": None,
+                "llama_context_length": None,
+                "llama_parallel_slots": None,
+                "llama_gpu_layers": None,
+            }
+            tasks, member_specs = self._build_grouped_sharded_members(
+                deployment_id=deployment_id,
+                engine=engine,
+                base=base,
+                node_ids=requested,
+                available=available,
+                fabrics=fabrics,
+                local_port=local_port,
+                tensor_parallel_size=tensor_parallel_size,
+                instances=1,
+                first_instance=next_instance,
+            )
+            deployment["members"] = members + member_specs
+            deployment["instances"] = next_instance + 1
+            launch["instances"] = deployment["instances"]
+            merged_nodes = list(dict.fromkeys(
+                [
+                    *(str(item) for item in deployment.get("node_ids") or []),
+                    *requested,
+                ]
+            ))
+            deployment["node_ids"] = merged_nodes
+            launch["node_ids"] = merged_nodes
+            # "launching" during the pull window keeps the health monitor
+            # away from the not-yet-existing containers, and if the
+            # controller dies here the startup resume path rebuilds the
+            # whole (already extended) topology coherently.
+            deployment["status"] = "launching"
+            deployment["status_message"] = (
+                f"Launching another deployment on {', '.join(requested)}"
+            )
+            self._save_deployments()
+
+            created = await asyncio.gather(*tasks, return_exceptions=True)
+            errors = []
+            for spec, result in zip(member_specs, created):
+                if isinstance(result, Exception):
+                    spec["status"] = "error"
+                    spec["error"] = str(result)
+                    spec["phase"] = {
+                        "phase": "error",
+                        "message": f"Launch failed: {result}",
+                    }
+                    errors.append(f"{spec['node_name']}: {result}")
+                else:
+                    spec["status"] = result.get("status", "starting")
+                    spec["phase"] = result.get("phase") or {
+                        "phase": "starting",
+                        "message": "Container created; starting the model server",
+                    }
+                    spec["container_id"] = result.get("id")
+                    spec["port"] = result.get("port") or spec.get("port")
+            if errors:
+                # Roll the failed group back: a partially created engine
+                # holds GPU memory without serving. The previous groups keep
+                # serving regardless, so the card returns to its derived
+                # state instead of a stale failure.
+                await asyncio.gather(
+                    *[
+                        self._member_action(spec, "remove")
+                        for spec in member_specs if spec.get("container_id")
+                    ],
+                    return_exceptions=True,
+                )
+                failed = {id(spec) for spec in member_specs}
+                deployment["members"] = [
+                    member for member in deployment["members"]
+                    if id(member) not in failed
+                ]
+                deployment["instances"] = next_instance
+                launch["instances"] = next_instance
+                deployment["node_ids"] = [
+                    str(item) for item in deployment.get("node_ids")
+                    if item not in requested
+                ]
+                launch["node_ids"] = list(deployment["node_ids"])
+                # A converted sharded record goes back to exactly what
+                # it was: no phantom grouped topology may survive. Keys the
+                # conversion introduced are removed, not nulled.
+                if pre_conversion is not None:
+                    deployment["mode"] = pre_conversion["mode"]
+                    launch["deployment_mode"] = pre_conversion["launch_mode"]
+                    for member in deployment["members"]:
+                        member.pop("instance_id", None)
+                    if pre_conversion["instances"] is None:
+                        deployment.pop("instances", None)
+                        launch.pop("instances", None)
+                    else:
+                        deployment["instances"] = pre_conversion["instances"]
+                        launch["instances"] = pre_conversion["launch_instances"]
+                    if pre_conversion["launch_tensor"] is None:
+                        launch.pop("tensor_parallel_size", None)
+                    else:
+                        launch["tensor_parallel_size"] = pre_conversion["launch_tensor"]
+                deployment.pop("status_message", None)
+                # With the failed group removed the remaining ranks derive
+                # the honest state (a sharded record's ranks read as one
+                # group here, which matches its health semantics).
+                deployment["status"] = self._grouped_deployment_status(
+                    deployment
+                )
+                deployment["error"] = "; ".join(errors)
+                self._save_deployments()
+                return {
+                    "ok": False,
+                    "errors": errors,
+                    "status": deployment.get("status"),
+                    "node_ids": list(deployment["node_ids"]),
+                }
+            deployment["error"] = None
+            deployment["last_deployed_at"] = time.time()
+            deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["status_message"] = None
+            self._save_deployments()
+            return {
+                "ok": True,
+                "errors": [],
+                "status": deployment.get("status"),
+                "node_ids": list(deployment["node_ids"]),
+            }
+
     @staticmethod
     def _container_started_epoch(value: Any) -> float | None:
         if not value or str(value).startswith("0001-"):
@@ -7624,6 +7980,11 @@ class Manager:
         expected: dict[int, list[tuple[dict, Any]]] = {}
         for member in deployment.get("members") or []:
             if str(member.get("desired_state") or "running") == "stopped":
+                continue
+            if str(member.get("status") or "") in {"queued", "creating"}:
+                # A launch still represented by a synthetic agent row is not
+                # a failed runtime (create_deployment and instance adds set
+                # this while containers are being pulled).
                 continue
             node = node_by_id.get(member.get("node_id"))
             if not node or not node.get("online") or not node.get("docker_ready"):

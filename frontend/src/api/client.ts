@@ -357,6 +357,7 @@ export interface WireDeployment {
   deployment_mode?: string
   instances?: Deployment['instances']
   required_node_count?: number
+  instance_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
   single_host_topology_replayable?: boolean
@@ -436,6 +437,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     deployment_mode: item.deployment_mode,
     instances: item.instances,
     required_node_count: item.required_node_count,
+    instance_node_count: item.instance_node_count,
     parallel_rank_count: item.parallel_rank_count,
     flexible_node_count: item.flexible_node_count,
     single_host_topology_replayable: item.single_host_topology_replayable,
@@ -616,7 +618,7 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[], promote = false, instance?: number) => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove' | 'add_instance', nodeIds?: string[], additionalNodeIds?: string[], promote = false, instance?: number) => {
       if (action === 'remove') {
         return request<void>(
           `/api/v1/deployments/${encodeURIComponent(id)}`,
@@ -624,7 +626,9 @@ export const api = {
           NO_REQUEST_TIMEOUT,
         )
       }
-      const payload = action === 'start' && additionalNodeIds?.length
+      const payload = action === 'add_instance' && nodeIds?.length
+        ? { node_ids: nodeIds }
+        : action === 'start' && additionalNodeIds?.length
         ? { additional_node_ids: additionalNodeIds }
         : action === 'start' && nodeIds?.length ? { node_ids: nodeIds, promote: promote || undefined } : instance !== undefined
           ? { instance }

@@ -3754,6 +3754,17 @@ class SparkDeckService:
         count = contract.get("required_node_count")
         if isinstance(count, int) and not isinstance(count, bool):
             result["required_node_count"] = count
+        # Nodes one additional engine group occupies: the per-group TP for a
+        # grouped-sharded deployment, the whole saved group for sharded. The
+        # start-another-deployment picker requires exactly this many free
+        # nodes.
+        if contract.get("deployment_mode") == "grouped_sharded":
+            tensor = contract.get("tensor_parallel_size")
+            if isinstance(tensor, int) and not isinstance(tensor, bool) and tensor > 0:
+                result["instance_node_count"] = tensor
+        elif contract.get("deployment_mode") == "sharded":
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                result["instance_node_count"] = count
         revision = contract.get("model_revision")
         if isinstance(revision, str) and revision.strip():
             result["model_revision"] = revision.strip()
@@ -4555,6 +4566,30 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
+        if action == "add_instance":
+            # Start another engine group of the same deployment on nodes the
+            # deployment does not already occupy. The deployment object, its
+            # alias, and its served name all stay the same.
+            target = manager_id or (owner or {}).get("id")
+            if not target:
+                raise ValueError(
+                    "start-another-deployment is only available for cluster "
+                    "deployments"
+                )
+            if not node_ids:
+                raise ValueError(
+                    "select the nodes for the additional deployment"
+                )
+            result = await self.manager.add_deployment_instance(target, node_ids)
+            if not result.get("ok"):
+                raise RuntimeError(
+                    "; ".join(result.get("errors") or ["cluster action failed"])
+                )
+            current = self.store.deployment(deployment_id) or deployment
+            current["status"] = str(result.get("status") or "starting")
+            if result.get("node_ids"):
+                current["node_ids"] = list(result["node_ids"])
+            return current
         if (
             discovered is not None and not deployment.get("managed")
             and action == "start" and node_ids

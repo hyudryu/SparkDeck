@@ -443,5 +443,327 @@ class GroupedShardedInstanceValidationTests(unittest.TestCase):
             )
 
 
+class AddInstanceTests(unittest.IsolatedAsyncioTestCase):
+    def add_instance_manager(self, deployment: dict) -> Manager:
+        instance = Manager.__new__(Manager)
+        instance.settings = {}
+        instance.deployments = [deployment]
+        instance._save_deployments = lambda: None
+        return instance
+
+    def running_grouped_deployment(self) -> dict:
+        return {
+            **grouped_deployment(),
+            "instances": 1,
+            "desired_state": "running",
+            "status": "running",
+            "node_ids": ["local", "remote-1"],
+            "members": [
+                {**grouped_member(0, 0), "node_id": "local", "status": "running"},
+                {**grouped_member(0, 1), "node_id": "remote-1", "status": "running"},
+            ],
+            "launch_settings": {
+                "deployment_mode": "grouped_sharded",
+                "tensor_parallel_size": 2,
+                "instances": 1,
+                "model": "org/model",
+                "engine": "vllm",
+                "extra_args": ["--max-model-len", "4096"],
+                "node_ids": ["local", "remote-1"],
+            },
+        }
+
+    def four_node_manager(self) -> Manager:
+        instance = Manager.__new__(Manager)
+        instance.settings = {
+            "cluster_fabric_ip": "169.254.10.1",
+            "cluster_fabric_interface": "cx7-local",
+        }
+        instance.deployments = []
+
+        async def cluster_nodes(local_stats=None):
+            return [
+                {
+                    "id": node_id,
+                    "name": f"Spark {index}",
+                    "online": True,
+                    "docker_ready": True,
+                    "fabric_ip": f"169.254.10.{index}",
+                    "fabric_interface": f"cx7-node-{index}",
+                    "interfaces": [],
+                }
+                for index, node_id in enumerate(
+                    ["local", "remote-1", "remote-2", "remote-3"], start=1,
+                )
+            ]
+
+        instance.cluster_nodes = cluster_nodes
+        instance._allocate_port = mock.AsyncMock(return_value=8100)
+        return instance
+
+    async def test_add_instance_launches_next_group_on_free_nodes(self) -> None:
+        deployment = self.running_grouped_deployment()
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        captured = []
+
+        async def create_member(node_id, payload):
+            captured.append((node_id, payload))
+            return {
+                "id": f"container-{node_id}", "status": "starting",
+                "model_source": "public_repository",
+            }
+
+        instance._create_member = create_member
+
+        result = await instance.add_deployment_instance(
+            "d1", ["remote-2", "remote-3"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["node_ids"], [
+            "local", "remote-1", "remote-2", "remote-3",
+        ])
+        self.assertEqual(len(captured), 2)
+        for index, (node_id, payload) in enumerate(captured):
+            self.assertEqual(node_id, f"remote-{2 + index}")
+            args = payload["extra_args"]
+            self.assertEqual(args[args.index("--node-rank") + 1], str(index))
+            self.assertEqual(args[args.index("--nnodes") + 1], "2")
+            self.assertEqual(args[args.index("--master-addr") + 1], "169.254.10.3")
+            self.assertEqual(args[args.index("--master-port") + 1], "29502")
+            self.assertEqual(args[args.index("--tensor-parallel-size") + 1], "2")
+            self.assertEqual(args[args.index("--max-model-len") + 1], "4096")
+            self.assertEqual("--headless" in args, index > 0)
+            self.assertEqual(payload["cluster_member"]["instance_id"], 1)
+
+        members = deployment["members"]
+        self.assertEqual([m["instance_id"] for m in members], [0, 0, 1, 1])
+        self.assertEqual(deployment["instances"], 2)
+        self.assertEqual(deployment["node_ids"], [
+            "local", "remote-1", "remote-2", "remote-3",
+        ])
+        self.assertEqual(deployment["launch_settings"]["instances"], 2)
+        self.assertEqual(deployment["launch_settings"]["node_ids"], [
+            "local", "remote-1", "remote-2", "remote-3",
+        ])
+        self.assertEqual(deployment["status"], "running")
+
+    async def test_add_instance_rejects_nodes_the_deployment_occupies(self) -> None:
+        deployment = self.running_grouped_deployment()
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "already runs on"):
+            await instance.add_deployment_instance("d1", ["local", "remote-2"])
+
+    async def test_add_instance_rejects_wrong_node_count(self) -> None:
+        deployment = self.running_grouped_deployment()
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "exactly 2 node"):
+            await instance.add_deployment_instance("d1", ["remote-2"])
+
+    async def test_add_instance_rejects_replicated_mode(self) -> None:
+        deployment = self.running_grouped_deployment()
+        deployment["mode"] = "replicated"
+        instance = self.add_instance_manager(deployment)
+        with self.assertRaisesRegex(ValueError, "tensor parallel"):
+            await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+
+    async def test_add_instance_converts_sharded_deployment_in_place(self) -> None:
+        deployment = {
+            "id": "d1",
+            "mode": "sharded",
+            "engine": "vllm",
+            "model": "org/model",
+            "desired_state": "running",
+            "status": "running",
+            "node_ids": ["local", "remote-1"],
+            "members": [
+                {"node_id": "local", "rank": 0, "status": "running",
+                 "container_name": "cluster-d1-r0-model"},
+                {"node_id": "remote-1", "rank": 1, "status": "running",
+                 "container_name": "cluster-d1-r1-model"},
+            ],
+            "launch_settings": {
+                "deployment_mode": "sharded",
+                "model": "org/model",
+                "engine": "vllm",
+                "extra_args": ["--tensor-parallel-size", "2"],
+                "node_ids": ["local", "remote-1"],
+            },
+        }
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        created = []
+
+        async def create_member(node_id, payload):
+            created.append((node_id, payload))
+            return {"id": f"container-{node_id}", "status": "starting"}
+
+        instance._create_member = create_member
+
+        result = await instance.add_deployment_instance(
+            "d1", ["remote-2", "remote-3"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(deployment["mode"], "grouped_sharded")
+        self.assertEqual(
+            [m["instance_id"] for m in deployment["members"]], [0, 0, 1, 1],
+        )
+        self.assertEqual(deployment["instances"], 2)
+        launch = deployment["launch_settings"]
+        self.assertEqual(launch["deployment_mode"], "grouped_sharded")
+        self.assertEqual(launch["tensor_parallel_size"], 2)
+        self.assertEqual(launch["instances"], 2)
+        # The new group's coordinator rendezvouses on its own port.
+        args = created[0][1]["extra_args"]
+        self.assertEqual(args[args.index("--master-port") + 1], "29502")
+
+    async def test_add_instance_rolls_back_a_failed_group(self) -> None:
+        deployment = self.running_grouped_deployment()
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        removed = []
+
+        async def create_member(node_id, payload):
+            if node_id == "remote-3":
+                raise RuntimeError("agent unreachable")
+            return {"id": f"container-{node_id}", "status": "starting"}
+
+        async def member_action(member, action, *, log_tail=300):
+            removed.append(member.get("container_name"))
+            return {"ok": True}
+
+        instance._create_member = create_member
+        instance._member_action = member_action
+
+        result = await instance.add_deployment_instance(
+            "d1", ["remote-2", "remote-3"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("agent unreachable" in e for e in result["errors"]))
+        self.assertEqual(
+            [m["instance_id"] for m in deployment["members"]], [0, 0],
+        )
+        self.assertEqual(deployment["instances"], 1)
+        self.assertEqual(deployment["node_ids"], ["local", "remote-1"])
+        self.assertEqual(deployment["launch_settings"]["instances"], 1)
+        # The failure is reported to the caller; the serving groups keep the
+        # card out of a stale failure state.
+        self.assertEqual(deployment["status"], "running")
+        self.assertEqual(len(removed), 1)
+
+    async def test_add_instance_failure_restores_sharded_record(self) -> None:
+        deployment = {
+            "id": "d1",
+            "mode": "sharded",
+            "engine": "vllm",
+            "model": "org/model",
+            "desired_state": "running",
+            "status": "running",
+            "node_ids": ["local", "remote-1"],
+            "members": [
+                {"node_id": "local", "rank": 0, "status": "running",
+                 "container_name": "cluster-d1-r0-model"},
+                {"node_id": "remote-1", "rank": 1, "status": "running",
+                 "container_name": "cluster-d1-r1-model"},
+            ],
+            "launch_settings": {
+                "deployment_mode": "sharded",
+                "model": "org/model",
+                "engine": "vllm",
+                "extra_args": ["--tensor-parallel-size", "2"],
+                "node_ids": ["local", "remote-1"],
+            },
+        }
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+
+        async def create_member(node_id, payload):
+            raise RuntimeError("agent unreachable")
+
+        async def member_action(member, action, *, log_tail=300):
+            return {"ok": True}
+
+        instance._create_member = create_member
+        instance._member_action = member_action
+
+        result = await instance.add_deployment_instance(
+            "d1", ["remote-2", "remote-3"],
+        )
+
+        self.assertFalse(result["ok"])
+        # The conversion must not survive a failed launch: a sharded record
+        # with a phantom grouped topology could never launch again.
+        self.assertEqual(deployment["mode"], "sharded")
+        self.assertNotIn("instances", deployment)
+        self.assertNotIn("instance_id", deployment["members"][0])
+        launch = deployment["launch_settings"]
+        self.assertEqual(launch["deployment_mode"], "sharded")
+        self.assertNotIn("tensor_parallel_size", launch)
+        self.assertNotIn("instances", launch)
+        self.assertEqual(launch["node_ids"], ["local", "remote-1"])
+        self.assertEqual(deployment["status"], "running")
+
+    async def test_add_instance_rejection_leaves_record_untouched(self) -> None:
+        deployment = self.running_grouped_deployment()
+        instance = self.add_instance_manager(deployment)
+        with self.assertRaises(ValueError):
+            await instance.add_deployment_instance("d1", ["remote-2"])
+        self.assertEqual(deployment["instances"], 1)
+        self.assertEqual(len(deployment["members"]), 2)
+        self.assertEqual(deployment["node_ids"], ["local", "remote-1"])
+        self.assertEqual(deployment["launch_settings"]["instances"], 1)
+
+    async def test_add_instance_rejects_pipeline_parallel_sharded(self) -> None:
+        deployment = self.running_grouped_deployment()
+        deployment["mode"] = "sharded"
+        deployment["launch_settings"]["deployment_mode"] = "sharded"
+        deployment["launch_settings"]["extra_args"] = []
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "pipelines across"):
+            await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+
+    async def test_add_instance_gates_on_dirty_settings_and_stop_intent(self) -> None:
+        deployment = self.running_grouped_deployment()
+        deployment["settings_dirty"] = True
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "settings changed"):
+            await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+
+        stopped = self.running_grouped_deployment()
+        stopped["desired_state"] = "stopped"
+        stopped_instance = self.add_instance_manager(stopped)
+        stopped_instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "start the deployment"):
+            await stopped_instance.add_deployment_instance(
+                "d1", ["remote-2", "remote-3"],
+            )
+
+    async def test_add_instance_rejects_multi_rank_per_node_layouts(self) -> None:
+        deployment = self.running_grouped_deployment()
+        deployment["launch_settings"]["extra_args"] = [
+            "--tensor-parallel-size", "4",
+        ]
+        instance = self.add_instance_manager(deployment)
+        node_manager = self.four_node_manager()
+        instance.cluster_nodes = node_manager.cluster_nodes
+        with self.assertRaisesRegex(ValueError, "one rank per node"):
+            await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+
+
 if __name__ == "__main__":
     unittest.main()

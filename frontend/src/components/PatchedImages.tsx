@@ -44,7 +44,7 @@ export function PatchedImages({ images, nodes, localLabel, onBuilt }: {
         const result = await api.images.patchBuilds(controller.signal)
         if (stopped) return
         const items = result.items ?? []
-        if (items.some((item) => known.current.has(item.id) && known.current.get(item.id) !== item.status && !active(item))) onBuilt()
+        if (items.some((item) => (known.current.has(item.id) || retry > 0) && known.current.get(item.id) !== item.status && !active(item))) onBuilt()
         known.current = new Map(items.map((item) => [item.id, item.status]))
         setBuilds(items)
         setHistoryError(undefined)

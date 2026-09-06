@@ -27,6 +27,17 @@ async function fillForm() {
 }
 
 describe('PatchedImages', () => {
+  it('refreshes inventory when response recovery finds an already completed build', async () => {
+    vi.spyOn(api.images, 'patchBuilds').mockResolvedValueOnce({ items: [] }).mockResolvedValue({ items: [{ ...build, status: 'succeeded' }] })
+    vi.spyOn(api.images, 'createPatchBuild').mockRejectedValue(new Error('Response lost'))
+    const onBuilt = vi.fn()
+    render(<PatchedImages images={[{ id: 'base', tags: ['example/base:v1'] }]} nodes={nodes} localLabel="This device" onBuilt={onBuilt} />)
+    const user = await fillForm()
+    await user.click(screen.getByRole('button', { name: 'Build patched image' }))
+    await waitFor(() => expect(onBuilt).toHaveBeenCalledOnce())
+    expect(screen.getByRole('status')).toHaveTextContent('Succeeded')
+  })
+
   it('recovers an accepted build from history after its response is lost', async () => {
     const list = vi.spyOn(api.images, 'patchBuilds').mockResolvedValueOnce({ items: [] }).mockResolvedValue({ items: [build] })
     vi.spyOn(api.images, 'createPatchBuild').mockRejectedValue(new Error('Network response lost'))

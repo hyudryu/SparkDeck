@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cluster import NodeAgentResponseError
-from sparkdeck.image_patches import build_patched_image, normalize_patch_request
+from sparkdeck.image_patches import build_patched_image, normalize_patch_request, valid_base_image_identity
 
 CAPABILITY = "patched-images-v1"
 ACTIVE = {"queued", "building"}
@@ -67,7 +67,7 @@ class ImagePatchJobs:
         return [{
             "id": job["id"], "image": job["image"], "status": job["status"],
             "files": job["files"],
-            "nodes": [{key: node.get(key) for key in ("node_id", "image_id", "base_id", "status")} for node in job["nodes"]],
+            "nodes": [{key: node.get(key) for key in ("node_id", "image_id", "base_id", "base_identity", "status")} for node in job["nodes"]],
         } for job in self.jobs if job["status"] == "succeeded"]
 
     def _save_progress(self):
@@ -127,8 +127,8 @@ class ImagePatchJobs:
                     if existing.get("request_fingerprint") != fingerprint:
                         raise ValueError("job_id already belongs to a different patch request")
                     return copy.deepcopy(existing)
-        if not agent and payload.get("expected_base_id"):
-            raise ValueError("expected_base_id is reserved for cluster coordination")
+        if not agent and ("expected_base_id" in payload or "expected_base_identity" in payload):
+            raise ValueError("expected_base_id and expected_base_identity are reserved for cluster coordination")
         if agent:
             selected = [{"id": "local", "name": "This node"}]
         else:
@@ -194,6 +194,13 @@ class ImagePatchJobs:
                 accepted = True
                 method = "GET"
             except (RuntimeError, OSError) as exc:
+                if (method == "POST" and "expected_base_identity" in request
+                        and isinstance(exc, NodeAgentResponseError) and exc.status_code == 400
+                        and "unsupported" in str(exc).casefold()):
+                    raise RuntimeError(
+                        f"Update SparkDeck on {node.get('node_name') or node['node_id']} "
+                        "before building this patched image; this node cannot verify the base runtime identity"
+                    ) from exc
                 if method == "GET" and not accepted and isinstance(exc, NodeAgentResponseError) and exc.status_code == 404:
                     # A lost POST response is ambiguous. Reconcile by known ID;
                     # if absent, resubmit the same idempotent request, never a
@@ -210,7 +217,10 @@ class ImagePatchJobs:
                 node["logs"] = logs
                 self._save_progress()
             if remote and remote["status"] == "succeeded":
-                return {"image_id": detail["image_id"], "base_id": detail["base_id"], "files": remote["files"]}
+                result = {"image_id": detail["image_id"], "base_id": detail["base_id"], "files": remote["files"]}
+                if detail.get("base_identity") is not None:
+                    result["base_identity"] = detail["base_identity"]
+                return result
             if remote and remote["status"] == "failed":
                 raise RuntimeError(detail.get("error") or remote.get("error") or "Image build failed")
             await asyncio.sleep(2)
@@ -228,8 +238,23 @@ class ImagePatchJobs:
                         raise RuntimeError("Built image file hashes do not match the submitted patch")
                     if request.get("expected_base_id") and request["expected_base_id"] != result["base_id"]:
                         raise RuntimeError("Selected nodes resolved different base images")
-                    request = {**request, "expected_base_id": result["base_id"]}
+                    identity = result.get("base_identity")
+                    if identity is not None and not valid_base_image_identity(identity):
+                        raise RuntimeError("Node returned an invalid base image runtime identity")
+                    if request.get("expected_base_identity") and identity is None:
+                        raise RuntimeError(f"Update SparkDeck on {node['node_name']} to verify the base runtime identity")
+                    if request.get("expected_base_identity") and request["expected_base_identity"] != identity:
+                        raise RuntimeError("Selected nodes resolved different base image contents")
+                    if identity is not None and "expected_base_id" not in request:
+                        request = {**request, "expected_base_identity": identity}
+                    else:
+                        # Older agents/controllers only understand Docker IDs.
+                        # Keep their strict comparison; never silently weaken
+                        # an existing constraint or compare tags as identity.
+                        request = {**request, "expected_base_id": result["base_id"]}
                     node.update(status="succeeded", image_id=result["image_id"], base_id=result["base_id"])
+                    if identity is not None:
+                        node["base_identity"] = identity
                 except Exception as exc:
                     node.update(status="failed", error=str(exc)[:2000])
                     raise

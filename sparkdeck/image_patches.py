@@ -15,12 +15,52 @@ MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 4 * MAX_FILE_BYTES
 _BUILD_LOCK = threading.Lock()
 _IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
+_BASE_IDENTITY = re.compile(r"runtime-v1:sha256:[0-9a-f]{64}")
+
+
+def valid_base_image_identity(value):
+    return isinstance(value, str) and _BASE_IDENTITY.fullmatch(value) is not None
+
+
+def base_image_identity(image):
+    """Fingerprint runnable contents, independent of Docker's storage backend.
+
+    Classic Docker IDs hash image configuration; containerd IDs may instead
+    identify a manifest or index. Both inspect APIs expose the selected
+    platform's runtime configuration and ordered uncompressed layer digests.
+    Deliberately exclude tags, creation timestamps, history, and store IDs.
+    """
+    attrs = image.attrs
+    config = attrs.get("Config")
+    rootfs = attrs.get("RootFS")
+    if not isinstance(config, dict) or not isinstance(rootfs, dict):
+        raise ValueError("Docker did not provide the base image configuration and filesystem identity")
+    layers = rootfs.get("Layers")
+    if (rootfs.get("Type") != "layers" or not isinstance(layers, list)
+            or any(not isinstance(layer, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", layer) for layer in layers)):
+        raise ValueError("Docker did not provide valid base image layer identities")
+    architecture, os_name = attrs.get("Architecture"), attrs.get("Os")
+    if not isinstance(architecture, str) or not architecture or os_name != "linux":
+        raise ValueError("Docker did not provide a supported Linux base image platform")
+    # Different API/store versions serialize absent default fields as null,
+    # empty, or false. Normalize only top-level defaults: nested empty values
+    # in Volumes or ExposedPorts are meaningful declarations and stay intact.
+    config = {key: value for key, value in config.items()
+              if value is not None and value is not False and value != "" and value != [] and value != {}}
+    identity = {
+        "config": config, "rootfs": {"type": "layers", "layers": layers},
+        "platform": {"os": os_name, "architecture": architecture,
+                     "variant": attrs.get("Variant") or "", "os_version": attrs.get("OsVersion") or "",
+                     "os_features": attrs.get("OsFeatures") or []},
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return "runtime-v1:sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def normalize_patch_request(payload):
     if not isinstance(payload, dict):
         raise ValueError("Patch request must be an object")
-    if set(payload) - {"base_image", "image", "files", "expected_base_id"}:
+    if set(payload) - {"base_image", "image", "files", "expected_base_id", "expected_base_identity"}:
         raise ValueError("Unsupported patch request fields")
     base = payload.get("base_image")
     output = payload.get("image")
@@ -73,6 +113,10 @@ def normalize_patch_request(payload):
         if not isinstance(expected, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected):
             raise ValueError("Expected base image ID must be a SHA-256 image ID")
         result["expected_base_id"] = expected
+    if "expected_base_identity" in payload:
+        if not valid_base_image_identity(payload["expected_base_identity"]):
+            raise ValueError("Expected base image identity must be a versioned runtime fingerprint")
+        result["expected_base_identity"] = payload["expected_base_identity"]
     return result
 
 
@@ -159,6 +203,9 @@ def build_patched_image(client, payload, on_log=lambda message: None):
             raise ValueError("Docker returned an invalid base image ID")
         if request.get("expected_base_id", base.id) != base.id:
             raise ValueError("Base image differs from the first node; use the same base image on every node")
+        identity = base_image_identity(base)
+        if request.get("expected_base_identity", identity) != identity:
+            raise ValueError("Base image runtime configuration, filesystem, or platform differs from the first node")
         temporary_tag = "sparkdeck-patch-build:" + uuid.uuid4().hex
         context = _context(base.id, request["files"])
         try:
@@ -178,7 +225,7 @@ def build_patched_image(client, payload, on_log=lambda message: None):
             repository, tag = output.rsplit(":", 1)
             if not built.tag(repository, tag=tag, force=False):
                 raise ValueError("Docker could not tag the patched image")
-            return {"image_id": built.id, "base_id": base.id,
+            return {"image_id": built.id, "base_id": base.id, "base_identity": identity,
                     "image": output, "files": hashes}
         finally:
             context.close()

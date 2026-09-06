@@ -64,6 +64,19 @@ class PatchedImageInventoryTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.inventory(job, raw)
                 self.assertEqual(len(result["items"]), 2)
 
+    async def test_cross_store_verified_outputs_group_using_common_runtime_identity(self):
+        job, raw = fixture()
+        for index, node in enumerate(job["nodes"]):
+            node["base_id"] = IDS[index]
+            node["base_identity"] = "runtime-v1:sha256:" + "f" * 64
+        item = (await self.inventory(job, raw))["items"][0]
+        self.assertEqual(item["node_ids"], ["local", "worker"])
+        self.assertEqual(item["node_image_ids"], dict(zip(["local", "worker"], IDS)))
+        for invalid in (None, "runtime-v1:sha256:" + "e" * 64, "malformed"):
+            with self.subTest(invalid=invalid):
+                job["nodes"][1]["base_identity"] = invalid
+                self.assertEqual(len((await self.inventory(job, raw))["items"]), 2)
+
     async def test_in_use_on_either_node_protects_entire_group(self):
         for identity in (IDS[1], TAG, IDS[1][:19]):
             job, raw = fixture()

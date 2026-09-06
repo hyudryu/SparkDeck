@@ -6228,6 +6228,7 @@ class Manager:
                 stream_owns_member = True
                 self._transfer_inference_ownership(
                     admission, request_id, owner=None, cancel=cancel,
+                    cleanup_stream=response,
                 )
 
                 async def stream_remote():
@@ -6254,11 +6255,13 @@ class Manager:
                                 if line.startswith("data:") and line[5:].strip() == "[DONE]":
                                     break
                     finally:
-                        if request_id is not None:
-                            self._track_end(request_id)
-                        self._release_inference_slot(admission)
-                        release_member_once()
-                        await close_async_stream(response)
+                        try:
+                            await self._close_inference_transport(request_id)
+                        finally:
+                            if request_id is not None:
+                                self._track_end(request_id)
+                            self._release_inference_slot(admission)
+                            release_member_once()
 
                 return stream_remote()
 
@@ -11113,6 +11116,7 @@ class Manager:
     def _transfer_inference_ownership(
         self, admission=None, request_id=None, *,
         owner=_CURRENT_INFERENCE_OWNER, cancel=None, release_callback=None,
+        cleanup_stream=None,
     ) -> None:
         """Transfer to a producer task, or detach during a stream handoff.
 
@@ -11130,6 +11134,9 @@ class Manager:
                 rec["owner_cancel"] = cancel
             if release_callback is not None:
                 rec["release_callback"] = release_callback
+            if cleanup_stream is not None:
+                rec["cleanup_stream"] = cleanup_stream
+                rec.pop("cleanup_task", None)
             if admission is None:
                 admission = rec.get("admission_target")
         if isinstance(admission, _AdmissionLease) and not admission.released:
@@ -11141,16 +11148,45 @@ class Manager:
     def _inference_owner_is_dead(owner, cancel) -> bool:
         return bool(cancel is not None and cancel.is_set()) or bool(owner is not None and owner.done())
 
-    def _reap_dead_inference_owners(self) -> list[str]:
+    async def _close_inference_transport(self, request_id) -> None:
+        """Share transport completion between a reaper and a resumed stream."""
+        rec = getattr(self, "_active_reqs", {}).get(request_id)
+        if rec is None or rec.get("cleanup_stream") is None:
+            return
+        task = rec.get("cleanup_task")
+        if task is None:
+            task = asyncio.create_task(close_async_stream(rec["cleanup_stream"]))
+            rec["cleanup_task"] = task
+        with anyio.CancelScope(shield=True):
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Native task cancellation must not release capacity while
+                # the shielded transport task is still closing upstream.
+                await task
+                raise
+
+    async def _reap_dead_inference_owners(self) -> list[str]:
         """Release abandoned requests using task/cancellation evidence only."""
         reaped = set()
         for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
+            admission = rec.get("admission_target")
             if not self._inference_owner_is_dead(rec.get("owner_task"), rec.get("owner_cancel")):
                 continue
             cancel = rec.get("owner_cancel")
             if cancel is not None:
                 cancel.set()
-            admission = rec.get("admission_target")
+            cleanup_stream = rec.get("cleanup_stream")
+            owner = rec.get("owner_task")
+            if cleanup_stream is not None:
+                # An active consumer owns its finally block. Do not race its
+                # transport close or release its capacity ahead of cleanup.
+                if owner is not None and not owner.done():
+                    continue
+                try:
+                    await self._close_inference_transport(rid)
+                except Exception:
+                    logger.exception("failed to close abandoned inference stream")
             if admission is not None:
                 reaped.add(str(admission))
                 self._release_inference_slot(admission)
@@ -11162,8 +11198,14 @@ class Manager:
                 logger.exception("failed to release abandoned inference reservation")
             finally:
                 self._track_end(rid)
+        owned_leases = {
+            id(rec.get("admission_target"))
+            for rec in getattr(self, "_active_reqs", {}).values()
+        }
         for target, state in list(self._admission_store().items()):
             for lease in list(state.get("leases", {}).values()):
+                if id(lease) in owned_leases:
+                    continue
                 if self._inference_owner_is_dead(lease.owner, lease.cancel):
                     if lease.cancel is not None:
                         lease.cancel.set()
@@ -11466,7 +11508,7 @@ class Manager:
         no local container may belong to remote cluster members and are not
         removed by the container-status fallback.
         """
-        reaped = self._reap_dead_inference_owners()
+        reaped = await self._reap_dead_inference_owners()
         store = self._admission_store()
         if not store:
             return reaped
@@ -17780,6 +17822,9 @@ class Manager:
                         stream_context.__aenter__(), cancel, nudge_event,
                     )
                     entered = True
+                    self._transfer_inference_ownership(
+                        admission, rid, cancel=cancel, cleanup_stream=r,
+                    )
                     if r.status_code != 200:
                         detail = (await r.aread()).decode("utf-8", errors="replace")
                         if (
@@ -17906,7 +17951,10 @@ class Manager:
                 finally:
                     if entered:
                         with anyio.CancelScope(shield=True):
-                            await stream_context.__aexit__(None, None, None)
+                            try:
+                                await self._close_inference_transport(rid)
+                            finally:
+                                await stream_context.__aexit__(None, None, None)
                 if nudged:
                     rec = self._active_reqs.get(rid)
                     if rec is None:

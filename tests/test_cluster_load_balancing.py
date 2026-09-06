@@ -393,9 +393,42 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_unconsumed_remote_stream_closes_and_releases_slots(self):
+        deployment = replicated_deployment()
+        deployment["launch_settings"]["extra_args"] = ["--max-num-seqs", "1"]
+        manager = build_manager(deployment)
+        # Use actual admission leases so the reaper must reclaim both pools.
+        del manager._acquire_inference_slot
+        del manager._release_inference_slot
+        response = StreamResponse()
+        response.aiter_lines = Mock(side_effect=AssertionError("must not consume stream"))
+        manager.node_registry.open_stream = AsyncMock(return_value=response)
+        cancel = asyncio.Event()
+
+        stream = await manager._proxy_cluster_member(
+            deployment, deployment["members"][0], "org/model",
+            {"model": "org/model", "stream": True}, "chat/completions", cancel,
+        )
+        self.assertFalse(response.closed)
+        self.assertEqual(member_loads(manager, deployment), [1, 0])
+        self.assertEqual(manager.inference_admission()["repl-1-r0"]["running"], 1)
+        self.assertEqual(await manager._reap_dead_inference_owners(), [])
+        self.assertFalse(response.closed)
+
+        cancel.set()
+        self.assertEqual(await manager._reap_dead_inference_owners(), ["repl-1-r0"])
+        self.assertTrue(response.closed)
+        self.assertEqual(manager.active_requests(), {})
+        self.assertEqual(manager.inference_admission(), {})
+        self.assertEqual(member_loads(manager, deployment), [0, 0])
+        response.aiter_lines.assert_not_called()
+        await stream.aclose()
+
     async def test_remote_stream_reports_measured_prompt_and_separate_token_rates(self):
         class UsageResponse(StreamResponse):
             async def aiter_lines(self):
+                # Ensure measurable prefill time even on coarse Windows clocks.
+                await asyncio.sleep(0.02)
                 yield 'data: {"choices":[{"delta":{"reasoning_content":"plan"},"token_ids":[1,2]}],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":20}}}'
                 yield "data: [DONE]"
         manager = build_manager(replicated_deployment())
@@ -430,6 +463,40 @@ class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
         manager._release_inference_slot.assert_called_once()
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
         self.assertTrue(response.closed)
+
+    async def test_remote_stream_keeps_slots_until_upstream_close_finishes(self):
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        class BlockingCloseResponse(StreamResponse):
+            async def aclose(self):
+                close_started.set()
+                await allow_close.wait()
+                await super().aclose()
+
+        manager = build_manager(replicated_deployment())
+        response = BlockingCloseResponse()
+        manager.node_registry.open_stream = AsyncMock(return_value=response)
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model", {"model": "org/model", "stream": True},
+            "chat/completions", caller_ip="192.0.2.45",
+        )
+        await stream.__anext__()
+        close_task = asyncio.create_task(stream.aclose())
+        try:
+            await asyncio.wait_for(close_started.wait(), timeout=2)
+            self.assertFalse(response.closed)
+            self.assertIn("org/model", manager.active_requests())
+            manager._release_inference_slot.assert_not_called()
+            self.assertEqual(member_loads(manager, manager.deployments[0]), [1, 0])
+        finally:
+            allow_close.set()
+            await asyncio.wait_for(close_task, timeout=2)
+
+        self.assertTrue(response.closed)
+        self.assertEqual(manager.active_requests(), {})
+        manager._release_inference_slot.assert_called_once()
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
     async def test_remote_close_failure_cannot_leak_tracking_or_slots(self):
         for failure in (RuntimeError("close failed"), asyncio.CancelledError()):

@@ -429,8 +429,10 @@ function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, po
 }
 
 function SessionRow({ model, request, groupLabel }: { model: string; request: ActiveRequestStats; groupLabel: string }) {
-  const rate = (request.thinking_tok_s ?? 0) + (request.output_tok_s ?? 0)
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
+  const rateLabel = (rate: number | null | undefined) => waiting ? '—'
+    : typeof rate === 'number' && Number.isFinite(rate) && rate >= 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'
+  const separateThinking = Number.isFinite(request.thinking_tok_s) && (request.thinking_tok_s ?? 0) > 0
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
     .map(([ip, connections]) => `${connections} from ${ip}`)
@@ -443,7 +445,14 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
-      <span className="session-rate">{waiting ? 'Waiting' : rate > 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'}</span>
+      <div className="session-metrics">
+        {waiting && <span className="session-rate">Waiting</span>}
+        <dl aria-label={`Aggregate inference rates for ${groupLabel || model}`}>
+          <div><dt>Prompt processing</dt><dd>{rateLabel(request.pp_tok_s)}</dd></div>
+          <div><dt>Output</dt><dd>{rateLabel(request.output_tok_s)}</dd></div>
+          {separateThinking && <div><dt>Thinking</dt><dd>{rateLabel(request.thinking_tok_s)}</dd></div>}
+        </dl>
+      </div>
     </div>
   )
 }

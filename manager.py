@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import quote
 
 import docker
+import anyio
 import httpx
 import requests
 import shutil
@@ -37,6 +38,7 @@ from cluster import (
     NodeRegistry,
 )
 from sparkdeck.onboarding import resolve_agent_connection
+from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.runtime_file_mounts import (
     RUNTIME_FILE_MOUNTS_CAPABILITY,
@@ -516,6 +518,21 @@ class PreparedAsyncStream:
 
     async def aclose(self):
         await self._stream.aclose()
+
+
+_CURRENT_INFERENCE_OWNER = object()
+
+
+class _AdmissionLease(str):
+    """A target-compatible grant tied to one admission-state generation."""
+
+    def __new__(cls, target, state, owner):
+        lease = super().__new__(cls, target)
+        lease.state = state
+        lease.owner = owner
+        lease.cancel = None
+        lease.released = False
+        return lease
 
 
 class FanSettingsConflict(Exception):
@@ -5803,13 +5820,25 @@ class Manager:
     def _tracked_cluster_stream(
         self, stream, deployment_id: str, member: dict,
     ):
+        released = False
+
+        def release_once():
+            nonlocal released
+            if not released:
+                released = True
+                self._release_cluster_member(deployment_id, member)
+
+        lifecycle = getattr(stream, "inference_lifecycle", None)
+        if isinstance(lifecycle, dict):
+            lifecycle["release_member"] = release_once
+
         async def relay():
             try:
                 async for chunk in stream:
                     yield chunk
             finally:
-                await stream.aclose()
-                self._release_cluster_member(deployment_id, member)
+                release_once()
+                await close_async_stream(stream)
 
         return relay()
 
@@ -6103,6 +6132,7 @@ class Manager:
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)
         stream_owns_member = False
+        release_member_once = None
         try:
             if node_id == LOCAL_NODE_ID:
                 proxy = (
@@ -6146,7 +6176,20 @@ class Manager:
                 container_name=member.get("container_name"),
                 streaming=bool(body.get("stream")),
             )
+            member_released = False
+
+            def release_member_once():
+                nonlocal member_released
+                if not member_released:
+                    member_released = True
+                    self._release_cluster_member(deployment_id, member)
+
+            self._transfer_inference_ownership(
+                admission, request_id, cancel=cancel,
+                release_callback=release_member_once,
+            )
             if body.get("stream"):
+                remote_started_at = time.monotonic()
                 try:
                     response = await self._await_or_cancel(
                         self.node_registry.open_stream(
@@ -6183,22 +6226,39 @@ class Manager:
                     self._release_inference_slot(admission)
                     raise
                 stream_owns_member = True
+                self._transfer_inference_ownership(
+                    admission, request_id, owner=None, cancel=cancel,
+                )
 
                 async def stream_remote():
+                    self._transfer_inference_ownership(admission, request_id)
+                    first_output_at = None
+                    latest_usage = None
                     try:
                         async for line in self._aiter_lines_cancellable(response, cancel):
                             if line:
                                 thinking, output = self._sse_chunk_token_counts(line)
                                 now = time.monotonic()
+                                if (thinking or output) and first_output_at is None:
+                                    first_output_at = now
+                                latest_usage = self._usage_from_sse_line(line) or latest_usage
+                                if first_output_at is not None and latest_usage and self._usage_has_cached_prompt_tokens(latest_usage):
+                                    prompt_tokens, cached_tokens = self._usage_prompt_counts(latest_usage)
+                                    self._track_prompt_processing(
+                                        request_id, prompt_tokens - cached_tokens,
+                                        first_output_at - remote_started_at,
+                                    )
                                 self._track_output(request_id, now, "thinking", thinking)
                                 self._track_output(request_id, now, "output", output)
                                 yield f"{line}\n\n"
+                                if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                                    break
                     finally:
-                        await response.aclose()
                         if request_id is not None:
                             self._track_end(request_id)
                         self._release_inference_slot(admission)
-                        self._release_cluster_member(deployment_id, member)
+                        release_member_once()
+                        await close_async_stream(response)
 
                 return stream_remote()
 
@@ -6215,7 +6275,10 @@ class Manager:
                 self._release_inference_slot(admission)
         finally:
             if not stream_owns_member:
-                self._release_cluster_member(deployment_id, member)
+                if release_member_once is not None:
+                    release_member_once()
+                else:
+                    self._release_cluster_member(deployment_id, member)
 
     async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
         """Check member readiness through authenticated agents.
@@ -10998,9 +11061,14 @@ class Manager:
             self._req_seq = 0
         self._req_seq += 1
         rid = self._req_seq
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
         self._active_reqs[rid] = {
             "key": key, "thinking": deque(), "output": deque(),
             "streaming": streaming,
+            "owner_task": owner,
             "started_at": time.monotonic(),
             "pp_tokens": 0,
             "pp_time_s": 0.0,
@@ -11041,6 +11109,67 @@ class Manager:
         rec = self._active_reqs.pop(rid, None)
         if rec:
             self._mark_deployment_used(rec.get("deployment_id"))
+
+    def _transfer_inference_ownership(
+        self, admission=None, request_id=None, *,
+        owner=_CURRENT_INFERENCE_OWNER, cancel=None, release_callback=None,
+    ) -> None:
+        """Transfer to a producer task, or detach during a stream handoff.
+
+        Detached streams remain live until explicitly canceled; completion of
+        the preparing HTTP task is not evidence that their consumers died.
+        """
+        if owner is _CURRENT_INFERENCE_OWNER:
+            owner = asyncio.current_task()
+        rec = getattr(self, "_active_reqs", {}).get(request_id)
+        if rec is not None:
+            rec["owner_task"] = owner
+            if admission is not None:
+                rec["admission_target"] = admission
+            if cancel is not None:
+                rec["owner_cancel"] = cancel
+            if release_callback is not None:
+                rec["release_callback"] = release_callback
+            if admission is None:
+                admission = rec.get("admission_target")
+        if isinstance(admission, _AdmissionLease) and not admission.released:
+            admission.owner = owner
+            if cancel is not None:
+                admission.cancel = cancel
+
+    @staticmethod
+    def _inference_owner_is_dead(owner, cancel) -> bool:
+        return bool(cancel is not None and cancel.is_set()) or bool(owner is not None and owner.done())
+
+    def _reap_dead_inference_owners(self) -> list[str]:
+        """Release abandoned requests using task/cancellation evidence only."""
+        reaped = set()
+        for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
+            if not self._inference_owner_is_dead(rec.get("owner_task"), rec.get("owner_cancel")):
+                continue
+            cancel = rec.get("owner_cancel")
+            if cancel is not None:
+                cancel.set()
+            admission = rec.get("admission_target")
+            if admission is not None:
+                reaped.add(str(admission))
+                self._release_inference_slot(admission)
+            callback = rec.pop("release_callback", None)
+            try:
+                if callback is not None:
+                    callback()
+            except Exception:
+                logger.exception("failed to release abandoned inference reservation")
+            finally:
+                self._track_end(rid)
+        for target, state in list(self._admission_store().items()):
+            for lease in list(state.get("leases", {}).values()):
+                if self._inference_owner_is_dead(lease.owner, lease.cancel):
+                    if lease.cancel is not None:
+                        lease.cancel.set()
+                    self._release_inference_slot(lease)
+                    reaped.add(target)
+        return sorted(reaped)
 
     def _mark_deployment_used(self, deployment_id: str | None) -> None:
         """Record cluster inference activity, persisting at a bounded rate."""
@@ -11097,6 +11226,10 @@ class Manager:
             if rec.get("pp_tokens") and rec.get("pp_time_s"):
                 e["pp_tokens"] += int(rec["pp_tokens"])
                 e["pp_time_s"] += float(rec["pp_time_s"])
+                if _grouped:
+                    e["pp_tok_s"] = (e.get("pp_tok_s") or 0.0) + (
+                        float(rec["pp_tokens"]) / float(rec["pp_time_s"])
+                    )
             else:
                 e["pp_measuring"] += 1
             for kind, field in (("thinking", "thinking_tok_s"), ("output", "output_tok_s")):
@@ -11110,11 +11243,14 @@ class Manager:
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
-            e["pp_tok_s"] = (
-                round(e["pp_tokens"] / e["pp_time_s"], 1)
-                if e["pp_time_s"] > 0
-                else None
-            )
+            if _grouped:
+                e["pp_tok_s"] = round(e["pp_tok_s"], 1) if e.get("pp_tok_s") is not None else None
+            else:
+                e["pp_tok_s"] = (
+                    round(e["pp_tokens"] / e["pp_time_s"], 1)
+                    if e["pp_time_s"] > 0
+                    else None
+                )
         admission_running: dict[str, int] = {}
         for target, admission in self.inference_admission().items():
             model = admission.get("model")
@@ -11184,6 +11320,9 @@ class Manager:
                 continue
             waiter["granted"] = True
             state["running"] += 1
+            lease = waiter.get("lease")
+            if lease is not None:
+                state.setdefault("leases", {})[id(lease)] = lease
             future.set_result(None)
 
     async def _acquire_inference_slot(
@@ -11214,7 +11353,9 @@ class Manager:
             "future": loop.create_future(),
             "created_at": time.monotonic(),
             "granted": False,
+            "lease": _AdmissionLease(target, state, asyncio.current_task()),
         }
+        waiter["lease"].cancel = cancel
         state["waiters"].append(waiter)
         self._drain_inference_waiters(state)
 
@@ -11231,10 +11372,10 @@ class Manager:
                 if cancel_waiter in done:
                     raise ClientAbort("client disconnected while queued")
                 await waiter["future"]
-            return target
+            return waiter["lease"]
         except BaseException:
             if waiter["granted"]:
-                self._release_inference_slot(target)
+                self._release_inference_slot(waiter["lease"])
             else:
                 try:
                     state["waiters"].remove(waiter)
@@ -11251,6 +11392,19 @@ class Manager:
         if target is None:
             return
         state = self._admission_store().get(target)
+        if isinstance(target, _AdmissionLease):
+            if target.released:
+                return
+            target.released = True
+            target.owner = None
+            target.state.get("leases", {}).pop(id(target), None)
+            if state is not target.state:
+                return
+        elif state is not None and state.get("leases"):
+            # Compatibility for administrative/legacy target-only callers.
+            # Runtime paths retain the exact lease returned by acquisition.
+            self._release_inference_slot(next(iter(state["leases"].values())))
+            return
         if state is None:
             return
         state["running"] = max(0, state["running"] - 1)
@@ -11289,11 +11443,19 @@ class Manager:
                     "queued request was dropped"
                 ))
         state["running"] = 0
-        self._admission_store().pop(target, None)
+        for lease in state.pop("leases", {}).values():
+            lease.released = True
+            lease.owner = None
+        if self._admission_store().get(target) is state:
+            self._admission_store().pop(target, None)
         getattr(self, "_nudger_slow_since", {}).pop(target, None)
 
     async def reap_stale_admission_targets(self) -> list[str]:
-        """Drop admission state whose deployment no longer has a container.
+        """Reap abandoned owners, then targets with confirmed dead containers.
+
+        Owner completion or explicit request cancellation proves a request is
+        abandoned, including remote requests and requests on live containers.
+        Neither request age nor a lack of generated tokens proves abandonment.
 
         A crashed or exited container cannot release its granted concurrency
         slots, so its admission counter stays saturated and every later
@@ -11301,19 +11463,19 @@ class Manager:
         that no live stream backs). After a target has had no live container
         for ``ADMISSION_REAP_GRACE_SECONDS``, its queued waiters are failed
         with a clear error and its accounting is dropped. Targets matching
-        no local container belong to remote cluster members and are never
-        touched here.
+        no local container may belong to remote cluster members and are not
+        removed by the container-status fallback.
         """
+        reaped = self._reap_dead_inference_owners()
         store = self._admission_store()
         if not store:
-            return []
+            return reaped
         if getattr(self, "_capacity_redeploying_models", None):
             # A capacity-triggered replacement briefly has no container for
             # the intended deployment; _resolve_vllm_target waits it out too.
-            return []
+            return reaped
         containers = await self.list_containers()
         now = time.monotonic()
-        reaped: list[str] = []
         for target, state in list(store.items()):
             matches = [
                 c for c in containers
@@ -11332,7 +11494,8 @@ class Manager:
             if now - dead_since < ADMISSION_REAP_GRACE_SECONDS:
                 continue
             self._fail_admission_target(target, state)
-            reaped.append(target)
+            if target not in reaped:
+                reaped.append(target)
         return reaped
 
     async def _reap_container_admission(
@@ -17529,11 +17692,14 @@ class Manager:
                      container_name: str | None = None,
                      deployment_id: str | None = None,
                      caller_ip: str | None = None):
-        return PreparedAsyncStream(self._vllm_stream_events(
+        lifecycle = {}
+        result = PreparedAsyncStream(self._vllm_stream_events(
             url, body, key, cancel, container, requested_model,
             container_name=container_name, deployment_id=deployment_id,
-            caller_ip=caller_ip,
+            caller_ip=caller_ip, lifecycle=lifecycle,
         ))
+        result.inference_lifecycle = lifecycle
+        return result
 
     async def _vllm_stream_events(
         self, url: str, body: dict, key: str,
@@ -17543,6 +17709,7 @@ class Manager:
         container_name: str | None = None,
         deployment_id: str | None = None,
         caller_ip: str | None = None,
+        lifecycle: dict | None = None,
     ):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
@@ -17593,6 +17760,13 @@ class Manager:
                 nudge_event=nudge_event,
                 deployment_id=(container or {}).get("deployment_id"),
                 container_name=(container or {}).get("name"), caller_ip=caller_ip,
+            )
+            def release_member():
+                callback = (lifecycle or {}).get("release_member")
+                if callback is not None:
+                    callback()
+            self._transfer_inference_ownership(
+                admission, rid, cancel=cancel, release_callback=release_member,
             )
             while True:
                 attempt_started_at = time.monotonic()
@@ -17646,7 +17820,11 @@ class Manager:
                         # ``PreparedAsyncStream.prepare`` consumes this marker;
                         # no generated event is pulled while response headers
                         # and status are validated.
+                        self._transfer_inference_ownership(
+                            admission, rid, owner=None, cancel=cancel,
+                        )
                         yield _STREAM_READY
+                        self._transfer_inference_ownership(admission, rid)
                     first_out_ts = None
                     last_out_ts = None
                     latest_usage = None
@@ -17698,6 +17876,8 @@ class Manager:
                                 rec.get("forwarded_chunks", 0) + 1
                             )
                         yield f"{line}\n\n"
+                        if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                            break
                     if latest_usage:
                         gen_time = (
                             last_out_ts - first_out_ts
@@ -17725,7 +17905,8 @@ class Manager:
                     nudged = True
                 finally:
                     if entered:
-                        await stream_context.__aexit__(None, None, None)
+                        with anyio.CancelScope(shield=True):
+                            await stream_context.__aexit__(None, None, None)
                 if nudged:
                     rec = self._active_reqs.get(rid)
                     if rec is None:

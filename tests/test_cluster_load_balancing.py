@@ -393,6 +393,77 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_stream_reports_measured_prompt_and_separate_token_rates(self):
+        class UsageResponse(StreamResponse):
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"delta":{"reasoning_content":"plan"},"token_ids":[1,2]}],"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":20}}}'
+                yield "data: [DONE]"
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.open_stream = AsyncMock(return_value=UsageResponse())
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model", {"model": "org/model", "stream": True},
+            "chat/completions", caller_ip="192.0.2.45",
+        )
+        await stream.__anext__()
+        stats = next(iter(manager.active_request_groups().values()))
+        self.assertEqual(stats["pp_tokens"], 80)
+        self.assertGreater(stats["pp_tok_s"], 0)
+        self.assertGreater(stats["thinking_tok_s"], 0)
+        self.assertEqual(stats["output_tok_s"], 0)
+        await stream.aclose()
+
+    async def test_done_releases_remote_slots_without_waiting_for_eof(self):
+        class NoEOF(StreamResponse):
+            async def aiter_lines(self):
+                yield "data: [DONE]"
+                raise AssertionError("must not read after terminal event")
+
+        manager = build_manager(replicated_deployment())
+        response = NoEOF()
+        manager.node_registry.open_stream = AsyncMock(return_value=response)
+        stream = await manager.proxy_cluster_inference(
+            "repl-1", "org/model", {"model": "org/model", "stream": True},
+            "chat/completions", caller_ip="192.0.2.45",
+        )
+        self.assertEqual([chunk async for chunk in stream], ["data: [DONE]\n\n"])
+        self.assertEqual(manager.active_requests(), {})
+        manager._release_inference_slot.assert_called_once()
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+        self.assertTrue(response.closed)
+
+    async def test_remote_close_failure_cannot_leak_tracking_or_slots(self):
+        for failure in (RuntimeError("close failed"), asyncio.CancelledError()):
+            with self.subTest(failure=type(failure).__name__):
+                manager = build_manager(replicated_deployment())
+                response = StreamResponse()
+                response.aclose = AsyncMock(side_effect=failure)
+                manager.node_registry.open_stream = AsyncMock(return_value=response)
+                stream = await manager.proxy_cluster_inference(
+                    "repl-1", "org/model", {"model": "org/model", "stream": True},
+                    "chat/completions", caller_ip="192.0.2.45",
+                )
+                await stream.__anext__()
+                with self.assertRaises(type(failure)):
+                    await stream.aclose()
+                self.assertEqual(manager.active_requests(), {})
+                manager._release_inference_slot.assert_called_once()
+                self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+    async def test_local_close_failure_still_releases_member(self):
+        manager = build_manager(replicated_deployment())
+        selected = manager.deployments[0]["members"][0]
+        manager._acquire_cluster_member("repl-1", selected)
+        async def source():
+            try:
+                yield "data: hello\n\n"
+            finally:
+                raise RuntimeError("close failed")
+        stream = manager._tracked_cluster_stream(source(), "repl-1", selected)
+        await stream.__anext__()
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
+            await stream.aclose()
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
     class UnavailableResponse:
         status_code = 503
 

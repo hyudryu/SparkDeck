@@ -37,6 +37,7 @@ from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
 )
+from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
@@ -129,7 +130,10 @@ async def _guard_stream(stream, watcher: asyncio.Task):
         async for chunk in stream:
             yield chunk
     finally:
-        watcher.cancel()
+        try:
+            await close_async_stream(stream)
+        finally:
+            watcher.cancel()
 
 # ---------- in-memory server log buffer ----------
 MAX_LOG_LINES = 5000

@@ -712,3 +712,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .patch-build summary { cursor: pointer; overflow-wrap: anywhere; }
 .patch-build pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--bg-subtle); font-size: 12px; }
 @media (max-width: 640px) { .patch-fields { grid-template-columns: minmax(0, 1fr); } .patch-editor, .patch-build { padding: 12px; } }
+
+.session-metrics { min-width: 0; }
+.session-metrics dl { display: grid; gap: 3px; margin: 0; }
+.session-metrics dl > div { display: flex; justify-content: space-between; gap: 12px; }
+.session-metrics dt { color: var(--text-secondary); font-size: 11px; }
+.session-metrics dd { margin: 0; color: var(--text-primary); font: 11px/1.5 "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+@media (max-width: 760px) { .session-row .session-metrics { grid-column: 2 / -1; width: 100%; } .session-metrics dl { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 4px 18px; } }

@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NodeInventoryItem } from '../api/types'
@@ -56,6 +56,25 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
+  it('shows each group aggregate prompt/output rates without merging separate thinking into output', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1', 'Node 2'], connections: 2, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10 },
+      second: { group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 3', 'Node 4'], connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0 },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const first = within(await screen.findByLabelText('Aggregate inference rates for Group 1 · Node 1 + Node 2'))
+    expect(first.getByText('Prompt processing')).toBeInTheDocument()
+    expect(first.getByText('1200.0 tok/s')).toBeInTheDocument()
+    expect(first.getByText('40.0 tok/s')).toBeInTheDocument()
+    expect(first.getByText('Thinking')).toBeInTheDocument()
+    expect(first.getByText('10.0 tok/s')).toBeInTheDocument()
+    expect(first.queryByText('50.0 tok/s')).not.toBeInTheDocument()
+    const second = within(screen.getByLabelText('Aggregate inference rates for Group 2 · Node 3 + Node 4'))
+    expect(second.getByText('Measuring…')).toBeInTheDocument()
+    expect(second.getByText('70.0 tok/s')).toBeInTheDocument()
+    expect(second.queryByText('Thinking')).not.toBeInTheDocument()
+  })
+
   it('keeps a booting group yellow independently of the ready peer group', async () => {
     const fallback = stubDashboardFetch({})
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

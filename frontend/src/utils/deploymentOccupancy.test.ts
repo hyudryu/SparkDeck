@@ -11,6 +11,13 @@ const split = {
 } as Deployment
 
 describe('deployment node occupancy', () => {
+  it('reserves persisted remote topology while a saved launch awaits Manager linkage', () => {
+    for (const node_ids of [undefined, []]) {
+      const launching = { ...split, status: 'starting' as const, instances: undefined, node_ids, settings: { node_ids: ['remote-1', 'remote-2'] } }
+      expect(Object.keys(occupiedNodeReasons([launching]))).toEqual(['remote-1', 'remote-2'])
+      expect(Object.keys(occupiedNodeReasons([{ ...launching, node_ids: ['current-node'] }]))).toEqual(['current-node'])
+    }
+  })
   it('reserves only active groups and keeps saved inactive peers free', () => {
     expect(Object.keys(occupiedNodeReasons([split]))).toEqual(['n1', 'n2'])
     expect(occupiedNodeReasons([{ ...split, status: 'saved' }])).toEqual({})
@@ -20,6 +27,21 @@ describe('deployment node occupancy', () => {
     for (const status of ['stopping', 'error']) {
       expect(Object.keys(occupiedNodeReasons([{ ...split, instances: [{ ...split.instances![0], status, desired_state: 'stopped' }] }]))).toEqual(['n1', 'n2'])
     }
+  })
+  it('reserves stopped groups awaiting recovery but frees explicitly stopped groups', () => {
+    for (const status of ['degraded', 'stopped'] as const) {
+      const recovering = { ...split, status, desired_state: 'running' as const, instances: [
+        { ...split.instances![0], status: 'stopped' }, split.instances![1],
+      ] }
+      expect(Object.keys(occupiedNodeReasons([recovering]))).toEqual(['n1', 'n2'])
+      expect(occupiedNodeReasons([{ ...recovering, desired_state: 'stopped' }])).toEqual({})
+    }
+  })
+  it('reserves local discovered containers without reserving remote external endpoints', () => {
+    const external = { ...split, managed: false, instances: undefined, node_ids: undefined }
+    expect(Object.keys(occupiedNodeReasons([{ ...external, id: 'container:vllm' }]))).toEqual(['local'])
+    expect(occupiedNodeReasons([{ ...external, id: 'container:vllm', status: 'stopped' }])).toEqual({})
+    expect(occupiedNodeReasons([{ ...external, id: 'remote-endpoint' }])).toEqual({})
   })
   it('maps legacy group topology and defaults only managed standalone to local', () => {
     expect(Object.keys(occupiedNodeReasons([{ ...split, instances: split.instances!.map((group) => ({ ...group, node_ids: undefined })) }]))).toEqual(['n1', 'n2'])

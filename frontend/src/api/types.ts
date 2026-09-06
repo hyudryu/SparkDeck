@@ -70,6 +70,7 @@ export interface RuntimeFileMount {
 }
 
 export interface DeploymentSettings {
+  node_ids?: string[]
   image?: string
   context_length?: number
   tensor_parallel_size?: number

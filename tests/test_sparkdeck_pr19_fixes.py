@@ -54,6 +54,68 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["status"], "missing")
         self.assertEqual(result[0]["last_error"], "Docker is unavailable")
 
+    async def test_queued_saved_launch_exposes_requested_nodes_without_persisting_them(self):
+        self.service.store.add_deployment(Deployment(
+            id="saved-remote", alias="remote", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            desired_state="stopped", settings={"node_ids": ["old-worker"]},
+        ))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def select_nodes(_node_ids):
+            entered.set()
+            await release.wait()
+            raise ValueError("worker unavailable")
+
+        self.manager.selected_cluster_nodes = AsyncMock(side_effect=select_nodes)
+        launch = asyncio.create_task(self.service.deployment_action(
+            "saved-remote", "start", node_ids=["new-worker"],
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            queued = (await self.service.deployments())[0]
+            self.assertEqual(queued["status"], "starting")
+            self.assertEqual(queued["launch_phase"], "queued")
+            self.assertEqual(queued["node_ids"], ["new-worker"])
+            self.assertEqual(queued["settings"]["node_ids"], ["old-worker"])
+        finally:
+            release.set()
+            with self.assertRaisesRegex(ValueError, "worker unavailable"):
+                await launch
+
+        saved = (await self.service.deployments())[0]
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(saved["node_ids"], ["old-worker"])
+        self.assertEqual(self.service._deployment_launch_node_ids, {})
+
+    async def test_queued_saved_launch_without_override_exposes_saved_nodes(self):
+        self.service.store.add_deployment(Deployment(
+            id="saved-remote", alias="remote", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            desired_state="stopped", settings={"node_ids": ["worker"]},
+        ))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def select_nodes(node_ids):
+            self.assertEqual(node_ids, ["worker"])
+            entered.set()
+            await release.wait()
+            raise ValueError("worker unavailable")
+
+        self.manager.selected_cluster_nodes = AsyncMock(side_effect=select_nodes)
+        launch = asyncio.create_task(self.service.deployment_action("saved-remote", "start"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            queued = (await self.service.deployments())[0]
+            self.assertEqual(queued["status"], "starting")
+            self.assertEqual(queued["node_ids"], ["worker"])
+        finally:
+            release.set()
+            with self.assertRaisesRegex(ValueError, "worker unavailable"):
+                await launch
+
     def test_cluster_progress_uses_least_advanced_active_member(self):
         deployment = {
             "status": "starting",

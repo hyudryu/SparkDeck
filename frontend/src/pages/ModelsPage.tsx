@@ -1157,7 +1157,9 @@ export function ModelsPage() {
       const settings = {
         ...form.settings,
         runtime_file_mounts: form.managed && form.runtime === 'vllm'
-          ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+          ? (runtimeFileMounts.length || editing
+              ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+              : undefined)
           : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
         environment: form.managed && form.runtime === 'vllm'

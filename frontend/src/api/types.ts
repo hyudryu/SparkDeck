@@ -609,7 +609,7 @@ export interface PatchBuild {
   created_at: string
   status: 'queued' | 'building' | 'succeeded' | 'failed'
   files: Array<{ target: string; sha256: string }>
-  nodes: Array<{ node_id: string; node_name: string; status: 'queued' | 'building' | 'succeeded' | 'failed'; logs: string[]; error?: string; image_id?: string; base_id?: string }>
+  nodes: Array<{ node_id: string; node_name: string; status: 'queued' | 'building' | 'succeeded' | 'failed'; logs: string[]; error?: string; image_id?: string; base_id?: string; base_identity?: string }>
   error?: string
 }
 

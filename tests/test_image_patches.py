@@ -1,4 +1,5 @@
 import io
+import copy
 import json
 import tarfile
 import unittest
@@ -7,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 from docker.errors import APIError, ImageNotFound
 from requests.exceptions import ConnectionError
 
-from sparkdeck.image_patches import build_patched_image, normalize_patch_request
+from sparkdeck.image_patches import base_image_identity, build_patched_image, normalize_patch_request
 
 
 BASE_ID = "sha256:" + "a" * 64
@@ -32,7 +33,9 @@ class ImagePatchTests(unittest.TestCase):
     def fake_client(self, payload=None):
         payload = payload or request()
         client = Mock()
-        base = Mock(id=BASE_ID, attrs={"Config": {"Entrypoint": ["vllm"]}})
+        base = Mock(id=BASE_ID, attrs={"Config": {"Entrypoint": ["vllm"]},
+                                     "RootFS": {"Type": "layers", "Layers": ["sha256:" + "c" * 64]},
+                                     "Os": "linux", "Architecture": "arm64", "Variant": "v8"})
         built = Mock(id=BUILT_ID)
         built.tag.return_value = True
         def get(reference):
@@ -104,6 +107,72 @@ class ImagePatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs"):
             build_patched_image(client, {**request(), "expected_base_id": BUILT_ID})
         client.api.build.assert_not_called()
+
+    def test_cross_store_ids_with_same_runtime_contents_build_using_local_id(self):
+        client, base, _ = self.fake_client()
+        first = copy.deepcopy(base.attrs)
+        first["Config"].update(User="", WorkingDir="", AttachStdin=False, Labels=None)
+        first.update(Id="sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0",
+                     Created="2026-01-01", RepoTags=["busybox:1.37.0"], Size=4000000)
+        identity = base_image_identity(Mock(attrs=first))
+        base.id = "sha256:6df9636795d37473994366014c25264edeb6c00d7a57188ff62d5a94276b4297"
+        captured = []
+        def build(**kwargs):
+            with tarfile.open(fileobj=kwargs["fileobj"], mode="r") as archive:
+                captured.append(archive.extractfile("Dockerfile").read().decode())
+            return iter([])
+        client.api.build.side_effect = build
+        result = build_patched_image(client, {**request(), "expected_base_identity": identity})
+        self.assertEqual(result["base_identity"], identity)
+        self.assertEqual(result["base_id"], base.id)
+        self.assertTrue(captured[0].startswith("FROM " + base.id + "\n"))
+        # A legacy coordinator's exact ID constraint remains authoritative.
+        with self.assertRaisesRegex(ValueError, "differs"):
+            build_patched_image(client, {**request(), "expected_base_id": BASE_ID,
+                                         "expected_base_identity": identity})
+
+    def test_changed_layers_runtime_config_or_platform_reject_before_build(self):
+        for change in ("layers", "layer_order", "entrypoint", "env", "architecture", "variant", "volume", "port", "healthcheck", "user"):
+            with self.subTest(change=change):
+                client, base, _ = self.fake_client()
+                base.attrs["RootFS"]["Layers"].append("sha256:" + "d" * 64)
+                identity = base_image_identity(base)
+                if change == "layers":
+                    base.attrs["RootFS"]["Layers"][0] = "sha256:" + "e" * 64
+                elif change == "layer_order":
+                    base.attrs["RootFS"]["Layers"].reverse()
+                elif change == "architecture":
+                    base.attrs["Architecture"] = "amd64"
+                elif change == "variant":
+                    base.attrs["Variant"] = "v9"
+                else:
+                    field, value = {"entrypoint": ("Entrypoint", ["other"]), "env": ("Env", ["FOO=bar"]),
+                                    "volume": ("Volumes", {"/opt/patch": {}}), "port": ("ExposedPorts", {"8000/tcp": {}}),
+                                    "healthcheck": ("Healthcheck", {"Test": ["CMD", "true"]}), "user": ("User", "1000")}[change]
+                    base.attrs["Config"][field] = value
+                with self.assertRaisesRegex(ValueError, "differs"):
+                    build_patched_image(client, {**request(), "expected_base_identity": identity})
+                client.api.build.assert_not_called()
+
+    def test_missing_or_malformed_identity_metadata_fails_closed(self):
+        for missing in ("Config", "RootFS", "Os", "Architecture"):
+            with self.subTest(missing=missing):
+                client, base, _ = self.fake_client()
+                base.attrs.pop(missing)
+                with self.assertRaises(ValueError):
+                    build_patched_image(client, request())
+                client.api.build.assert_not_called()
+        for layers in (None, ["not-a-digest"], "sha256:" + "c" * 64):
+            client, base, _ = self.fake_client()
+            base.attrs["RootFS"]["Layers"] = layers
+            with self.assertRaisesRegex(ValueError, "layer identities"):
+                build_patched_image(client, request())
+            client.api.build.assert_not_called()
+
+    def test_runtime_identity_constraint_requires_known_version_and_digest(self):
+        for invalid in (None, BASE_ID, "runtime-v2:sha256:" + "a" * 64, "runtime-v1:sha256:short"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "runtime fingerprint"):
+                normalize_patch_request({**request(), "expected_base_identity": invalid})
 
     def test_wrong_content_is_not_published_and_container_is_removed(self):
         client, _, built = self.fake_client()

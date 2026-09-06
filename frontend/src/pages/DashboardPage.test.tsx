@@ -56,6 +56,26 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
+  it('keeps a booting group yellow independently of the ready peer group', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split model', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed', status: 'running', settings: {},
+        instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'running' },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'starting' },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const ready = await screen.findByText('Status: running')
+    const starting = screen.getByText('Status: starting')
+    expect(ready.previousElementSibling).toHaveClass('status-running')
+    expect(starting.previousElementSibling).toHaveClass('status-starting')
+    expect(screen.getByText('Group 2 · Node 1 + Node 2')).toBeInTheDocument()
+  })
+
   it('shows running models and inference separately for each engine group', async () => {
     const groups = [
       { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'running', desired_state: 'running' },

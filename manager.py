@@ -5660,13 +5660,20 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
-        return await self.node_registry.request(
-            node_id,
-            "POST",
-            "/api/agent/containers",
-            json_body=payload,
-            timeout=1800,
-        )
+        try:
+            return await self.node_registry.request(
+                node_id,
+                "POST",
+                "/api/agent/containers",
+                json_body=payload,
+                timeout=1800,
+            )
+        finally:
+            # Preflight may have cached this node before the member existed.
+            # Creation can also succeed despite an ambiguous agent failure.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
 
     @staticmethod
     def _cluster_members_sorted(deployment: dict) -> list[dict]:
@@ -6955,9 +6962,18 @@ class Manager:
         )
         if explicit_stop:
             suffix += "?explicit=true"
-        return await self.node_registry.request(
-            node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
-        )
+        try:
+            return await self.node_registry.request(
+                node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
+            )
+        finally:
+            if action != "logs":
+                # A cached pre-action phase may still say ready after a
+                # restart. Refresh this node before the action response and
+                # next dashboard snapshot, including ambiguous agent errors.
+                invalidate = getattr(self.node_registry, "invalidate_status", None)
+                if callable(invalidate):
+                    invalidate(node_id)
 
     def _cluster_action_lock(self) -> asyncio.Lock:
         """Return the lifecycle lock, including on lightweight test instances."""
@@ -14175,7 +14191,30 @@ class Manager:
                 logs = await self.get_logs(c["name"], tail=150)
             except Exception as e:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
-        return self._parse_phase(logs)
+        strict_api_rank = c.get("deployment_mode") in _SHARDED_MEMBER_MODES and c.get("rank") == 0
+        if strict_api_rank:
+            # The last successful startup separates historical loading from
+            # current progress. After a failed probe, only its suffix can
+            # explain this startup; old 100% shard lines must not resurface.
+            lines = logs.splitlines()
+            last_ready = max((
+                index for index, line in enumerate(lines)
+                if "Application startup complete" in line or "Uvicorn running on" in line
+            ), default=-1)
+            logs = "\n".join(lines[last_ready + 1:])
+        phase = self._parse_phase(logs)
+        if (
+            strict_api_rank and phase.get("phase") in {"ready", "starting"}
+        ):
+            # A stopped/restarted container keeps old startup log markers.
+            # The failed current probe above must win for an engine group's
+            # API rank. Include sharded labels: an existing TP group retains
+            # those labels when another group is added to its deployment.
+            return {
+                "phase": "starting", "progress": None,
+                "message": "Waiting for the model API to become ready",
+            }
+        return phase
 
     async def _used_host_ports(
         self, *, exclude_deployment_id: str | None = None,

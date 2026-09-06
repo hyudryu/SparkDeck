@@ -196,6 +196,9 @@ const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', '
 const deploymentNeedsPoll = (deployment: Deployment) => (
   ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
   || Boolean(deployment.launch_phase && !FINISHED_LAUNCH_PHASES.has(deployment.launch_phase))
+  || Boolean(deployment.instances?.some((instance) => (
+    ['launching', 'starting', 'stopping'].includes(instance.status)
+  )))
 )
 
 const showLaunchDetails = (deployment: Deployment) => !(
@@ -440,6 +443,7 @@ export function ModelsPage() {
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [groupSelection, setGroupSelection] = useState<{ deployment: Deployment; action: 'start' | 'stop'; instance: number | 'all' }>()
   const [groupError, setGroupError] = useState<string>()
+  const [groupActionRevision, setGroupActionRevision] = useState(0)
   const [startError, setStartError] = useState<string>()
   const [startNotice, setStartNotice] = useState<string>()
   const [editingDeployment, setEditingDeployment] = useState<Deployment>()
@@ -509,20 +513,26 @@ export function ModelsPage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       setNow(Date.now() / 1000)
-      // Running rows otherwise stop polling, which would freeze the
-      // last-inference age at whatever the page first loaded.
-      if (resource.data?.some((deployment) => deployment.status === 'running')) {
-        reloadDeployments()
-      }
+      // Refresh stable rows too: a partially running deployment can be
+      // degraded, and actions on another client can start stopped groups.
+      if (!resource.loading) reloadDeployments()
     }, 30_000)
     return () => window.clearInterval(timer)
-  }, [resource.data, reloadDeployments])
+  }, [resource.loading, reloadDeployments])
 
   useEffect(() => {
     if (resource.loading || !resource.data?.some(deploymentNeedsPoll)) return
     const timer = window.setTimeout(reloadDeployments, 2000)
     return () => window.clearTimeout(timer)
   }, [resource.data, resource.loading, reloadDeployments])
+
+  useEffect(() => {
+    if (!groupActionRevision) return
+    // A successful action can return before the runtime probe reflects its
+    // transition, including when the aggregate status is still degraded.
+    const timer = window.setTimeout(reloadDeployments, 2000)
+    return () => window.clearTimeout(timer)
+  }, [groupActionRevision, reloadDeployments])
 
   useEffect(() => {
     if (!recipeDeployment) return
@@ -1253,10 +1263,22 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setGroupError(undefined)
     try {
-      await api.deployments.action(deployment.id, action, undefined, undefined, false,
+      const updated = await api.deployments.action(deployment.id, action, undefined, undefined, false,
         instance === 'all' ? undefined : instance)
       setGroupSelection(undefined)
-      resource.reload()
+      // The action response includes the new per-group desired states. Use
+      // it immediately so another stopped group can be started without
+      // waiting for the next catalog probe.
+      if (updated) {
+        const fields = Object.fromEntries(Object.entries(updated).filter(([, value]) => value !== undefined))
+        const settings = Object.fromEntries(Object.entries(updated.settings).filter(([, value]) => value !== undefined))
+        resource.setData((current) => current?.map((item) => item.id === updated.id
+          ? { ...item, ...fields, settings: { ...item.settings, ...settings } }
+          : item))
+        setGroupActionRevision((revision) => revision + 1)
+      } else {
+        resource.reload()
+      }
     } catch (reason) {
       setGroupError(reason instanceof Error ? reason.message : 'Could not update deployment group')
       resource.reload()

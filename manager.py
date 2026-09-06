@@ -7139,7 +7139,10 @@ class Manager:
         })
         local = next((m for m in selected if m["node_id"] == LOCAL_NODE_ID), None)
         if local and local.get("port"):
-            if launch.get("port") is not None and launch["port"] != local["port"]:
+            # The deployment port belongs to its first primary, which may be
+            # remote. Other groups keep their own allocated member ports.
+            if (launch.get("port") is not None
+                    and launch["port"] != deployment.get("api_port")):
                 raise ValueError(
                     "changing the saved port requires starting the whole deployment"
                 )

@@ -93,6 +93,7 @@ export interface DeploymentSettings {
 
 // One independent engine group of a grouped-sharded deployment.
 export interface DeploymentInstance {
+  node_ids?: string[]
   instance_id: number
   status: string
   desired_state: 'running' | 'stopped'

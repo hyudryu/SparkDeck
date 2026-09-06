@@ -16,6 +16,7 @@ import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { groupNodeIds, occupiedNodeReasons } from '../utils/deploymentOccupancy'
 import { formatEnvironment, parseEnvironment, unquoteEnvValue } from '../utils/environment'
 
 const quoteArg = (arg: string) => (arg === '' || /[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
@@ -328,6 +329,7 @@ export function DeploymentPage() {
   const navigate = useNavigate()
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const nodes = useResource((signal) => api.nodes.list(signal))
+  const deployments = useResource((signal) => api.deployments.list(signal))
   const [editor, setEditor] = useState<Editor>()
   const [savedEditor, setSavedEditor] = useState<Editor>()
   const [envText, setEnvText] = useState('')
@@ -342,6 +344,20 @@ export function DeploymentPage() {
   const [runSelection, setRunSelection] = useState<string[]>()
   const [finalFlags, setFinalFlags] = useState('')
   const [previewError, setPreviewError] = useState<string>()
+
+  useEffect(() => {
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    setRunSelection((current) => {
+      const next = current?.filter((id) => !occupied[id])
+      return next?.length === current?.length ? current : next
+    })
+  }, [deployments.data, deploymentId])
+
+  useEffect(() => {
+    if (!runSelection) return
+    const timer = window.setInterval(deployments.reload, 5000)
+    return () => window.clearInterval(timer)
+  }, [runSelection, deployments.reload])
 
   useEffect(() => {
     if (resource.data) {
@@ -529,10 +545,20 @@ export function DeploymentPage() {
       return
     }
     const required = requiredRunNodes()
-    const selectable = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
+    deployments.reload()
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    const selectable = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id]).map((node) => node.id)
     const preferred = (resource.data?.node_ids ?? []).filter((id) => selectable.includes(id))
     setError(undefined); setNotice(undefined)
     setRunSelection([...new Set([...preferred, ...selectable])].slice(0, required))
+  }
+
+  const checkOccupancy = async (ids: string[]) => {
+    const latest = await api.deployments.list()
+    deployments.apply(latest)
+    const occupied = occupiedNodeReasons(latest, deploymentId)
+    const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
+    if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
   }
 
   const run = async () => {
@@ -541,6 +567,7 @@ export function DeploymentPage() {
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       if (resource.data?.editable) await persist()
+      await checkOccupancy(selection ?? resource.data?.node_ids ?? [])
       await api.deployments.action(deploymentId, 'start', selection)
       navigate('/models')
     } catch (reason) {
@@ -565,6 +592,10 @@ export function DeploymentPage() {
   const actOnInstance = async (instance: number, action: 'start' | 'stop') => {
     setBusy(`instance-${instance}`); setError(undefined); setNotice(undefined)
     try {
+      if (action === 'start' && resource.data) {
+        const group = resource.data.instances?.find((entry) => entry.instance_id === instance)
+        await checkOccupancy(group ? groupNodeIds(resource.data, group) : [])
+      }
       const updated = await api.deployments.action(
         deploymentId, action, undefined, undefined, false, instance,
       )
@@ -700,8 +731,9 @@ export function DeploymentPage() {
             ? `This grouped layout runs ${detail.instances?.length ?? 2} independent engine group(s) on exactly ${required} nodes.`
             : `This single-node layout runs TP${tensor} on one physical node.`
       const exactCount = runSelection.length === required
-      const allSelectable = runSelection.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-      const ready = directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable)
+      const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+      const allSelectable = runSelection.every((id) => !occupied[id] && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+      const ready = !deployments.loading && !deployments.error && (directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable))
       return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="run-deployment-title">
           <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="run-deployment-title">Start {detail.alias}</h2></div><button className="icon-button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)} aria-label="Close dialog">×</button></div>
@@ -709,9 +741,12 @@ export function DeploymentPage() {
             ? `This externally controlled deployment will start on its existing fixed targets (${required} ${required === 1 ? 'node' : 'nodes'}). Confirm to continue.`
             : `${layoutDescription} Select where SparkDeck should start the deployment.`}</p>
           {error && <p className="form-error" role="alert">{error}</p>}
+          {deployments.error && <ErrorState message={deployments.error} onRetry={deployments.reload} />}
           {!directLifecycle && <NodeSelector
             nodes={nodes.data ?? []}
             selectedIds={runSelection}
+            allowedIds={(nodes.data ?? []).filter((node) => !occupied[node.id]).map((node) => node.id)}
+            unavailableReasons={occupied}
             onChange={(next) => setRunSelection(next.length <= required ? next : runSelection)}
             loading={nodes.loading}
             error={nodes.error}

@@ -32,6 +32,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
   fetchMock.mockClear()
   fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
     const path = String(input)
     if (path === '/api/v1/nodes') {
       return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -81,11 +82,55 @@ const groupedDetail = {
 }
 
 describe('deployment object page', () => {
+  it('shows occupied nodes disabled in Run while allowing the inactive peer group nodes', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [{ ...detail, id: 'other', alias: 'Chat model', status: 'running',
+        node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'], instances: [
+          { instance_id: 0, status: 'starting', node_ids: ['local', 'worker-1'], node_names: ['Controller', 'Node 2'] },
+          { instance_id: 1, status: 'stopped', node_ids: ['worker-2', 'worker-3'], node_names: ['Node 3', 'Node 4'] },
+        ],
+      }] }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeDisabled())
+    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).not.toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 2/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 3/ })).toBeEnabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeEnabled()
+    expect(within(dialog).getAllByText(/Already used by deployment Chat model/)).toHaveLength(2)
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+    await screen.findByRole('heading', { name: 'Models destination' })
+    const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+    expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['worker-2', 'worker-3'])
+  })
+
+  it('rechecks occupancy before starting from Run and preserves the dialog on conflict', async () => {
+    const user = userEvent.setup()
+    let occupied = false
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: occupied ? [{ ...detail, id: 'other', alias: 'Chat model', status: 'running' }] : [] }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled())
+    occupied = true
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Already used by deployment Chat model')
+    expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')).toBe(false)
+  })
+
   it('edits and removes runtime file mounts after a managed deployment has launched', async () => {
     const user = userEvent.setup()
     let mounts = [{ source: '/home/user/old.py', target: '/opt/runtime/model.py' }]
     const fallback = fetchMock.getMockImplementation()!
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
         mounts = JSON.parse(String(init.body)).runtime_file_mounts
@@ -155,6 +200,7 @@ describe('deployment object page', () => {
   it('starts one grouped-sharded engine group without touching the others', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -189,6 +235,7 @@ describe('deployment object page', () => {
       status: 'stopped', editable: false, controllable: true,
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -208,6 +255,7 @@ describe('deployment object page', () => {
   it('polls the detail while a stop is in flight and updates once stopped', async () => {
     let detailRequests = 0
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -260,6 +308,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
     }
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -322,6 +371,7 @@ describe('deployment object page', () => {
 
   it('preserves a custom KV cache dtype as a selectable current value', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const body = String(input) === '/api/v1/nodes'
         ? { items: nodes }
         : { ...detail, launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'future_dtype' } }
@@ -336,6 +386,7 @@ describe('deployment object page', () => {
 
   it('uses SGLang KV choices and hides the unsupported llama.cpp control', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       const body = path === '/api/v1/nodes'
         ? { items: nodes }
@@ -351,6 +402,7 @@ describe('deployment object page', () => {
 
     rendered.unmount()
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       const body = path === '/api/v1/nodes'
         ? { items: nodes }
@@ -427,6 +479,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -454,6 +507,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 1 },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -486,6 +540,7 @@ describe('deployment object page', () => {
       },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -518,6 +573,7 @@ describe('deployment object page', () => {
       launch_controls: { ...fourNode.launch_controls, tensor_parallel_size: 2 },
     }
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -666,6 +722,7 @@ describe('deployment object page', () => {
 
   it('hides the model weights field for llama.cpp deployments', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -717,6 +774,7 @@ describe('env-file backed deployment page', () => {
     requestedDetail: Record<string, unknown> = envFileDetail,
   ) {
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -864,6 +922,7 @@ describe('env-file backed deployment page', () => {
 
     let detailRequests = 0
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })

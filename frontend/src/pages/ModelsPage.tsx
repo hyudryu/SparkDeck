@@ -11,6 +11,7 @@ import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components
 import { useResource } from '../hooks/useResource'
 import { formatEnvironment, parseEnvironment } from '../utils/environment'
 import { formatBytes } from '../utils/format'
+import { groupNodeIds, occupiedNodeReasons } from '../utils/deploymentOccupancy'
 import { artifactFilesDownloaded, ggufArtifactOptions, type GgufArtifactOption, type GgufQuantization } from '../utils/gguf'
 
 const initialForm: CreateDeploymentInput = {
@@ -479,6 +480,40 @@ export function ModelsPage() {
   const [additionalError, setAdditionalError] = useState<string>()
   const [addInstanceLaunch, setAddInstanceLaunch] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [addInstanceError, setAddInstanceError] = useState<string>()
+  useEffect(() => {
+    const trim = (ids: string[], exceptId?: string) => {
+      const occupied = occupiedNodeReasons(resource.data ?? [], exceptId)
+      return ids.filter((id) => !occupied[id])
+    }
+    setStartSelection((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setRecipeDeployment((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setAddInstanceLaunch((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setAdditionalLaunch((current) => {
+      if (!current) return current
+      const additionalIds = trim(current.additionalIds, current.deployment.id)
+      return additionalIds.length === current.additionalIds.length ? current : { ...current, additionalIds }
+    })
+  }, [resource.data])
+
+  const assertNodesUnoccupied = async (ids: string[], exceptId?: string) => {
+    const latest = await api.deployments.list()
+    resource.setData(latest)
+    const occupied = occupiedNodeReasons(latest, exceptId)
+    const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
+    if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
+  }
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
@@ -1260,8 +1295,10 @@ export function ModelsPage() {
 
   const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
     const groups = selectableGroups(deployment, action)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id]))
     setGroupError(undefined)
-    setGroupSelection({ deployment, action, instance: groups[0]?.instance_id ?? 'all' })
+    setGroupSelection({ deployment, action, instance: first?.instance_id ?? 'all' })
   }
 
   const requestStop = (deployment: Deployment) => {
@@ -1278,6 +1315,9 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setGroupError(undefined)
     try {
+      if (action === 'start') await assertNodesUnoccupied((deployment.instances ?? [])
+        .filter((group) => instance === 'all' || group.instance_id === instance)
+        .flatMap((group) => groupNodeIds(deployment, group)), deployment.id)
       const updated = await api.deployments.action(deployment.id, action, undefined, undefined, false,
         instance === 'all' ? undefined : instance)
       setGroupSelection(undefined)
@@ -1419,6 +1459,7 @@ export function ModelsPage() {
       }
       const promote = canPromoteDiscovered(deployment)
       const adoptingDirect = promote && deployment.direct_start
+      await assertNodesUnoccupied(directLifecycle ? deployment.node_ids ?? [] : nodeIds, deployment.id)
       await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
       setActionNotice(directLifecycle
         ? `Starting ${deployment.alias} on its existing fixed target.`
@@ -1464,7 +1505,8 @@ export function ModelsPage() {
     const required = deploymentRequiredNodes(deployment)
     // Saved node preferences are the default selection even before weights
     // exist; the launch flow can prepare missing nodes via Virtual NAS.
-    const selectableNodes = (nodes.data ?? []).filter(isNodeSelectable)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const selectableNodes = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id])
     const selectableIds = selectableNodes.map((node) => node.id)
     const saved = (deployment.node_ids ?? []).filter((id) => selectableIds.includes(id))
     const flexibleCounts = directParallelHostCounts(deployment, selectableNodes)
@@ -1475,7 +1517,7 @@ export function ModelsPage() {
     let nodeIds = saved.slice(0, targetCount)
     if (nodeIds.length < targetCount) {
       const candidates = deployment.managed
-        ? nodes.data?.filter((node) => deploymentWeightedNodes(deployment).has(node.id) && isNodeSelectable(node)) ?? []
+        ? selectableNodes.filter((node) => deploymentWeightedNodes(deployment).has(node.id))
         : [...selectableNodes].sort((left, right) => (
           (usableGpuCount(right) ?? 0) - (usableGpuCount(left) ?? 0)
         ))
@@ -1518,10 +1560,11 @@ export function ModelsPage() {
 
   const confirmAdditionalLaunch = async () => {
     if (!additionalLaunch) return
-    const { deployment, additionalIds } = additionalLaunch
+    const { deployment, currentIds, additionalIds } = additionalLaunch
     setBusy(deployment.id)
     setAdditionalError(undefined)
     try {
+      await assertNodesUnoccupied([...currentIds, ...additionalIds], deployment.id)
       await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
       setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
       setAdditionalLaunch(undefined)
@@ -1551,7 +1594,7 @@ export function ModelsPage() {
     const required = deployment.instance_node_count ?? 0
     const occupied = new Set(deployment.node_ids ?? [])
     const free = (nodes.data ?? []).filter(
-      (node) => isNodeSelectable(node) && !occupied.has(node.id),
+      (node) => isNodeSelectable(node) && !occupied.has(node.id) && !occupiedNodeReasons(resource.data ?? [], deployment.id)[node.id],
     )
     setAddInstanceError(undefined)
     // Preselect the first free nodes so Confirm is one click away; every
@@ -1568,6 +1611,7 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setAddInstanceError(undefined)
     try {
+      await assertNodesUnoccupied(nodeIds, deployment.id)
       await api.deployments.action(deployment.id, 'add_instance', nodeIds)
       setActionNotice(`Starting another deployment of ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}. Requests load-balance across every engine group.`)
       setAddInstanceLaunch(undefined)
@@ -1878,7 +1922,7 @@ export function ModelsPage() {
     setRecipeError(undefined)
     setRecipeTransferNotice(undefined)
     setRecipeSeedNodeId(undefined)
-    setRecipeDeployment({ recipe, nodeIds })
+    setRecipeDeployment({ recipe, nodeIds: nodeIds.filter((id) => !occupiedNodeReasons(resource.data ?? [])[id]) })
   }
 
   const prepareRecipeWeights = async () => {
@@ -1960,6 +2004,7 @@ export function ModelsPage() {
     setActionNotice(undefined)
     setRecipeError(undefined)
     try {
+      await assertNodesUnoccupied(nodeIds)
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
       setRecipeDeployment(undefined)
@@ -2276,6 +2321,7 @@ export function ModelsPage() {
 
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment
+        const occupied = occupiedNodeReasons(resource.data ?? [])
         const localPath = isLocalModelPath(recipe.model)
         const preflightTargets = new Map((transferPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
         const weighted = localPath
@@ -2285,11 +2331,12 @@ export function ModelsPage() {
             .map((target) => target.node_id))
         const missingNodes = (nodes.data ?? []).filter((node) => !weighted.has(node.id))
         const allowedIds = (nodes.data ?? []).filter((node) => {
+          if (occupied[node.id]) return false
           if (weighted.has(node.id)) return true
           const option = preflightTargets.get(node.id)
           return Boolean(option?.eligible || option?.download_eligible || option?.transfer_after_download_eligible)
         }).map((node) => node.id)
-        const unavailableReasons = Object.fromEntries(missingNodes.map((node) => [
+        const unavailableReasons = { ...Object.fromEntries(missingNodes.map((node) => [
           node.id,
           localPath
             ? 'Local paths are available only on the controller'
@@ -2299,7 +2346,7 @@ export function ModelsPage() {
                 ?? preflightTargets.get(node.id)?.download_reason
                 ?? preflightTargets.get(node.id)?.transfer_after_download_reason
                 ?? 'Model weights not cached',
-        ]))
+        ])), ...occupied }
         const exactCount = nodeIds.length === recipe.required_node_count
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const weightsReady = nodeIds.every((id) => weighted.has(id))
@@ -2389,6 +2436,10 @@ export function ModelsPage() {
       {groupSelection && (() => {
         const { deployment, action, instance } = groupSelection
         const groups = selectableGroups(deployment, action)
+        const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id) : {}
+        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => occupied[id]).find(Boolean)
+        const allBlocked = (deployment.instances ?? []).some((group) => groupReason(group))
+        const selectedBlocked = instance === 'all' ? allBlocked : groups.some((group) => group.instance_id === instance && groupReason(group))
         const label = action === 'stop' ? 'Stop' : 'Start'
         const groupBusy = busy === deployment.id
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !groupBusy && setGroupSelection(undefined)}>
@@ -2398,19 +2449,20 @@ export function ModelsPage() {
             <fieldset className="node-selector deployment-group-picker" disabled={groupBusy}>
               <legend>Deployment groups</legend>
               {groups.map((group) => <label className="node-option" key={group.instance_id}>
-                <input type="radio" name="deployment-group" checked={instance === group.instance_id} onChange={() => setGroupSelection({ ...groupSelection, instance: group.instance_id })} />
-                <span><strong>Group {group.instance_id + 1}: {group.node_names.join(' + ')}</strong><small>{deployment.desired_state === 'stopped' || deployment.status === 'stopped' ? 'stopped' : group.status}</small></span>
+                <input type="radio" name="deployment-group" disabled={Boolean(groupReason(group))} checked={instance === group.instance_id} onChange={() => setGroupSelection({ ...groupSelection, instance: group.instance_id })} />
+                <span><strong>Group {group.instance_id + 1}: {group.node_names.join(' + ')}</strong><small>{groupReason(group) || (deployment.desired_state === 'stopped' || deployment.status === 'stopped' ? 'stopped' : group.status)}</small></span>
               </label>)}
-              {(deployment.instances?.length ?? 0) > 1 && <label className="node-option"><input type="radio" name="deployment-group" checked={instance === 'all'} onChange={() => setGroupSelection({ ...groupSelection, instance: 'all' })} /><span>All groups{action === 'start' ? ' (includes running groups and applies saved settings)' : ''}</span></label>}
+              {(deployment.instances?.length ?? 0) > 1 && <label className="node-option"><input type="radio" name="deployment-group" disabled={allBlocked} checked={instance === 'all'} onChange={() => setGroupSelection({ ...groupSelection, instance: 'all' })} /><span>All groups{action === 'start' ? ' (includes running groups and applies saved settings)' : ''}</span></label>}
             </fieldset>
             {groupError && <p className="form-error" role="alert">{groupError}</p>}
-            <div className="modal-actions"><Button disabled={groupBusy} onClick={() => setGroupSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={groupBusy || !groups.length} onClick={() => void confirmGroupAction()}>{groupBusy ? `${label === 'Stop' ? 'Stopping' : 'Starting'}...` : `${label} ${instance === 'all' ? 'all groups' : 'selected group'}`}</Button></div>
+            <div className="modal-actions"><Button disabled={groupBusy} onClick={() => setGroupSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={groupBusy || !groups.length || selectedBlocked} onClick={() => void confirmGroupAction()}>{groupBusy ? `${label === 'Stop' ? 'Stopping' : 'Starting'}...` : `${label} ${instance === 'all' ? 'all groups' : 'selected group'}`}</Button></div>
           </section>
         </div>
       })()}
 
       {startSelection && (() => {
         const { deployment, nodeIds } = startSelection
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
         const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
         const fixedTargets = deployment.selected_nodes?.length
           ? deployment.selected_nodes.map((node) => node.name)
@@ -2440,6 +2492,7 @@ export function ModelsPage() {
             || target.transfer_after_download_eligible)
           .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
+          .filter((node) => !occupied[node.id])
           .filter((node) => (
             (!deployment.managed && !preparableLaunch)
             || weighted.has(node.id)
@@ -2449,14 +2502,14 @@ export function ModelsPage() {
         const unavailableReasons = Object.fromEntries((nodes.data ?? [])
           .filter((node) => !allowedIds.includes(node.id)).map((node) => {
             const target = planTargets.get(node.id)
-            return [node.id, controllerArtifact
+            return [node.id, occupied[node.id] ?? (controllerArtifact
               ? 'Local model artifacts are available only on the controller'
               : target?.active_job_status
                 ? `Model preparation ${target.active_job_status}`
                 : target?.reason
                   ?? target?.download_reason
                   ?? target?.transfer_after_download_reason
-                  ?? 'Model weights not cached and the node cannot receive them']
+                  ?? 'Model weights not cached and the node cannot receive them')]
           }))
         const weightWarnings = preparableLaunch ? Object.fromEntries((nodes.data ?? [])
           .filter((node) => allowedIds.includes(node.id)
@@ -2550,16 +2603,17 @@ export function ModelsPage() {
 
       {additionalLaunch && (() => {
         const { deployment, currentIds, additionalIds } = additionalLaunch
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
         const weighted = deploymentWeightedNodes(deployment)
         // Gate on the cache predicate only: cached nodes that are offline or
         // Docker-unready stay in allowedIds so the selector reports their
         // real status ("Offline", "Docker unavailable") instead of a
         // misleading "weights not cached".
-        const cachedIds = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
-        const allowedIds = [...currentIds, ...cachedIds]
-        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached']))
+        const cachedIds = (nodes.data ?? []).filter((node) => !occupied[node.id] && !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
+        const allowedIds = [...currentIds.filter((id) => !occupied[id]), ...cachedIds]
+        const unavailableReasons = { ...Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached'])), ...occupied }
         const additionalBusy = busy === deployment.id
-        const ready = additionalIds.length > 0 && !nodes.loading && !nodes.error
+        const ready = additionalIds.length > 0 && [...currentIds, ...additionalIds].every((id) => allowedIds.includes(id)) && !nodes.loading && !nodes.error
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !additionalBusy && setAdditionalLaunch(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="additional-nodes-title">
             <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
@@ -2590,16 +2644,17 @@ export function ModelsPage() {
 
       {addInstanceLaunch && (() => {
         const { deployment, nodeIds } = addInstanceLaunch
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
         const required = deployment.instance_node_count ?? 0
         const occupiedIds = deployment.node_ids ?? []
         // Occupied nodes stay visible but disabled so the picker shows where
         // this deployment already runs; only free selectable nodes count.
         const allowedIds = (nodes.data ?? [])
-          .filter((node) => isNodeSelectable(node) && !occupiedIds.includes(node.id))
+          .filter((node) => isNodeSelectable(node) && !occupiedIds.includes(node.id) && !occupied[node.id])
           .map((node) => node.id)
-        const unavailableReasons = Object.fromEntries(
+        const unavailableReasons = { ...Object.fromEntries(
           occupiedIds.map((id) => [id, 'Already running this deployment']),
-        )
+        ), ...occupied }
         const addBusy = busy === deployment.id
         const exact = nodeIds.length === required
         const allFree = nodeIds.every((id) => allowedIds.includes(id))

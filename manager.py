@@ -2,6 +2,7 @@
 import asyncio
 import codecs
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -6538,6 +6539,7 @@ class Manager:
         fabrics: dict[str, tuple[str | None, str | None]],
         local_port: int | None, tensor_parallel_size: int, instances: int,
         first_instance: int = 0,
+        existing_members: list[dict] | None = None,
     ) -> tuple[list, list[dict]]:
         """Build one independent sharded engine group per instance.
 
@@ -6548,6 +6550,9 @@ class Manager:
         """
         tasks: list = []
         member_specs: list[dict] = []
+        existing_by_node = {
+            member["node_id"]: member for member in existing_members or []
+        }
         safe_model = re.sub(
             r"[^a-zA-Z0-9_.-]+", "-", str(base.get("model") or ""),
         ).strip("-").lower()
@@ -6564,6 +6569,9 @@ class Manager:
                 fabric_ip, fabric_interface = fabrics[node_id]
                 global_rank = instance * tensor_parallel_size + local_rank
                 name = f"cluster-{deployment_id}-r{global_rank}-{safe_model[:36]}"
+                existing = existing_by_node.get(node_id, {})
+                name = existing.get("container_name") or name
+                member_port = existing.get("port") or member_port
                 payload = dict(base)
                 payload.update({
                     "port": member_port,
@@ -7086,6 +7094,180 @@ class Manager:
             return "running"
         return "degraded"
 
+    @staticmethod
+    def _group_launch_settings_fingerprint(deployment: dict) -> str:
+        encoded = json.dumps(
+            deployment.get("launch_settings") or {}, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _recreate_grouped_instance(
+        self, deployment: dict, instance: int,
+    ) -> dict:
+        """Apply saved settings to one existing group without moving its peers."""
+        members = list(deployment.get("members") or [])
+        selected = sorted(
+            [member for member in members
+             if int(member.get("instance_id") or 0) == instance],
+            key=lambda member: int(member.get("rank") or 0),
+        )
+        launch = copy.deepcopy(deployment.get("launch_settings") or {})
+        saved_nodes = list(launch.get("node_ids") or [])
+        tp, _ = _grouped_sharded_topology(launch, len(saved_nodes))
+        if (
+            len(selected) != tp
+            or [int(member.get("rank") or 0) for member in selected] != list(range(tp))
+            or saved_nodes != [
+                member.get("node_id") for member in sorted(
+                    members, key=lambda member: (
+                        int(member.get("instance_id") or 0),
+                        int(member.get("rank") or 0),
+                    ),
+                )
+            ]
+        ):
+            raise ValueError(
+                "changing the node layout requires starting the whole deployment"
+            )
+        fingerprint = self._group_launch_settings_fingerprint(deployment)
+        launch.update({
+            "node_ids": [member["node_id"] for member in selected],
+            "deployment_mode": "grouped_sharded",
+            "instances": 1,
+            "tensor_parallel_size": tp,
+        })
+        local = next((m for m in selected if m["node_id"] == LOCAL_NODE_ID), None)
+        if local and local.get("port"):
+            if launch.get("port") is not None and launch["port"] != local["port"]:
+                raise ValueError(
+                    "changing the saved port requires starting the whole deployment"
+                )
+            launch["port"] = local["port"]
+        plan = await self._preflight_deployment_launch(
+            launch, exclude_deployment_id=deployment["id"],
+        )
+        # A legacy deployment-wide Stop may predate per-member intent. Record
+        # that intent before waking this group so peers remain stopped.
+        if deployment.get("desired_state") == "stopped" or deployment.get("status") == "stopped":
+            for member in members:
+                member["desired_state"] = "stopped"
+                member["status"] = "stopped"
+        for member in selected:
+            member["desired_state"] = "stopped"
+            member["recreate_pending"] = True
+        self._save_deployments()
+        removed = await asyncio.gather(
+            *(self._member_action(member, "remove") for member in selected),
+            return_exceptions=True,
+        )
+        errors = self._member_action_errors(removed, "remove")
+        if errors:
+            for member, result in zip(selected, removed):
+                if not self._member_action_errors([result], "remove"):
+                    member["status"] = "stopped"
+                    member.pop("container_id", None)
+                member.pop("launch_settings_fingerprint", None)
+            deployment["settings_dirty"] = True
+            deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["error"] = "; ".join(errors)
+            self._save_deployments()
+            return {"ok": False, "errors": errors, "status": deployment["status"], "instance": instance}
+
+        body = plan["body"]
+        base = {key: body.get(key) for key in (
+            "model", "engine", "gpu_memory_utilization", "gpu_memory_gb",
+            "shm_size", "infiniband_device", "environment", "image", "sg_tp_size",
+            "sg_context_length", "sg_max_running_requests", "sg_mem_fraction", "sg_image",
+        )}
+        base["hf_token"] = self._resolved_hf_token()
+        base["extra_args"] = (
+            self._with_vllm_prompt_token_details(list(body.get("extra_args") or []))
+            if plan["engine"] == "vllm" else list(body.get("extra_args") or [])
+        )
+        tasks, specs = self._build_grouped_sharded_members(
+            deployment_id=deployment["id"], engine=plan["engine"], base=base,
+            node_ids=plan["node_ids"], available=plan["available"],
+            fabrics=plan["fabrics"], local_port=plan["local_port"],
+            tensor_parallel_size=tp, instances=1, first_instance=instance,
+            existing_members=selected,
+        )
+        replacements = {spec["node_id"]: spec for spec in specs}
+        for spec in specs:
+            # Keep inference and recovery away until every rank is created.
+            spec["desired_state"] = "stopped"
+            spec["recreate_pending"] = True
+        deployment["members"] = [
+            replacements[member["node_id"]]
+            if int(member.get("instance_id") or 0) == instance else member
+            for member in members
+        ]
+        deployment["status"] = self._grouped_deployment_status(deployment)
+        self._save_deployments()
+        interrupted = False
+        creating = asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            try:
+                created = await asyncio.shield(creating)
+                break
+            except asyncio.CancelledError:
+                # Docker creation can continue in a thread or on a remote
+                # agent after its caller is cancelled. Retain the lifecycle
+                # lock and wait for creation before removing these identities.
+                interrupted = True
+        if interrupted:
+            errors.append("Group launch was interrupted")
+        for spec, result in zip(specs, created):
+            if isinstance(result, BaseException):
+                spec["status"] = "error"
+                spec["error"] = str(result)
+                errors.append(f"{spec['node_name']}: {result}")
+            else:
+                spec["status"] = result.get("status", "starting")
+                spec["phase"] = result.get("phase") or {
+                    "phase": "starting", "message": "Container created; starting the model server",
+                }
+                spec["container_id"] = result.get("id")
+                spec["port"] = result.get("port") or spec.get("port")
+        if errors:
+            # Even a request that failed can have created a remote container.
+            # Clean every selected identity, never a sibling group's ranks.
+            cleaning = asyncio.gather(
+                *(self._member_action(spec, "remove") for spec in specs),
+                return_exceptions=True,
+            )
+            while True:
+                try:
+                    cleaned = await asyncio.shield(cleaning)
+                    break
+                except asyncio.CancelledError:
+                    interrupted = True
+            errors.extend(self._member_action_errors(cleaned, "remove"))
+            for spec, result in zip(specs, cleaned):
+                if not self._member_action_errors([result], "remove"):
+                    spec["status"] = "stopped"
+                    spec.pop("container_id", None)
+            deployment["settings_dirty"] = True
+        else:
+            for spec in specs:
+                spec["desired_state"] = "running"
+                spec.pop("recreate_pending", None)
+                spec["launch_settings_fingerprint"] = fingerprint
+            deployment["desired_state"] = "running"
+            deployment["last_deployed_at"] = time.time()
+            if deployment.get("settings_dirty"):
+                deployment["settings_dirty"] = any(
+                    member.get("launch_settings_fingerprint") != fingerprint
+                    for member in deployment["members"]
+                )
+        deployment["status"] = self._grouped_deployment_status(deployment)
+        deployment["status_message"] = None
+        deployment["error"] = "; ".join(errors) if errors else None
+        self._save_deployments()
+        if interrupted:
+            raise asyncio.CancelledError
+        return {"ok": not errors, "errors": errors, "status": deployment["status"], "instance": instance}
+
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -7115,11 +7297,23 @@ class Manager:
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
         if targeted_instance is not None and action == "start" and (
-            deployment.get("settings_dirty") or node_ids
+            node_ids or relaunch_mode
         ):
             raise ValueError(
-                "saved launch settings changed; start the whole deployment "
-                "to apply them"
+                "changing the node layout requires starting the whole deployment"
+            )
+
+        selected_members = [
+            member for member in deployment.get("members") or []
+            if targeted_instance is None
+            or int(member.get("instance_id") or 0) == targeted_instance
+        ]
+        settings_dirty = bool(deployment.get("settings_dirty"))
+        if targeted_instance is not None and settings_dirty:
+            fingerprint = self._group_launch_settings_fingerprint(deployment)
+            settings_dirty = not selected_members or any(
+                member.get("launch_settings_fingerprint") != fingerprint
+                for member in selected_members
             )
 
         # Persist user intent before touching any member. Inference and health
@@ -7138,7 +7332,10 @@ class Manager:
         # Containers cannot move between nodes: an explicit node selection (or
         # any argv-affecting setting change) means removing the old ranks and
         # relaunching the deployment through the fully validated path.
-        relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
+        relaunch = action == "start" and (
+            settings_dirty or node_ids
+            or any(member.get("recreate_pending") for member in selected_members)
+        )
         environment_drift: dict[str, list[str]] | None = None
         if action == "start" and not relaunch and deployment.get("members"):
             # A container bakes its environment at create time. When the saved
@@ -7147,26 +7344,26 @@ class Manager:
             # the ranks through the same validated relaunch path instead.
             try:
                 environment_drift = await self._deployment_environment_drift(
-                    deployment,
+                    {**deployment, "members": selected_members},
                 )
             except Exception:
                 # An unexpected inspection failure must never block a start.
                 environment_drift = None
             if environment_drift:
-                if targeted_instance is not None:
-                    raise ValueError(
-                        "saved launch environment changed; start the whole "
-                        "deployment to apply it"
-                    )
                 relaunch = True
                 drifted = ", ".join(sorted(environment_drift))
-                deployment["status"] = "starting"
-                deployment["status_message"] = (
-                    "Recreating containers: their environment no longer "
-                    f"matches the saved launch settings ({drifted})"
-                )
-                self._save_deployments()
+                if targeted_instance is None:
+                    deployment["status"] = "starting"
+                    deployment["status_message"] = (
+                        "Recreating containers: their environment no longer "
+                        f"matches the saved launch settings ({drifted})"
+                    )
+                    self._save_deployments()
         if relaunch:
+            if targeted_instance is not None:
+                return await self._recreate_grouped_instance(
+                    deployment, targeted_instance,
+                )
             launch_body = dict(deployment.get("launch_settings") or {})
             launch_body["recipe_id"] = deployment.get("recipe_id")
             if node_ids:
@@ -13986,13 +14183,20 @@ class Manager:
             if (
                 not isinstance(deployment, dict)
                 or deployment.get("id") == exclude_deployment_id
-                or deployment.get("status") in {"error", "stopped", "removed"}
             ):
                 continue
             members = [
                 member for member in (deployment.get("members") or [])
                 if isinstance(member, dict)
             ]
+            inactive = deployment.get("status") in {"error", "stopped", "removed"}
+            if inactive:
+                # Independent group recreation deliberately keeps its ranks
+                # stopped until every create settles. Keep the durable port
+                # reservation while Docker has no container left to inspect.
+                members = [member for member in members if member.get("recreate_pending")]
+                if not members:
+                    continue
             # Persisted member order is the compatibility fallback. Inspect
             # ranks individually so one corrupt entry cannot hide a later
             # valid rank 0, and never infer primary ownership from negatives.
@@ -14021,7 +14225,7 @@ class Manager:
             # and must not consume the same number on the controller.
             values = (
                 [deployment.get("api_port")]
-                if primary_member
+                if not inactive and primary_member
                 and primary_member.get("node_id") == LOCAL_NODE_ID
                 else []
             )

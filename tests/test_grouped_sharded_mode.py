@@ -366,8 +366,10 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return_value={"node-1-0": ["NCCL_DEBUG"]},
         )
         instance.create_deployment = mock.AsyncMock()
-        with self.assertRaisesRegex(ValueError, "start the whole deployment"):
-            await instance.deployment_action("d1", "start", instance=1)
+        instance._recreate_grouped_instance = mock.AsyncMock(return_value={"ok": True})
+        result = await instance.deployment_action("d1", "start", instance=1)
+        self.assertTrue(result["ok"])
+        instance._recreate_grouped_instance.assert_awaited_once_with(deployment, 1)
         self.assertEqual(actions, [])
         instance.create_deployment.assert_not_awaited()
         self.assertEqual(deployment["members"][0]["status"], "running")

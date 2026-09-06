@@ -6954,9 +6954,18 @@ class Manager:
         )
         if explicit_stop:
             suffix += "?explicit=true"
-        return await self.node_registry.request(
-            node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
-        )
+        try:
+            return await self.node_registry.request(
+                node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
+            )
+        finally:
+            if action != "logs":
+                # A cached pre-action phase may still say ready after a
+                # restart. Refresh this node before the action response and
+                # next dashboard snapshot, including ambiguous agent errors.
+                invalidate = getattr(self.node_registry, "invalidate_status", None)
+                if callable(invalidate):
+                    invalidate(node_id)
 
     def _cluster_action_lock(self) -> asyncio.Lock:
         """Return the lifecycle lock, including on lightweight test instances."""

@@ -7,6 +7,7 @@ import pytest
 
 from sparkdeck.service import SparkDeckService, _deployment_launch_progress, _grouped_instance_summary
 from manager import Manager
+from cluster import NodeRegistry, AGENT_PROTOCOL_VERSION
 
 
 def split_deployment(stopped_status):
@@ -145,6 +146,80 @@ def test_other_runtime_log_phase_behavior_is_unchanged(mode, rank):
     container = {"name": "runtime", "status": "running", "rank": rank, "deployment_mode": mode}
 
     assert asyncio.run(manager._get_container_phase(container))["phase"] == "ready"
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "remove"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_remote_group_action_invalidates_cached_ready_inventory(action, fails):
+    manager = Manager.__new__(Manager)
+    cache = {"remote": (0, {"phase": "ready"}), "peer": (0, {"phase": "ready"})}
+    manager.node_registry = SimpleNamespace(
+        _status_cache=cache,
+        invalidate_status=lambda node_id: cache.pop(node_id, None),
+        request=AsyncMock(side_effect=RuntimeError("agent disconnected") if fails else None),
+    )
+    member = {"node_id": "remote", "container_name": "group-r0"}
+    if fails:
+        with pytest.raises(RuntimeError, match="agent disconnected"):
+            asyncio.run(manager._member_action(member, action))
+    else:
+        asyncio.run(manager._member_action(member, action))
+    assert "remote" not in cache
+    assert "peer" in cache
+
+
+def test_lifecycle_invalidation_discards_inflight_ready_probe(tmp_path):
+    async def exercise():
+        registry = NodeRegistry(tmp_path, None, "controller")
+        node = {"id": "remote", "name": "Remote", "agent_url": "http://remote:7878", "enabled": True}
+        old_probe = asyncio.Event()
+        release = asyncio.Event()
+        status_calls = 0
+
+        async def request(node_id, method, path, **kwargs):
+            nonlocal status_calls
+            common = {"protocol_version": AGENT_PROTOCOL_VERSION, "name": "Remote", "docker_ready": True}
+            if path == "/api/agent/status":
+                status_calls += 1
+                if status_calls == 1:
+                    old_probe.set()
+                    await release.wait()
+                    return {**common, "containers": [{"phase": {"phase": "ready"}}]}
+                return {**common, "containers": [{"phase": {"phase": "starting"}}]}
+            return common
+
+        registry.request = AsyncMock(side_effect=request)
+        pending = asyncio.create_task(registry.probe(node))
+        await old_probe.wait()
+        registry.invalidate_status("remote")
+        release.set()
+        result = await pending
+        assert result["containers"][0]["phase"]["phase"] == "starting"
+        assert registry._status_cache["remote"][1] == result
+        assert status_calls == 2
+
+    asyncio.run(exercise())
+
+
+def test_remote_group_start_reads_fresh_starting_inventory(tmp_path):
+    async def exercise():
+        registry = NodeRegistry(tmp_path, None, "controller")
+        node = {"id": "remote", "name": "Remote", "agent_url": "http://remote:7878", "enabled": True}
+        registry._status_cache["remote"] = (float("inf"), {
+            "docker_ready": True, "containers": [{"phase": {"phase": "ready"}}],
+        })
+        registry.request = AsyncMock(return_value={
+            "protocol_version": AGENT_PROTOCOL_VERSION, "name": "Remote", "docker_ready": True,
+            "containers": [{"phase": {"phase": "starting"}}],
+        })
+        manager = Manager.__new__(Manager)
+        manager.node_registry = registry
+        await manager._member_action({"node_id": "remote", "container_name": "rank-0"}, "start")
+
+        assert (await registry.probe(node))["containers"][0]["phase"]["phase"] == "starting"
+        assert registry.request.await_count == 3
+
+    asyncio.run(exercise())
 
 
 def test_unexpected_peer_failure_still_surfaces_in_progress():

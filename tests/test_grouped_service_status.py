@@ -222,6 +222,41 @@ def test_remote_group_start_reads_fresh_starting_inventory(tmp_path):
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_remote_group_create_replaces_preflight_empty_inventory(tmp_path, fails):
+    async def exercise():
+        registry = NodeRegistry(tmp_path, None, "controller")
+        node = {"id": "remote", "name": "Remote", "agent_url": "http://remote:7878", "enabled": True}
+        registry._status_cache["remote"] = (float("inf"), {"docker_ready": True, "containers": []})
+        registry._status_cache["peer"] = (float("inf"), {"docker_ready": True, "containers": []})
+        created = {"name": "new-rank-0", "status": "running", "phase": {"phase": "starting"}}
+
+        async def request(node_id, method, path, **kwargs):
+            if method == "POST":
+                if fails:
+                    raise RuntimeError("agent disconnected after creation")
+                return created
+            return {
+                "protocol_version": AGENT_PROTOCOL_VERSION, "name": "Remote", "docker_ready": True,
+                "containers": [created],
+            }
+
+        registry.request = AsyncMock(side_effect=request)
+        manager = Manager.__new__(Manager)
+        manager.node_registry = registry
+        if fails:
+            with pytest.raises(RuntimeError, match="agent disconnected"):
+                await manager._create_member("remote", {"name": "new-rank-0"})
+        else:
+            await manager._create_member("remote", {"name": "new-rank-0"})
+
+        assert (await registry.probe(node))["containers"] == [created]
+        assert registry._status_generations["remote"] == 1
+        assert "peer" in registry._status_cache
+
+    asyncio.run(exercise())
+
+
 def test_unexpected_peer_failure_still_surfaces_in_progress():
     deployment = split_deployment("dead")
     for member in deployment["members"][2:]:

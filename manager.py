@@ -5659,13 +5659,20 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
-        return await self.node_registry.request(
-            node_id,
-            "POST",
-            "/api/agent/containers",
-            json_body=payload,
-            timeout=1800,
-        )
+        try:
+            return await self.node_registry.request(
+                node_id,
+                "POST",
+                "/api/agent/containers",
+                json_body=payload,
+                timeout=1800,
+            )
+        finally:
+            # Preflight may have cached this node before the member existed.
+            # Creation can also succeed despite an ambiguous agent failure.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
 
     @staticmethod
     def _cluster_members_sorted(deployment: dict) -> list[dict]:

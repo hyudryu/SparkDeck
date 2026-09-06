@@ -494,6 +494,41 @@ class GroupedShardedInstanceValidationTests(unittest.TestCase):
 
 
 class AddInstanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_add_instance_with_mounts_checks_only_new_nodes_and_preserves_payload(self) -> None:
+        from sparkdeck.runtime_file_mounts import RUNTIME_FILE_MOUNTS_CAPABILITY
+
+        deployment = self.running_grouped_deployment()
+        mounts = [{"source": "/opt/patch.py", "target": "/opt/runtime.py"}]
+        deployment["launch_settings"]["runtime_file_mounts"] = mounts
+        instance = self.add_instance_manager(deployment)
+        nodes = await self.four_node_manager().cluster_nodes()
+        for node in nodes:
+            if node["id"] in {"remote-2", "remote-3"}:
+                node["capabilities"] = [RUNTIME_FILE_MOUNTS_CAPABILITY]
+        instance.cluster_nodes = mock.AsyncMock(return_value=nodes)
+        instance._create_member = mock.AsyncMock(return_value={"id": "new-rank", "status": "starting"})
+        result = await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(instance._create_member.await_count, 2)
+        for call in instance._create_member.await_args_list:
+            self.assertEqual(call.args[1]["runtime_file_mounts"], mounts)
+
+    async def test_add_instance_with_file_mounts_rejects_old_agents_before_mutation(self) -> None:
+        deployment = self.running_grouped_deployment()
+        deployment["launch_settings"]["runtime_file_mounts"] = [
+            {"source": "/opt/patch.py", "target": "/opt/runtime.py"},
+        ]
+        instance = self.add_instance_manager(deployment)
+        instance.cluster_nodes = self.four_node_manager().cluster_nodes
+        instance._save_deployments = mock.Mock()
+        instance._create_member = mock.AsyncMock()
+        with self.assertRaisesRegex(ValueError, "updated SparkDeck agents on: Spark 3, Spark 4"):
+            await instance.add_deployment_instance("d1", ["remote-2", "remote-3"])
+        instance._create_member.assert_not_awaited()
+        instance._save_deployments.assert_not_called()
+        self.assertEqual(deployment["instances"], 1)
+        self.assertEqual(len(deployment["members"]), 2)
+
     def add_instance_manager(self, deployment: dict) -> Manager:
         instance = Manager.__new__(Manager)
         instance.settings = {}

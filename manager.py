@@ -38,7 +38,11 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
-from sparkdeck.runtime_file_mounts import normalize_runtime_file_mounts, runtime_file_volumes
+from sparkdeck.runtime_file_mounts import (
+    RUNTIME_FILE_MOUNTS_CAPABILITY,
+    normalize_runtime_file_mounts,
+    runtime_file_volumes,
+)
 from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
@@ -1172,6 +1176,7 @@ class Manager:
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
+                RUNTIME_FILE_MOUNTS_CAPABILITY,
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -6254,6 +6259,24 @@ class Manager:
         )
         return bool((result or {}).get("ready"))
 
+    @staticmethod
+    def _validate_runtime_file_mount_nodes(
+        mounts: list[dict[str, str]] | None, node_ids: list[str], available: dict,
+    ) -> None:
+        if not mounts:
+            return
+        incompatible = [
+            available.get(nid, {}).get("name") or nid for nid in node_ids
+            if nid != LOCAL_NODE_ID and RUNTIME_FILE_MOUNTS_CAPABILITY
+            not in (available.get(nid, {}).get("capabilities") or [])
+        ]
+        if incompatible:
+            raise ValueError(
+                "Runtime file mounts require updated SparkDeck agents on: "
+                + ", ".join(incompatible)
+                + ". Update these nodes in Settings before starting this deployment."
+            )
+
     async def _preflight_deployment_launch(
         self, body: dict, *, exclude_deployment_id: str | None = None,
     ) -> dict:
@@ -6332,6 +6355,9 @@ class Manager:
         if docker_unready:
             names = [available[n].get("name", n) for n in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
+        self._validate_runtime_file_mount_nodes(
+            body["runtime_file_mounts"], node_ids, available,
+        )
 
         model = body.get("model") or ""
         if not model:
@@ -7319,6 +7345,15 @@ class Manager:
             if targeted_instance is None
             or int(member.get("instance_id") or 0) == targeted_instance
         ]
+        if action == "start" and (deployment.get("launch_settings") or {}).get("runtime_file_mounts"):
+            # Also guard ordinary starts of existing containers. A mixed-version
+            # cluster may have created them while silently ignoring the mounts.
+            available = {node["id"]: node for node in await self.cluster_nodes()}
+            self._validate_runtime_file_mount_nodes(
+                deployment["launch_settings"]["runtime_file_mounts"],
+                node_ids or [member["node_id"] for member in selected_members],
+                available,
+            )
         settings_dirty = bool(deployment.get("settings_dirty"))
         if targeted_instance is not None and settings_dirty:
             fingerprint = self._group_launch_settings_fingerprint(deployment)
@@ -7673,6 +7708,9 @@ class Manager:
             ]
             if unready:
                 raise ValueError("Docker is unavailable on: " + ", ".join(unready))
+            self._validate_runtime_file_mount_nodes(
+                launch.get("runtime_file_mounts"), requested, available,
+            )
             gpu_short = []
             fabrics: dict[str, tuple[str | None, str | None]] = {}
             for nid in requested:

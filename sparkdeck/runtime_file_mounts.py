@@ -3,6 +3,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 MAX_RUNTIME_FILE_MOUNTS = 16
+RUNTIME_FILE_MOUNTS_CAPABILITY = "runtime-file-mounts-v1"
 
 
 def _overlap(first: str, second: str) -> bool:

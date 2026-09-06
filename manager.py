@@ -7148,12 +7148,14 @@ class Manager:
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
         instance: int | None = None,
+        *, model_revision: str | None = None,
     ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
             return await self._deployment_action_locked(
                 deployment_id, action, node_ids, relaunch_mode, instance,
+                model_revision=model_revision,
             )
 
     @staticmethod
@@ -7432,12 +7434,23 @@ class Manager:
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
         instance: int | None = None,
+        *, model_revision: str | None = None,
     ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
+        if model_revision is not None and (
+            action != "start" or not node_ids or instance is not None
+            or deployment.get("engine", "vllm") not in {"vllm", "sglang"}
+            or not isinstance(model_revision, str)
+            or not IMMUTABLE_HF_REVISION.fullmatch(model_revision)
+        ):
+            raise ValueError(
+                "a cached model revision requires an explicit full-deployment "
+                "start selection for vLLM or SGLang"
+            )
         targeted_instance = self._grouped_target_instance(
             deployment, action, instance,
         )
@@ -7533,6 +7546,13 @@ class Manager:
                     deployment, targeted_instance,
                 )
             launch_body = dict(deployment.get("launch_settings") or {})
+            if model_revision is not None:
+                args = list(launch_body.get("extra_args") or [])
+                previous_revision = self._cli_option(args, {"--revision"})
+                if previous_revision and previous_revision != model_revision:
+                    raise ValueError("cached model revision cannot replace an explicit revision")
+                if not previous_revision:
+                    launch_body["extra_args"] = [*args, "--revision", model_revision]
             launch_body["recipe_id"] = deployment.get("recipe_id")
             if node_ids:
                 launch_body["node_ids"] = [str(item) for item in node_ids]

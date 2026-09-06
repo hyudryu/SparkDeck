@@ -3525,7 +3525,17 @@ class SparkDeckService:
             # is verified by each node when its container is created; the
             # whole-repository inventory check would reject selective GGUF
             # snapshots that are perfectly launchable.
-            await self._validate_start_selection(deployment_dict, selected_ids, None)
+            cached_revision = await self._validate_start_selection(
+                deployment_dict, selected_ids, settings,
+            )
+            if cached_revision:
+                settings = {
+                    **settings,
+                    "extra_args": [
+                        *(settings.get("extra_args") or []),
+                        "--revision", cached_revision,
+                    ],
+                }
         llama_artifact = None
         if record.runtime is RuntimeKind.LLAMA_CPP:
             if not artifact:
@@ -3801,8 +3811,8 @@ class SparkDeckService:
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
         launch_settings: dict[str, Any] | None,
-    ) -> None:
-        """Mirror the recipe deploy gate for an explicit start selection."""
+    ) -> str | None:
+        """Validate weights and select an immutable cached default when unpinned."""
         repository = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         is_local_path = bool(repository and resolve_local and resolve_local(repository))
@@ -3833,24 +3843,56 @@ class SparkDeckService:
         revision = (
             (deployment.get("model") or {}).get("revision")
             or self._persisted_revision(launch_settings)
-            or "main"
         )
+        if deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value:
+            # GGUF selection owns its cache-relative artifact revision and
+            # llama-server has no --revision flag. Preserve that contract.
+            revision = revision or "main"
         inventory = await self.manager.model_cache_inventory()
-        nodes_with_weights = {
-            node.get("id")
+        cached = {
+            node.get("id"): next((
+                model for model in node.get("models") or []
+                if isinstance(model, dict) and not model.get("partial")
+                and model.get("model_id") == repository
+            ), None)
             for node in inventory if isinstance(node, dict)
-            for model in node.get("models") or []
-            if isinstance(model, dict)
-            and not model.get("partial")
-            and model.get("model_id") == repository
-            and revision in (model.get("revisions") or [])
         }
-        missing = [node_id for node_id in node_ids if node_id not in nodes_with_weights]
+        missing = [
+            node_id for node_id in node_ids if not cached.get(node_id)
+            or (revision and revision not in (cached[node_id].get("revisions") or []))
+        ]
         if missing:
             raise ValueError(
                 "model weights are not available on selected node(s): "
                 + ", ".join(missing)
             )
+        if revision:
+            # Explicit pins remain authoritative; do not substitute another
+            # cached snapshot merely because it is complete.
+            return None
+        snapshots = [
+            {
+                value for value in cached[node_id].get("revisions") or []
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+            }
+            for node_id in node_ids
+        ]
+        common = set.intersection(*snapshots) if snapshots else set()
+        main_refs = [
+            (cached[node_id].get("revision_refs") or {}).get("main")
+            for node_id in node_ids
+        ]
+        if (
+            main_refs and main_refs[0] in common
+            and all(value == main_refs[0] for value in main_refs)
+        ):
+            return main_refs[0]
+        if len(common) == 1:
+            return next(iter(common))
+        raise ValueError(
+            "selected nodes do not have one unambiguous complete cached model revision; "
+            "set --revision to a snapshot available on every selected node"
+        )
 
     def _adopt_manager_replacement(
         self, deployment: dict[str, Any], replacement: dict[str, Any],
@@ -4683,6 +4725,7 @@ class SparkDeckService:
             # runtime, model, settings, and node preferences.
             return await self._launch_saved_deployment(deployment, node_ids)
         relaunch_mode: str | None = None
+        cached_start_revision: str | None = None
         if additional_node_ids and action == "start":
             # "Launch on additional nodes" grows the running node set instead
             # of relocating it: the current cluster nodes stay first in the
@@ -4716,7 +4759,9 @@ class SparkDeckService:
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
-            await self._validate_start_selection(deployment, merged, launch_settings)
+            cached_start_revision = await self._validate_start_selection(
+                deployment, merged, launch_settings,
+            )
             if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
                 relaunch_mode = "replicated"
             node_ids = merged
@@ -4732,7 +4777,9 @@ class SparkDeckService:
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
-            await self._validate_start_selection(deployment, node_ids, launch_settings)
+            cached_start_revision = await self._validate_start_selection(
+                deployment, node_ids, launch_settings,
+            )
         if instance is not None and (node_ids is not None or additional_node_ids):
             # A per-instance grouped-sharded action addresses one engine
             # group; a node selection relocates the whole deployment. The
@@ -4748,6 +4795,7 @@ class SparkDeckService:
             # grouped-sharded stop does not own the deployment's intent.
             self.store.update_desired_state(deployment_id, "stopped")
         if manager_id:
+            revision_kwargs = {"model_revision": cached_start_revision} if cached_start_revision else {}
             if node_ids is None:
                 if instance is not None:
                     result = await self.manager.deployment_action(
@@ -4758,10 +4806,12 @@ class SparkDeckService:
             elif relaunch_mode:
                 result = await self.manager.deployment_action(
                     manager_id, action, node_ids, relaunch_mode,
+                    **revision_kwargs,
                 )
             else:
                 result = await self.manager.deployment_action(
                     manager_id, action, node_ids,
+                    **revision_kwargs,
                 )
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
@@ -4796,6 +4846,7 @@ class SparkDeckService:
                 current, replacement["id"] if isinstance(replacement, dict) and replacement.get("id") else manager_id,
             )
         if owner:
+            revision_kwargs = {"model_revision": cached_start_revision} if cached_start_revision else {}
             # A discovered card can be one rank of a manager-only cluster.
             # Acting on the single rank leaves the remaining ranks running,
             # and the cluster health monitor restarts the whole deployment —
@@ -4804,9 +4855,12 @@ class SparkDeckService:
                 if relaunch_mode:
                     result = await self.manager.deployment_action(
                         owner["id"], action, node_ids, relaunch_mode,
+                        **revision_kwargs,
                     )
                 else:
-                    result = await self.manager.deployment_action(owner["id"], action, node_ids)
+                    result = await self.manager.deployment_action(
+                        owner["id"], action, node_ids, **revision_kwargs,
+                    )
             else:
                 if instance is not None:
                     result = await self.manager.deployment_action(

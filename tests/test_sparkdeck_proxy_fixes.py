@@ -631,7 +631,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
                     "id": node_id,
                     "models": [{
                         "model_id": "/cache/models/org--model/snapshots/rev",
-                        "revisions": ["main"],
+                        "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40},
                     }],
                 }
                 for node_id in ("local", "worker-1")

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from sparkdeck.service import SparkDeckService, _deployment_launch_progress, _grouped_instance_summary
+from manager import Manager
 
 
 def split_deployment(stopped_status):
@@ -88,6 +89,41 @@ def test_ready_peer_or_worker_cannot_substitute_for_missing_primary_readiness():
                              if not (member["instance_id"] == 1 and member["rank"] == 0)]
 
     assert _grouped_instance_summary(deployment)[1]["status"] == "starting"
+
+
+@pytest.mark.parametrize("mode", ["sharded", "grouped_sharded"])
+@pytest.mark.parametrize("marker", ["Application startup complete", "Uvicorn running on http://0.0.0.0:8000"])
+def test_group_api_rank_ignores_old_ready_logs_until_current_probe_succeeds(mode, marker):
+    manager = Manager.__new__(Manager)
+    manager._check_ready = AsyncMock(return_value=False)
+    manager.get_logs = AsyncMock(return_value=marker)
+    container = {"name": "group-api", "status": "running", "rank": 0, "deployment_mode": mode}
+
+    phase = asyncio.run(manager._get_container_phase(container))
+    assert phase["phase"] == "starting"
+    assert "API" in phase["message"]
+
+    manager._check_ready.return_value = True
+    assert asyncio.run(manager._get_container_phase(container))["phase"] == "ready"
+
+
+def test_group_api_rank_preserves_weight_loading_progress_after_failed_probe():
+    manager = Manager.__new__(Manager)
+    manager._check_ready = AsyncMock(return_value=False)
+    manager.get_logs = AsyncMock(return_value="Loading checkpoint shards: 1/4")
+    container = {"name": "group-api", "status": "running", "rank": 0, "deployment_mode": "grouped_sharded"}
+
+    assert asyncio.run(manager._get_container_phase(container))["phase"] == "loading"
+
+
+@pytest.mark.parametrize("mode, rank", [("single", 0), ("grouped_sharded", 1)])
+def test_other_runtime_log_phase_behavior_is_unchanged(mode, rank):
+    manager = Manager.__new__(Manager)
+    manager._check_ready = AsyncMock(return_value=False)
+    manager.get_logs = AsyncMock(return_value="Application startup complete")
+    container = {"name": "runtime", "status": "running", "rank": rank, "deployment_mode": mode}
+
+    assert asyncio.run(manager._get_container_phase(container))["phase"] == "ready"
 
 
 def test_unexpected_peer_failure_still_surfaces_in_progress():

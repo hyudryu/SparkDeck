@@ -14174,7 +14174,21 @@ class Manager:
                 logs = await self.get_logs(c["name"], tail=150)
             except Exception as e:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
-        return self._parse_phase(logs)
+        phase = self._parse_phase(logs)
+        if (
+            c.get("deployment_mode") in _SHARDED_MEMBER_MODES
+            and c.get("rank") == 0
+            and phase.get("phase") == "ready"
+        ):
+            # A stopped/restarted container keeps old startup log markers.
+            # The failed current probe above must win for an engine group's
+            # API rank. Include sharded labels: an existing TP group retains
+            # those labels when another group is added to its deployment.
+            return {
+                "phase": "starting", "progress": None,
+                "message": "Waiting for the model API to become ready",
+            }
+        return phase
 
     async def _used_host_ports(
         self, *, exclude_deployment_id: str | None = None,

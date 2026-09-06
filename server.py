@@ -2281,7 +2281,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         "served_model_name", "env_file_mtime",
         # Saved-deployment bookmarks (never launched) accept the creator-form
         # contract; which keys apply is decided per record in the service.
-        "alias", "context_length", "tensor_parallel_size", "parallel_slots",
+        "alias", "context_length", "tensor_parallel_size", "instances", "parallel_slots",
         "gpu_layers", "quantization", "artifact", "image", "node_ids", "deployment_mode",
     }
     unknown = sorted(set(body) - allowed)

@@ -119,6 +119,25 @@ def test_group_api_rank_preserves_weight_loading_progress_after_failed_probe(pre
     assert asyncio.run(manager._get_container_phase(container))["phase"] == "loading"
 
 
+@pytest.mark.parametrize("current_log, expected_phase, expected_progress", [
+    ("Starting process", "starting", None),
+    ("Loading checkpoint shards: 1/4", "loading", 0.25),
+])
+def test_failed_probe_discards_loading_before_last_successful_startup(current_log, expected_phase, expected_progress):
+    manager = Manager.__new__(Manager)
+    manager._check_ready = AsyncMock(return_value=False)
+    manager.get_logs = AsyncMock(return_value="\n".join([
+        "Application startup complete", "Loading checkpoint shards: 4/4",
+        "Uvicorn running on http://0.0.0.0:8000", current_log,
+    ]))
+    container = {"name": "group-api", "status": "running", "rank": 0, "deployment_mode": "grouped_sharded"}
+
+    phase = asyncio.run(manager._get_container_phase(container))
+
+    assert phase["phase"] == expected_phase
+    assert phase["progress"] == expected_progress
+
+
 @pytest.mark.parametrize("peer_status", ["starting", "stopped"])
 def test_group_action_response_probes_ready_sibling_instead_of_saved_startup_phase(peer_status):
     saved = split_deployment(peer_status)

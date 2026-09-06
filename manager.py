@@ -14192,12 +14192,15 @@ class Manager:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
         strict_api_rank = c.get("deployment_mode") in _SHARDED_MEMBER_MODES and c.get("rank") == 0
         if strict_api_rank:
-            # A failed current probe makes historical ready lines irrelevant,
-            # but newer loading/initialization lines still explain startup.
-            logs = "\n".join(
-                line for line in logs.splitlines()
-                if "Application startup complete" not in line and "Uvicorn running on" not in line
-            )
+            # The last successful startup separates historical loading from
+            # current progress. After a failed probe, only its suffix can
+            # explain this startup; old 100% shard lines must not resurface.
+            lines = logs.splitlines()
+            last_ready = max((
+                index for index, line in enumerate(lines)
+                if "Application startup complete" in line or "Uvicorn running on" in line
+            ), default=-1)
+            logs = "\n".join(lines[last_ready + 1:])
         phase = self._parse_phase(logs)
         if (
             strict_api_rank and phase.get("phase") in {"ready", "starting"}

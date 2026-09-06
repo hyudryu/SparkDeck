@@ -180,3 +180,26 @@ class GroupRecreateTests(unittest.IsolatedAsyncioTestCase):
             await manager.deployment_action("group-test", "start", instance=0)
         manager._member_action.assert_not_awaited()
         self.assertTrue(deployment["settings_dirty"])
+
+    async def test_start_remote_pair_then_local_pair_with_distinct_saved_ports(self):
+        manager, deployment = self.manager(dirty=True, sibling_running=False)
+        nodes = ["remote-2", "remote-3", "local", "remote-1"]
+        for member, node, port in zip(deployment["members"], nodes, [8011, 8011, 8009, 8010]):
+            member.update(node_id=node, node_name=node, port=port)
+        deployment["node_ids"] = nodes
+        deployment["launch_settings"].update(node_ids=nodes, port=8011)
+        deployment["api_port"] = 8011
+        manager._validate_available_port = AsyncMock(return_value=8009)
+        async def create(node, payload):
+            return {"id": f"new-{node}", "status": "running", "port": payload["port"]}
+        manager._create_member.side_effect = create
+        self.assertTrue((await manager.deployment_action("group-test", "start", instance=0))["ok"])
+        sibling = copy.deepcopy(deployment["members"][:2])
+        self.assertTrue(all(m["desired_state"] == "stopped" for m in deployment["members"][2:]))
+        self.assertTrue((await manager.deployment_action("group-test", "start", instance=1))["ok"])
+        self.assertEqual(deployment["members"][:2], sibling)
+        self.assertTrue(all(m["desired_state"] == "running" for m in deployment["members"]))
+        self.assertEqual([m["port"] for m in deployment["members"]], [8011, 8011, 8009, 8010])
+        manager._validate_available_port.assert_awaited_once_with(8009, exclude_deployment_id="group-test")
+        self.assertEqual(deployment["launch_settings"]["port"], 8011)
+        self.assertFalse(deployment["settings_dirty"])

@@ -4535,6 +4535,34 @@ class SparkDeckService:
             container, required,
         )
 
+    def _grouped_action_response(
+        self, current: dict[str, Any], manager_id: str,
+    ) -> dict[str, Any]:
+        """Attach immediate group state without waiting for node inventory."""
+        cluster = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict) and item.get("id") == manager_id
+        ), None)
+        if not cluster or cluster.get("mode") != "grouped_sharded":
+            return current
+        current.update(self._layout_contract(cluster.get("launch_settings")))
+        current.update(_deployment_launch_progress(cluster))
+        current.update({
+            "status": _deployment_status(cluster.get("status")),
+            "desired_state": cluster.get("desired_state") or current.get("desired_state"),
+            "instances": _grouped_instance_summary(cluster),
+            "node_ids": list(cluster.get("node_ids") or []),
+            "last_error": str(cluster["error"]) if cluster.get("error") else None,
+        })
+        last_deployed_at = cluster.get("last_deployed_at")
+        if isinstance(last_deployed_at, (int, float)) and last_deployed_at:
+            current["last_deployed_at"] = datetime.fromtimestamp(
+                last_deployed_at, timezone.utc,
+            ).isoformat()
+        elif isinstance(last_deployed_at, str) and last_deployed_at:
+            current["last_deployed_at"] = last_deployed_at
+        return current
+
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -4589,7 +4617,7 @@ class SparkDeckService:
             current["status"] = str(result.get("status") or "starting")
             if result.get("node_ids"):
                 current["node_ids"] = list(result["node_ids"])
-            return current
+            return self._grouped_action_response(current, target)
         if (
             discovered is not None and not deployment.get("managed")
             and action == "start" and node_ids
@@ -4741,7 +4769,9 @@ class SparkDeckService:
             else:
                 current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
-            return current
+            return self._grouped_action_response(
+                current, replacement["id"] if isinstance(replacement, dict) and replacement.get("id") else manager_id,
+            )
         if owner:
             # A discovered card can be one rank of a manager-only cluster.
             # Acting on the single rank leaves the remaining ranks running,
@@ -4768,7 +4798,10 @@ class SparkDeckService:
                 return self._adopt_manager_replacement(
                     deployment, replacement, launch_settings,
                 )
-            return {**deployment, "status": "running" if action == "start" else "stopped"}
+            return self._grouped_action_response(
+                {**deployment, "status": "running" if action == "start" else "stopped"},
+                owner["id"],
+            )
         if not container:
             raise LookupError("managed container not found")
         if discovered is None:
@@ -7367,7 +7400,7 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
         entry["node_names"].append(
             str(member.get("node_name") or member.get("node_id") or ""),
         )
-        entry["statuses"].append(str(member.get("status") or "queued"))
+        entry["statuses"].append(_deployment_status(member.get("status")))
         if str(member.get("desired_state") or "running") == "stopped":
             entry["desired_state"] = "stopped"
     for entry in groups.values():
@@ -7380,6 +7413,8 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             entry["status"] = "stopping"
         elif "error" in states:
             entry["status"] = "error"
+        elif "stopping" in states:
+            entry["status"] = "stopping"
         elif states and all(state == "stopped" for state in states):
             entry["status"] = "stopped"
         elif states and all(state in {"running", "ready"} for state in states):
@@ -7420,6 +7455,19 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
         member for member in (deployment.get("members") or [])
         if isinstance(member, dict)
     ]
+    if (
+        deployment.get("mode") == "grouped_sharded"
+        and deployment.get("desired_state") != "stopped"
+        and status != "stopped"
+    ):
+        # An intentionally stopped peer group is not part of this launch.
+        # Recreated ranks keep stopped intent until every create settles, so
+        # retain their pending progress while excluding ordinary stopped peers.
+        members = [
+            member for member in members
+            if member.get("desired_state") != "stopped"
+            or member.get("recreate_pending")
+        ]
     # Report the least-advanced active rank. Rank order is only a tie-breaker:
     # a queued worker must win over a rank-0 image pull, and an image pull must
     # win over another rank that has already started loading model weights.

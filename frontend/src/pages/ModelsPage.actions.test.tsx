@@ -1657,4 +1657,80 @@ describe('deployment group controls', () => {
     expect(within(dialog).getAllByRole('radio')).toHaveLength(2)
     expect(within(dialog).getByRole('radio', { name: /Group 2/ })).toBeChecked()
   })
+
+  it('starts both groups sequentially using the returned group states without a page reload', async () => {
+    const user = userEvent.setup()
+    const stopped = {
+      ...grouped, status: 'stopped', desired_state: 'stopped',
+      instances: grouped.instances.map((instance) => ({ ...instance, status: 'stopped', desired_state: 'stopped' })),
+    }
+    let updated = stopped
+    const started: number[] = []
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        // The catalog can still contain the pre-action probe snapshot.
+        return new Response(JSON.stringify({ items: [stopped] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/dep-1/start') && init?.method === 'POST') {
+        const { instance } = JSON.parse(String(init.body)) as { instance: number }
+        started.push(instance)
+        updated = {
+          ...updated, status: started.length === 2 ? 'running' : 'degraded', desired_state: 'running',
+          instances: updated.instances.map((group) => group.instance_id === instance
+            ? { ...group, status: 'running', desired_state: 'running' } : group),
+        }
+        return new Response(JSON.stringify({
+          ...updated, deployment_mode: undefined, required_node_count: undefined,
+          node_ids: undefined, selected_nodes: undefined,
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    let dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await user.click(await screen.findByRole('button', { name: 'Start group' }))
+    dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).queryByRole('radio', { name: /Group 2:/ })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Group 1:/ })).toBeChecked()
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument())
+    expect(started).toEqual([1, 0])
+    expect(await screen.findByText('running')).toBeInTheDocument()
+  })
+
+  it('probes again after accepting a group action with a degraded status and no launch phase', async () => {
+    const user = userEvent.setup()
+    const stopped = {
+      ...grouped, status: 'stopped', desired_state: 'stopped',
+      instances: grouped.instances.map((instance) => ({ ...instance, status: 'stopped', desired_state: 'stopped' })),
+    }
+    const accepted = {
+      ...grouped, status: 'degraded',
+      instances: [grouped.instances[0], stopped.instances[1]],
+    }
+    let actionAccepted = false
+    let followupProbes = 0
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        if (actionAccepted) followupProbes += 1
+        return new Response(JSON.stringify({ items: [actionAccepted ? accepted : stopped] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/dep-1/start') && init?.method === 'POST') {
+        actionAccepted = true
+        return new Response(JSON.stringify(accepted), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await screen.findByRole('button', { name: 'Start group' })
+    await waitFor(() => expect(followupProbes).toBeGreaterThan(0), { timeout: 3500 })
+  })
 })

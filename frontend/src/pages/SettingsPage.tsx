@@ -28,7 +28,14 @@ function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
 
 function SoftwareUpdatePanel() {
   const { confirm, confirmationDialog } = useConfirmDialog()
-  const resource = useResource((signal) => api.updates.overview(signal))
+  const checkedMain = useRef(false)
+  const resource = useResource(async (signal) => {
+    // Every visit checks GitHub again; active rollout polling can reuse the
+    // cached target. An aborted initial request must not consume the check.
+    const data = await api.updates.overview(signal, !checkedMain.current)
+    if (!signal.aborted) checkedMain.current = true
+    return data
+  })
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState<string>()
   const active = Boolean(resource.data?.job?.active)

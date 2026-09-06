@@ -1021,8 +1021,8 @@ export const api = {
     clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
-    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>(
-      '/api/v1/system-update', { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
+    overview: (signal?: AbortSignal, refresh = false) => request<SystemUpdateOverview>(
+      `/api/v1/system-update${refresh ? '?refresh=true' : ''}`, { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
     ),
     start: (revision: string) => request<SystemUpdateJob>('/api/v1/system-update', {
       method: 'POST',

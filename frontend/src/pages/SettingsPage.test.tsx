@@ -47,6 +47,28 @@ async function submitCommunitySignOut(user: ReturnType<typeof userEvent.setup>, 
 }
 
 describe('settings page', () => {
+  it('checks the latest main commit on every settings mount', async () => {
+    let revision = 'b'.repeat(40)
+    const paths: string[] = []
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) {
+        paths.push(String(input))
+        return new Response(JSON.stringify({
+          current_revision: 'a'.repeat(40), target: { branch: 'main', revision },
+          can_update: false, blockers: [], nodes: [],
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ theme: 'system' }), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const firstVisit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    expect(await screen.findByText(/origin\/main bbbbbbbb/)).toBeInTheDocument()
+    firstVisit.unmount()
+    revision = 'c'.repeat(40)
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    expect(await screen.findByText(/origin\/main cccccccc/)).toBeInTheDocument()
+    expect(paths).toEqual(['/api/v1/system-update?refresh=true', '/api/v1/system-update?refresh=true'])
+  })
+
   it('opens accessible legal dialogs and links bug reports without saving settings', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -348,9 +370,11 @@ describe('settings page', () => {
 
   it('waits for an active update status request to settle before polling again', async () => {
     let updateRequests = 0
+    const updatePaths: string[] = []
     const pendingSignals: AbortSignal[] = []
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (String(input).includes('system-update')) {
+        updatePaths.push(String(input))
         updateRequests += 1
         if (updateRequests > 1) {
           if (init?.signal) pendingSignals.push(init.signal)
@@ -386,6 +410,7 @@ describe('settings page', () => {
 
     expect(updateRequests).toBe(2)
     expect(pendingSignals[0]?.aborted).toBe(false)
+    expect(updatePaths).toEqual(['/api/v1/system-update?refresh=true', '/api/v1/system-update'])
   }, 8_000)
 
   it('does not trust an up-to-date phase saved for an older target', async () => {

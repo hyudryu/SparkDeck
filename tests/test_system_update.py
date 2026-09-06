@@ -139,6 +139,36 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(overview["up_to_date"])
         self.assertFalse(overview["can_update"])
 
+    async def test_settings_refresh_bypasses_main_cache_but_retains_cached_preflight(self):
+        self.manager.http.get.side_effect = [
+            response(200, {"sha": "b" * 40}),
+            response(200, {"sha": "c" * 40}),
+        ]
+        with patch("sparkdeck.updater.local_blockers", return_value=[]) as blockers:
+            initial = await self.service.overview()
+            cached = await self.service.overview()
+            refreshed = await self.service.overview(refresh=True)
+            polled = await self.service.overview()
+
+        self.assertEqual(initial["target"]["revision"], "b" * 40)
+        self.assertEqual(cached["target"]["revision"], "b" * 40)
+        self.assertEqual(refreshed["target"]["revision"], "c" * 40)
+        self.assertEqual(polled["target"]["revision"], "c" * 40)
+        self.assertEqual(self.manager.http.get.await_count, 2)
+        self.assertEqual(blockers.call_count, 1)
+
+    async def test_settings_refresh_reports_github_failure_instead_of_old_target(self):
+        self.manager.http.get.side_effect = [
+            response(200, {"sha": "b" * 40}),
+            response(503, {"message": "Unavailable"}),
+        ]
+        with patch("sparkdeck.updater.local_blockers", return_value=[]):
+            await self.service.overview()
+            refreshed = await self.service.overview(refresh=True)
+        self.assertIsNone(refreshed["target"])
+        self.assertFalse(refreshed["can_update"])
+        self.assertTrue(any("Could not check origin/main" in blocker for blocker in refreshed["blockers"]))
+
     async def test_overview_uses_lightweight_liveness_and_caches_local_checks(self):
         self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
         with patch("sparkdeck.updater.local_blockers", return_value=[]) as blockers:

@@ -33,6 +33,13 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.assignment_patch.stop()
 
+    async def test_update_overview_passes_explicit_refresh_flag(self):
+        with patch.object(server.updater, "overview", AsyncMock(return_value={})) as overview:
+            for suffix, expected in [("", False), ("?refresh=true", True), ("?refresh=false", False)]:
+                response = await self.client.get(f"/api/v1/system-update{suffix}")
+                self.assertEqual(response.status_code, 200)
+                overview.assert_awaited_with(refresh=expected)
+
     async def test_get_returns_only_masked_credential_status_and_live_ui_settings(self):
         sentinel = "hf_get_sentinel_secret"
         stored = {

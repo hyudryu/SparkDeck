@@ -670,7 +670,7 @@ class UpdateService:
         self._main_cache = (time.monotonic(), *result)
         return result
 
-    async def overview(self, *, force_preflight: bool = False) -> dict:
+    async def overview(self, *, force_preflight: bool = False, refresh: bool = False) -> dict:
         revision = self.runtime_revision
         state = self._read(self.cluster_path)
         agent_state = self._reconciled_agent_state(revision)
@@ -744,7 +744,7 @@ class UpdateService:
         elif completed_job_reconciled:
             self._write(self.cluster_path, state)
         (main_target, main_error), nodes, blockers = await asyncio.gather(
-            self.resolve_main(),
+            self.resolve_main(force=refresh),
             self.manager.cluster_node_liveness(),
             self._overview_local_blockers(force=force_preflight),
         )

@@ -2703,8 +2703,8 @@ async def update_routeros_fan(node_id: str, req: Request):
 
 
 @app.get("/api/v1/system-update")
-async def system_update_overview():
-    return await updater.overview()
+async def system_update_overview(refresh: bool = False):
+    return await updater.overview(refresh=refresh)
 
 
 @app.post("/api/v1/system-update", status_code=202)

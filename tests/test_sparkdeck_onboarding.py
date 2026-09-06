@@ -1165,6 +1165,30 @@ class OnboardingFlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_refresh_query_is_forwarded_to_controller(self):
+        requests = []
+
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'{}'
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, stream=Body(), request=request)
+
+        self.assertTrue(is_forwardable_path("/api/v1/system-update"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            response = await forward_management_request(
+                request_for("/api/v1/system-update", query="refresh=true"),
+                Mock(http=http), {
+                    "controller_url": "http://100.64.0.30:7878",
+                    "forward_token": "worker-secret", "node_id": "worker-id",
+                },
+            )
+            content = b"".join([chunk async for chunk in response.body_iterator])
+        self.assertEqual(content, b'{}')
+        self.assertEqual(str(requests[0].url), "http://100.64.0.30:7878/api/v1/system-update?refresh=true")
+
     async def test_proxy_tries_pinned_addresses_and_preserves_streaming(self):
         requests = []
         resolutions = []

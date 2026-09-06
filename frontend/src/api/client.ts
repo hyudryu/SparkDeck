@@ -46,6 +46,7 @@ import type {
   SavedConfigurationDetail,
   RecipeUpdateInput,
   RuntimeFlagsPreview,
+  RuntimeFileMount,
   UsageAnalysis,
   UsageSummary,
   SystemUpdateOverview,
@@ -380,6 +381,7 @@ export interface WireDeployment {
 }
 
 interface WireDeploymentDetail extends WireDeployment {
+  runtime_file_mounts?: RuntimeFileMount[]
   editable: boolean
   edit_reason?: string | null
   edit_mode?: string | null
@@ -460,6 +462,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
 function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail {
   return {
     ...deploymentFromWire(item),
+    runtime_file_mounts: item.runtime_file_mounts ?? item.settings?.runtime_file_mounts,
     editable: item.editable,
     edit_reason: item.edit_reason,
     edit_mode: item.edit_mode,

@@ -81,6 +81,77 @@ const groupedDetail = {
 }
 
 describe('deployment object page', () => {
+  it('edits and removes runtime file mounts after a managed deployment has launched', async () => {
+    const user = userEvent.setup()
+    let mounts = [{ source: '/home/user/old.py', target: '/opt/runtime/model.py' }]
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        mounts = JSON.parse(String(init.body)).runtime_file_mounts
+      }
+      if (path === '/api/v1/deployments/dep-1' || path === '/api/v1/deployments/dep-1/settings') {
+        return new Response(JSON.stringify({ ...detail, runtime_file_mounts: mounts }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    const source = await screen.findByLabelText('Host file path 1')
+    expect(source).toHaveValue('/home/user/old.py')
+    expect(screen.getByLabelText('Container file path 1')).toHaveValue('/opt/runtime/model.py')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    await user.clear(source)
+    await user.type(source, '/home/user/fixed.py')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(mounts).toEqual([{ source: '/home/user/fixed.py', target: '/opt/runtime/model.py' }]))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
+    expect(screen.getByLabelText('Host file path 1')).toHaveValue('/home/user/fixed.py')
+    await user.click(screen.getByRole('button', { name: 'Remove runtime file mount 1' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(mounts).toEqual([]))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    cleanup()
+    renderPage()
+    await screen.findByRole('button', { name: 'Add runtime file' })
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+  })
+
+  it('preserves unchanged runtime file mounts when saving runtime flags', async () => {
+    const user = userEvent.setup()
+    const mounts = [{ source: '/home/user/patch.py', target: '/opt/runtime/model.py' }]
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify({ ...detail, settings: { ...detail.settings, runtime_file_mounts: mounts } }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await screen.findByLabelText('Host file path 1')
+    await user.type(screen.getByRole('textbox', { name: /^Runtime flags/ }), ' --enable-chunked-prefill')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(request).toBeDefined()
+      const body = JSON.parse(String(request?.[1]?.body))
+      expect(body.extra_args).toContain('--enable-chunked-prefill')
+      expect(body).not.toHaveProperty('runtime_file_mounts')
+    })
+  })
+
+  it.each([
+    { kind: 'external' },
+    { has_start_hook: true },
+    { edit_mode: 'env-file' },
+    { runtime: 'sglang' },
+  ])('hides runtime file mounts for unsupported deployments: %j', async (override) => {
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify({ ...detail, ...override }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await screen.findByText('Reasoning server')
+    expect(screen.queryByRole('button', { name: 'Add runtime file' })).not.toBeInTheDocument()
+  })
+
   it('starts one grouped-sharded engine group without touching the others', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

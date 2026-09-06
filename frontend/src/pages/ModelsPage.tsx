@@ -3,6 +3,7 @@ import { ArrowDownToLine, Bookmark, Check, ChevronDown, ChevronRight, Copy, Fold
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, NodeInventoryItem, RecipeUpdateInput, RuntimeFileMount, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import { RuntimeFileMountsEditor } from '../components/RuntimeFileMountsEditor'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
@@ -2745,16 +2746,7 @@ export function ModelsPage() {
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
                   {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
-                  {form.runtime === 'vllm' && <fieldset className="field runtime-file-mounts">
-                    <legend>Runtime file mounts</legend>
-                    <small>Each host file must already exist at the same path on every selected node. Files are mounted read-only inside every vLLM container. Up to 16 files.</small>
-                    {runtimeFileMounts.map((mount, index) => <div className="field-grid" key={index}>
-                      <label className="field"><span>Host file path {index + 1}</span><input required placeholder="/home/user/patches/model.py" value={mount.source} onChange={(event) => setRuntimeFileMounts((mounts) => mounts.map((item, position) => position === index ? { ...item, source: event.target.value } : item))} /></label>
-                      <label className="field"><span>Container file path {index + 1}</span><input required placeholder="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/model.py" value={mount.target} onChange={(event) => setRuntimeFileMounts((mounts) => mounts.map((item, position) => position === index ? { ...item, target: event.target.value } : item))} /></label>
-                      <Button type="button" variant="tertiary" aria-label={`Remove runtime file mount ${index + 1}`} onClick={() => setRuntimeFileMounts((mounts) => mounts.filter((_, position) => position !== index))}><Trash2 size={15} /> Remove file</Button>
-                    </div>)}
-                    <Button type="button" variant="tertiary" disabled={runtimeFileMounts.length >= 16} onClick={() => setRuntimeFileMounts((mounts) => [...mounts, { source: '', target: '' }])}><Plus size={15} /> Add runtime file</Button>
-                  </fieldset>}
+                  {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
                 </div>}

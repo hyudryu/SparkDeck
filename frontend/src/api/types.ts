@@ -189,6 +189,7 @@ export interface DeploymentSettingsEnv {
 }
 
 export interface DeploymentDetail extends Deployment {
+  runtime_file_mounts?: RuntimeFileMount[]
   editable: boolean
   edit_reason?: string | null
   edit_mode?: string | null
@@ -225,6 +226,7 @@ export interface EnvFileDeploymentUpdateInput {
 }
 
 export interface DeploymentUpdateInput {
+  runtime_file_mounts?: RuntimeFileMount[]
   model?: string
   extra_args?: string[]
   command_flags?: string

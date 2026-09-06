@@ -14174,11 +14174,17 @@ class Manager:
                 logs = await self.get_logs(c["name"], tail=150)
             except Exception as e:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
+        strict_api_rank = c.get("deployment_mode") in _SHARDED_MEMBER_MODES and c.get("rank") == 0
+        if strict_api_rank:
+            # A failed current probe makes historical ready lines irrelevant,
+            # but newer loading/initialization lines still explain startup.
+            logs = "\n".join(
+                line for line in logs.splitlines()
+                if "Application startup complete" not in line and "Uvicorn running on" not in line
+            )
         phase = self._parse_phase(logs)
         if (
-            c.get("deployment_mode") in _SHARDED_MEMBER_MODES
-            and c.get("rank") == 0
-            and phase.get("phase") == "ready"
+            strict_api_rank and phase.get("phase") in {"ready", "starting"}
         ):
             # A stopped/restarted container keeps old startup log markers.
             # The failed current probe above must win for an engine group's

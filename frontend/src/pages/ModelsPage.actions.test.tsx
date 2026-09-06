@@ -1734,6 +1734,21 @@ describe('deployment group controls', () => {
     expect(within(dialog).getByRole('radio', { name: /Group 2/ })).toBeChecked()
   })
 
+  it('allows Start group but disables adding another deployment during container preparation', async () => {
+    const user = userEvent.setup()
+    const preparing = { ...grouped, status: 'starting', launch_phase: 'pulling_image', instance_node_count: 2,
+      instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }],
+    }
+    mockGrouped(preparing)
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.getByRole('button', { name: 'Stop', hidden: true })).toBeDisabled()
+    expect(screen.getByRole('menuitem', { name: 'Start another deployment…' })).toBeDisabled()
+    expect(screen.getByRole('menuitem', { name: 'Start group' })).toBeEnabled()
+    await user.click(screen.getByRole('menuitem', { name: 'Start group' }))
+    expect(await screen.findByRole('dialog', { name: 'Start a group for Chat model' })).toBeInTheDocument()
+  })
+
   it('starts both groups sequentially using the returned group states without a page reload', async () => {
     const user = userEvent.setup()
     const stopped = {

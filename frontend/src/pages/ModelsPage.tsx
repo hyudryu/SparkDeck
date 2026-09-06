@@ -2141,7 +2141,7 @@ export function ModelsPage() {
                             toggleAriaLabel={`More actions for ${deployment.alias}`}
                             items={[
                               { key: 'start-group', label: 'Start group', onSelect: () => openGroupPicker(deployment, 'start') },
-                              ...(supportsAnotherInstance(deployment) ? [{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => openAddInstancePicker(deployment) }] : []),
+                              ...(supportsAnotherInstance(deployment) ? [{ key: 'add-instance', label: 'Start another deployment…', disabled: Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase)), onSelect: () => openAddInstancePicker(deployment) }] : []),
                             ]}
                           />
                         : supportsAnotherInstance(deployment)

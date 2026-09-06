@@ -4546,16 +4546,26 @@ class SparkDeckService:
             container, required,
         )
 
-    def _grouped_action_response(
+    async def _grouped_action_response(
         self, current: dict[str, Any], manager_id: str,
     ) -> dict[str, Any]:
-        """Attach immediate group state without waiting for node inventory."""
+        """Attach current group readiness rather than saved creation phases."""
         cluster = next((
             item for item in getattr(self.manager, "deployments", [])
             if isinstance(item, dict) and item.get("id") == manager_id
         ), None)
         if not cluster or cluster.get("mode") != "grouped_sharded":
             return current
+        try:
+            state = await self.manager.get_state()
+            cluster = next((
+                item for item in state.get("deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ), cluster)
+        except Exception:
+            # The action already succeeded. Preserve its durable state when
+            # inventory is temporarily unavailable instead of failing it.
+            pass
         current.update(self._layout_contract(cluster.get("launch_settings")))
         current.update(_deployment_launch_progress(cluster))
         current.update({
@@ -4628,7 +4638,7 @@ class SparkDeckService:
             current["status"] = str(result.get("status") or "starting")
             if result.get("node_ids"):
                 current["node_ids"] = list(result["node_ids"])
-            return self._grouped_action_response(current, target)
+            return await self._grouped_action_response(current, target)
         if (
             discovered is not None and not deployment.get("managed")
             and action == "start" and node_ids
@@ -4780,7 +4790,7 @@ class SparkDeckService:
             else:
                 current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
-            return self._grouped_action_response(
+            return await self._grouped_action_response(
                 current, replacement["id"] if isinstance(replacement, dict) and replacement.get("id") else manager_id,
             )
         if owner:
@@ -4809,7 +4819,7 @@ class SparkDeckService:
                 return self._adopt_manager_replacement(
                     deployment, replacement, launch_settings,
                 )
-            return self._grouped_action_response(
+            return await self._grouped_action_response(
                 {**deployment, "status": "running" if action == "start" else "stopped"},
                 owner["id"],
             )

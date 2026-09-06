@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -107,13 +108,33 @@ def test_group_api_rank_ignores_old_ready_logs_until_current_probe_succeeds(mode
     assert asyncio.run(manager._get_container_phase(container))["phase"] == "ready"
 
 
-def test_group_api_rank_preserves_weight_loading_progress_after_failed_probe():
+@pytest.mark.parametrize("prefix", ["", "Application startup complete\nUvicorn running on http://0.0.0.0:8000\n"])
+def test_group_api_rank_preserves_weight_loading_progress_after_failed_probe(prefix):
     manager = Manager.__new__(Manager)
     manager._check_ready = AsyncMock(return_value=False)
-    manager.get_logs = AsyncMock(return_value="Loading checkpoint shards: 1/4")
+    manager.get_logs = AsyncMock(return_value=prefix + "Loading checkpoint shards: 1/4")
     container = {"name": "group-api", "status": "running", "rank": 0, "deployment_mode": "grouped_sharded"}
 
     assert asyncio.run(manager._get_container_phase(container))["phase"] == "loading"
+
+
+@pytest.mark.parametrize("peer_status", ["starting", "stopped"])
+def test_group_action_response_probes_ready_sibling_instead_of_saved_startup_phase(peer_status):
+    saved = split_deployment(peer_status)
+    for member in saved["members"][:2]:
+        member["phase"] = {"phase": "starting"}
+    saved.update(id="cluster-1", node_ids=["node-1", "node-2", "node-3", "node-4"])
+    live = copy.deepcopy(saved)
+    live["members"][0]["phase"] = {"phase": "ready"}
+    service = SparkDeckService.__new__(SparkDeckService)
+    service.manager = SimpleNamespace(deployments=[saved], get_state=AsyncMock(return_value={"deployments": [live]}))
+    service._layout_contract = Mock(return_value={})
+
+    response = asyncio.run(service._grouped_action_response({}, "cluster-1"))
+
+    assert [group["status"] for group in response["instances"]] == ["running", peer_status]
+    service.manager.get_state.assert_awaited_once()
+    assert saved["members"][0]["phase"]["phase"] == "starting"
 
 
 @pytest.mark.parametrize("mode, rank", [("single", 0), ("grouped_sharded", 1)])

@@ -151,12 +151,24 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("base_identity", job["nodes"][1])
 
     async def test_legacy_first_node_keeps_exact_id_constraint_on_updated_followers(self):
-        with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=[result(), {**result(), "base_identity": BASE_IDENTITY}, result()])) as remote:
+        image_ids = ["sha256:" + char * 64 for char in "bce"]
+        outputs = [result(image=image_ids[0]), {**result(image=image_ids[1]), "base_identity": BASE_IDENTITY}, result(image=image_ids[2])]
+        with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=outputs)) as remote:
             job = await self.finish(await self.jobs.start(request(["node-4", "node-3", "node-2"])))
         self.assertEqual(job["status"], "succeeded")
+        self.assertTrue(all("base_identity" not in node for node in job["nodes"]))
         for call in remote.await_args_list[1:]:
             self.assertEqual(call.args[1]["expected_base_id"], BASE_ID)
             self.assertNotIn("expected_base_identity", call.args[1])
+        inventory = {"partial": False, "errors": [], "results": [
+            {"node": {"id": node["node_id"], "name": node["node_name"]}, "containers": [],
+             "images": [{"id": node["image_id"][:19], "full_id": node["image_id"], "tags": [job["image"]]}]}
+            for node in job["nodes"]]}
+        with patch.object(server, "image_patch_jobs", self.jobs), \
+                patch.object(server.manager, "cluster_image_inventory", AsyncMock(return_value=inventory)):
+            grouped = await server._v1_image_inventory()
+        self.assertEqual(len(grouped["items"]), 1)
+        self.assertEqual(grouped["items"][0]["node_image_ids"], dict(zip(["node-4", "node-3", "node-2"], image_ids)))
 
     async def test_remote_failure_keeps_completed_node_and_skips_remaining_nodes(self):
         with patch.object(self.jobs, "_remote", new=AsyncMock(side_effect=[result(), RuntimeError("base unavailable")])) as remote:

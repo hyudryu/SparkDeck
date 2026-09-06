@@ -253,7 +253,10 @@ class ImagePatchJobs:
                         # an existing constraint or compare tags as identity.
                         request = {**request, "expected_base_id": result["base_id"]}
                     node.update(status="succeeded", image_id=result["image_id"], base_id=result["base_id"])
-                    if identity is not None:
+                    if identity is not None and "expected_base_id" not in request:
+                        # A legacy-ID coordinated build has no runtime proof
+                        # for its first node. Keep one consistent provenance
+                        # scheme even when later agents support fingerprints.
                         node["base_identity"] = identity
                 except Exception as exc:
                     node.update(status="failed", error=str(exc)[:2000])

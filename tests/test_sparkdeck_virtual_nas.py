@@ -1479,6 +1479,71 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["model_id"], "org/raw")
             self.assertFalse(model["partial"])
 
+    async def test_dflash2_without_tokenizer_downloads_and_transfers_as_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            model_id = "z-lab/Qwen3.8-27B-DFlash2"
+            snapshot = hub / "models--z-lab--Qwen3.8-27B-DFlash2" / "snapshots" / RESOLVED_REVISION
+            source = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: False)
+
+            def download(**kwargs):
+                snapshot.mkdir(parents=True)
+                (snapshot / "config.json").write_text(json.dumps({
+                    "architectures": ["DFlash2DraftModel"], "model_type": "qwen3",
+                    "dflash_config": {"block_size": 8},
+                }), encoding="utf-8")
+                (snapshot / "model.safetensors").write_bytes(b"draft weights")
+                return str(snapshot)
+
+            with patch("huggingface_hub.snapshot_download", side_effect=download):
+                result = source.download_model(model_id, RESOLVED_REVISION, requested_revision="main")
+            self.assertTrue(result["ok"])
+            self.assertFalse(source.inventory()[0]["partial"])
+            capability = source.issue_direct_export_capability(model_id, RESOLVED_REVISION)
+            target_hub = Path(directory) / "target-hub"
+            target = VirtualNAS(Path(directory) / "target", lambda: target_hub, FakeRegistry(), lambda: False)
+            await target.import_model(model_id, source.export_model_with_capability(model_id, capability))
+            target_model = target.inventory()[0]
+            self.assertFalse(target_model["partial"])
+            self.assertIn(RESOLVED_REVISION, target_model["revisions"])
+
+    async def test_dflash2_exception_does_not_accept_other_or_malformed_configs(self):
+        invalid_configs = [
+            {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "dflash_config": {}},
+            {"architectures": ["DFlash2DraftModel"]},
+            {"architectures": ["DFlash2DraftModel"], "dflash_config": None},
+            {"architectures": ["DFlash2DraftModel", "Qwen3ForCausalLM"], "dflash_config": {}},
+            [],
+        ]
+        raw_configs = [json.dumps(value) for value in invalid_configs]
+        raw_configs += ['{"architectures":["DFlash2DraftModel"]', ' ' * (1024 * 1024 + 1)]
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory)
+            (snapshot / "model.safetensors").write_bytes(b"draft weights")
+            for raw in raw_configs:
+                with self.subTest(config=raw[:100]):
+                    (snapshot / "config.json").write_text(raw, encoding="utf-8")
+                    self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+
+    async def test_dflash2_still_requires_nonempty_complete_weights_and_indexes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory)
+            (snapshot / "config.json").write_text(json.dumps({
+                "architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8},
+            }), encoding="utf-8")
+            self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+            weights = snapshot / "model.safetensors"
+            weights.touch()
+            self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+            weights.write_bytes(b"draft weights")
+            index = snapshot / "model.safetensors.index.json"
+            for raw in ('{', json.dumps({"weight_map": {"layer": "missing.safetensors"}})):
+                index.write_text(raw, encoding="utf-8")
+                self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+            index.unlink()
+            weights.rename(snapshot / "model-00001-of-00002.safetensors")
+            self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+
     async def test_inventory_marks_config_without_tokenizer_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

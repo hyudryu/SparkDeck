@@ -4196,6 +4196,10 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return True
     if not _required_files_are_nonempty([config]):
         return False
+    if _is_tokenizer_free_dflash2_config(config):
+        # This draft is loaded inside the target model's speculative decoder
+        # and uses its tokenizer. Its Hub repository has no tokenizer assets.
+        return True
     tokenizer = [
         path for name, path in lowered.items()
         if Path(name).name in _TOKENIZER_FILES
@@ -4208,6 +4212,24 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _required_files_are_nonempty(tokenizer):
         return False
     return True
+
+
+def _is_tokenizer_free_dflash2_config(config: Path) -> bool:
+    """Recognize the explicit DFlash 2 draft architecture, not a model name."""
+    try:
+        # Cache metadata is untrusted; never parse an unbounded config file.
+        with config.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return False
+        value = json.loads(raw)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("architectures") == ["DFlash2DraftModel"]
+        and isinstance(value.get("dflash_config"), dict)
+    )
 
 
 def _is_complete_diffusers_snapshot(files: dict[str, Path]) -> bool:

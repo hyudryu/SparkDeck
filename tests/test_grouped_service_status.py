@@ -63,6 +63,46 @@ def test_unexpected_peer_failure_still_surfaces_in_progress():
     assert _deployment_launch_progress(deployment)["launch_phase"] == "error"
 
 
+@pytest.mark.parametrize("pending", [False, True])
+def test_completed_stop_overrides_stale_member_launch_phases(pending):
+    deployment = split_deployment("exited")
+    deployment.update({"status": "stopped", "desired_state": "stopped"})
+    for member in deployment["members"]:
+        member.update({
+            "desired_state": "stopped", "recreate_pending": pending,
+            "phase": {"phase": "starting", "message": "Container created; starting the model server"},
+        })
+
+    assert _deployment_launch_progress(deployment) == {
+        "launch_phase": "stopped", "launch_message": "Deployment stopped",
+    }
+
+
+def test_stopped_aggregate_keeps_only_actual_recreation_progress():
+    deployment = split_deployment("exited")
+    deployment.update({"status": "stopped", "desired_state": "stopped"})
+    for member in deployment["members"][:2]:
+        member["phase"] = {"phase": "queued", "message": "Stale peer launch"}
+    for member in deployment["members"][2:]:
+        member.update({
+            "status": "queued", "recreate_pending": True,
+            "phase": {"phase": "pulling_image", "message": "Downloading group image"},
+        })
+
+    assert _deployment_launch_progress(deployment) == {
+        "launch_phase": "pulling_image", "launch_message": "Downloading group image",
+    }
+
+
+def test_stopped_launch_failure_keeps_its_diagnostic():
+    deployment = split_deployment("exited")
+    deployment.update({"status": "stopped", "error": "Group launch failed"})
+
+    assert _deployment_launch_progress(deployment) == {
+        "launch_phase": "error", "launch_message": "Group launch failed",
+    }
+
+
 @pytest.mark.parametrize("linked", [True, False])
 def test_group_action_returns_fresh_instances_without_inventory_reconcile(linked):
     cluster = split_deployment("exited")

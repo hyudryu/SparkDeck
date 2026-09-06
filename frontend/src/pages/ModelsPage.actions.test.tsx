@@ -473,6 +473,25 @@ describe('models page running actions', () => {
     })
   })
 
+  it.each(['stopped', 'exited'])('hides completed %s launch details while keeping Start available', async (phase) => {
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [{
+          ...runningDeployment, status: 'stopped', desired_state: 'stopped',
+          launch_phase: phase, launch_message: 'Deployment stopped',
+        }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return defaultFetch(input, init)
+    })
+    renderPage()
+
+    expect(await screen.findByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(screen.getByText('stopped')).toBeInTheDocument()
+    expect(screen.queryByText('Deployment stopped')).not.toBeInTheDocument()
+    expect(screen.queryByText('Exited')).not.toBeInTheDocument()
+  })
+
   it('shows a disabled Stopping button while a stop is in flight', async () => {
     const stopping = {
       ...runningDeployment, status: 'stopping', desired_state: 'stopped',

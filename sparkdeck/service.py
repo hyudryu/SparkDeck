@@ -7455,6 +7455,20 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
         member for member in (deployment.get("members") or [])
         if isinstance(member, dict)
     ]
+    if status == "stopped":
+        # Completed Stop is authoritative over stale heartbeat launch phases.
+        # Independent recreation temporarily keeps stopped intent while its
+        # new ranks are queued; only those actual creates retain progress.
+        members = [
+            member for member in members
+            if member.get("recreate_pending")
+            and member.get("status") in {"queued", "creating"}
+        ]
+        if not members:
+            return {
+                "launch_phase": "stopped",
+                "launch_message": "Deployment stopped",
+            }
     if (
         deployment.get("mode") == "grouped_sharded"
         and deployment.get("desired_state") != "stopped"

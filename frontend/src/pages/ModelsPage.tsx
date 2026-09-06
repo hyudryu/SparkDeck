@@ -202,7 +202,7 @@ const deploymentNeedsPoll = (deployment: Deployment) => (
 )
 
 const showLaunchDetails = (deployment: Deployment) => !(
-  deployment.status === 'stopped' && deployment.launch_phase === 'exited'
+  deployment.status === 'stopped' && ['stopped', 'exited'].includes(deployment.launch_phase ?? '')
 )
 
 const formatLaunchPhase = (phase: string) => phase

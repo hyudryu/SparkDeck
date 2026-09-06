@@ -75,6 +75,7 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(instances=instances):
                 body = {
                     "alias": "Recipe TP2", "image": "vllm/test",
+                    "model": "org/model",
                     "context_length": 262144, "tensor_parallel_size": 2,
                     "instances": instances, "parallel_slots": None,
                     "gpu_layers": None, "quantization": None, "artifact": None,
@@ -243,8 +244,10 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_deployment_settings_uses_exact_public_contract(self):
         changes = {
+            # The detail editor sends the unchanged model on a context edit.
+            "model": "org/model",
             "extra_args": ["--enable-prefix-caching"],
-            "launch_controls": {"context_window": 65536},
+            "launch_controls": {"context_window": 256000},
             "gpu_memory_utilization": 0.9,
             "gpu_memory_gb": None,
         }

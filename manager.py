@@ -148,6 +148,7 @@ PERSISTED_DEPLOYMENT_ARGS_ERROR = (
 # ``grouped_sharded`` runs N independent sharded engine groups (each a
 # tensor-parallel-sized node group) behind one served name.
 _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+MEMBER_LOG_TIMEOUT_SECONDS = 5.0
 # Member-label modes that run one rank of a distributed engine: host
 # networking, fabric environment, and per-rank VRAM fitting all apply.
 _SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
@@ -7069,6 +7070,19 @@ class Manager:
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
     ) -> Any:
+        if action == "logs":
+            # One offline worker must not hold the entire logs dialog behind
+            # lifecycle timeouts. Bound all connection attempts together.
+            try:
+                return await asyncio.wait_for(
+                    self._read_member_logs(member, log_tail),
+                    timeout=MEMBER_LOG_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Logs unavailable from {member.get('node_name') or member['node_id']}: "
+                    f"node did not respond within {MEMBER_LOG_TIMEOUT_SECONDS:g} seconds"
+                ) from exc
         if action in {"start", "stop", "restart", "remove"}:
             self._prefix_affinity_generation = getattr(self, "_prefix_affinity_generation", 0) + 1
         node_id = member["node_id"]
@@ -7098,14 +7112,8 @@ class Manager:
                 return await self.stop_container(name, explicit=explicit_stop)
             if action == "remove":
                 return await self.remove_cluster_member(name)
-            if action == "logs":
-                return {"logs": await self.get_cluster_member_logs(name, log_tail)}
-        method = "GET" if action == "logs" else ("DELETE" if action == "remove" else "POST")
-        suffix = (
-            f"/logs?tail={max(1, min(int(log_tail), 100_000))}"
-            if action == "logs"
-            else ("" if action == "remove" else f"/{action}")
-        )
+        method = "DELETE" if action == "remove" else "POST"
+        suffix = "" if action == "remove" else f"/{action}"
         if explicit_stop:
             suffix += "?explicit=true"
         try:
@@ -7113,13 +7121,28 @@ class Manager:
                 node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
             )
         finally:
-            if action != "logs":
-                # A cached pre-action phase may still say ready after a
-                # restart. Refresh this node before the action response and
-                # next dashboard snapshot, including ambiguous agent errors.
-                invalidate = getattr(self.node_registry, "invalidate_status", None)
-                if callable(invalidate):
-                    invalidate(node_id)
+            # A cached pre-action phase may still say ready after a restart.
+            # Refresh after lifecycle actions, including ambiguous errors.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
+
+    async def _read_member_logs(self, member: dict, tail: int) -> dict:
+        node_id = member["node_id"]
+        name = member["container_name"]
+        if node_id == LOCAL_NODE_ID:
+            return {"logs": await self.get_cluster_member_logs(name, tail)}
+        cached_status = getattr(self.node_registry, "cached_status", None)
+        cached = cached_status(node_id) if callable(cached_status) else None
+        if isinstance(cached, dict) and cached.get("online") is False:
+            raise RuntimeError(
+                f"Logs unavailable from {member.get('node_name') or node_id}: node is offline"
+            )
+        return await self.node_registry.request(
+            node_id, "GET",
+            f"/api/agent/containers/{name}/logs?tail={max(1, min(int(tail), 100_000))}",
+            timeout=MEMBER_LOG_TIMEOUT_SECONDS,
+        )
 
     def _cluster_action_lock(self) -> asyncio.Lock:
         """Return the lifecycle lock, including on lightweight test instances."""

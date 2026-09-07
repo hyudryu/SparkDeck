@@ -2878,7 +2878,9 @@ export function ModelsPage() {
             >
               {!logData && logLoading
                 ? <span className="deployment-log-status">Loading logs…</span>
-                : <pre>{selectedLogMember?.logs || logData?.logs || 'No log output.'}</pre>}
+                : <pre>{selectedLogMember
+                  ? selectedLogMember.logs || selectedLogMember.error || 'No log output.'
+                  : logData?.logs || 'No log output.'}</pre>}
             </div>
             <div className="modal-actions">
               <Button type="button" variant={logTailing ? 'primary' : 'tertiary'} aria-pressed={logTailing} onClick={() => setLogTailing((current) => !current)}><ArrowDownToLine size={15} /> {logTailing ? 'Tailing' : 'Tail'}</Button>

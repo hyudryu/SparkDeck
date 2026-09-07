@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from http import HTTPStatus
 
 from fastapi import (
     FastAPI, HTTPException, Query, Request, Response, WebSocket,
@@ -141,14 +142,65 @@ async def _guard_stream(stream, watcher: asyncio.Task):
 # ---------- in-memory server log buffer ----------
 MAX_LOG_LINES = 5000
 _log_buffer: deque[str] = deque(maxlen=MAX_LOG_LINES)
+# Activity entries can carry up to 16 KiB of response body each, so a count
+# bound alone would let an unauthenticated caller inflate controller memory.
+# Retain by a total-byte budget in addition to an entry-count cap.
+MAX_ACTIVITY_BYTES = 4 * 1024 * 1024
+_activity_buffer: deque[dict] = deque()
+_activity_sizes: deque[int] = deque()
+_activity_bytes = 0
+
+
+def _push_activity(entry: dict) -> None:
+    """Append to the activity buffer honoring both count and byte budgets."""
+    global _activity_bytes
+    size = len(json.dumps(entry, default=str))
+    _activity_buffer.append(entry)
+    _activity_sizes.append(size)
+    _activity_bytes += size
+    while _activity_buffer and (
+        _activity_bytes > MAX_ACTIVITY_BYTES or len(_activity_buffer) > MAX_LOG_LINES
+    ):
+        _activity_buffer.popleft()
+        _activity_bytes -= _activity_sizes.popleft()
 
 
 class _DequeHandler(logging.Handler):
     """Appends formatted log records to the in-memory deque."""
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Uvicorn records may reach this handler directly and through root.
+            if getattr(record, "_sparkdeck_captured", False):
+                return
+            record._sparkdeck_captured = True
             msg = _redact_log(self.format(record))
             _log_buffer.append(msg)
+            event = getattr(record, "deployment_event", None)
+            if record.levelno >= logging.ERROR or event in {
+                "launched", "stopped", "crashed",
+            }:
+                # Keep a separate buffer so routine traffic cannot evict events.
+                formatter = self.formatter or logging.Formatter()
+                entry = {
+                    "timestamp": formatter.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+                    "level": record.levelname.lower(),
+                    "source": record.name,
+                    "message": _redact_log(record.getMessage()),
+                }
+                if record.levelno >= logging.ERROR:
+                    details = dict(getattr(record, "error_details", None) or {
+                        "kind": "error", "message": record.getMessage(),
+                    })
+                    if record.exc_info:
+                        details["exception"] = {
+                            "type": record.exc_info[0].__name__,
+                            "message": str(record.exc_info[1]),
+                            "traceback": formatter.formatException(record.exc_info),
+                        }
+                    entry["details"] = _redact_log_value(details)
+                if event in {"launched", "stopped", "crashed"}:
+                    entry["event"] = event
+                _push_activity(entry)
         except Exception:
             pass
 
@@ -176,16 +228,115 @@ def _redact_log(message: str) -> str:
     return redacted
 
 
+_LOG_PRIVATE_KEYS = {
+    "authorization", "proxyauthorization", "cookie", "setcookie", "token",
+    "apikey", "accesstoken", "refreshtoken", "idtoken", "hftoken", "agenttoken",
+    "huggingfacehubtoken", "password", "secret", "clientsecret", "input",
+}
+
+
+def _redact_log_value(value, depth=0):
+    """Preserve JSON structure without credentials or echoed validation input."""
+    if depth >= 12:
+        return "[Nested details omitted]"
+    if isinstance(value, dict):
+        return {
+            _redact_log(str(key)): (
+                "[REDACTED]" if re.sub(r"[^a-z0-9]", "", str(key).lower()) in _LOG_PRIVATE_KEYS
+                else _redact_log_value(item, depth + 1)
+            ) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_log_value(item, depth + 1) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_log(str(value))
+
+
+class _ErrorResponseLogMiddleware:
+    """Observe failed ASGI responses without consuming or buffering their streams."""
+    MAX_BODY_BYTES = 16 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        status = None
+        body = bytearray()
+        total = 0
+        complete = False
+        content_type = ""
+        exception = None
+
+        async def capture(message):
+            nonlocal status, total, complete, content_type
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                content_type = dict(message.get("headers", [])).get(b"content-type", b"").decode("latin-1")
+            elif message["type"] == "http.response.body" and status is not None and status >= 400:
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                body.extend(chunk[:max(0, self.MAX_BODY_BYTES - len(body))])
+                complete = not message.get("more_body", False)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        except Exception:
+            exception = sys.exc_info()
+            if status is None:
+                status = 500
+            raise
+        finally:
+            if status is not None and (status >= 400 or exception):
+                response = None
+                if body:
+                    if total > self.MAX_BODY_BYTES or not complete:
+                        # Partial JSON can split credentials before redaction can
+                        # recognize them. Report the omission rather than a prefix.
+                        response = "[Response body omitted: truncated or incomplete]"
+                    elif "json" in content_type or content_type.startswith("text/"):
+                        response = body.decode("utf-8", errors="replace")
+                        try:
+                            response = json.loads(response)
+                        except (ValueError, RecursionError):
+                            pass
+                    else:
+                        response = "[Non-text response body omitted]"
+                elif exception and status == 500:
+                    response = "Internal Server Error"
+                try:
+                    reason = HTTPStatus(status).phrase
+                except ValueError:
+                    reason = "HTTP error"
+                details = {
+                    "kind": "http_error", "method": scope.get("method", ""),
+                    "path": scope.get("path", ""), "status": status,
+                    "reason": reason, "response": response,
+                    "response_truncated": total > self.MAX_BODY_BYTES,
+                }
+                if isinstance(response, dict):
+                    details["detail"] = response.get("detail", response.get("error"))
+                logging.getLogger("sparkdeck.http").error(
+                    "%s %s returned %s %s", details["method"], details["path"], status, reason,
+                    extra={"error_details": details}, exc_info=exception,
+                )
+
+
 def _install_log_capture():
     """Route Python logging + uvicorn access logs into the in-memory buffer."""
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
         datefmt="%H:%M:%S",
     )
-    handler = _DequeHandler()
+    root_logger = logging.getLogger()
+    handler = next((item for item in root_logger.handlers if isinstance(item, _DequeHandler)), None)
+    if handler is None:
+        handler = _DequeHandler()
     handler.setFormatter(fmt)
     # Capture all loggers
-    root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
     # Also capture uvicorn access logs
@@ -197,11 +348,32 @@ def _install_log_capture():
 _install_log_capture()
 
 
+async def _deployment_log_loop():
+    """Observe lifecycle changes even when no dashboard or Logs tab is open."""
+    last_error = None
+    while True:
+        try:
+            await sparkdeck.deployments(observe_events=True)
+            last_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A repeated discovery outage should produce one actionable error.
+            message = str(exc)
+            if message != last_error:
+                logging.getLogger("sparkdeck.lifecycle").error(
+                    "Could not refresh deployment activity: %s", message,
+                )
+                last_error = message
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
         uploader = asyncio.create_task(community_upload_loop())
+        deployment_logs = asyncio.create_task(_deployment_log_loop())
         startup_benchmark_monitor = StartupBenchmarkMonitor(sparkdeck)
         sparkdeck.register_consent_canceller(startup_benchmark_monitor.cancel_active)
         startup_benchmarks = asyncio.create_task(startup_benchmark_monitor.run())
@@ -209,10 +381,12 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             uploader.cancel()
+            deployment_logs.cancel()
             startup_benchmarks.cancel()
             await asyncio.gather(startup_benchmarks, return_exceptions=True)
             await manager.virtual_nas.stop_dispatcher()
             await updater.close()
+            await asyncio.gather(deployment_logs, return_exceptions=True)
             await sparkdeck.close()
             await manager.stop()
 
@@ -289,6 +463,9 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     return response
 
+
+# Wrap forwarding and security middleware so their errors are captured too.
+app.add_middleware(_ErrorResponseLogMiddleware)
 
 def _require_agent(request: Request) -> None:
     authorization = request.headers.get("authorization", "")
@@ -4150,6 +4327,12 @@ async def v1_completions(req: Request):
 
 
 # ---------- server logs ----------
+@app.get("/api/v1/logs")
+async def get_activity_logs(tail: int = 500):
+    """Deployment lifecycle events and errors, without routine server traffic."""
+    return {"entries": list(_activity_buffer)[-max(1, min(tail, MAX_LOG_LINES)):]}
+
+
 @app.get("/api/server-logs")
 async def get_server_logs(tail: int = 500):
     """Return the most recent server log lines from the in-memory buffer."""
@@ -4250,6 +4433,9 @@ async def _serve_application() -> None:
         log_level="info",
         timeout_graceful_shutdown=10,
     ))
+
+    # Config applies Uvicorn logging and replaces its logger handlers.
+    _install_log_capture()
 
     async def watch_launcher_shutdown() -> None:
         while not instance.should_exit:

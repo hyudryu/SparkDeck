@@ -1465,6 +1465,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.create_deployment = AsyncMock()
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
+            self._explicitly_stopped_containers = set()
             self.recipe_model_preparation_preflight = AsyncMock(return_value={
                 "eligible": True, "action": "ready", "targets": [],
             })
@@ -3003,6 +3004,45 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_hook_actions_update_discovered_stop_intent(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            manager._explicitly_stopped_containers.add("external-stack")
+            spawn = AsyncMock(side_effect=[self.FakeProcess(), self.FakeProcess()])
+            with patch("asyncio.create_subprocess_shell", spawn):
+                await service.deployment_action("container:external-stack", "start")
+                await service._external_lifecycle_tasks["external-stack"]["task"]
+                self.assertNotIn(
+                    "external-stack", manager._explicitly_stopped_containers,
+                )
+                self.assertEqual(
+                    service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )["desired_state"],
+                    "running",
+                )
+
+                await service.deployment_action("container:external-stack", "stop")
+                await service._external_lifecycle_tasks["external-stack"]["task"]
+                self.assertIn(
+                    "external-stack", manager._explicitly_stopped_containers,
+                )
+                self.assertEqual(
+                    service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )["desired_state"],
+                    "stopped",
+                )
+
             await manager.http.aclose()
             await service.close()
 

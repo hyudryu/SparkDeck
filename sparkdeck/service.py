@@ -419,6 +419,8 @@ class SparkDeckService:
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_node_ids: dict[str, list[str]] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
+        self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
         # {"action": str, "task": asyncio.Task, "process": subprocess | None}.
         self._external_lifecycle_tasks: dict[str, dict[str, Any]] = {}
@@ -996,7 +998,7 @@ class SparkDeckService:
             model["local_deployment_ids"] = [item["id"] for item in local]
         return {"model": model, "aggregates": []}
 
-    async def deployments(self) -> list[dict[str, Any]]:
+    async def deployments(self, *, observe_events: bool = False) -> list[dict[str, Any]]:
         raw_manager_deployments = getattr(self.manager, "deployments", [])
         registered = await self._adopt_unlinked_manager_deployments(
             raw_manager_deployments, skip_if_creating=True,
@@ -1053,13 +1055,20 @@ class SparkDeckService:
             # request can otherwise block the polling endpoint.
             containers = cluster_state.get("containers") or []
             docker_unavailable = not bool(cluster_state.get("docker_ready"))
+            # Absence is authoritative when the container snapshot itself
+            # succeeded, even if the separate image inventory failed.
+            container_inventory_ready = bool(cluster_state.get("containers_ready"))
         else:
             docker_unavailable = False
+            container_inventory_ready = False
             try:
                 containers = await self.manager.list_containers()
             except Exception:
                 containers = []
                 docker_unavailable = True
+            # A successful snapshot is authoritative for absence even when a
+            # later inventory facet is unavailable.
+            container_inventory_ready = not docker_unavailable
         seen: set[str] = set()
         local_cluster_members: dict[str, dict[str, Any]] = {}
         for stored in registered:
@@ -1291,7 +1300,147 @@ class SparkDeckService:
         for deployment in registered:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
+        if observe_events:
+            runtime_deployments = {
+                str(item["id"]): (
+                    cluster_by_id.get((item.get("settings") or {}).get("manager_deployment_id"))
+                    or cluster_by_record.get(item["id"])
+                    or cluster_by_container.get(item.get("container_name"))
+                    or {}
+                ) for item in registered
+            }
+            self._observe_deployment_events(
+                registered, inventory_complete=container_inventory_ready,
+                runtime_deployments=runtime_deployments,
+            )
         return registered
+
+    def _observe_deployment_events(
+        self, deployments: list[dict[str, Any]], *, inventory_complete: bool = False,
+        runtime_deployments: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Log actual lifecycle changes once, including independent engine groups.
+
+        Missing inventory is not proof of a shutdown. Keep the last known state
+        through discovery outages so recovery does not manufacture another launch.
+        """
+        states = self._deployment_log_states
+        errors = self._deployment_log_errors
+        event_logger = logging.getLogger("sparkdeck.lifecycle")
+        if inventory_complete:
+            present_ids = {str(item.get("id") or "") for item in deployments}
+            for key in (states.keys() | errors.keys()):
+                if key[0] in present_ids:
+                    continue
+                previous = states.pop(key, None)
+                errors.pop(key, None)
+                if previous and previous[0] in {"running", "starting", "stopping", "degraded"}:
+                    name = key[0]
+                    if key[1] is not None:
+                        name += f" (engine group {key[1]})"
+                    event_logger.info(
+                        "Deployment %s stopped (removed from inventory)", name,
+                        extra={"deployment_event": "stopped"},
+                    )
+        for deployment in deployments:
+            deployment_id = str(deployment.get("id") or "")
+            if not deployment_id:
+                continue
+            label = str(deployment.get("alias") or deployment.get("name") or deployment_id)
+            groups = deployment.get("instances") or [deployment]
+            if deployment.get("instances"):
+                # Recovery/action failures belong to the deployment, including
+                # degraded layouts whose healthy groups keep serving.
+                parent_error = str(deployment.get("last_error") or deployment.get("error") or "")
+                parent_key = (deployment_id, None)
+                if deployment.get("status") == "running":
+                    parent_error = ""
+                if parent_error and errors.get(parent_key) != parent_error:
+                    event_logger.error("Deployment %s error: %s", label, parent_error)
+                if parent_error:
+                    errors[parent_key] = parent_error
+                else:
+                    errors.pop(parent_key, None)
+            for group in groups:
+                instance = group.get("instance_id")
+                key = (deployment_id, instance)
+                name = f"{label} (engine group {instance})" if instance is not None else label
+                status = str(group.get("status") or "unknown")
+                error = str(group.get("last_error") or group.get("error") or "")
+                if not error and status == "error":
+                    error = str(deployment.get("last_error") or deployment.get("error") or "")
+                external_endpoint = (
+                    deployment.get("kind") == DeploymentKind.EXTERNAL.value
+                    and not deployment_id.startswith("container:")
+                )
+                if external_endpoint or status in {"unknown", "missing", "unreachable"}:
+                    # Endpoint health and failed inventory cannot prove that a
+                    # process launched or exited. Report their errors without
+                    # replacing the last known process state.
+                    if external_endpoint and status != "error":
+                        error = ""
+                    if error and errors.get(key) != error:
+                        event_logger.error("Deployment %s error: %s", name, error)
+                    if error:
+                        errors[key] = error
+                    else:
+                        errors.pop(key, None)
+                    continue
+                # Error details on degraded/recovering states are actionable;
+                # only healthy rows can carry irrelevant persisted errors.
+                if status == "running":
+                    error = ""
+                previous = states.get(key)
+                runtime = (runtime_deployments or {}).get(deployment_id) or {}
+                process_lost = _deployment_process_lost(runtime, instance)
+                if status != "running" and process_lost and previous and previous[0] == "running":
+                    message = f"Deployment {name} crashed"
+                    if error:
+                        message += f": {error}"
+                    event_logger.error(message, extra={"deployment_event": "crashed"})
+                    states[key] = ("crashed", error)
+                    if error:
+                        errors[key] = error
+                    continue
+                if error and status != "error" and errors.get(key) != error:
+                    event_logger.error("Deployment %s error: %s", name, error)
+                if error:
+                    errors[key] = error
+                else:
+                    errors.pop(key, None)
+                # Readiness probes and partial group availability can wobble
+                # without the process exiting. Only a terminal state ends a
+                # launch; recovery from these probes is not another launch.
+                # A deliberate recreation (recreate_pending) ends the prior
+                # generation: let the transition record so the replacement that
+                # returns to running announces a new launch.
+                if previous and previous[0] == "running" and status in {
+                    "starting", "degraded", "stopping",
+                } and not _deployment_recreating(runtime, instance):
+                    continue
+                current = (status, error)
+                if previous == current:
+                    continue
+                states[key] = current
+                event = None
+                level = logging.INFO
+                if status == "running" and (previous is None or previous[0] != "running"):
+                    event = "launched"
+                elif status == "error":
+                    event = "crashed" if previous and previous[0] == "running" else "error"
+                    level = logging.ERROR
+                elif status == "stopped" and previous and previous[0] in {
+                    "running", "starting", "stopping", "degraded",
+                }:
+                    desired = group.get("desired_state", deployment.get("desired_state"))
+                    event = "crashed" if desired == "running" else "stopped"
+                    if event == "crashed":
+                        level = logging.ERROR
+                if event:
+                    message = f"Deployment {name} {event}"
+                    if error:
+                        message += f": {error}"
+                    event_logger.log(level, message, extra={"deployment_event": event})
 
     async def register_manager_deployment(
         self, cluster: dict[str, Any],
@@ -3664,7 +3813,7 @@ class SparkDeckService:
                 self._link_cluster_record(
                     deployment, settings, mode, node_ids, cluster,
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Manager persists node-specific launch failures. Once linked,
                 # retaining the SQLite row makes that diagnostic durable and
                 # visible in Deployments. A preflight failure is handled by
@@ -3676,6 +3825,8 @@ class SparkDeckService:
                 )
                 if not linked:
                     self.store.delete_deployment(deployment.id)
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Deployment %s launch failed: %s", deployment.alias, exc)
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment.id, None)
@@ -4977,6 +5128,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "start", str(start_command),
                     )
+                    self._record_external_lifecycle_intent(container, "start")
                 else:
                     await self.manager.start_container(
                         container, explicit=True, managed=False,
@@ -4992,6 +5144,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "stop", str(stop_command),
                     )
+                    self._record_external_lifecycle_intent(container, "stop")
                 else:
                     await self.manager.stop_container(
                         container, explicit=True, managed=False,
@@ -5003,6 +5156,18 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    def _record_external_lifecycle_intent(
+        self, container_name: str, action: str,
+    ) -> None:
+        """Mirror hook-backed Start/Stop intent in Manager's container ledger."""
+        stopped = getattr(self.manager, "_explicitly_stopped_containers", None)
+        if stopped is None:
+            stopped = self.manager._explicitly_stopped_containers = set()
+        if action == "stop":
+            stopped.add(container_name)
+        else:
+            stopped.discard(container_name)
 
     def _reject_external_lifecycle_in_flight(self, container_name: str) -> None:
         """Reject any action while a lifecycle hook runs for this container."""
@@ -5169,7 +5334,7 @@ class SparkDeckService:
             )
             arguments = (action, container_name, process.returncode, duration)
             if process.returncode:
-                logger.warning(message, *arguments)
+                logger.error(message, *arguments)
             else:
                 logger.info(message, *arguments)
         except asyncio.CancelledError:
@@ -6413,6 +6578,17 @@ class SparkDeckService:
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            # An unmanaged container has no persisted desired state. Distinguish
+            # a SparkDeck explicit Stop (kept in the manager's stop ledger) from
+            # an unexpected Docker exit so the Logs view does not report a crash
+            # as an intentional shutdown.
+            "desired_state": (
+                "stopped"
+                if str(container.get("name") or "") in getattr(
+                    self.manager, "_explicitly_stopped_containers", (),
+                )
+                else "running"
+            ),
             "promotable": (
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
@@ -7542,6 +7718,53 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy"):
         return "error"
     return "unknown"
+
+
+def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Distinguish confirmed rank loss/health recovery from readiness or outages."""
+    if cluster.get("desired_state") == "stopped" or cluster.get("status") in {"stopped", "stopping"}:
+        return False
+    members = [
+        member for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    ]
+    expected = [member for member in members if member.get("desired_state") != "stopped"]
+    for member in expected:
+        member_status = member.get("status")
+        if member_status in {"exited", "dead", "removed", "error"}:
+            return True
+        if member_status == "missing" and member.get("node_docker_ready") is True:
+            # An absent container is only a confirmed loss when the node's
+            # container inventory was reliable. A reachable node reporting
+            # docker_ready=false advertises nothing and must not be treated
+            # as a crash, or recovery later manufactures a false launch.
+            return True
+    # Startup reconnects and environment migrations also use recovering. Only
+    # the health recovery path proves a broken generation. For grouped layouts
+    # require evidence in that group so healthy siblings never emit crashes.
+    if cluster.get("status") == "recovering" and cluster.get("health_issue"):
+        return instance is None or any(
+            member.get("status") in {"starting", "restarting", "stopped"}
+            for member in expected
+        )
+    return False
+
+
+def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Whether a deliberate recreation is in flight for this engine group.
+
+    Recreation publishes ``recreate_pending`` while it tears down and queues
+    replacement ranks. Such a transition ends the previous generation rather
+    than being a readiness wobble, so the eventual running state must announce
+    a new launch instead of matching the stale running tuple.
+    """
+    return any(
+        member.get("recreate_pending")
+        for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    )
 
 
 def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:

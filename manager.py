@@ -19473,7 +19473,13 @@ class Manager:
                         "phase": "missing",
                         "message": "Managed container is missing",
                     }
-                member["node_status"] = node.get("status", "unknown") if node.get("online") else "offline"
+                member["node_status"] = (
+                    node.get("status", "unknown") if node.get("online") else "offline"
+                )
+                # A remote node that is online but reports docker_ready=false
+                # advertises no container summary, so an absent container there
+                # means the inventory is unreliable rather than a confirmed loss.
+                member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
@@ -19623,6 +19629,10 @@ class Manager:
         return {
             "containers": containers,
             "images": images,
+            # Container snapshot success is authoritative for absence even when
+            # the separate image inventory fails; only container listing being
+            # unavailable means we cannot trust a missing container.
+            "containers_ready": not containers_unavailable,
             "docker_ready": bool(
                 local_docker_ready
                 and not containers_unavailable

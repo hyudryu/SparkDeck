@@ -69,6 +69,7 @@ describe('LogsPage', () => {
   it('exports only the displayed events', async () => {
     vi.spyOn(api.logs, 'list').mockResolvedValue([
       { event: 'launched', level: 'info', message: 'Model launched' },
+      { level: 'error', message: 'POST /api/deployments 400', details: { status: 400, reason: 'Bad Request', response: { detail: 'Not enough memory' } } },
       { level: 'info', message: 'Routine request' },
     ])
     const blobs: Blob[] = []
@@ -80,6 +81,27 @@ describe('LogsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Export' }))
     const reader = new FileReader()
     reader.readAsText(blobs[0])
-    await waitFor(() => expect(reader.result).toBe('info  Model launched'))
+    await waitFor(() => expect(typeof reader.result).toBe('string'))
+    expect(JSON.parse(reader.result as string)).toEqual([
+      { event: 'launched', level: 'info', message: 'Model launched' },
+      { level: 'error', message: 'POST /api/deployments 400', details: { status: 400, reason: 'Bad Request', response: { detail: 'Not enough memory' } } },
+    ])
+    expect(blobs[0].type).toBe('application/json')
+  })
+
+  it('displays and searches structured response details', async () => {
+    const details = { status: 400, reason: 'Bad Request', response: { detail: 'Missing model weights', node: 'node-3' } }
+    vi.spyOn(api.logs, 'list').mockResolvedValue([
+      { level: 'error', message: 'Deployment request failed', details },
+      { event: 'launched', message: 'Another model launched' },
+    ])
+    render(<LogsPage />)
+    const summary = await screen.findByText('Error details (JSON)')
+    fireEvent.click(summary)
+    expect(summary.parentElement).toHaveAttribute('open')
+    expect(summary.parentElement?.querySelector('pre')?.textContent).toBe(JSON.stringify(details, null, 2))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Filter logs' }), { target: { value: 'node-3' } })
+    expect(screen.getByText('Deployment request failed')).toBeInTheDocument()
+    expect(screen.queryByText('Another model launched')).not.toBeInTheDocument()
   })
 })

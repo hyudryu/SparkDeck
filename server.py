@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from http import HTTPStatus
 
 from fastapi import (
     FastAPI, HTTPException, Query, Request, Response, WebSocket,
@@ -153,28 +154,28 @@ class _DequeHandler(logging.Handler):
             msg = _redact_log(self.format(record))
             _log_buffer.append(msg)
             event = getattr(record, "deployment_event", None)
-            is_http_error = (
-                record.name == "uvicorn.access"
-                and isinstance(record.args, tuple)
-                and len(record.args) == 5
-                and str(record.args[4]).isdigit()
-                and int(record.args[4]) >= 400
-            )
-            if record.levelno >= logging.ERROR or is_http_error or event in {
+            if record.levelno >= logging.ERROR or event in {
                 "launched", "stopped", "crashed",
             }:
                 # Keep a separate buffer so routine traffic cannot evict events.
                 formatter = self.formatter or logging.Formatter()
                 entry = {
                     "timestamp": formatter.formatTime(record, "%Y-%m-%d %H:%M:%S"),
-                    "level": "error" if is_http_error else record.levelname.lower(),
+                    "level": record.levelname.lower(),
                     "source": record.name,
                     "message": _redact_log(record.getMessage()),
                 }
-                if record.exc_info:
-                    entry["message"] += "\n" + _redact_log(
-                        formatter.formatException(record.exc_info)
-                    )
+                if record.levelno >= logging.ERROR:
+                    details = dict(getattr(record, "error_details", None) or {
+                        "kind": "error", "message": record.getMessage(),
+                    })
+                    if record.exc_info:
+                        details["exception"] = {
+                            "type": record.exc_info[0].__name__,
+                            "message": str(record.exc_info[1]),
+                            "traceback": formatter.formatException(record.exc_info),
+                        }
+                    entry["details"] = _redact_log_value(details)
                 if event in {"launched", "stopped", "crashed"}:
                     entry["event"] = event
                 _activity_buffer.append(entry)
@@ -203,6 +204,103 @@ def _redact_log(message: str) -> str:
     if configured_token:
         redacted = redacted.replace(configured_token, "[REDACTED]")
     return redacted
+
+
+_LOG_PRIVATE_KEYS = {
+    "authorization", "proxyauthorization", "cookie", "setcookie", "token",
+    "apikey", "accesstoken", "refreshtoken", "idtoken", "hftoken", "agenttoken",
+    "huggingfacehubtoken", "password", "secret", "clientsecret", "input",
+}
+
+
+def _redact_log_value(value, depth=0):
+    """Preserve JSON structure without credentials or echoed validation input."""
+    if depth >= 12:
+        return "[Nested details omitted]"
+    if isinstance(value, dict):
+        return {
+            _redact_log(str(key)): (
+                "[REDACTED]" if re.sub(r"[^a-z0-9]", "", str(key).lower()) in _LOG_PRIVATE_KEYS
+                else _redact_log_value(item, depth + 1)
+            ) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_log_value(item, depth + 1) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_log(str(value))
+
+
+class _ErrorResponseLogMiddleware:
+    """Observe failed ASGI responses without consuming or buffering their streams."""
+    MAX_BODY_BYTES = 16 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        status = None
+        body = bytearray()
+        total = 0
+        complete = False
+        content_type = ""
+        exception = None
+
+        async def capture(message):
+            nonlocal status, total, complete, content_type
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                content_type = dict(message.get("headers", [])).get(b"content-type", b"").decode("latin-1")
+            elif message["type"] == "http.response.body" and status is not None and status >= 400:
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                body.extend(chunk[:max(0, self.MAX_BODY_BYTES - len(body))])
+                complete = not message.get("more_body", False)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        except Exception:
+            exception = sys.exc_info()
+            if status is None:
+                status = 500
+            raise
+        finally:
+            if status is not None and (status >= 400 or exception):
+                response = None
+                if body:
+                    if total > self.MAX_BODY_BYTES or not complete:
+                        # Partial JSON can split credentials before redaction can
+                        # recognize them. Report the omission rather than a prefix.
+                        response = "[Response body omitted: truncated or incomplete]"
+                    elif "json" in content_type or content_type.startswith("text/"):
+                        response = body.decode("utf-8", errors="replace")
+                        try:
+                            response = json.loads(response)
+                        except (ValueError, RecursionError):
+                            pass
+                    else:
+                        response = "[Non-text response body omitted]"
+                elif exception and status == 500:
+                    response = "Internal Server Error"
+                try:
+                    reason = HTTPStatus(status).phrase
+                except ValueError:
+                    reason = "HTTP error"
+                details = {
+                    "kind": "http_error", "method": scope.get("method", ""),
+                    "path": scope.get("path", ""), "status": status,
+                    "reason": reason, "response": response,
+                    "response_truncated": total > self.MAX_BODY_BYTES,
+                }
+                if isinstance(response, dict):
+                    details["detail"] = response.get("detail", response.get("error"))
+                logging.getLogger("sparkdeck.http").error(
+                    "%s %s returned %s %s", details["method"], details["path"], status, reason,
+                    extra={"error_details": details}, exc_info=exception,
+                )
 
 
 def _install_log_capture():
@@ -336,6 +434,9 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     return response
 
+
+# Wrap forwarding and security middleware so their errors are captured too.
+app.add_middleware(_ErrorResponseLogMiddleware)
 
 def _require_agent(request: Request) -> None:
     authorization = request.headers.get("authorization", "")

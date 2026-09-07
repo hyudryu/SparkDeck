@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -115,6 +115,62 @@ function renderPage() {
 }
 
 describe('BenchmarkRunner', () => {
+  it.each([false, true])('keeps loaded cards stable during polling (empty history: %s)', async (emptyHistory) => {
+    let poll: () => void = () => { throw new Error('Polling was not scheduled') }
+    const setInterval = window.setInterval.bind(window)
+    vi.spyOn(window, 'setInterval').mockImplementation((callback, delay, ...args) => {
+      if (delay === 2_000) {
+        poll = callback as () => void
+        return 1
+      }
+      return setInterval(callback, delay, ...args)
+    })
+    const activeRun = {
+      ...completedRun,
+      status: 'running',
+      progress: { requests_done: 3 },
+    }
+    const state = stubFetch({
+      status: { installed: true, version: '0.4.0', active_run_id: activeRun.id },
+      runs: emptyHistory ? [] : [activeRun],
+      runDetail: activeRun,
+    })
+    const user = userEvent.setup()
+    const { container } = renderPage()
+    expect(screen.getByText('Loading benchmark runs')).toBeInTheDocument()
+    expect(screen.getByText(/Checking for llama-benchy/)).toBeInTheDocument()
+    await screen.findByText('3 requests completed')
+    if (!emptyHistory) {
+      const history = await screen.findByRole('table', { name: 'Benchmark run history' })
+      await user.click(within(history).getByText(activeRun.model))
+      await screen.findByRole('region', { name: 'Results for run run-1' })
+    } else {
+      await screen.findByText('No benchmark runs yet')
+    }
+
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const respond = fetchMock.getMockImplementation()!
+    let finishPoll!: () => void
+    const pending = new Promise<void>((resolve) => { finishPoll = resolve })
+    fetchMock.mockImplementation(async (...args) => {
+      await pending
+      return respond(...args)
+    })
+    fetchMock.mockClear()
+    const loadedMarkup = container.innerHTML
+    await act(async () => { poll() })
+
+    expect(fetchMock).toHaveBeenCalledTimes(emptyHistory ? 3 : 4)
+    expect(container.innerHTML).toBe(loadedMarkup)
+    expect(screen.queryByText('Loading benchmark runs')).not.toBeInTheDocument()
+    expect(screen.queryByText('Loading run results')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Checking for llama-benchy/)).not.toBeInTheDocument()
+
+    state.runDetail = { ...activeRun, progress: { requests_done: 4 } }
+    await act(async () => { finishPoll() })
+    expect(await screen.findByText('4 requests completed')).toBeInTheDocument()
+  })
+
   it('offers a one-button install when llama-benchy is missing', async () => {
     const state = stubFetch({ status: { installed: false }, runs: [] })
     const user = userEvent.setup()

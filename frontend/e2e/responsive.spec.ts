@@ -105,6 +105,52 @@ test('shows only deployment activity and errors in Logs', async ({ page }) => {
   expect(overflow).toBeLessThanOrEqual(1)
 })
 
+test('keeps benchmark cards in place during background polling', async ({ page }, testInfo) => {
+  const run = {
+    id: 'run-live', model: 'org/test-model', model_id: 'org/test-model', status: 'running',
+    created_at: '2026-09-06T10:00:00Z', results: [], result_count: 0,
+    config: { prompt_sizes: [2048], response_sizes: [128], concurrency_levels: [1], context_depths: [0] },
+    progress: { requests_done: 3 },
+  }
+  let holdPoll = false
+  let pendingRequests = 0
+  let releasePoll!: () => void
+  const pending = new Promise<void>((resolve) => { releasePoll = resolve })
+  await page.clock.install()
+  await page.route('**/api/v1/benchmark-runner/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (holdPoll) {
+      pendingRequests += 1
+      await pending
+    }
+    const body = path.endsWith('/status')
+      ? { installed: true, version: '0.4.0', active_run_id: run.id }
+      : path.endsWith('/models') ? { items: [{ id: run.model, label: run.model }] }
+        : path.endsWith('/runs') ? { items: [run] } : run
+    await route.fulfill({ json: body })
+  })
+  await page.goto('/benchmarks')
+  await expect(page.getByText('3 requests completed')).toBeVisible()
+  const runner = page.locator('.benchmark-runner')
+  await runner.getByRole('table', { name: 'Benchmark run history' }).getByText(run.model).click()
+  await expect(page.getByRole('region', { name: `Results for run ${run.id}` })).toBeVisible()
+  const geometry = () => page.locator('.runner-tool-panel, .runner-config-panel, .runner-active-panel, .runner-history-table, .runner-detail, .benchmark-summary-grid').evaluateAll((cards) => cards.map((card) => {
+    const { top, height } = card.getBoundingClientRect()
+    return { top: top + window.scrollY, height }
+  }))
+  const before = await geometry()
+  holdPoll = true
+  await page.clock.fastForward(2_000)
+  await expect.poll(() => pendingRequests).toBe(4)
+  await expect(runner.getByText(/Checking for llama-benchy|Loading benchmark runs|Loading run results/)).toHaveCount(0)
+  expect(await geometry()).toEqual(before)
+  await page.screenshot({ path: testInfo.outputPath('benchmark-polling.png'), fullPage: true })
+  run.progress.requests_done = 4
+  releasePoll()
+  await expect(page.getByText('4 requests completed')).toBeVisible()
+  expect(await geometry()).toEqual(before)
+})
+
 test('keeps every primary route within the viewport', async ({ page }) => {
   for (const route of routes) {
     await page.goto(route)

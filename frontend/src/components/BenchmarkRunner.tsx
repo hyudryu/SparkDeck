@@ -202,7 +202,7 @@ export function BenchmarkRunner() {
           <span className="runner-tool-icon"><Gauge size={19} aria-hidden="true" /></span>
           <div className="runner-tool-info">
             <h2>llama-benchy</h2>
-            {status.loading && <p className="muted">Checking for llama-benchy…</p>}
+            {status.loading && !status.data && <p className="muted">Checking for llama-benchy…</p>}
             {status.data && (status.data.installed
               ? <p className="runner-install-badge">Installed{status.data.version ? ` · v${status.data.version}` : ''}{status.data.launch_mode === 'python_module' ? ' · Python module' : ''}</p>
               : <p>Not installed. llama-benchy drives benchmark requests against a running model endpoint and reports llama-bench style statistics. Install it to enable the runner below.</p>)}
@@ -361,9 +361,9 @@ export function BenchmarkRunner() {
       </>}
 
       <div className="section-heading"><div><h2>Output history</h2><p>Select a completed run to chart prompt processing and generation speed per concurrency level.</p></div></div>
-      {runs.loading && <LoadingState label="Loading benchmark runs" />}
+      {runs.loading && !runs.data && <LoadingState label="Loading benchmark runs" />}
       {runs.error && <ErrorState message={runs.error} onRetry={runs.reload} />}
-      {!runs.loading && !runs.error && runs.data?.length === 0 && (
+      {!runs.error && runs.data?.length === 0 && (
         <EmptyState
           title="No benchmark runs yet"
           description="Start a run above — results are stored as CSV with the model name, quantization, and full configuration."
@@ -426,7 +426,7 @@ export function BenchmarkRunner() {
         </div></Panel>
       )}
 
-      {selectedRunId && detail.loading && <LoadingState label="Loading run results" />}
+      {selectedRunId && detail.loading && !activeDetail && <LoadingState label="Loading run results" />}
       {selectedRunId && detail.error && <ErrorState message={detail.error} onRetry={detail.reload} />}
       {activeDetail && (
         <section className="runner-detail" aria-label={`Results for run ${activeDetail.id}`}>

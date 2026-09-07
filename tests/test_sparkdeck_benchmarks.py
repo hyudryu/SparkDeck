@@ -63,11 +63,12 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.temp.cleanup()
 
-    def _record_passive_sample(
+    def _record_startup_sample(
         self, *, model="org/model", settings=None, input_tokens=400,
-        output_tokens=320, decode_seconds=4.0,
+        output_tokens=200, decode_seconds=2.5,
     ):
         observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
         token = self.service._community_observation.set(observation)
         try:
             now = time.monotonic()
@@ -75,13 +76,88 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "dep-1", model, "vllm", settings or {},
                 now - decode_seconds - 0.1,
                 {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
-                now - decode_seconds,
+                now - decode_seconds, completed_at=now,
                 hardware={"hardware_class": "dgx-spark"},
                 hardware_verified=True,
             )
         finally:
             self.service._community_observation.reset(token)
             self.service._community_observation_end(observation)
+
+    async def test_startup_samples_update_user_average_per_weight_quant_and_tp(self):
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        for model, quant, tp, seconds in (
+            ("org/model", "FP8", 1, 2.0),
+            ("org/model", "FP8", 1, 4.0),
+            ("org/model", "FP8", 2, 1.0),
+            ("org/model", "AWQ", 1, 5.0),
+            ("org/other", "FP8", 1, 8.0),
+        ):
+            self._record_startup_sample(
+                model=model, settings={"quantization": quant, "tensor_parallel_size": tp},
+                decode_seconds=seconds,
+            )
+        averages = {
+            (row["model_id"], row["quantization"], row["tensor_parallel_size"]):
+            row["inference_tokens_per_second"]
+            for row in self.service.store.outbox_batch()
+        }
+        self.assertEqual(averages, {
+            ("org/model", "FP8", 1): 75.0,
+            ("org/model", "FP8", 2): 200.0,
+            ("org/model", "AWQ", 1): 40.0,
+            ("org/other", "FP8", 1): 25.0,
+        })
+        samples, total = self.service.store.benchmarks()
+        self.assertEqual(total, 5)
+        for sample in samples:
+            self.assertEqual(sample["configuration"]["benchmark_depth"], 0)
+            self.assertEqual(sample["configuration"]["benchmark_concurrency"], 1)
+            self.assertEqual(sample["configuration"]["benchmark_source"], "container_startup")
+
+    async def test_startup_samples_reject_direct_manager_or_manual_benchmark_overlap(self):
+        self.service.store.set_community_consent(True)
+        for manual, request_sequence in ((True, 1), (False, 2)):
+            self.service._startup_benchmark_busy = lambda: manual
+            self.manager._req_seq = request_sequence
+            observation = self.service._community_observation_start()
+            observation.update(startup_benchmark=True, manager_request_sequence=0)
+            token = self.service._community_observation.set(observation)
+            try:
+                self.service._record_usage(
+                    "dep", "org/model", "vllm", {}, 1.0,
+                    {"prompt_tokens": 20, "completion_tokens": 200}, 1.1,
+                    completed_at=3.1,
+                )
+            finally:
+                self.service._community_observation.reset(token)
+                self.service._community_observation_end(observation)
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+
+    async def test_startup_samples_reject_incomplete_generation(self):
+        self.service.store.set_community_consent(True)
+        for count in (0, 32, 199, 201):
+            self._record_startup_sample(output_tokens=count)
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+
+    async def test_startup_sample_rechecks_consent_epoch_before_inserting(self):
+        self.service.store.set_community_consent(True)
+        observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
+        self.service.store.set_community_consent(False)
+        self.service.store.set_community_consent(True)
+        token = self.service._community_observation.set(observation)
+        try:
+            self.service._record_usage(
+                "dep", "org/model", "vllm", {}, 1.0,
+                {"prompt_tokens": 20, "completion_tokens": 200}, 1.1,
+                completed_at=3.1,
+            )
+        finally:
+            self.service._community_observation.reset(token)
+            self.service._community_observation_end(observation)
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
 
     async def test_models_contract_keeps_benchmark_routing_fields(self):
         self.service.deployments = AsyncMock(return_value=[{
@@ -220,16 +296,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["model"]["repository"], model)
         self.assertEqual(self.service.store.outbox_batch(), [])
 
-    async def test_passive_telemetry_collects_nothing_when_opted_out(self):
-        self._record_passive_sample()
+    async def test_startup_telemetry_collects_nothing_when_opted_out(self):
+        self._record_startup_sample()
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
         self.assertEqual(self.service.store.outbox_batch(), [])
 
-    async def test_passive_telemetry_uses_canonical_model_quant_and_400_bucket(self):
+    async def test_startup_telemetry_uses_canonical_model_quant_and_400_bucket(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(
+        self._record_startup_sample(
             model="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
         )
         self.assertEqual(self.service.store.outbox_batch(), [{
@@ -244,9 +320,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "tensor_parallel_size": 1,
         }])
 
-    async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
+    async def test_startup_telemetry_overlap_invalidates_entire_decode(self):
         self.service.store.set_community_consent(True)
         first = self.service._community_observation_start()
+        first["startup_benchmark"] = True
         second = self.service._community_observation_start()
         self.service._community_observation_end(second)
         token = self.service._community_observation.set(first)
@@ -254,7 +331,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             now = time.monotonic()
             self.service._record_usage(
                 "dep-1", "org/model", "vllm", {}, now - 4.1,
-                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+                {"prompt_tokens": 400, "completion_tokens": 200}, now - 4,
             )
         finally:
             self.service._community_observation.reset(token)
@@ -262,22 +339,22 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
 
-    async def test_passive_telemetry_has_four_hour_model_quant_cooldown(self):
+    async def test_startup_telemetry_records_each_start_without_a_cooldown(self):
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
-        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+        self._record_startup_sample(settings={"quantization": "Q4_K_M"})
+        self._record_startup_sample(settings={"quantization": "Q4_K_M"})
         _, total = self.service.store.benchmarks()
-        self.assertEqual(total, 1)
+        self.assertEqual(total, 2)
 
-    async def test_passive_telemetry_cooldown_is_separate_per_tp_setting(self):
+    async def test_startup_telemetry_pool_is_separate_per_tp_setting(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(settings={"tensor_parallel_size": 1})
-        self._record_passive_sample(settings={"tensor_parallel_size": 4})
-        self._record_passive_sample(settings={"tensor_parallel_size": 4})
+        self._record_startup_sample(settings={"tensor_parallel_size": 1})
+        self._record_startup_sample(settings={"tensor_parallel_size": 4})
+        self._record_startup_sample(settings={"tensor_parallel_size": 4})
 
         samples, total = self.service.store.benchmarks()
-        self.assertEqual(total, 2)
+        self.assertEqual(total, 3)
         self.assertEqual(
             {sample["configuration"]["tensor_parallel_size"] for sample in samples},
             {1, 4},
@@ -288,9 +365,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             {1, 4},
         )
 
-    async def test_passive_telemetry_rejects_context_at_or_above_10k(self):
+    async def test_startup_telemetry_rejects_context_at_or_above_10k(self):
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(input_tokens=10_000)
+        self._record_startup_sample(input_tokens=10_000)
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
 
@@ -314,7 +391,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             now = time.monotonic()
             self.service._record_usage(
                 "dep-1", "org/model", "vllm", {}, now - 4.1,
-                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+                {"prompt_tokens": 400, "completion_tokens": 200}, now - 4,
                 hardware={"hardware_class": "dgx-spark"},
                 hardware_verified=True,
             )
@@ -365,13 +442,14 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_streamed_usage_uses_upstream_timing_despite_slow_consumer(self):
         self.service.store.set_community_consent(True)
         observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
         token = self.service._community_observation.set(observation)
 
         async def upstream():
             yield 'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
             yield (
                 'data: {"choices":[],"usage":{"prompt_tokens":400,'
-                '"completion_tokens":320}}\n\n'
+                '"completion_tokens":200}}\n\n'
             )
             yield "data: [DONE]\n\n"
 
@@ -380,7 +458,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
                 hardware={"hardware_class": "dgx-spark"},
                 hardware_verified=True,
-                timing_clock=Mock(side_effect=[100.0, 104.0]),
+                timing_clock=Mock(side_effect=[100.0, 102.5]),
             )
             async for _chunk in stream:
                 await asyncio.sleep(0.01)
@@ -395,11 +473,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         samples, total = self.service.store.benchmarks()
         self.assertEqual(total, 1)
         self.assertEqual(samples[0]["generation_tokens_per_second"], 80.0)
-        self.assertFalse(self.service._community_sample_due("org/model", "UNKNOWN"))
 
     async def test_streamed_usage_is_rejected_if_bounded_relay_fills(self):
         self.service.store.set_community_consent(True)
         observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
         token = self.service._community_observation.set(observation)
 
         async def upstream():
@@ -407,7 +485,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             yield 'data: {"choices":[{"delta":{"content":"two"}}]}\n\n'
             yield (
                 'data: {"choices":[],"usage":{"prompt_tokens":400,'
-                '"completion_tokens":320}}\n\n'
+                '"completion_tokens":200}}\n\n'
             )
             yield "data: [DONE]\n\n"
 
@@ -417,7 +495,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                     upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
                     hardware={"hardware_class": "dgx-spark"},
                     hardware_verified=True,
-                    timing_clock=Mock(side_effect=[100.0, 104.0]),
+                    timing_clock=Mock(side_effect=[100.0, 102.5]),
                 ):
                     await asyncio.sleep(0.01)
         finally:
@@ -425,20 +503,20 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service._community_observation_end(observation)
 
         self.assertEqual(self.service.store.benchmarks()[1], 0)
-        self.assertTrue(self.service._community_sample_due("org/model", "UNKNOWN"))
 
     async def test_partial_or_failed_stream_usage_is_not_benchmarked(self):
         self.service.store.set_community_consent(True)
 
         async def exercise(trailer):
             observation = self.service._community_observation_start()
+            observation["startup_benchmark"] = True
             token = self.service._community_observation.set(observation)
 
             async def upstream():
                 yield 'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
                 yield (
                     'data: {"choices":[],"usage":{"prompt_tokens":400,'
-                    '"completion_tokens":320}}\n\n'
+                    '"completion_tokens":200}}\n\n'
                 )
                 for chunk in trailer:
                     yield chunk
@@ -448,7 +526,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                     upstream(), "dep-1", "org/model", "vllm", {}, 99.9,
                     hardware={"hardware_class": "dgx-spark"},
                     hardware_verified=True,
-                    timing_clock=Mock(side_effect=[100.0, 104.0]),
+                    timing_clock=Mock(side_effect=[100.0, 102.5]),
                 ):
                     pass
             finally:
@@ -466,6 +544,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_client_abandonment_cancels_full_relay_and_ends_observation(self):
         self.service.store.set_community_consent(True)
         observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
         token = self.service._community_observation.set(observation)
         finalized = asyncio.Event()
 
@@ -496,7 +575,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_kv_cache_dtype_is_separate_from_weight_quantization(self):
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(settings={
+        self._record_startup_sample(settings={
             "extra_args": ["--kv-cache-dtype", "fp8"],
         })
 
@@ -505,10 +584,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(samples[0]["model"]["quantization"], "UNKNOWN")
         self.assertEqual(samples[0]["configuration"]["kv_cache_dtype"], "FP8")
 
-        self.service.store.set_setting(
-            self.service._community_sample_setting("org/model", "UNKNOWN"), None,
-        )
-        self._record_passive_sample(settings={
+        self._record_startup_sample(settings={
             "extra_args": [
                 "--quantization", "fp8", "--kv-cache-dtype", "fp16",
             ],
@@ -520,10 +596,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(newest["model"]["quantization"], "FP8")
         self.assertEqual(newest["configuration"]["kv_cache_dtype"], "FP16")
 
-        self.service.store.set_setting(
-            self.service._community_sample_setting("org/model", "FP8"), None,
-        )
-        self._record_passive_sample(settings={
+        self._record_startup_sample(settings={
             "extra_args": [
                 "--quantization", "fp8", "--quantization=awq",
                 "--quantization=", "--kv-cache-dtype", "fp8",
@@ -536,22 +609,23 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(newest["model"]["quantization"], "AWQ")
         self.assertNotIn("kv_cache_dtype", newest["configuration"])
 
-    async def test_equivalent_explicit_quantizations_share_upload_and_cooldown_key(self):
+    async def test_equivalent_explicit_quantizations_share_upload_cohort(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(settings={"quantization": "F16"})
-        self._record_passive_sample(settings={"quantization": "fp16"})
+        self._record_startup_sample(settings={"quantization": "F16"})
+        self._record_startup_sample(settings={"quantization": "fp16"})
 
         samples, total = self.service.store.benchmarks()
-        self.assertEqual(total, 1)
+        self.assertEqual(total, 2)
         self.assertEqual(samples[0]["model"]["quantization"], "FP16")
         self.assertEqual(self.service.store.outbox_batch()[0]["quantization"], "FP16")
 
-    def _record_passive_sample(
+    def _record_startup_sample(
         self, *, model="org/model", settings=None, input_tokens=400,
-        output_tokens=320, decode_seconds=4.0,
+        output_tokens=200, decode_seconds=2.5,
     ):
         observation = self.service._community_observation_start()
+        observation["startup_benchmark"] = True
         token = self.service._community_observation.set(observation)
         try:
             now = time.monotonic()
@@ -559,7 +633,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "dep-1", model, "vllm", settings or {},
                 now - decode_seconds - 0.1,
                 {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
-                now - decode_seconds,
+                now - decode_seconds, completed_at=now,
                 hardware={"hardware_class": "dgx-spark"},
                 hardware_verified=True,
             )
@@ -567,18 +641,18 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             self.service._community_observation.reset(token)
             self.service._community_observation_end(observation)
 
-    async def test_passive_telemetry_collects_nothing_when_opted_out(self):
-        self._record_passive_sample()
+    async def test_startup_telemetry_collects_nothing_when_opted_out(self):
+        self._record_startup_sample()
 
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
         self.assertEqual(self.service.store.outbox_batch(), [])
 
-    async def test_passive_telemetry_uses_canonical_model_quant_and_400_bucket(self):
+    async def test_startup_telemetry_uses_canonical_model_quant_and_400_bucket(self):
         self.service.store.set_setting("device_pairing", {"status": "paired"})
         self.service.store.set_community_consent(True)
 
-        self._record_passive_sample(
+        self._record_startup_sample(
             model="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
         )
 
@@ -594,9 +668,10 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "tensor_parallel_size": 1,
         }])
 
-    async def test_passive_telemetry_overlap_invalidates_entire_decode(self):
+    async def test_startup_telemetry_overlap_invalidates_entire_decode(self):
         self.service.store.set_community_consent(True)
         first = self.service._community_observation_start()
+        first["startup_benchmark"] = True
         second = self.service._community_observation_start()
         self.service._community_observation_end(second)
         token = self.service._community_observation.set(first)
@@ -604,7 +679,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             now = time.monotonic()
             self.service._record_usage(
                 "dep-1", "org/model", "vllm", {}, now - 4.1,
-                {"prompt_tokens": 400, "completion_tokens": 320}, now - 4,
+                {"prompt_tokens": 400, "completion_tokens": 200}, now - 4,
             )
         finally:
             self.service._community_observation.reset(token)
@@ -613,17 +688,17 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
 
-    async def test_passive_telemetry_has_four_hour_model_quant_cooldown(self):
+    async def test_startup_telemetry_records_each_start_without_a_cooldown(self):
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
-        self._record_passive_sample(settings={"quantization": "Q4_K_M"})
+        self._record_startup_sample(settings={"quantization": "Q4_K_M"})
+        self._record_startup_sample(settings={"quantization": "Q4_K_M"})
 
         _, total = self.service.store.benchmarks()
-        self.assertEqual(total, 1)
+        self.assertEqual(total, 2)
 
-    async def test_passive_telemetry_rejects_context_at_or_above_10k(self):
+    async def test_startup_telemetry_rejects_context_at_or_above_10k(self):
         self.service.store.set_community_consent(True)
-        self._record_passive_sample(input_tokens=10_000)
+        self._record_startup_sample(input_tokens=10_000)
 
         _, total = self.service.store.benchmarks()
         self.assertEqual(total, 0)
@@ -1490,11 +1565,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             "worker-2", "GET", "/api/agent/stats", timeout=5,
         )
 
-    async def test_managed_llama_uses_local_hardware_but_external_stays_unknown(self):
+    async def test_ordinary_inference_never_creates_automatic_benchmarks(self):
         def respond(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={
                 "model": "org/model", "choices": [],
-                "usage": {"prompt_tokens": 32, "completion_tokens": 320},
+                "usage": {"prompt_tokens": 32, "completion_tokens": 200},
                 "timings": {"predicted_per_second": 80.0},
             }, request=request)
 
@@ -1518,14 +1593,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "chat/completions",
             )
 
-        items, _ = self.service.store.benchmarks()
-        by_deployment = {item["deployment_id"]: item for item in items}
-        managed = by_deployment["managed-llama"]
-
-        self.assertEqual(managed["hardware"]["hardware_class"], "dgx-spark")
-        self.assertEqual(managed["hardware"]["gpus"][0]["model"], "NVIDIA GB10")
-        self.assertTrue(managed["eligible_for_community"])
-        self.assertNotIn("external-llama", by_deployment)
+        self.assertEqual(self.service.store.benchmarks()[1], 0)
+        self.assertEqual(self.service.store.outbox_batch(), [])
 
     async def test_unknown_endpoint_hardware_stays_local_only(self):
         self.service.store.set_community_consent(True)

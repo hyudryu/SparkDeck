@@ -17817,7 +17817,7 @@ class Manager:
 
     async def inference_target_health(
         self, model: str, *, container_name: str | None = None,
-        deployment_id: str | None = None,
+        deployment_id: str | None = None, strict_health: bool = False,
     ) -> bool:
         """Observe an exact inference target without waking a stopped model."""
         if deployment_id:
@@ -17837,7 +17837,9 @@ class Manager:
                 and container.get("status") == "running"
                 and not self._container_is_durably_stopped(container)
             ):
-                return bool(await self._check_ready(container))
+                return bool(await self._check_ready(
+                    container, **({"strict_health": True} if strict_health else {}),
+                ))
         return False
 
     def _vllm_stream(self, url: str, body: dict, key: str,
@@ -19213,7 +19215,7 @@ class Manager:
                 await asyncio.sleep(2.0)
             raise TimeoutError(f"{model} not ready after {int(timeout)}s")
 
-    async def _check_ready(self, container: dict) -> bool:
+    async def _check_ready(self, container: dict, *, strict_health: bool = False) -> bool:
         port = container.get("port")
         if not port:
             return False
@@ -19223,6 +19225,8 @@ class Manager:
                 return True
         except Exception:
             pass
+        if strict_health:
+            return False
         # Fall back to /v1/models
         try:
             r = await self.http.get(f"http://localhost:{port}/v1/models", timeout=2)

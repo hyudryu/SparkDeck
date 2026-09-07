@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { BarChart3, Check, ChevronRight, CloudOff, RotateCw, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
+import { BarChart3, Check, ChevronRight, Trash2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, formatDuration, formatRate, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
@@ -14,7 +14,6 @@ export function BenchmarksPage() {
   const [tab, setTab] = useState<'speed' | 'temp'>('speed')
   const samples = useResource((signal) => api.benchmarks.list(signal))
   const benchmarkModels = useResource((signal) => api.benchmarks.models(signal))
-  const sync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const communityAccess = useCommunityAccess()
   const accessHint = communityAccessHint(communityAccess.signedIn)
   const aggregates = useResource(
@@ -22,9 +21,6 @@ export function BenchmarksPage() {
     [communityAccess.enabled],
     communityAccess.enabled,
   )
-  const [syncBusy, setSyncBusy] = useState(false)
-  const [syncActionError, setSyncActionError] = useState<string>()
-  const [reviewingConsent, setReviewingConsent] = useState(false)
   const [selectedModel, setSelectedModel] = useState<string>()
   const [selectedTp, setSelectedTp] = useState<number>()
   const modelTriggerRef = useRef<HTMLButtonElement>(null)
@@ -45,42 +41,11 @@ export function BenchmarksPage() {
     if (sizes.length && !sizes.includes(selectedTp ?? -1)) setSelectedTp(sizes[0])
   }, [activeModelDetail, selectedTp])
 
-  const applyConsent = async (enabled: boolean) => {
-    if (!sync.data) return
-    setSyncBusy(true)
-    setSyncActionError(undefined)
-    try {
-      const updated = await api.benchmarks.setConsent(enabled)
-      sync.setData(updated)
-      communityAccess.reload()
-      setReviewingConsent(false)
-      if (updated.cluster_errors?.length) {
-        setSyncActionError(`Sharing was updated on this controller, but not on: ${updated.cluster_errors.join('; ')}. Retry when those nodes are reachable.`)
-      }
-    } catch (reason) {
-      setSyncActionError(reason instanceof Error ? reason.message : 'Could not update community sharing')
-    } finally {
-      setSyncBusy(false)
-    }
-  }
-
-  const toggleSharing = () => applyConsent(!sync.data?.sharing_enabled)
-
-  const retry = async () => {
-    setSyncBusy(true)
-    try {
-      sync.setData(await api.benchmarks.retry())
-    } finally {
-      setSyncBusy(false)
-    }
-  }
-
   const remove = async (modelId: string) => {
     await api.benchmarks.deleteLocalModel(modelId)
     samples.reload()
     benchmarkModels.reload()
     aggregates.reload()
-    sync.reload()
   }
 
   return (
@@ -92,24 +57,12 @@ export function BenchmarksPage() {
       </div>
       {tab === 'speed' && <>
       <BenchmarkRunner />
-      <div className="benchmark-summary-grid">
-        <Panel className="sync-panel">
-          <div className="sync-heading"><span className="sync-icon"><UploadCloud size={19} /></span><div><h2>Community sharing</h2><p>Optional, account-linked benchmark evidence with a strict data allowlist.</p></div></div>
-          {sync.loading && <p className="muted">Checking sync status…</p>}
-          {sync.error && <p className="inline-error">{sync.error}</p>}
-          {syncActionError && <p className="inline-error" role="alert">{syncActionError}</p>}
-          {sync.data && <>
-            <div className="sync-state"><Status status={sync.data.sharing_enabled ? (sync.data.account_paired && sync.data.upload_configured ? 'running' : 'waiting') : 'stopped'}>{sync.data.sharing_enabled ? (sync.data.account_paired ? (sync.data.upload_configured ? 'Sharing enabled' : 'Queued locally') : 'Waiting for account') : 'Sharing off'}</Status><span>{sync.data.pending_count} pending · {sync.data.synced_count} synced</span></div>
-            <div className="sync-actions"><Button variant={sync.data.sharing_enabled ? 'secondary' : 'primary'} disabled={syncBusy} onClick={() => sync.data?.sharing_enabled ? void toggleSharing() : setReviewingConsent(true)}>{sync.data.sharing_enabled ? <><CloudOff size={15} /> Turn off</> : <><ShieldCheck size={15} /> Review & enable</>}</Button>{syncActionError && !sync.data.sharing_enabled && <Button variant="secondary" disabled={syncBusy} onClick={() => void applyConsent(false)}>Retry turn off everywhere</Button>}{sync.data.failed_count > 0 && <Button disabled={syncBusy} onClick={() => void retry()}><RotateCw size={15} /> Retry {sync.data.failed_count}</Button>}</div>
-          </>}
-        </Panel>
-        <Panel className="privacy-panel">
-          <p className="eyebrow">Always private</p>
-          <h2>Your content stays local</h2>
-          <p>Prompts and outputs never enter benchmark JSON. Ordinary authenticated request and network metadata may still be processed to operate the service.</p>
-          <span><Check size={15} /> Sharing is off until you opt in</span>
-        </Panel>
-      </div>
+      <Panel className="privacy-panel">
+        <p className="eyebrow">Always private</p>
+        <h2>Your content stays local</h2>
+        <p>Prompts and outputs never enter benchmark JSON. Ordinary authenticated request and network metadata may still be processed to operate the service.</p>
+        <span><Check size={15} /> Sharing is off until you opt in</span>
+      </Panel>
 
       <div className="section-heading"><div><h2>Benchmark runs by model</h2><p>Run a deployed model at C1, C2, C5, or C10. Select a model to compare prompt and generation throughput across context windows.</p></div></div>
       {benchmarkModels.loading && <LoadingState label="Loading benchmark runs" />}
@@ -137,9 +90,7 @@ export function BenchmarksPage() {
       {!communityAccess.enabled && !communityAccess.loading && <EmptyState
         title="Community estimates are locked"
         description={accessHint}
-        action={communityAccess.signedIn
-          ? <Button variant="secondary" onClick={() => setReviewingConsent(true)}>Review sharing</Button>
-          : <Link className="button button-secondary" to="/settings">Open community settings</Link>}
+        action={<Link className="button button-secondary" to="/settings">Open community settings</Link>}
       />}
       {communityAccess.enabled && aggregates.loading && <LoadingState label="Loading community aggregates" />}
       {communityAccess.enabled && aggregates.error && <ErrorState message={aggregates.error} onRetry={aggregates.reload} />}
@@ -186,7 +137,6 @@ export function BenchmarksPage() {
           <p className="benchmark-method-note">Each point is the average of completed coordinated runs for the exact model, context window, concurrency, and TP size. Prompt throughput uses measured time to first token; generation throughput uses concurrent batch wall time. Results vary with runtime, thermals, networking, and workload.</p>
         </>}
       </LegalDialog>}
-      {reviewingConsent && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReviewingConsent(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="sharing-review-title"><div className="modal-heading"><div><p className="eyebrow">Privacy review</p><h2 id="sharing-review-title">Enable community sharing?</h2></div><button className="icon-button" onClick={() => setReviewingConsent(false)} aria-label="Close dialog">×</button></div><p><strong>Benchmark JSON:</strong> canonical model identifier, quantization, tensor-parallel (TP) size, prompt-length/context-occupancy bucket, measured inference tok/s, concurrency when recorded, and a stable opaque telemetry cluster ID. The authenticated account, not the cluster ID, defines one equal-weight contributor with at most one average per TP setting.</p><p><strong>Eligibility:</strong> only samples captured after you enable sharing can be uploaded; existing benchmark history stays local.</p><p><strong>The opaque ID:</strong> is randomly generated and contains no account ID, hostname, node name, or endpoint alias.</p><p><strong>Never in benchmark JSON:</strong> prompts or outputs, runtime, revision, hardware, settings, account email, paths, or endpoint aliases. The service still receives ordinary authenticated request and network metadata.</p><div className="modal-actions"><Button onClick={() => setReviewingConsent(false)}>Keep sharing off</Button><Button variant="primary" disabled={syncBusy} onClick={() => void toggleSharing()}><ShieldCheck size={15} /> I understand, enable sharing</Button></div></section></div>}
       </>}
       {tab === 'temp' && <TemperatureRuns />}
     </div>

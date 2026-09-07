@@ -38,6 +38,7 @@ from sparkdeck.service import (
     _public_community_aggregates,
 )
 from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
@@ -63,6 +64,7 @@ ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 benchmark_runner = BenchmarkRunnerService(manager, sparkdeck, data_dir=ROOT / "data")
+sparkdeck._startup_benchmark_busy = lambda: benchmark_runner.active_run() is not None
 onboarding = OnboardingService(
     manager, data_dir=ROOT / "data", port=7878,
     revoke_community_consent=sparkdeck.revoke_community_membership,
@@ -200,10 +202,13 @@ async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
         uploader = asyncio.create_task(community_upload_loop())
+        startup_benchmarks = asyncio.create_task(StartupBenchmarkMonitor(sparkdeck).run())
         try:
             yield
         finally:
             uploader.cancel()
+            startup_benchmarks.cancel()
+            await asyncio.gather(startup_benchmarks, return_exceptions=True)
             await manager.virtual_nas.stop_dispatcher()
             await updater.close()
             await sparkdeck.close()
@@ -1197,11 +1202,16 @@ async def agent_inference_health(req: Request):
         raise HTTPException(400, "model is required")
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
+    strict_health = body.get("strict_health") is True
     try:
         ready = await manager.inference_target_health(
             model, container_name=container_name, deployment_id=deployment_id,
+            **({"strict_health": True} if strict_health else {}),
         )
-        return {"ready": ready, "model": model}
+        return {
+            "ready": ready, "model": model,
+            **({"health_status": 200 if ready else None} if strict_health else {}),
+        }
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 

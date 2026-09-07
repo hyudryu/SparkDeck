@@ -39,6 +39,7 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.prefix_affinity import PrefixAffinity
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
 from sparkdeck.runtime_file_mounts import (
     RUNTIME_FILE_MOUNTS_CAPABILITY,
@@ -5820,6 +5821,60 @@ class Manager:
         rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
         return [chosen, *rest]
 
+    def _cluster_affinity_context(self, deployment, model, body, endpoint, caller_ip):
+        """Keep cache hints within a caller, model and deployment generation."""
+        if deployment.get("mode") not in {"replicated", "grouped_sharded"}:
+            return None
+        affinity = getattr(self, "_prefix_affinity", None)
+        if affinity is None:
+            affinity = self._prefix_affinity = PrefixAffinity()
+        keys = affinity.keys(body, endpoint)
+        if not keys:
+            return None
+        scope = json.dumps([
+            deployment.get("id"), model, endpoint, caller_ip,
+            getattr(self, "_prefix_affinity_generation", 0),
+            deployment.get("health_restarted_at"),
+            deployment.get("health_restart_counts"),
+            [(m.get("node_id"), m.get("container_name"), m.get("container_id"),
+              m.get("instance_id"), m.get("desired_state"))
+             for m in self._cluster_members_sorted(deployment)],
+        ], sort_keys=True)
+        return affinity, scope, keys
+
+    def _prefer_cluster_affinity(self, deployment, candidates, context):
+        if context is None or len(candidates) < 2:
+            return candidates
+        affinity, scope, keys = context
+        deployment_id = str(deployment.get("id") or "")
+        targets = {self._cluster_member_key(deployment_id, m): m for m in candidates}
+        preferred = targets.get(affinity.lookup(scope, keys, list(targets)))
+        if preferred is None:
+            return candidates
+        minimum = min(self._cluster_member_active(deployment_id, m) for m in candidates)
+        if self._cluster_member_active(deployment_id, preferred) > minimum + 2:
+            return candidates
+        return [preferred, *(m for m in candidates if m is not preferred)]
+
+    def _remember_cluster_affinity(self, context, deployment_id, member):
+        if context is not None:
+            affinity, scope, keys = context
+            affinity.remember(scope, keys, self._cluster_member_key(deployment_id, member))
+
+    @staticmethod
+    def _affinity_stream_error(chunk):
+        # Errors can use engine-specific types; all SSE error objects prevent
+        # a failed response from teaching the router a cache location.
+        for line in chunk.splitlines():
+            if line.startswith("data:"):
+                try:
+                    payload = json.loads(line[5:].strip())
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(payload, dict) and "error" in payload:
+                    return True
+        return False
+
     def _tracked_cluster_stream(
         self, stream, deployment_id: str, member: dict,
     ):
@@ -5956,6 +6011,7 @@ class Manager:
         initial_member: dict,
         route_observation: dict | None,
         caller_ip: str | None = None,
+        affinity_context=None,
     ):
         """Relay a stream, failing over until its first real SSE event.
 
@@ -6045,9 +6101,17 @@ class Manager:
                     self._observe_cluster_serving_member(
                         route_observation, current_member,
                     )
+                    failed = self._affinity_stream_error(first_chunk)
+                    completed = "data: [DONE]" in first_chunk
                     yield first_chunk
                     async for chunk in current:
+                        failed = failed or self._affinity_stream_error(chunk)
+                        completed = completed or "data: [DONE]" in chunk
                         yield chunk
+                    if completed and not failed and not (cancel and cancel.is_set()):
+                        self._remember_cluster_affinity(
+                            affinity_context, deployment_id, current_member,
+                        )
                     return
             finally:
                 if current is not None:
@@ -6071,7 +6135,12 @@ class Manager:
             raise LookupError("cluster deployment not found")
         if deployment.get("desired_state") == "stopped":
             raise RuntimeError("deployment is stopped; start it before sending inference requests")
-        candidates = self._cluster_route_order(deployment)
+        affinity_context = self._cluster_affinity_context(
+            deployment, model, body, endpoint, caller_ip,
+        )
+        candidates = self._prefer_cluster_affinity(
+            deployment, self._cluster_route_order(deployment), affinity_context,
+        )
         if not candidates:
             raise LookupError("cluster deployment has no inference member")
         for index, member in enumerate(candidates):
@@ -6084,8 +6153,12 @@ class Manager:
                     return self._cluster_stream_with_failover(
                         result, candidates[index + 1:], deployment, model,
                         body, endpoint, cancel, member, route_observation,
-                        caller_ip,
+                        caller_ip, affinity_context,
                     )
+                if not (cancel and cancel.is_set()) and not (
+                    isinstance(result, dict) and "error" in result
+                ):
+                    self._remember_cluster_affinity(affinity_context, deployment_id, member)
                 self._observe_cluster_serving_member(
                     route_observation, member,
                 )
@@ -6996,6 +7069,8 @@ class Manager:
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
     ) -> Any:
+        if action in {"start", "stop", "restart", "remove"}:
+            self._prefix_affinity_generation = getattr(self, "_prefix_affinity_generation", 0) + 1
         node_id = member["node_id"]
         name = member["container_name"]
         owner = next(

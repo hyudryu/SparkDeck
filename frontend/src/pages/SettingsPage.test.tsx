@@ -384,6 +384,38 @@ describe('settings page', () => {
     expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
+  it('shows a pending update while source and destination transfers finish', async () => {
+    const revision = 'b'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
+        target: { branch: 'main', revision },
+        can_update: false, blockers: [], nodes: [],
+        job: {
+          id: 'waiting-job', active: true, phase: 'pending_transfers', target_branch: 'main', target_revision: revision,
+          nodes: [
+            { id: 'source', name: 'Transfer source', local: false, online: true, current_revision: 'a'.repeat(40), blockers: [], phase: 'pending_transfers' },
+            { id: 'destination', name: 'Transfer destination', local: false, online: true, current_revision: 'a'.repeat(40), blockers: [], phase: 'pending_transfers' },
+          ],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ theme: 'system' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('button', { name: 'Waiting for transfers' })).toBeDisabled()
+    expect(screen.getByText(/Waiting for model transfers to finish before updating/)).toHaveTextContent('Both source and destination nodes are protected.')
+    for (const name of ['Transfer source', 'Transfer destination']) {
+      const node = screen.getByText(name).closest<HTMLElement>('.update-node')!
+      expect(within(node).getByText('Waiting for transfers')).toBeInTheDocument()
+      expect(node.querySelector('.status-dot')).toHaveClass('status-starting')
+    }
+    expect(screen.queryByText('pending_transfers')).not.toBeInTheDocument()
+  })
+
   it('waits for an active update status request to settle before polling again', async () => {
     let updateRequests = 0
     const updatePaths: string[] = []

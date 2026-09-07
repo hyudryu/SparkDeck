@@ -68,6 +68,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .app-shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); min-height: 100dvh; }
 .sidebar { position: fixed; z-index: 30; inset: 0 auto 0 0; width: var(--sidebar-width); display: flex; flex-direction: column; padding: 18px 12px 14px; background: var(--bg-surface); border-right: 1px solid var(--border-subtle); transition: width 200ms ease, transform 200ms ease; }
 .app-stage { grid-column: 2; min-width: 0; }
+.app-topbar { position: sticky; z-index: 20; top: 0; background: var(--bg-canvas); }
 .main-content { width: 100%; min-width: 0; }
 .update-banner { display: flex; align-items: stretch; gap: 4px; padding: 0 10px 0 16px; background: var(--accent-soft); border-bottom: 1px solid var(--border-subtle); }
 .update-banner-link { display: flex; flex: 1 1 auto; align-items: center; gap: 9px; min-width: 0; padding: 8px 0; color: var(--accent); text-decoration: none; font-size: 12.5px; }
@@ -571,7 +572,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .sidebar-collapsed .brand-row { justify-content: space-between; padding-inline: 6px; }.sidebar-collapsed .collapse-button { display: none; }
   .icon-button.mobile-close { display: grid; }
   .drawer-backdrop { display: block; position: fixed; z-index: 25; inset: 0; border: 0; background: rgba(0,0,0,.36); }
-  .mobile-appbar { position: sticky; z-index: 20; top: 0; height: calc(52px + env(safe-area-inset-top)); display: grid; grid-template-columns: 40px 1fr 40px; align-items: end; padding: env(safe-area-inset-top) 10px 6px; background: color-mix(in srgb, var(--bg-canvas) 92%, transparent); border-bottom: 1px solid var(--border-subtle); backdrop-filter: blur(16px); }
+  .mobile-appbar { height: calc(52px + env(safe-area-inset-top)); display: grid; grid-template-columns: 40px 1fr 40px; align-items: end; padding: env(safe-area-inset-top) 10px 6px; background: color-mix(in srgb, var(--bg-canvas) 92%, transparent); border-bottom: 1px solid var(--border-subtle); backdrop-filter: blur(16px); }
   .mobile-title { align-self: center; text-align: center; font-size: 13px; font-weight: 650; }.mobile-brand-mark { justify-self: center; align-self: center; width: 8px; height: 14px; border: solid var(--accent); border-width: 0 3px; }
   .page { padding: 24px 16px calc(40px + env(safe-area-inset-bottom)); }
   .page-header { align-items: flex-start; margin-bottom: 24px; }.page-actions { align-self: flex-start; }

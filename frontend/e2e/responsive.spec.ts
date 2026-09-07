@@ -89,6 +89,33 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
+test('keeps the update banner and mobile navigation visible while scrolling', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/system-update', (route) => route.fulfill({ json: {
+    up_to_date: false, can_update: true, target: { revision: 'abc12345' }, nodes: [],
+  } }))
+  await page.goto('/settings')
+  const banner = page.locator('.update-banner')
+  await expect(banner).toBeVisible()
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(100)
+  await expect.poll(() => banner.evaluate((element) => element.getBoundingClientRect().top)).toBe(0)
+  const mobileBar = page.locator('.mobile-appbar')
+  if (await mobileBar.isVisible()) {
+    const bannerBox = await banner.boundingBox()
+    const barBox = await mobileBar.boundingBox()
+    expect(barBox!.y).toBe(bannerBox!.height)
+    await page.getByRole('button', { name: 'Open navigation', exact: true }).click()
+    await expect(page.locator('.sidebar')).toHaveClass(/drawer-open/)
+    await page.locator('.sidebar').getByRole('button', { name: 'Close navigation' }).click()
+  }
+  await page.screenshot({ path: testInfo.outputPath('sticky-update-banner.png') })
+  await page.getByRole('button', { name: 'Dismiss update notification' }).click()
+  await expect(banner).toHaveCount(0)
+  if (await mobileBar.isVisible()) {
+    await expect.poll(() => mobileBar.evaluate((element) => element.getBoundingClientRect().top)).toBe(0)
+  }
+})
+
 test('keeps benchmark cards in place during background polling', async ({ page }, testInfo) => {
   const run = {
     id: 'run-live', model: 'org/test-model', model_id: 'org/test-model', status: 'running',

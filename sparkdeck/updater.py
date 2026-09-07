@@ -9,6 +9,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -429,15 +430,39 @@ class UpdateService:
         self.agent_path = self.data_dir / UPDATE_STATE_FILENAME
         self._task: asyncio.Task | None = None
         self._agent_task: asyncio.Task | None = None
+        self._closing = False
         self._local_update_reserved = False
         self._cluster_update_reserved = False
         self._lock = asyncio.Lock()
         self._agent_lock = asyncio.Lock()
+        self._agent_state_lock = threading.RLock()
         self._release_cache: tuple[float, list[dict], str | None] | None = None
         self._resolved_releases: dict[str, dict] = {}
         self._main_cache: tuple[float, dict | None, str | None] | None = None
         self._overview_blockers_cache: tuple[float, tuple[str, ...]] | None = None
         self._overview_blockers_lock = asyncio.Lock()
+
+    async def close(self) -> None:
+        """Cancel pending update work before shutdown drains the transfer queue."""
+        self._closing = True
+        cluster_pending = self._task is not None and not self._task.done()
+        agent_pending = self._agent_task is not None and not self._agent_task.done()
+        tasks = [task for task in (self._task, self._agent_task)
+                 if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # A task canceled before its first instruction cannot run its cleanup.
+        if agent_pending:
+            self._reconciled_agent_state(self.runtime_revision)
+        if cluster_pending:
+            state = self._read(self.cluster_path)
+            if state.get("active"):
+                for node in state.get("nodes", []):
+                    if node.get("phase") not in FAILED_NODE_PHASES | {"succeeded", "up_to_date"}:
+                        node.update(phase="failed", error="Update interrupted by service shutdown")
+                self._finish_cluster_state(state)
 
     @staticmethod
     def _read(path: Path) -> dict:
@@ -500,6 +525,12 @@ class UpdateService:
         return False
 
     def _reconciled_agent_state(self, revision: str | None = None) -> dict:
+        # Status runs in a worker thread. It must observe task ownership and
+        # durable state together, including the helper's initial identity.
+        with self._agent_state_lock:
+            return self._reconciled_agent_state_locked(revision)
+
+    def _reconciled_agent_state_locked(self, revision: str | None = None) -> dict:
         state = self._read(self.agent_path)
         if state.get("phase") == "pending_transfers":
             if self._agent_task is not None and not self._agent_task.done():
@@ -810,6 +841,8 @@ class UpdateService:
         }
 
     async def start_cluster(self, confirmation: str, revision: str) -> dict:
+        if self._closing:
+            raise RuntimeError("Service is shutting down")
         if confirmation != CONFIRMATION:
             raise ValueError("Explicit cluster update confirmation is required")
         revision = revision.lower()
@@ -823,6 +856,8 @@ class UpdateService:
             if not overview["can_update"]:
                 raise RuntimeError("; ".join(overview["blockers"]) or "No update is available")
             release, release_error = await self.resolve_main(force=True)
+            if self._closing:
+                raise RuntimeError("Service is shutting down")
             if release_error or not release:
                 raise ValueError(release_error or "origin/main is unavailable")
             if release["revision"] != revision:
@@ -1030,6 +1065,8 @@ class UpdateService:
 
     async def start_local(self, branch: str, revision: str) -> dict:
         async with self._agent_lock:
+            if self._closing:
+                raise RuntimeError("SparkDeck is shutting down")
             if not branch or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
                 raise ValueError("A valid update target and immutable commit are required")
             installed_revision = self.runtime_revision
@@ -1039,6 +1076,8 @@ class UpdateService:
             if state.get("phase") in {"pending_transfers", "accepted", "staging", "restarting"}:
                 raise RuntimeError("This node is already updating")
             await self.preflight_local(branch, revision)
+            if self._closing:
+                raise RuntimeError("SparkDeck is shutting down")
             if installed_revision == revision.lower():
                 state = {
                     "phase": "succeeded", "target_branch": branch,
@@ -1049,14 +1088,26 @@ class UpdateService:
             state = {"phase": "accepted", "target_branch": branch, "target_revision": revision.lower(), "message": "Update accepted"}
             nas = getattr(self.manager, "virtual_nas", None)
             if nas is not None:
-                nas.reserve_update()
-                self._local_update_reserved = True
-                state.update(
-                    phase="pending_transfers",
-                    message="Update pending until active model transfers finish",
-                )
-                self._write(self.agent_path, state)
-                self._agent_task = asyncio.create_task(self._start_after_transfers(state, nas))
+                with self._agent_state_lock:
+                    nas.reserve_update()
+                    self._local_update_reserved = True
+                    try:
+                        state.update(
+                            phase="pending_transfers",
+                            message="Update pending until active model transfers finish",
+                        )
+                        self._write(self.agent_path, state)
+                        operation = self._start_after_transfers(state, nas)
+                        try:
+                            self._agent_task = asyncio.create_task(operation)
+                        except BaseException:
+                            operation.close()
+                            raise
+                    except BaseException:
+                        self._local_update_reserved = False
+                        if not self._cluster_update_reserved:
+                            nas.end_update()
+                        raise
             else:
                 self._launch_local_helper(state)
             return state
@@ -1064,6 +1115,8 @@ class UpdateService:
     async def _start_after_transfers(self, state: dict, nas: Any) -> None:
         try:
             await nas.wait_for_transfers()
+            if self._closing:
+                raise RuntimeError("Service is shutting down")
             # A long transfer may outlive changes to the checkout or service.
             await self.preflight_local(state["target_branch"], state["target_revision"])
             self._launch_local_helper(state)
@@ -1078,6 +1131,12 @@ class UpdateService:
                 nas.end_update()
 
     def _launch_local_helper(self, state: dict) -> None:
+        with self._agent_state_lock:
+            if self._closing:
+                raise RuntimeError("SparkDeck is shutting down")
+            self._launch_local_helper_locked(state)
+
+    def _launch_local_helper_locked(self, state: dict) -> None:
         state.update(phase="accepted", message="Update accepted")
         self._write(self.agent_path, state)
         command = [

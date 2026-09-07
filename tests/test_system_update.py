@@ -826,6 +826,55 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["phase"], "failed")
         self.assertIn("checkout changed", state["error"])
 
+    async def test_pending_publication_is_atomic_with_threaded_status(self):
+        drained = asyncio.Event()
+        nas = SimpleNamespace(
+            reserve_update=Mock(), wait_for_transfers=drained.wait, end_update=Mock(),
+        )
+        self.manager.virtual_nas = nas
+        self.service.preflight_local = AsyncMock(return_value={})
+        original_write = self.service._write
+        entered = threading.Event()
+        finished = threading.Event()
+        statuses = []
+
+        def poll():
+            entered.set()
+            statuses.append(self.service.agent_status())
+            finished.set()
+
+        polling = threading.Thread(target=poll)
+
+        def publish(path, state):
+            original_write(path, state)
+            if state.get("phase") == "pending_transfers":
+                polling.start()
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(finished.wait(0.03))
+
+        with patch.object(self.service, "_write", side_effect=publish), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]), \
+             patch("sparkdeck.updater._spawn_update_helper", return_value=4321), \
+             patch("sparkdeck.updater.platform.system", return_value="Linux"):
+            await self.service.start_local("main", "b" * 40)
+            polling.join(1)
+            self.assertTrue(finished.is_set())
+            self.assertEqual(statuses[0]["phase"], "pending_transfers")
+            nas.end_update.assert_not_called()
+            drained.set()
+            await self.service._agent_task
+
+    async def test_pending_write_failure_releases_reservation_without_task(self):
+        nas = SimpleNamespace(reserve_update=Mock(), end_update=Mock())
+        self.manager.virtual_nas = nas
+        self.service.preflight_local = AsyncMock(return_value={})
+        with patch.object(self.service, "_write", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await self.service.start_local("main", "b" * 40)
+        self.assertIsNone(self.service._agent_task)
+        self.assertFalse(self.service._local_update_reserved)
+        nas.end_update.assert_called_once()
+
     async def test_interrupted_pending_update_becomes_retryable(self):
         self.service._write(self.service.agent_path, {
             "phase": "pending_transfers", "target_revision": "b" * 40,

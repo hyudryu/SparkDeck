@@ -204,6 +204,7 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             uploader.cancel()
+            await updater.close()
             await sparkdeck.close()
             await manager.stop()
 

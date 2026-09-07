@@ -114,6 +114,6 @@ def test_queued_transfer_stays_queued_until_update_releases(tmp_path):
             assert service.jobs[0]["status"] == "queued"
             service.end_update()
             await asyncio.wait_for(started.wait(), 1)
-            await service.stop()
+            await asyncio.wait_for(service.stop(), 1)
         runner.assert_awaited_once()
     asyncio.run(scenario())

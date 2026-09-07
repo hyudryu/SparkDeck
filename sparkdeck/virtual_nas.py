@@ -3108,7 +3108,11 @@ class VirtualNAS:
                         task.add_done_callback(lambda _task: self._wake.set())
                 self._wake.clear()
                 try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=0.5)
+                    # Keep cancellation in this task. On Python 3.11 wait_for
+                    # can swallow shutdown cancellation when its child waiter
+                    # completes at the same moment a transfer wakes the queue.
+                    async with asyncio.timeout(0.5):
+                        await self._wake.wait()
                 except TimeoutError:
                     pass
         except asyncio.CancelledError:

@@ -52,6 +52,23 @@ class ActivityLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[0]["message"], "Failed using [REDACTED] api_key=[REDACTED]")
         self.assertEqual(entries[0]["details"]["kind"], "error")
 
+    async def test_activity_buffer_is_bounded_by_total_bytes(self):
+        with patch.object(server, "_activity_buffer", server.deque()), \
+                patch.object(server, "_activity_sizes", server.deque()), \
+                patch.object(server, "_activity_bytes", 0):
+            # Each error carries a sizeable response body; the byte budget must
+            # evict older entries instead of retaining ~80 MiB of payloads.
+            for _ in range(400):
+                self.emit("error", logging.ERROR)
+                record = logging.LogRecord("x", logging.ERROR, __file__, 1, "err", (), None)
+                record.error_details = {"detail": "x" * (16 * 1024)}
+                self.handler.emit(record)
+            retained = list(server._activity_buffer)
+            self.assertTrue(retained)
+            self.assertLess(len(retained), 400 * 2)
+            estimated = sum(len(json.dumps(entry, default=str)) + 1 for entry in retained)
+            self.assertLessEqual(estimated, server.MAX_ACTIVITY_BYTES)
+
     async def test_endpoint_returns_events_without_waiting_for_inventory(self):
         self.emit("Model launched", event="launched")
         self.emit("Model stopped", event="stopped")

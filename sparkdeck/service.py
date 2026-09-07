@@ -1033,13 +1033,20 @@ class SparkDeckService:
             # request can otherwise block the polling endpoint.
             containers = cluster_state.get("containers") or []
             docker_unavailable = not bool(cluster_state.get("docker_ready"))
+            # Absence is authoritative when the container snapshot itself
+            # succeeded, even if the separate image inventory failed.
+            container_inventory_ready = bool(cluster_state.get("containers_ready"))
         else:
             docker_unavailable = False
+            container_inventory_ready = False
             try:
                 containers = await self.manager.list_containers()
             except Exception:
                 containers = []
                 docker_unavailable = True
+            # A successful snapshot is authoritative for absence even when a
+            # later inventory facet is unavailable.
+            container_inventory_ready = not docker_unavailable
         seen: set[str] = set()
         local_cluster_members: dict[str, dict[str, Any]] = {}
         for stored in registered:
@@ -1273,7 +1280,7 @@ class SparkDeckService:
                 ) for item in registered
             }
             self._observe_deployment_events(
-                registered, inventory_complete=not docker_unavailable,
+                registered, inventory_complete=container_inventory_ready,
                 runtime_deployments=runtime_deployments,
             )
         return registered
@@ -1374,9 +1381,12 @@ class SparkDeckService:
                 # Readiness probes and partial group availability can wobble
                 # without the process exiting. Only a terminal state ends a
                 # launch; recovery from these probes is not another launch.
+                # A deliberate recreation (recreate_pending) ends the prior
+                # generation: let the transition record so the replacement that
+                # returns to running announces a new launch.
                 if previous and previous[0] == "running" and status in {
                     "starting", "degraded", "stopping",
-                }:
+                } and not _deployment_recreating(runtime, instance):
                     continue
                 current = (status, error)
                 if previous == current:
@@ -6495,6 +6505,17 @@ class SparkDeckService:
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            # An unmanaged container has no persisted desired state. Distinguish
+            # a SparkDeck explicit Stop (kept in the manager's stop ledger) from
+            # an unexpected Docker exit so the Logs view does not report a crash
+            # as an intentional shutdown.
+            "desired_state": (
+                "stopped"
+                if str(container.get("name") or "") in getattr(
+                    self.manager, "_explicitly_stopped_containers", (),
+                )
+                else "running"
+            ),
             "promotable": (
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
@@ -7660,9 +7681,16 @@ def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> b
         and (instance is None or str(member.get("instance_id") or 0) == str(instance))
     ]
     expected = [member for member in members if member.get("desired_state") != "stopped"]
-    if any(member.get("status") in {"exited", "dead", "removed", "missing", "error"}
-           for member in expected):
-        return True
+    for member in expected:
+        member_status = member.get("status")
+        if member_status in {"exited", "dead", "removed", "error"}:
+            return True
+        if member_status == "missing" and member.get("node_docker_ready") is True:
+            # An absent container is only a confirmed loss when the node's
+            # container inventory was reliable. A reachable node reporting
+            # docker_ready=false advertises nothing and must not be treated
+            # as a crash, or recovery later manufactures a false launch.
+            return True
     # Startup reconnects and environment migrations also use recovering. Only
     # the health recovery path proves a broken generation. For grouped layouts
     # require evidence in that group so healthy siblings never emit crashes.
@@ -7672,6 +7700,22 @@ def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> b
             for member in expected
         )
     return False
+
+
+def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Whether a deliberate recreation is in flight for this engine group.
+
+    Recreation publishes ``recreate_pending`` while it tears down and queues
+    replacement ranks. Such a transition ends the previous generation rather
+    than being a readiness wobble, so the eventual running state must announce
+    a new launch instead of matching the stale running tuple.
+    """
+    return any(
+        member.get("recreate_pending")
+        for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    )
 
 
 def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:

@@ -140,7 +140,27 @@ async def _guard_stream(stream, watcher: asyncio.Task):
 # ---------- in-memory server log buffer ----------
 MAX_LOG_LINES = 5000
 _log_buffer: deque[str] = deque(maxlen=MAX_LOG_LINES)
-_activity_buffer: deque[dict] = deque(maxlen=MAX_LOG_LINES)
+# Activity entries can carry up to 16 KiB of response body each, so a count
+# bound alone would let an unauthenticated caller inflate controller memory.
+# Retain by a total-byte budget in addition to an entry-count cap.
+MAX_ACTIVITY_BYTES = 4 * 1024 * 1024
+_activity_buffer: deque[dict] = deque()
+_activity_sizes: deque[int] = deque()
+_activity_bytes = 0
+
+
+def _push_activity(entry: dict) -> None:
+    """Append to the activity buffer honoring both count and byte budgets."""
+    global _activity_bytes
+    size = len(json.dumps(entry, default=str))
+    _activity_buffer.append(entry)
+    _activity_sizes.append(size)
+    _activity_bytes += size
+    while _activity_buffer and (
+        _activity_bytes > MAX_ACTIVITY_BYTES or len(_activity_buffer) > MAX_LOG_LINES
+    ):
+        _activity_buffer.popleft()
+        _activity_bytes -= _activity_sizes.popleft()
 
 
 class _DequeHandler(logging.Handler):
@@ -178,7 +198,7 @@ class _DequeHandler(logging.Handler):
                     entry["details"] = _redact_log_value(details)
                 if event in {"launched", "stopped", "crashed"}:
                     entry["event"] = event
-                _activity_buffer.append(entry)
+                _push_activity(entry)
         except Exception:
             pass
 

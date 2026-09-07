@@ -217,6 +217,7 @@ def test_group_rank_loss_reports_only_affected_engine_and_relaunch(caplog):
             "desired_state": "running",
             "members": [
                 {"instance_id": group, "rank": rank, "desired_state": "running",
+                 "node_id": f"node-{group}", "node_docker_ready": True,
                  "status": rank_status if group == 1 and rank == 1 else "running",
                  "phase": {"phase": "ready"}}
                 for group in (0, 1) for rank in (0, 1)
@@ -287,3 +288,109 @@ def test_inventory_passes_raw_recovery_evidence_to_observer(caplog):
 
     asyncio.run(scenario())
     assert [record.deployment_event for record in events(caplog)] == ["launched", "crashed", "launched"]
+
+
+def test_missing_rank_requires_reliable_node_inventory_to_be_crash():
+    from sparkdeck.service import _deployment_process_lost
+
+    cluster = {"desired_state": "running", "members": [
+        {"instance_id": 0, "rank": 0, "desired_state": "running",
+         "status": "missing",
+         # A reachable node reporting docker_ready=false advertises no
+         # container summary, so absence is an inventory outage, not a crash.
+         "node_docker_ready": False},
+    ]}
+    assert _deployment_process_lost(cluster) is False
+    cluster["members"][0]["node_docker_ready"] = True
+    assert _deployment_process_lost(cluster) is True
+    # Legacy members without node-docker evidence are treated as unreliable too.
+    cluster["members"][0].pop("node_docker_ready")
+    assert _deployment_process_lost(cluster) is False
+
+
+def test_recreation_records_new_launch(caplog):
+    from sparkdeck.service import _grouped_instance_summary
+
+    caplog.set_level(logging.INFO)
+    service = observer()
+    member = {"instance_id": 0, "rank": 0, "desired_state": "running",
+              "node_id": "node-0", "node_docker_ready": True,
+              "status": "running", "phase": {"phase": "ready"}}
+    cluster = {"status": "running", "desired_state": "running", "members": [member]}
+    service._observe_deployment_events(
+        [deployment("running", instances=_grouped_instance_summary(cluster))],
+    )
+    # A deliberate recreation queues replacement ranks with recreate_pending.
+    member.update(status="creating", recreate_pending=True)
+    cluster["status"] = "starting"
+    service._observe_deployment_events(
+        [deployment("starting", instances=_grouped_instance_summary(cluster))],
+        runtime_deployments={"model-1": cluster},
+    )
+    # The replacement reaches ready: the new generation announces a launch.
+    member.update(status="running", recreate_pending=False, phase={"phase": "ready"})
+    cluster["status"] = "running"
+    service._observe_deployment_events(
+        [deployment("running", instances=_grouped_instance_summary(cluster))],
+        runtime_deployments={"model-1": cluster},
+    )
+    assert [record.deployment_event for record in events(caplog)] == ["launched", "launched"]
+
+
+def test_discovered_container_carries_explicit_stop_intent():
+    from types import SimpleNamespace
+
+    service = observer()
+    service.manager = SimpleNamespace(_explicitly_stopped_containers={"legacy-vllm"})
+    stopped = service._discovered_deployment(
+        {"name": "legacy-vllm", "status": "exited"}, "vllm", "repo/model",
+    )
+    assert stopped["desired_state"] == "stopped"
+    service.manager._explicitly_stopped_containers = set()
+    crashed = service._discovered_deployment(
+        {"name": "legacy-vllm", "status": "exited"}, "vllm", "repo/model",
+    )
+    assert crashed["desired_state"] == "running"
+
+
+def test_removed_discovered_container_retired_when_only_images_unavailable(caplog):
+    from unittest.mock import AsyncMock
+
+    caplog.set_level(logging.INFO)
+
+    async def scenario():
+        service = observer()
+        service.store = Mock()
+        service.registry = SimpleNamespace(kinds=["vllm"])
+        service._probe_external_endpoint = AsyncMock()
+        # A managed card is registered so get_state() is invoked every poll.
+        service._adopt_unlinked_manager_deployments = AsyncMock(side_effect=lambda *a, **k: [
+            deployment("running", kind="managed", desired_state="running",
+                       settings={"manager_deployment_id": "cluster-1"}),
+        ])
+        runtime = {"id": "cluster-1", "sparkdeck_record_id": "model-1",
+                   "desired_state": "running", "status": "ready"}
+        container_a = {"name": "legacy-vllm", "status": "running", "runtime": "vllm",
+                       "model": "repo/model", "served_model": "repo/model"}
+        service.manager = SimpleNamespace(
+            deployments=[runtime],
+            get_state=AsyncMock(side_effect=[
+                {"deployments": [runtime], "docker_ready": True,
+                 "containers_ready": True, "containers": [container_a]},
+                # Container absence is authoritative even though the separate
+                # image inventory failed and docker_ready is therefore false.
+                {"deployments": [runtime], "docker_ready": False,
+                 "containers_ready": True, "containers": []},
+            ]),
+            cluster_nodes=AsyncMock(return_value=[]),
+        )
+        await service.deployments(observe_events=True)
+        await service.deployments(observe_events=True)
+
+    asyncio.run(scenario())
+    retirements = [
+        record for record in events(caplog)
+        if "removed from inventory" in record.getMessage()
+    ]
+    assert len(retirements) == 1
+    assert retirements[0].deployment_event == "stopped"

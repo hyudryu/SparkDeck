@@ -1649,6 +1649,20 @@ async def agent_remove_container(name: str, req: Request):
         raise HTTPException(404, str(exc)) from exc
 
 
+@app.get("/api/agent/containers/{name}/state")
+async def agent_container_state(name: str, req: Request, check_ready: bool = False):
+    await _require_managed_agent_container(name, req)
+    container = await manager._container_by_name(name)
+    if container is None:
+        raise HTTPException(404, "managed container not found")
+    ready = None
+    if check_ready:
+        ready = container.get("status") == "running" and await manager._check_ready(
+            container, strict_health=True,
+        )
+    return {"name": name, "status": container.get("status"), "ready": ready}
+
+
 @app.get("/api/agent/containers/{name}/logs")
 async def agent_container_logs(name: str, req: Request, tail: int = 300):
     _require_agent(req)

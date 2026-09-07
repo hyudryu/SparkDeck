@@ -317,11 +317,22 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "served_models": ["shared-model"],
                 "settings": {"manager_deployment_id": cluster["id"]},
                 "instances": [
-                    {"instance_id": 0, "status": "running"},
-                    {"instance_id": 1, "status": "running"},
+                    {
+                        "instance_id": 0, "status": "running",
+                        "node_ids": ["node-a", "node-b"],
+                    },
+                    {
+                        "instance_id": 1, "status": "running",
+                        "node_ids": ["node-c", "node-d"],
+                    },
                 ],
             })
         service.deployments = AsyncMock(return_value=live)
+        service._source_routing_snapshot = AsyncMock(
+            side_effect=lambda stored, rule: [
+                item for item in live if item["id"] == stored["id"]
+            ],
+        )
         return manager, service
 
     async def test_two_source_ips_pin_distinct_groups_before_ambiguous_resolution(self):
@@ -381,6 +392,42 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 (first["selected_node"], second["selected_node"]),
                 ("node-a", "node-c"),
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_selected_group_uses_observed_health_not_stale_saved_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = _grouped_deployment()
+            for member in cluster["members"]:
+                if member["instance_id"] == 1:
+                    member["status"] = "exited"
+            manager, service = await self._service(directory, [cluster])
+            active = _rule(
+                source_ip="10.0.0.1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            )
+
+            await service.upsert_source_ip_routing_rule(active)
+            response = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            self.assertEqual(response["selected_node"], "node-c")
+
+            live = await service.deployments()
+            live[0]["instances"][1]["status"] = "starting"
+            service._source_routing_cache = None
+            service._source_routing_retry_after = 0.0
+            with self.assertRaisesRegex(LookupError, "engine group is unavailable"):
+                await service.upsert_source_ip_routing_rule(active)
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "engine group is unavailable",
+            ):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            self.assertEqual(manager._proxy_cluster_member.await_count, 1)
             await manager.http.aclose()
             await service.close()
 

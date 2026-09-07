@@ -3690,7 +3690,11 @@ class Manager:
         return dict(rule) if rule and rule.get("enabled") is True else None
 
     def upsert_source_ip_routing_rule(
-        self, value: Any, *, observed_replicas: list[dict] | None = None,
+        self,
+        value: Any,
+        *,
+        observed_replicas: list[dict] | None = None,
+        observed_instances: list[dict] | None = None,
     ) -> dict:
         self._assert_source_ip_routing_config_valid()
         rule = self._normalize_source_ip_routing_rule(value)
@@ -3702,7 +3706,9 @@ class Manager:
             )
             try:
                 self._source_route_candidates(deployment, {
-                    **rule, "_observed_replicas": observed_replicas,
+                    **rule,
+                    "_observed_replicas": observed_replicas,
+                    "_observed_instances": observed_instances,
                 })
             except SourceRoutingUnavailable as exc:
                 raise ValueError(str(exc)) from exc
@@ -6135,11 +6141,32 @@ class Manager:
         # get_state decorates copies: persisted container status can remain
         # exited after an external restart. Service supplies trusted live
         # replica observations separately; these never enter persisted rules.
-        observed = source_route.get("_observed_replicas")
-        if mode == "replicated" and observed is not None:
-            replica = next((row for row in observed if row.get("node_id") == derived_nodes[0]), None)
+        observed_replicas = source_route.get("_observed_replicas")
+        observed_instances = source_route.get("_observed_instances")
+        if mode == "replicated" and observed_replicas is not None:
+            replica = next((
+                row for row in observed_replicas
+                if row.get("node_id") == derived_nodes[0]
+            ), None)
             if replica is None or replica.get("available") is not True:
-                raise SourceRoutingUnavailable("source-IP routing target replica is unavailable")
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target replica is unavailable"
+                )
+            health_members = []
+        elif mode == "grouped_sharded" and observed_instances is not None:
+            observed_instance = next((
+                row for row in observed_instances
+                if row.get("instance_id") == instance_id
+            ), None)
+            if (
+                observed_instance is None
+                or list(observed_instance.get("node_ids") or []) != derived_nodes
+                or observed_instance.get("status") != "running"
+                or observed_instance.get("desired_state") == "stopped"
+            ):
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target engine group is unavailable"
+                )
             health_members = []
         else:
             health_members = unit

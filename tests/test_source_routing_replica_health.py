@@ -52,6 +52,7 @@ class ReplicaHealthTests(unittest.IsolatedAsyncioTestCase):
                         "desired_state": "running", "deployment_mode": "replicated",
                         "replicas": _replica_summary(observed)}
                 service.deployments = AsyncMock(return_value=[live])
+                service._source_routing_snapshot = AsyncMock(return_value=[live])
                 service._record_response = Mock()
                 service._managed_hardware_snapshot = AsyncMock(return_value=({}, True))
                 await service.upsert_source_ip_routing_rule(rule("a"))
@@ -151,6 +152,7 @@ class ReplicaHealthTests(unittest.IsolatedAsyncioTestCase):
         service.store = SimpleNamespace(deployment=Mock(return_value=stored))
         service.manager = SimpleNamespace(deployments=[deployment])
         service.deployments = AsyncMock(return_value=[live])
+        service._source_routing_snapshot = AsyncMock(return_value=[live])
         selected = await service._source_routed_deployment(rule("a"), "model", validating=True)
         self.assertEqual(selected["id"], "saved")
         with self.assertRaisesRegex(LookupError, "replica is unavailable"):

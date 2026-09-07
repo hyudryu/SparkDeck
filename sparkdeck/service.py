@@ -438,6 +438,8 @@ class SparkDeckService:
         # background work (e.g. startup synthetic probes) can be canceled
         # promptly rather than waiting for the next polling tick.
         self._consent_cancellers: list[Any] = []
+        self._source_routing_cache = {}
+        self._source_routing_refresh_tasks = {}
 
     def register_consent_canceller(self, canceller: Any) -> None:
         """Register a callable invoked immediately when sharing is disabled."""
@@ -453,6 +455,10 @@ class SparkDeckService:
                 log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
+        refreshes = list(getattr(self, "_source_routing_refresh_tasks", {}).values())
+        for refresh in refreshes:
+            refresh.cancel()
+        await asyncio.gather(*refreshes, return_exceptions=True)
         tasks = list(self._deployment_launch_tasks.values())
         for task in tasks:
             task.cancel()
@@ -6856,13 +6862,17 @@ class SparkDeckService:
         # live deployment which currently owns the exact request model.
         normalized = self.manager._normalize_source_ip_routing_rule(value)
         observed_replicas = None
+        observed_instances = None
         if normalized["enabled"]:
             target = await self._source_routed_deployment(
                 normalized, normalized["requested_model"], validating=True,
             )
             observed_replicas = target.get("replicas")
+            observed_instances = target.get("instances")
         return self.manager.upsert_source_ip_routing_rule(
-            normalized, observed_replicas=observed_replicas,
+            normalized,
+            observed_replicas=observed_replicas,
+            observed_instances=observed_instances,
         )
 
     def delete_source_ip_routing_rule(
@@ -6871,6 +6881,145 @@ class SparkDeckService:
         return self.manager.delete_source_ip_routing_rule(
             source_ip, requested_model,
         )
+
+    def _source_routing_config_signature(self, stored: dict) -> str:
+        """Cheap local config identity; health observations are cached separately."""
+        linked = next((item for item in getattr(self.manager, "deployments", [])
+                       if item.get("sparkdeck_record_id") == stored.get("id")), {})
+        return json.dumps({
+            "stored": {key: stored.get(key) for key in (
+                "id", "alias", "runtime", "kind", "model", "settings", "desired_state",
+            )},
+            "manager_id": linked.get("id"),
+            "manager_model": linked.get("model"),
+            "record_id": linked.get("sparkdeck_record_id"),
+            "mode": linked.get("mode"),
+            "engine": linked.get("engine"),
+            "served_model": linked.get("served_model"),
+            "served_models": linked.get("served_models"),
+            "launch_settings": linked.get("launch_settings"),
+            "desired_state": linked.get("desired_state"),
+            "members": [(m.get("node_id"), m.get("rank"), m.get("instance_id"),
+                         m.get("container_name"), m.get("desired_state")) for m in linked.get("members") or []],
+        }, sort_keys=True, default=str)
+
+    async def _source_routing_member_state(self, deployment: dict, member: dict, coordinator: bool) -> dict:
+        from cluster import NodeAgentResponseError
+
+        name = member["container_name"]
+        node_id = member["node_id"]
+        if node_id == "local":
+            container = await self.manager._container_by_name(name)
+            ready = bool(container and container.get("status") == "running")
+            if ready and coordinator:
+                ready = await self.manager._check_ready(container, strict_health=True)
+            return {"status": (container or {}).get("status", "missing"), "ready": ready}
+        try:
+            return await self.manager.node_registry.request(
+                node_id, "GET", f"/api/agent/containers/{name}/state?check_ready={'true' if coordinator else 'false'}",
+                timeout=8,
+            )
+        except NodeAgentResponseError as exc:
+            if exc.status_code != 404:
+                raise
+            # Older agents lack the targeted endpoint. Compatibility work is
+            # restricted to this selected node; never inspect sibling groups.
+            status = await self.manager.node_registry.request(node_id, "GET", "/api/agent/status", timeout=8)
+            if status.get("docker_ready") is not True or status.get("inventory_available") is False:
+                raise RuntimeError("selected node container inventory is unavailable")
+            container = next((row for row in status.get("containers") or [] if row.get("name") == name), {})
+            ready = container.get("status") == "running"
+            if ready and coordinator:
+                health = await self.manager.node_registry.request(
+                    node_id, "POST", "/api/agent/inference/health", timeout=8,
+                    json_body={"model": deployment.get("model"), "_sparkdeck_container_name": name,
+                               "_sparkdeck_deployment_id": deployment["id"], "strict_health": True},
+                )
+                ready = health.get("ready") is True and health.get("health_status") == 200
+            return {"status": container.get("status", "missing"), "ready": ready}
+
+    async def _observe_source_routing_target(self, stored: dict, rule: dict) -> list[dict]:
+        deployment, nodes = self.manager.source_ip_routing_target(
+            stored["id"], rule.get("instance_id"), rule["node_ids"],
+        )
+        mode = deployment.get("mode")
+        members = [m for m in self.manager._cluster_members_sorted(deployment)
+                   if m.get("node_id") in nodes
+                   and (mode != "grouped_sharded" or m.get("instance_id") == rule.get("instance_id"))]
+        if stored.get("desired_state") == "stopped" or deployment.get("desired_state") == "stopped" or any(m.get("desired_state") == "stopped" for m in members):
+            raise RuntimeError("selected serving unit is stopped")
+        probes = [asyncio.create_task(
+            self._source_routing_member_state(deployment, member, mode == "replicated" or int(member.get("rank") or 0) == 0))
+            for member in members
+        ]
+        try:
+            observations = await asyncio.gather(*probes)
+        finally:
+            for probe in probes:
+                if not probe.done():
+                    probe.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
+        observed_members = []
+        for member, state in zip(members, observations):
+            coordinator = mode == "replicated" or int(member.get("rank") or 0) == 0
+            healthy = state.get("status") == "running" and (not coordinator or state.get("ready") is True)
+            observed_members.append({**member, "status": "running" if healthy else "unknown",
+                                     "node_status": "online", "node_docker_ready": True,
+                                     "phase": {"phase": "ready" if healthy else "unknown"}})
+        healthy = bool(observed_members) and all(m["status"] == "running" for m in observed_members)
+        observed = {**deployment, "members": observed_members, "status": "running" if healthy else "unknown"}
+        live = {**stored, "status": "running" if healthy else "unknown", "deployment_mode": mode,
+                "desired_state": deployment.get("desired_state"), "managed": True,
+                "served_models": self.manager._deployment_served_models(deployment)}
+        if mode == "replicated":
+            live["replicas"] = _replica_summary(observed)
+        elif mode == "grouped_sharded":
+            live["instances"] = _grouped_instance_summary(observed)
+        return [live]
+
+    async def _refresh_source_routing_snapshot(self, key: str, stored: dict, rule: dict, signature: str) -> None:
+        try:
+            rows = await asyncio.wait_for(self._observe_source_routing_target(stored, rule), timeout=10.0)
+            current = self.store.deployment(stored["id"], include_private=True)
+            if current is None or self._source_routing_config_signature(current) != signature:
+                raise RuntimeError("source-IP routing configuration changed during health refresh")
+            entry = (time.monotonic() + 4.0, copy.deepcopy(rows), signature)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            entry = (time.monotonic() + 1.0, None, signature)
+        finally:
+            self._source_routing_refresh_tasks.pop(key, None)
+        if key not in self._source_routing_cache and len(self._source_routing_cache) >= 128:
+            self._source_routing_cache.pop(next(iter(self._source_routing_cache)))
+        self._source_routing_cache[key] = entry
+
+    async def _source_routing_snapshot(self, stored: dict, rule: dict) -> list[dict]:
+        from manager import SourceRoutingUnavailable
+
+        if not isinstance(getattr(self, "_source_routing_cache", None), dict):
+            self._source_routing_cache = {}
+        if not hasattr(self, "_source_routing_refresh_tasks"):
+            self._source_routing_refresh_tasks = {}
+        key = json.dumps([stored["id"], rule.get("instance_id"), rule.get("node_ids")])
+        signature = self._source_routing_config_signature(stored)
+        cached = self._source_routing_cache.get(key)
+        if not cached or cached[0] <= time.monotonic() or cached[2] != signature:
+            task = self._source_routing_refresh_tasks.get(key)
+            if task is None:
+                if len(self._source_routing_refresh_tasks) >= 128:
+                    raise SourceRoutingUnavailable("source-IP routing health refresh capacity is unavailable")
+                if len(self._source_routing_cache) >= 128:
+                    self._source_routing_cache.pop(next(iter(self._source_routing_cache)))
+                task = asyncio.create_task(
+                    self._refresh_source_routing_snapshot(key, stored, rule, signature),
+                )
+                self._source_routing_refresh_tasks[key] = task
+            await asyncio.shield(task)
+        cached = self._source_routing_cache.get(key)
+        if not cached or cached[1] is None or cached[0] <= time.monotonic() or cached[2] != self._source_routing_config_signature(stored):
+            raise SourceRoutingUnavailable("source-IP routing health snapshot is unavailable")
+        return copy.deepcopy(cached[1])
 
     async def _source_routed_deployment(
         self,
@@ -6883,11 +7032,13 @@ class SparkDeckService:
 
         stable_id = str(rule.get("deployment_id") or "")
         stored = self.store.deployment(stable_id, include_private=True)
+        error_type = LookupError if validating else SourceRoutingUnavailable
+        if stored is None:
+            raise error_type("source-IP routing target deployment is unavailable")
         live = next((
-            deployment for deployment in await self.deployments()
+            deployment for deployment in await self._source_routing_snapshot(stored, rule)
             if deployment.get("id") == stable_id
         ), None)
-        error_type = LookupError if validating else SourceRoutingUnavailable
         if stored is None or live is None:
             raise error_type("source-IP routing target deployment is unavailable")
         deployment = {**stored, **live}
@@ -6908,6 +7059,21 @@ class SparkDeckService:
             ), None)
             if selected is None or selected.get("available") is not True:
                 raise error_type("source-IP routing target replica is unavailable")
+        if deployment.get("deployment_mode") == "grouped_sharded":
+            selected_instance = next((
+                instance for instance in deployment.get("instances") or []
+                if instance.get("instance_id") == rule.get("instance_id")
+            ), None)
+            if (
+                selected_instance is None
+                or list(selected_instance.get("node_ids") or [])
+                != list(rule.get("node_ids") or [])
+                or selected_instance.get("status") != "running"
+                or selected_instance.get("desired_state") == "stopped"
+            ):
+                raise error_type(
+                    "source-IP routing target engine group is unavailable"
+                )
         if (
             deployment.get("kind") != DeploymentKind.MANAGED.value
             or deployment.get("runtime") not in {
@@ -6960,7 +7126,11 @@ class SparkDeckService:
             deployment = await self._source_routed_deployment(
                 source_route, requested_model,
             )
-            source_route = {**source_route, "_observed_replicas": deployment.get("replicas")}
+            source_route = {
+                **source_route,
+                "_observed_replicas": deployment.get("replicas"),
+                "_observed_instances": deployment.get("instances"),
+            }
         else:
             deployment = await self._live_deployment_for_model_id(
                 requested_model

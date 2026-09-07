@@ -47,6 +47,13 @@ such as `192.0.2.10` and `192.0.2.20` in fixtures.
 - [ ] A stopped/offline target, missing coordinator, changed node membership,
   removed deployment, or changed served model returns unavailable without
   dispatch to another group.
+- [ ] With one group running and another starting or offline, a direct API save
+  rejects the unavailable group. Existing pins to that group also fail before
+  dispatch, even if saved member statuses still say running.
+- [ ] Concurrent pinned requests share a bounded health snapshot refresh and
+  do not run a full Docker/image/hardware inventory per request. Expiry and
+  failed refreshes do not reuse healthy observations indefinitely; stop intent
+  and topology changes are enforced immediately.
 - [ ] Upstream failures before and after the first streamed token never cause
   an override request to be replayed on a different group.
 - [ ] Disconnects and cancellations release admission and active-request state.

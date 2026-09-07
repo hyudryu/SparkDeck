@@ -322,7 +322,7 @@ describe('settings page', () => {
         can_update: true, blockers: [],
         nodes: [
           { id: 'current', name: 'Already current', local: false, online: true, current_revision: current, blockers: [] },
-          { id: 'old', name: 'Needs update', local: true, online: true, current_revision: old, blockers: [] },
+          { id: 'old', name: 'Needs update', local: true, online: true, current_revision: old, commits_behind: 1, blockers: [] },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
@@ -338,8 +338,24 @@ describe('settings page', () => {
     expect(oldNode).not.toBeNull()
     expect(within(currentNode!).getByText('Latest')).toBeInTheDocument()
     expect(currentNode!.querySelector('.status-dot')).toHaveClass('status-running')
-    expect(within(oldNode!).getByText('Ready')).toBeInTheDocument()
+    expect(within(oldNode!).getByText('1 commit behind')).toBeInTheDocument()
     expect(oldNode!.querySelector('.status-dot')).toHaveClass('status-starting')
+  })
+
+  it.each([null, 0])('does not mark a different revision latest with a %s comparison', async (commitsBehind) => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const data = String(input).includes('system-update') ? {
+        repository: 'hyudryu/SparkDeck', target: { branch: 'main', revision: 'b'.repeat(40) },
+        can_update: true, blockers: [],
+        nodes: [{ id: 'unknown', name: 'Unknown version node', local: false, online: true,
+          current_revision: 'a'.repeat(40), commits_behind: commitsBehind, blockers: [] }],
+      } : { theme: 'system' }
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const node = (await screen.findByText('Unknown version node')).closest<HTMLElement>('.update-node')!
+    expect(within(node).getByText('Version unknown')).toBeInTheDocument()
+    expect(node.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
   it('labels preflight-ready nodes as queued during a rollout', async () => {
@@ -413,7 +429,7 @@ describe('settings page', () => {
     expect(updatePaths).toEqual(['/api/v1/system-update?refresh=true', '/api/v1/system-update'])
   }, 8_000)
 
-  it('does not trust an up-to-date phase saved for an older target', async () => {
+  it('shows live commit counts instead of a succeeded job saved for an older target', async () => {
     const current = 'b'.repeat(40)
     const old = 'a'.repeat(40)
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
@@ -422,10 +438,10 @@ describe('settings page', () => {
         target: { branch: 'main', revision: current, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
         up_to_date: false,
         can_update: true, blockers: [],
-        nodes: [],
+        nodes: [{ id: 'stale', name: 'Current node', local: false, online: true, current_revision: old, commits_behind: 7, blockers: [] }],
         job: {
           id: 'old-job', active: false, phase: 'partial', target_branch: 'main', target_revision: old,
-          nodes: [{ id: 'stale', name: 'Stale job node', local: false, online: true, current_revision: old, blockers: [], phase: 'up_to_date' }],
+          nodes: [{ id: 'stale', name: 'Stale job node', local: false, online: true, current_revision: old, blockers: [], phase: 'succeeded' }],
         },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
@@ -435,10 +451,10 @@ describe('settings page', () => {
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    const node = (await screen.findByText('Stale job node')).closest<HTMLElement>('.update-node')
+    const node = (await screen.findByText('Current node')).closest<HTMLElement>('.update-node')
     expect(node).not.toBeNull()
     expect(within(node!).queryByText('Latest')).not.toBeInTheDocument()
-    expect(within(node!).getByText('Ready')).toBeInTheDocument()
+    expect(within(node!).getByText('7 commits behind')).toBeInTheDocument()
     expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 })

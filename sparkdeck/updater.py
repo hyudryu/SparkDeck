@@ -433,6 +433,7 @@ class UpdateService:
         self._release_cache: tuple[float, list[dict], str | None] | None = None
         self._resolved_releases: dict[str, dict] = {}
         self._main_cache: tuple[float, dict | None, str | None] | None = None
+        self._comparison_cache: dict[tuple[str, str], tuple[float, int | None]] = {}
         self._overview_blockers_cache: tuple[float, tuple[str, ...]] | None = None
         self._overview_blockers_lock = asyncio.Lock()
 
@@ -670,6 +671,39 @@ class UpdateService:
         self._main_cache = (time.monotonic(), *result)
         return result
 
+    async def _commits_behind(
+        self, revision: str | None, target: str | None, *, force: bool = False,
+    ) -> int | None:
+        """Count target commits absent from a node without fetching into its checkout."""
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                   for value in (revision, target)):
+            return None
+        if revision == target:
+            return 0
+        key = (revision, target)
+        cached = self._comparison_cache.get(key)
+        if not force and cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
+        count = None
+        try:
+            response = await self.manager.http.get(
+                f"https://api.github.com/repos/{REPOSITORY}/compare/{target}...{revision}?per_page=1",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "SparkDeck"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            value = payload.get("behind_by") if isinstance(payload, dict) else None
+            if type(value) is int and value >= 0:
+                count = value
+        except (httpx.HTTPError, ValueError):
+            pass
+        # Cache failed comparisons too, so polling does not exhaust API limits.
+        if len(self._comparison_cache) >= 256:
+            self._comparison_cache.pop(next(iter(self._comparison_cache)))
+        self._comparison_cache[key] = (time.monotonic(), count)
+        return count
+
     async def overview(self, *, force_preflight: bool = False, refresh: bool = False) -> dict:
         revision = self.runtime_revision
         state = self._read(self.cluster_path)
@@ -764,9 +798,17 @@ class UpdateService:
             public_nodes.append({
                 "id": node.get("id"), "name": node.get("name"),
                 "local": bool(node.get("local")), "online": bool(node.get("online")),
-                "current_revision": node.get("app_revision") or (revision if node.get("local") else None),
+                "current_revision": revision if node.get("local") else node.get("app_revision"),
                 "blockers": node_blockers,
             })
+        node_revisions = list(dict.fromkeys(node["current_revision"] for node in public_nodes))
+        target = main_target["revision"] if main_target else None
+        comparisons = dict(zip(node_revisions, await asyncio.gather(*(
+            self._commits_behind(node_revision, target, force=refresh)
+            for node_revision in node_revisions
+        ))))
+        for node in public_nodes:
+            node["commits_behind"] = comparisons[node["current_revision"]]
         all_blockers = ([main_error] if main_error else []) + [
             f"{node['name']}: {item}" for node in public_nodes for item in node["blockers"]
         ]

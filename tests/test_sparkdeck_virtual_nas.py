@@ -1743,6 +1743,83 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FileExistsError):
                 await target.import_model("org/model", bytes_stream(b"unused"))
 
+    async def test_streamed_export_omits_unreadable_hub_tree_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "source"
+            repository = create_cached_model(hub)
+            (repository / "trees").mkdir()
+            cached_listing = repository / "trees" / "revision-1.json"
+            cached_listing.write_text("{}")
+            # An actual model folder with the same name must still be copied.
+            model_trees = repository / "snapshots" / "revision-1" / "trees"
+            model_trees.mkdir()
+            (model_trees / "weights.bin").write_bytes(b"required model data")
+            source = VirtualNAS(base / "source-data", lambda: hub, FakeRegistry(), lambda: True)
+            target_hub = base / "target"
+            target = VirtualNAS(base / "target-data", lambda: target_hub, FakeRegistry(), lambda: True)
+            original_open = Path.open
+
+            def guarded_open(path, *args, **kwargs):
+                if path == cached_listing:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", guarded_open):
+                capability = source.issue_direct_export_capability("org/model", "revision-1")
+                await target.import_model(
+                    "org/model", source.export_model_with_capability("org/model", capability),
+                )
+            imported = target_hub / repository.name
+            self.assertFalse((imported / "trees").exists())
+            self.assertEqual(
+                (imported / "snapshots" / "revision-1" / "trees" / "weights.bin").read_bytes(),
+                b"required model data",
+            )
+
+    async def test_unreadable_required_source_fails_before_any_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "hub"
+            repository = create_cached_model(hub)
+            source = VirtualNAS(base / "data", lambda: hub, FakeRegistry(), lambda: True)
+            blocked = repository / "snapshots" / "revision-1" / "tokenizer.json"
+            original_open = Path.open
+
+            def guarded_open(path, *args, **kwargs):
+                if path == blocked:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", guarded_open):
+                with self.assertRaisesRegex(ValueError, "cannot read source model file .*tokenizer.json"):
+                    source.issue_direct_export_capability("org/model", "revision-1")
+                stream = source.export_model("org/model")
+                with self.assertRaisesRegex(ValueError, "cannot read source model file .*tokenizer.json"):
+                    await anext(stream)
+            self.assertFalse(source.model_in_transfer("org/model"))
+
+    async def test_truncated_payload_checksum_and_completion_marker_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "source"
+            create_cached_model(hub)
+            source = VirtualNAS(base / "source-data", lambda: hub, FakeRegistry(), lambda: True)
+            target_hub = base / "target"
+            target = VirtualNAS(base / "target-data", lambda: target_hub, FakeRegistry(), lambda: True)
+            body = b"".join([chunk async for chunk in source.export_model("org/model")])
+            payload_end = body.index(b"model-weights") + len(b"model-weights")
+            for cut, context in (
+                (payload_end - 1, "payload"),
+                (payload_end, "checksum"),
+                (len(body) - 4, "completion marker"),
+            ):
+                with self.subTest(context=context):
+                    with self.assertRaisesRegex(ValueError, f"file stream ended unexpectedly.*{context}.*at byte"):
+                        await target.import_model("org/model", bytes_stream(body[:cut]))
+                    self.assertFalse((target_hub / "models--org--model").exists())
+                    self.assertFalse(target.model_in_transfer("org/model"))
+
     async def test_streamed_import_rejects_corrupted_file_payload(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
             source_hub = Path(source_dir) / "hub"

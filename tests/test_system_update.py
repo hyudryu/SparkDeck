@@ -786,6 +786,136 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["helper_pid"], 4321)
         self.assertEqual(state["helper_started_at"], 987654321)
 
+    async def test_update_waits_for_transfers_without_launching_helper(self):
+        drained = asyncio.Event()
+        nas = SimpleNamespace(
+            reserve_update=Mock(), wait_for_transfers=drained.wait, end_update=Mock(),
+        )
+        self.manager.virtual_nas = nas
+        self.service.preflight_local = AsyncMock(return_value={"ok": True})
+        with patch("sparkdeck.updater._spawn_update_helper", return_value=4321) as spawn, \
+             patch("sparkdeck.updater.platform.system", return_value="Linux"), \
+             patch("sparkdeck.updater.local_blockers", return_value=[]):
+            state = await self.service.start_local("main", "b" * 40)
+            self.assertEqual(state["phase"], "pending_transfers")
+            nas.reserve_update.assert_called_once()
+            await asyncio.sleep(0)
+            spawn.assert_not_called()
+            self.assertEqual(self.service.agent_status()["phase"], "pending_transfers")
+            with self.assertRaisesRegex(RuntimeError, "already updating"):
+                await self.service.start_local("main", "b" * 40)
+            drained.set()
+            await self.service._agent_task
+            spawn.assert_called_once()
+        self.assertEqual(self.service._read(self.service.agent_path)["phase"], "accepted")
+        nas.end_update.assert_not_called()
+
+    async def test_waiting_update_failure_releases_transfer_reservation(self):
+        nas = SimpleNamespace(
+            reserve_update=Mock(), wait_for_transfers=AsyncMock(), end_update=Mock(),
+        )
+        self.manager.virtual_nas = nas
+        self.service.preflight_local = AsyncMock(side_effect=[{}, RuntimeError("checkout changed")])
+        with patch("sparkdeck.updater._spawn_update_helper") as spawn:
+            await self.service.start_local("main", "b" * 40)
+            await self.service._agent_task
+        spawn.assert_not_called()
+        nas.end_update.assert_called_once()
+        state = self.service._read(self.service.agent_path)
+        self.assertEqual(state["phase"], "failed")
+        self.assertIn("checkout changed", state["error"])
+
+    async def test_interrupted_pending_update_becomes_retryable(self):
+        self.service._write(self.service.agent_path, {
+            "phase": "pending_transfers", "target_revision": "b" * 40,
+        })
+        with patch("sparkdeck.updater.local_blockers", return_value=[]):
+            self.assertEqual(self.service.agent_status()["phase"], "failed")
+
+    async def test_old_agent_failure_does_not_release_cluster_transfer_guard(self):
+        self.manager.virtual_nas = SimpleNamespace(end_update=Mock())
+        self.service._write(self.service.agent_path, {"phase": "failed"})
+        self.service._reconciled_agent_state()
+        self.manager.virtual_nas.end_update.assert_not_called()
+
+    async def test_failed_helper_releases_its_transfer_guard(self):
+        self.manager.virtual_nas = SimpleNamespace(end_update=Mock())
+        self.service._local_update_reserved = True
+        self.service._write(self.service.agent_path, {"phase": "failed"})
+        self.service._reconciled_agent_state()
+        self.manager.virtual_nas.end_update.assert_called_once()
+        self.assertFalse(self.service._local_update_reserved)
+
+    async def test_old_local_success_cannot_release_new_cluster_reservation(self):
+        self.manager.virtual_nas = SimpleNamespace(end_update=Mock())
+        self.service._local_update_reserved = True
+        self.service._cluster_update_reserved = True
+        self.service._write(self.service.agent_path, {"phase": "succeeded"})
+        self.service._reconciled_agent_state()
+        self.manager.virtual_nas.end_update.assert_not_called()
+        self.assertFalse(self.service._local_update_reserved)
+        self.assertTrue(self.service._cluster_update_reserved)
+
+    async def test_already_installed_controller_releases_cluster_reservation(self):
+        self.manager.virtual_nas = SimpleNamespace(
+            reserve_update=Mock(), wait_for_transfers=AsyncMock(), end_update=Mock(),
+        )
+        self.service.preflight_local = AsyncMock(return_value={})
+        state = {
+            "active": True, "target_branch": "main", "target_revision": "a" * 40,
+            "nodes": [{"id": "local", "name": "Controller", "local": True}],
+        }
+        with patch("sparkdeck.updater._spawn_update_helper") as spawn:
+            await self.service._run_cluster(state)
+        spawn.assert_not_called()
+        self.assertEqual(state["phase"], "succeeded")
+        self.assertFalse(state["active"])
+        self.manager.virtual_nas.end_update.assert_called_once()
+        self.assertFalse(self.service._cluster_update_reserved)
+
+    async def test_cluster_waits_before_updating_either_transfer_endpoint(self):
+        drained = asyncio.Event()
+        self.manager.virtual_nas = SimpleNamespace(
+            reserve_update=Mock(), wait_for_transfers=drained.wait, end_update=Mock(),
+        )
+        state = {
+            "active": True, "target_branch": "main", "target_revision": "b" * 40,
+            "nodes": [{"id": "source", "name": "Source", "local": False},
+                      {"id": "target", "name": "Target", "local": False}],
+        }
+        self.manager.node_registry.request.side_effect = [
+            {"capability": CAPABILITY}, {"capability": CAPABILITY},
+            {}, {"phase": "succeeded", "current_revision": "b" * 40},
+            {}, {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        task = asyncio.create_task(self.service._run_cluster(state))
+        await asyncio.sleep(0)
+        self.assertEqual(state["phase"], "pending_transfers")
+        self.assertEqual(self.manager.node_registry.request.await_count, 2)
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()):
+            drained.set()
+            await task
+        self.assertEqual(state["phase"], "succeeded")
+        self.manager.virtual_nas.end_update.assert_called_once()
+
+    async def test_pending_worker_transfers_do_not_consume_restart_timeout(self):
+        state = {
+            "active": True, "target_branch": "main", "target_revision": "b" * 40,
+            "nodes": [{"id": "worker", "name": "Worker", "local": False}],
+        }
+        self.manager.node_registry.request.side_effect = [
+            {"capability": CAPABILITY}, {},
+            {"phase": "pending_transfers"},
+            {"phase": "pending_transfers"},
+            {"phase": "succeeded", "current_revision": "b" * 40},
+        ]
+        # Advance the clock past the original 10-minute deadline while the
+        # worker continues to report a healthy, pending transfer wait.
+        with patch("sparkdeck.updater.asyncio.sleep", new=AsyncMock()), \
+             patch("sparkdeck.updater.time.monotonic", side_effect=[0, 3, 500, 700, 1000, 1200]):
+            await self.service._run_cluster(state)
+        self.assertEqual(state["phase"], "succeeded")
+
 
 class UpdateHelperProcessTests(unittest.TestCase):
     @patch("sparkdeck.updater._terminate_exact_windows_process")

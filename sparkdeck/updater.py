@@ -428,6 +428,9 @@ class UpdateService:
         self.cluster_path = self.data_dir / "system-update.json"
         self.agent_path = self.data_dir / UPDATE_STATE_FILENAME
         self._task: asyncio.Task | None = None
+        self._agent_task: asyncio.Task | None = None
+        self._local_update_reserved = False
+        self._cluster_update_reserved = False
         self._lock = asyncio.Lock()
         self._agent_lock = asyncio.Lock()
         self._release_cache: tuple[float, list[dict], str | None] | None = None
@@ -498,6 +501,14 @@ class UpdateService:
 
     def _reconciled_agent_state(self, revision: str | None = None) -> dict:
         state = self._read(self.agent_path)
+        if state.get("phase") == "pending_transfers":
+            if self._agent_task is not None and not self._agent_task.done():
+                return state
+            state.update(
+                phase="failed", message="Interrupted update can be retried",
+                error="The pending local update was interrupted",
+            )
+            self._write(self.agent_path, state)
         if state.get("phase") in {"accepted", "staging", "restarting"}:
             installed_after_restart = bool(
                 state.get("phase") == "restarting"
@@ -529,6 +540,11 @@ class UpdateService:
                 else:
                     state["error"] = "The local update helper was interrupted"
                 self._write(self.agent_path, state)
+        if state.get("phase") in FAILED_NODE_PHASES | {"succeeded"} and self._local_update_reserved:
+            nas = getattr(self.manager, "virtual_nas", None)
+            if nas is not None and not self._cluster_update_reserved:
+                nas.end_update()
+            self._local_update_reserved = False
         return state
 
     def agent_status(self) -> dict:
@@ -710,8 +726,11 @@ class UpdateService:
                             current_revision=revision,
                         )
                     self._finish_cluster_state(state)
-                elif _helper_alive(agent_state):
-                    pass
+                elif agent_state.get("phase") == "pending_transfers" or _helper_alive(agent_state):
+                    if local and agent_state.get("phase") == "pending_transfers":
+                        local["phase"] = "pending_transfers"
+                        local["message"] = agent_state.get("message")
+                        self._write(self.cluster_path, state)
                 else:
                     if local:
                         local.update(
@@ -829,6 +848,8 @@ class UpdateService:
             return state
 
     async def _run_cluster(self, state: dict) -> None:
+        nas = getattr(self.manager, "virtual_nas", None)
+        handed_to_local = False
         try:
             # Probe every node independently before mutating any of them. A node
             # failure is durable state for that node, not a cluster-wide abort.
@@ -861,6 +882,25 @@ class UpdateService:
                 node for node in state["nodes"]
                 if not node["local"] and node.get("phase") == "ready"
             ]
+            if nas is not None:
+                # The coordinator owns the full copy, including destination
+                # validation after the source stream has already closed.
+                nas.reserve_update()
+                self._cluster_update_reserved = True
+                state.update(
+                    phase="pending_transfers",
+                    message="Update pending until active model transfers finish on both nodes",
+                )
+                for node in state["nodes"]:
+                    if node.get("phase") == "ready":
+                        node["phase"] = "pending_transfers"
+                        node["message"] = "Waiting for active model transfers"
+                self._write(self.cluster_path, state)
+                await nas.wait_for_transfers()
+                for node in state["nodes"]:
+                    if node.get("phase") == "pending_transfers":
+                        node["phase"] = "ready"
+                        node.pop("message", None)
             state.update(
                 phase="updating_workers",
                 message=f"Updating {len(eligible_workers)} eligible worker(s) one at a time",
@@ -885,9 +925,15 @@ class UpdateService:
                         except RuntimeError:
                             continue
                         node["phase"] = status.get("phase", "updating")
+                        node["message"] = status.get("message")
                         node["current_revision"] = status.get("current_revision")
                         node["error"] = status.get("error")
                         self._write(self.cluster_path, state)
+                        if status.get("phase") == "pending_transfers":
+                            # Large copies can take hours. The restart deadline
+                            # starts only after the node has drained its transfers.
+                            deadline = time.monotonic() + 600
+                            continue
                         if status.get("phase") == "succeeded" and status.get("current_revision") == state["target_revision"]:
                             node.pop("error", None)
                             break
@@ -905,7 +951,12 @@ class UpdateService:
                 local["phase"] = "updating"
                 self._write(self.cluster_path, state)
                 try:
-                    await self.start_local(state["target_branch"], state["target_revision"])
+                    local_state = await self.start_local(state["target_branch"], state["target_revision"])
+                    if isinstance(local_state, dict) and local_state.get("phase") == "succeeded":
+                        local.update(phase="succeeded", current_revision=state["target_revision"])
+                        self._finish_cluster_state(state)
+                        return
+                    handed_to_local = True
                     return
                 except Exception as exc:
                     local.update(phase="failed", error=str(exc)[:500])
@@ -915,6 +966,10 @@ class UpdateService:
                 if node.get("phase") not in FAILED_NODE_PHASES | {"succeeded", "up_to_date"}:
                     node.update(phase="failed", error=f"Rollout interrupted: {str(exc)[:440]}")
             self._finish_cluster_state(state)
+        finally:
+            self._cluster_update_reserved = False
+            if nas is not None and not handed_to_local and not self._local_update_reserved:
+                nas.end_update()
 
     async def preflight_local(self, branch: str, revision: str) -> dict:
         if branch != MAIN_BRANCH:
@@ -981,7 +1036,7 @@ class UpdateService:
             if not installed_revision:
                 raise RuntimeError(RUNTIME_REVISION_BLOCKER)
             state = self._reconciled_agent_state(installed_revision)
-            if state.get("phase") in {"accepted", "staging", "restarting"}:
+            if state.get("phase") in {"pending_transfers", "accepted", "staging", "restarting"}:
                 raise RuntimeError("This node is already updating")
             await self.preflight_local(branch, revision)
             if installed_revision == revision.lower():
@@ -992,18 +1047,49 @@ class UpdateService:
                 self._write(self.agent_path, state)
                 return state
             state = {"phase": "accepted", "target_branch": branch, "target_revision": revision.lower(), "message": "Update accepted"}
-            self._write(self.agent_path, state)
-            command = [
-                sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
-                "--state", str(self.agent_path), "--branch", branch,
-                "--revision", revision.lower(),
-            ]
-            helper_pid = _spawn_update_helper(self.root, command)
-            state.update(helper_pid=helper_pid, boot_id=_boot_id())
-            if platform.system() == "Windows":
-                helper_started_at = _windows_process_started(helper_pid)
-                if helper_started_at is None:
-                    raise RuntimeError("Could not verify the detached Windows update helper")
-                state["helper_started_at"] = helper_started_at
-            self._write(self.agent_path, state)
+            nas = getattr(self.manager, "virtual_nas", None)
+            if nas is not None:
+                nas.reserve_update()
+                self._local_update_reserved = True
+                state.update(
+                    phase="pending_transfers",
+                    message="Update pending until active model transfers finish",
+                )
+                self._write(self.agent_path, state)
+                self._agent_task = asyncio.create_task(self._start_after_transfers(state, nas))
+            else:
+                self._launch_local_helper(state)
             return state
+
+    async def _start_after_transfers(self, state: dict, nas: Any) -> None:
+        try:
+            await nas.wait_for_transfers()
+            # A long transfer may outlive changes to the checkout or service.
+            await self.preflight_local(state["target_branch"], state["target_revision"])
+            self._launch_local_helper(state)
+        except (Exception, asyncio.CancelledError) as exc:
+            state.update(
+                phase="failed", message="Update could not start",
+                error=str(exc)[:500] or "The pending local update was interrupted",
+            )
+            self._write(self.agent_path, state)
+            self._local_update_reserved = False
+            if not self._cluster_update_reserved:
+                nas.end_update()
+
+    def _launch_local_helper(self, state: dict) -> None:
+        state.update(phase="accepted", message="Update accepted")
+        self._write(self.agent_path, state)
+        command = [
+            sys.executable, "-m", "sparkdeck.update_helper", "--root", str(self.root),
+            "--state", str(self.agent_path), "--branch", state["target_branch"],
+            "--revision", state["target_revision"],
+        ]
+        helper_pid = _spawn_update_helper(self.root, command)
+        state.update(helper_pid=helper_pid, boot_id=_boot_id())
+        if platform.system() == "Windows":
+            helper_started_at = _windows_process_started(helper_pid)
+            if helper_started_at is None:
+                raise RuntimeError("Could not verify the detached Windows update helper")
+            state["helper_started_at"] = helper_started_at
+        self._write(self.agent_path, state)

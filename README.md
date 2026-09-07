@@ -284,7 +284,7 @@ Adjust the template if your checkout lives elsewhere. Never place tokens directl
 
 ### Cluster-wide main updates
 
-After installing the bundled user service, open **Settings → Software update** to update the cluster to the immutable commit currently at `origin/main`. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
+After installing the bundled user service, open **Settings → Software update** to update the cluster to the immutable commit currently at `origin/main`. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced. If a model transfer is in progress, the update stays pending until it finishes, protecting both the source and destination nodes from restarting during the transfer.
 
 Self-update never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled service launcher (`sparkdeck.service` on Linux or the Windows launcher), and already support the update protocol. A dirty, offline, or unsupported node blocks the rollout before any node changes. A clean divergent or non-main checkout is detached at the verified main commit so its branch pointer is preserved and later updates continue tracking verified `origin/main` commits.
 

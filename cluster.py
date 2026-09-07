@@ -238,6 +238,13 @@ class NodeRegistry:
             return {"id": LOCAL_NODE_ID, "name": "This node", "local": True}
         return next((n for n in self.nodes if n.get("id") == node_id), None)
 
+    def cached_status(self, node_id: str) -> dict | None:
+        """Read a recent connectivity observation without probing the node."""
+        cached = self._status_cache.get(node_id)
+        if cached and time.monotonic() - cached[0] < 4.0:
+            return cached[1]
+        return None
+
     async def pair_remote(
         self,
         agent_url: str,

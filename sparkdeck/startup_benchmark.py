@@ -27,6 +27,7 @@ _POLL_MAX_INTERVAL = 30.0
 # synthetic GPU workload, while still allowing transient failures to retry.
 _RETRY_BACKOFF_BASE = 60.0
 _RETRY_BACKOFF_MAX = 3600.0
+_RETRY_BACKOFF_MAX_EXPONENT = 8
 
 
 @dataclass
@@ -136,8 +137,15 @@ class StartupBenchmarkMonitor:
             previous = int(state.get("attempts") or 0) if isinstance(state, dict) else 0
         except (TypeError, ValueError):
             previous = 0
-        attempts = previous + 1
-        delay = min(_RETRY_BACKOFF_BASE * (2 ** (attempts - 1)), _RETRY_BACKOFF_MAX)
+        # Attempts only select a bounded exponential delay. Cap the persisted
+        # counter too, so corrupt or long-lived state cannot make exponentiation
+        # overflow before the maximum delay is applied.
+        attempts = min(max(previous, 0) + 1, _RETRY_BACKOFF_MAX_EXPONENT + 1)
+        delay = min(
+            _RETRY_BACKOFF_BASE
+            * (2 ** min(attempts - 1, _RETRY_BACKOFF_MAX_EXPONENT)),
+            _RETRY_BACKOFF_MAX,
+        )
         retry_after = time.time() + delay
         self._retry_attempts[fingerprint] = attempts
         self._retry_after[fingerprint] = retry_after

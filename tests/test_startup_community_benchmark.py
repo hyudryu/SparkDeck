@@ -362,6 +362,18 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await restarted.tick())
         self.assertFalse(restarted._tasks)
 
+    def test_retry_backoff_caps_large_persisted_attempt_count(self):
+        retry_key = self.monitor._retry_key(self.target.fingerprint)
+        self.service.store.set_setting(retry_key, {"attempts": 1024})
+
+        with patch("sparkdeck.startup_benchmark.time.time", return_value=1000.0):
+            self.monitor._back_off(self.target.fingerprint)
+
+        persisted = self.service.store.get_setting(retry_key, {})
+        self.assertEqual(persisted["attempts"], 9)
+        self.assertEqual(persisted["retry_after"], 4600.0)
+        self.assertEqual(self.monitor._retry_after[self.target.fingerprint], 4600.0)
+
     async def test_benchmark_returns_whether_a_sample_was_recorded(self):
         observed = []
         closed = []

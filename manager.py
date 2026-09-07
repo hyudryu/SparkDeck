@@ -148,6 +148,7 @@ PERSISTED_DEPLOYMENT_ARGS_ERROR = (
 # ``grouped_sharded`` runs N independent sharded engine groups (each a
 # tensor-parallel-sized node group) behind one served name.
 _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+MEMBER_LOG_TIMEOUT_SECONDS = 5.0
 # Member-label modes that run one rank of a distributed engine: host
 # networking, fabric environment, and per-rank VRAM fitting all apply.
 _SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
@@ -7076,6 +7077,19 @@ class Manager:
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
     ) -> Any:
+        if action == "logs":
+            # One offline worker must not hold the entire logs dialog behind
+            # lifecycle timeouts. Bound all connection attempts together.
+            try:
+                return await asyncio.wait_for(
+                    self._read_member_logs(member, log_tail),
+                    timeout=MEMBER_LOG_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Logs unavailable from {member.get('node_name') or member['node_id']}: "
+                    f"node did not respond within {MEMBER_LOG_TIMEOUT_SECONDS:g} seconds"
+                ) from exc
         if action in {"start", "stop", "restart", "remove"}:
             self._prefix_affinity_generation = getattr(self, "_prefix_affinity_generation", 0) + 1
         node_id = member["node_id"]
@@ -7105,14 +7119,8 @@ class Manager:
                 return await self.stop_container(name, explicit=explicit_stop)
             if action == "remove":
                 return await self.remove_cluster_member(name)
-            if action == "logs":
-                return {"logs": await self.get_cluster_member_logs(name, log_tail)}
-        method = "GET" if action == "logs" else ("DELETE" if action == "remove" else "POST")
-        suffix = (
-            f"/logs?tail={max(1, min(int(log_tail), 100_000))}"
-            if action == "logs"
-            else ("" if action == "remove" else f"/{action}")
-        )
+        method = "DELETE" if action == "remove" else "POST"
+        suffix = "" if action == "remove" else f"/{action}"
         if explicit_stop:
             suffix += "?explicit=true"
         try:
@@ -7120,13 +7128,28 @@ class Manager:
                 node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
             )
         finally:
-            if action != "logs":
-                # A cached pre-action phase may still say ready after a
-                # restart. Refresh this node before the action response and
-                # next dashboard snapshot, including ambiguous agent errors.
-                invalidate = getattr(self.node_registry, "invalidate_status", None)
-                if callable(invalidate):
-                    invalidate(node_id)
+            # A cached pre-action phase may still say ready after a restart.
+            # Refresh after lifecycle actions, including ambiguous errors.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
+
+    async def _read_member_logs(self, member: dict, tail: int) -> dict:
+        node_id = member["node_id"]
+        name = member["container_name"]
+        if node_id == LOCAL_NODE_ID:
+            return {"logs": await self.get_cluster_member_logs(name, tail)}
+        cached_status = getattr(self.node_registry, "cached_status", None)
+        cached = cached_status(node_id) if callable(cached_status) else None
+        if isinstance(cached, dict) and cached.get("online") is False:
+            raise RuntimeError(
+                f"Logs unavailable from {member.get('node_name') or node_id}: node is offline"
+            )
+        return await self.node_registry.request(
+            node_id, "GET",
+            f"/api/agent/containers/{name}/logs?tail={max(1, min(int(tail), 100_000))}",
+            timeout=MEMBER_LOG_TIMEOUT_SECONDS,
+        )
 
     def _cluster_action_lock(self) -> asyncio.Lock:
         """Return the lifecycle lock, including on lightweight test instances."""
@@ -19397,7 +19420,9 @@ class Manager:
                     member.get("container_name")
                 )
                 if not node.get("online"):
-                    member["status"] = "unreachable"
+                    # Offline nodes are treated as stopped for public runtime
+                    # state; retain node connectivity separately from intent.
+                    member["status"] = "stopped"
                     if saved.get("status") == "recovering":
                         member["phase"] = {
                             "phase": "recovering",
@@ -19407,10 +19432,10 @@ class Manager:
                         }
                     else:
                         member["phase"] = {
-                            "phase": "unreachable",
+                            "phase": "stopped",
                             "message": (
                                 f"{member.get('node_name') or member.get('node_id')} "
-                                "is unreachable"
+                                "is offline; container is assumed stopped"
                             ),
                         }
                 elif container:
@@ -19429,8 +19454,11 @@ class Manager:
                     if primary_container is None or member.get("rank") == 0:
                         primary_container = container
                 elif (
-                    containers_unavailable
-                    and member.get("node_id") == LOCAL_NODE_ID
+                    (
+                        containers_unavailable
+                        and member.get("node_id") == LOCAL_NODE_ID
+                    )
+                    or node.get("docker_ready") is False
                 ):
                     member["status"] = "unknown"
                     member["status_message"] = "Docker is unavailable"
@@ -19445,13 +19473,43 @@ class Manager:
                         "phase": "missing",
                         "message": "Managed container is missing",
                     }
-                member["node_status"] = node.get("status", "unknown")
+                member["node_status"] = node.get("status", "unknown") if node.get("online") else "offline"
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
+                # A completed Stop is durable even when a node subsequently
+                # disconnects. Keep the member's offline node observation, but
+                # do not turn a stopped deployment into a degraded workload.
+                # Stop intent alone is not proof that its containers stopped.
+                confirmed_stopped = (
+                    saved.get("status") == "stopped"
+                    and saved.get("desired_state") != "running"
+                    and not saved.get("error")
+                    and all(
+                        state in {"stopped", "exited", "missing", "unreachable"}
+                        for state in member_states
+                    )
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        or member.get("error")
+                        for member in deployment["members"]
+                    )
+                )
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif confirmed_stopped:
+                    deployment["status"] = "stopped"
+                elif (
+                    member_states
+                    and all(state in {"stopped", "exited"} for state in member_states)
+                    and saved.get("status") not in {"recovering", "stopping", "launching"}
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        for member in deployment["members"]
+                    )
+                ):
+                    deployment["status"] = "stopped"
                 elif saved.get("mode") == "grouped_sharded":
                     failed_stops = [str(member["failed_stop_error"]) for member in deployment["members"] if member.get("failed_stop_error")]
                     if failed_stops:
@@ -19465,22 +19523,32 @@ class Manager:
                     elif saved.get("desired_state") == "stopped" or (
                         saved.get("desired_state") != "running" and saved.get("status") == "stopped"
                     ):
-                        deployment["status"] = "stopped"
+                        deployment["status"] = (
+                            "stopped" if all(
+                                state in {"stopped", "exited", "missing"}
+                                for state in member_states
+                            ) else "degraded"
+                        )
                     else:
                         deployment["status"] = self._grouped_deployment_status(deployment)
+                        if deployment["status"] == "stopped" and any(
+                            state not in {"stopped", "exited", "missing", "unreachable"}
+                            for state in member_states
+                        ):
+                            deployment["status"] = "degraded"
                         if deployment["status"] == "running":
                             deployment["error"] = None
                         if saved.get("status") == "recovering" and deployment["status"] == "degraded":
                             deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
-                    s in {"unreachable", "missing", "dead", "error"}
+                    s in {"stopped", "unreachable", "missing", "dead", "error"}
                     for s in member_states
                 ):
                     # Startup recovery owns this deployment and will retry when
                     # its selected nodes reconnect. Keep the public deployment
                     # active while its member phase carries the honest wait.
                     deployment["status"] = "recovering"
-                elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
+                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"

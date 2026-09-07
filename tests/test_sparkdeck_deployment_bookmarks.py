@@ -82,6 +82,7 @@ class FakeBookmarkManager:
         return [str(item) for item in args or []]
 
     # Reuse Manager's real parser so llama.cpp controls surface correctly.
+    _cli_option = staticmethod(Manager._cli_option)
     _deployment_launch_controls = Manager._deployment_launch_controls
     _deployment_served_models = Manager._deployment_served_models
     _normalize_runtime_environment = staticmethod(
@@ -557,6 +558,112 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertEqual(stored["desired_state"], "running")
         self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
+
+    async def test_edited_sharded_bookmark_starts_on_all_four_nodes(self):
+        selected = ["local", "remote-1", "remote-2", "remote-3"]
+        self.manager.nodes.extend([
+            node("remote-2", "Worker 2"), node("remote-3", "Worker 3"),
+        ])
+        self.manager.model_cache_inventory.return_value = [{
+            "id": node_id, "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION],
+            }],
+        } for node_id in selected]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "resized", "runtime": "vllm",
+            "node_ids": selected[:2], "deployment_mode": "sharded",
+            "settings": {"tensor_parallel_size": 2},
+        })
+        await self.service.update_deployment_settings("resized", {
+            "launch_controls": {"tensor_parallel_size": 4},
+        })
+
+        await self.service.deployment_action("resized", "start", selected)
+
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["node_ids"], selected)
+        self.assertEqual(launch["deployment_mode"], "sharded")
+        self.assertEqual(
+            Manager._cli_option(launch["extra_args"], {"--tensor-parallel-size"}), "4",
+        )
+
+    async def test_manager_sharded_start_uses_edited_parallelism_not_saved_hosts(self):
+        selected = ["local", "remote-1", "remote-2", "remote-3"]
+        self.service.store.add_deployment(Deployment(
+            id="resized", alias="resized", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "launch_settings": {
+                "engine": "vllm", "deployment_mode": "sharded",
+                "node_ids": selected[:2], "tensor_parallel_size": 2,
+                "extra_args": ["--tensor-parallel-size", "4"],
+            },
+        }]
+        self.manager.recipe_deployment_contract = lambda recipe: (
+            Manager.recipe_deployment_contract(self.manager, recipe)
+        )
+        self.manager.model_cache_inventory.return_value = [{
+            "id": node_id, "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION],
+            }],
+        } for node_id in selected]
+
+        for invalid in (selected[:3], ["local", "remote-1"] * 2):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                await self.service.deployment_action("resized", "start", invalid)
+            self.manager.deployment_action.assert_not_awaited()
+
+        for allowed in (selected, selected[:2]):
+            with self.subTest(allowed=allowed):
+                await self.service.deployment_action("resized", "start", allowed)
+                self.manager.deployment_action.assert_awaited_with(
+                    "cluster-1", "start", allowed, model_revision=CACHED_REVISION,
+                )
+
+    async def test_sharded_selection_uses_tensor_times_pipeline_parallelism(self):
+        for engine, args in (
+            ("vllm", ["--tensor-parallel-size", "2", "--pipeline-parallel-size", "2"]),
+            ("sglang", ["--tp-size", "4"]),
+        ):
+            with self.subTest(engine=engine):
+                self.manager.recipe_deployment_contract = lambda recipe: (
+                    Manager.recipe_deployment_contract(self.manager, recipe)
+                )
+                settings = {
+                    "engine": engine, "deployment_mode": "sharded",
+                    "node_ids": ["a", "b"], "extra_args": args,
+                }
+                for allowed in (["d", "c", "b", "a"], ["b", "a"]):
+                    self.assertEqual(
+                        self.service._normalized_start_selection(settings, allowed), allowed,
+                    )
+                for invalid in ([], ["a"], ["a", "b", "c"]):
+                    with self.assertRaises(ValueError):
+                        self.service._normalized_start_selection(settings, invalid)
+
+    async def test_start_selection_preserves_fixed_grouped_and_replicated_layouts(self):
+        for mode in ("grouped_sharded", "replicated"):
+            with self.subTest(mode=mode):
+                self.manager.recipe_deployment_contract = Mock(return_value={
+                    "deployment_mode": mode, "required_node_count": 4,
+                    "tensor_parallel_size": 4,
+                })
+                settings = {
+                    "engine": "vllm", "deployment_mode": mode,
+                    "node_ids": ["a", "b", "c", "d"],
+                    "extra_args": ["--tensor-parallel-size", "4"],
+                }
+                with self.assertRaises(ValueError):
+                    self.service._normalized_start_selection(settings, ["a", "b"])
+                self.assertEqual(
+                    self.service._normalized_start_selection(settings, ["d", "c", "b", "a"]),
+                    ["d", "c", "b", "a"],
+                )
 
     async def test_gui_bookmark_start_pins_complete_snapshot_without_default_alias(self):
         self.manager.model_cache_inventory.return_value = [{
@@ -1229,6 +1336,18 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["settings"]["tensor_parallel_size"], 4)
         listed = (await self.service.deployments())[0]
         self.assertEqual(listed["required_node_count"], 2)
+
+        # The Models list needs total ranks even though PP is stored inside
+        # launch_controls and the preferred saved host count remains two.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 2,
+            },
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+        self.assertEqual(listed["parallel_rank_count"], 4)
 
         # A layout the saved nodes cannot divide requires one node per rank.
         await self.service.update_deployment_settings("sharded-bookmark", {

@@ -1863,18 +1863,24 @@ describe('model deployments', () => {
     }
   })
 
-  it('switches multi-node deployment logs locally and preserves the selected node on refresh', async () => {
+  it('keeps available node logs accessible with an offline peer and preserves selection after refresh failures', async () => {
     const user = userEvent.setup()
     let logRequests = 0
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/deployments/dep-logs/logs')) {
         logRequests += 1
+        if (logRequests === 3) {
+          return new Response(JSON.stringify({ detail: 'Temporary log refresh failure' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          })
+        }
         return new Response(JSON.stringify({
           logs: 'combined output',
           members: [
             { node_id: 'node-2', node_name: 'Render Spark', rank: 1, logs: logRequests === 1 ? 'worker first output' : 'worker refreshed output' },
             { node_id: 'local', rank: 0, logs: 'primary output' },
+            { node_id: 'node-3', node_name: 'Offline Spark', rank: 2, logs: '', error: 'Node is offline; logs unavailable' },
           ],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -1896,7 +1902,7 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Parallel model' })
     const tablist = await within(dialog).findByRole('tablist', { name: 'Deployment log nodes' })
     const tabs = within(tablist).getAllByRole('tab')
-    expect(tabs).toHaveLength(2)
+    expect(tabs).toHaveLength(3)
     expect(tabs[0]).toHaveTextContent('Control Spark')
     expect(tabs[0]).toHaveTextContent('Primary')
     expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
@@ -1904,6 +1910,10 @@ describe('model deployments', () => {
     expect(tabs[1]).toHaveTextContent('Rank 1')
     expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('primary output')
     expect(within(dialog).queryByText('worker first output')).not.toBeInTheDocument()
+
+    await user.click(tabs[2])
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('Node is offline; logs unavailable')
+    expect(within(dialog).getByRole('tabpanel')).not.toHaveTextContent('combined output')
 
     await user.click(tabs[1])
     expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
@@ -1914,7 +1924,7 @@ describe('model deployments', () => {
     await user.keyboard('{ArrowLeft}')
     expect(tabs[0]).toHaveFocus()
     expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
-    await user.keyboard('{End}')
+    await user.keyboard('{ArrowRight}')
     expect(tabs[1]).toHaveFocus()
     expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
 
@@ -1922,6 +1932,14 @@ describe('model deployments', () => {
     expect(await within(dialog).findByText('worker refreshed output')).toBeInTheDocument()
     expect(within(tablist).getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true')
     expect(logRequests).toBe(2)
+
+    await user.click(within(dialog).getByRole('button', { name: 'Refresh' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Temporary log refresh failure')
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('worker refreshed output')
+    expect(within(tablist).getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true')
+    await user.click(within(tablist).getAllByRole('tab')[0])
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('primary output')
+    expect(logRequests).toBe(3)
   })
 
   it('formats recent deployment times compactly and uses a date after seven days', () => {

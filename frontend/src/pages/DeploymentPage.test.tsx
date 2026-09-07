@@ -551,7 +551,35 @@ describe('deployment object page', () => {
     expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
     await user.click(screen.getByRole('button', { name: 'Run' }))
     expect(await screen.findByRole('button', { name: 'Start on 2 nodes' })).toBeInTheDocument()
-    expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
+    expect(screen.getByText(/TP4 uses 4 GPU ranks distributed evenly across the selected nodes/)).toBeInTheDocument()
+  })
+
+  it.each(['vllm', 'sglang'])('allows a cloned two-node %s deployment to run TP4 on four nodes', async (runtime) => {
+    const user = userEvent.setup()
+    const cloned = {
+      ...detail, runtime, node_ids: ['local', 'worker-1'], required_node_count: 2,
+      settings: { tensor_parallel_size: 2 },
+      extra_args: runtime === 'sglang' ? ['--tp-size', '2'] : [],
+    }
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments/dep-1' && (!init?.method || init.method === 'GET')) {
+        return new Response(JSON.stringify(cloned), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    const tensor = await screen.findByLabelText(runtime === 'vllm' ? 'Tensor parallel size' : 'TP size')
+    fireEvent.change(tensor, { target: { value: '4' } })
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    expect(within(dialog).getByRole('button', { name: 'Start on 3 nodes' })).toBeDisabled()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 4/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 4 nodes' }))
+    await screen.findByRole('heading', { name: 'Models destination' })
+    const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+    expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(nodes.map((node) => node.id))
   })
 
   it('recomputes the run topology from the server-persisted node set after a trimming save', async () => {

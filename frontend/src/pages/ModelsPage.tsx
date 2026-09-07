@@ -1495,6 +1495,17 @@ export function ModelsPage() {
       openGroupPicker(deployment, 'start')
       return
     }
+    if (deployment.managed && deployment.deployment_mode === 'sharded'
+      && (deployment.runtime === 'vllm' || deployment.runtime === 'sglang')) {
+      const ranks = deployment.parallel_rank_count ?? ((deployment.settings.tensor_parallel_size ?? 1)
+        * (deployment.runtime === 'vllm' ? deployment.settings.pipeline_parallel_size ?? 1 : 1))
+      if (Number.isInteger(ranks) && ranks > 1) {
+        deployment = {
+          ...deployment, flexible_node_count: true, parallel_rank_count: ranks,
+          single_host_topology_replayable: false, distributed_host_topology_replayable: true,
+        }
+      }
+    }
     if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
       setStartError(undefined)
       setStartNotice(undefined)
@@ -2471,7 +2482,7 @@ export function ModelsPage() {
             : deployment.has_start_hook
               ? []
               : [nodes.data?.find((node) => node.id === 'local')?.name ?? localLabel]
-        const required = deploymentRequiredNodes(deployment)
+        const required = deployment.flexible_node_count ? nodeIds.length : deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
         const adoptingDirect = Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
         const preparableLaunch = savedLaunch || adoptingDirect
@@ -2567,7 +2578,7 @@ export function ModelsPage() {
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
-              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
+              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= (flexibleParallel ? deployment.parallel_rank_count ?? required : required) ? next : nodeIds })}
               loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}

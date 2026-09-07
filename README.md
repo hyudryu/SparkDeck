@@ -31,7 +31,7 @@ _Deployments of vLLM and SGLang, each with running/stop state, across the cluste
 
 ![Cluster node telemetry and current inference](docs/screenshots/readme/feature-cluster-monitoring.png)
 
-_Node CPU/GPU temperature, unified memory, sessions, and current inference speed per node. Illustrative demo data._
+_Node CPU/GPU temperature, unified memory, and session telemetry per node, plus aggregate inference rate per active engine group. Illustrative demo data._
 </details>
 
 <details>
@@ -51,7 +51,7 @@ _Community throughput and per-node/replicated cluster-fit evidence, matched by m
 
 ![Deployment table with target nodes and launch recipes for grouped engines](docs/screenshots/readme/feature-routing.png)
 
-_Deployments grouped by runtime and target node, plus launch recipes for choosing node groups when deploying. Illustrative demo data._
+_A single TP2 model served across Group 1 and Group 2, with per-group aggregate output and thinking inference rates. Illustrative demo data._
 </details>
 
 <details>
@@ -77,7 +77,7 @@ _Token activity, time-range heatmap, daily trend, and per-model usage breakdown.
 <details>
 <summary><strong>Docker image manager</strong></summary>
 
-> Pull and manage runtime container images, and deploy them across the cluster with one action.
+> Pull and manage runtime container images, and see cluster image availability per node.
 
 ![Runtime images manager and pull form](docs/screenshots/readme/feature-docker-images.png)
 

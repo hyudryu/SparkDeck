@@ -421,6 +421,8 @@ class SparkDeckService:
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_node_ids: dict[str, list[str]] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
+        self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
         # {"action": str, "task": asyncio.Task, "process": subprocess | None}.
         self._external_lifecycle_tasks: dict[str, dict[str, Any]] = {}
@@ -1262,6 +1264,82 @@ class SparkDeckService:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         return registered
+
+    def _observe_deployment_events(self, deployments: list[dict[str, Any]]) -> None:
+        """Log actual lifecycle changes once, including independent engine groups.
+
+        Missing inventory is not proof of a shutdown. Keep the last known state
+        through discovery outages so recovery does not manufacture another launch.
+        """
+        states = self._deployment_log_states
+        errors = self._deployment_log_errors
+        event_logger = logging.getLogger("sparkdeck.lifecycle")
+        for deployment in deployments:
+            deployment_id = str(deployment.get("id") or "")
+            if not deployment_id:
+                continue
+            label = str(deployment.get("alias") or deployment.get("name") or deployment_id)
+            groups = deployment.get("instances") or [deployment]
+            for group in groups:
+                instance = group.get("instance_id")
+                key = (deployment_id, instance)
+                name = f"{label} (engine group {instance})" if instance is not None else label
+                status = str(group.get("status") or "unknown")
+                error = str(group.get("last_error") or group.get("error") or "")
+                if not error and status == "error":
+                    error = str(deployment.get("last_error") or deployment.get("error") or "")
+                external_endpoint = (
+                    deployment.get("kind") == DeploymentKind.EXTERNAL.value
+                    and not deployment_id.startswith("container:")
+                )
+                if external_endpoint or status in {"unknown", "missing", "unreachable"}:
+                    # Endpoint health and failed inventory cannot prove that a
+                    # process launched or exited. Report their errors without
+                    # replacing the last known process state.
+                    if external_endpoint and status != "error":
+                        error = ""
+                    if error and errors.get(key) != error:
+                        event_logger.error("Deployment %s error: %s", name, error)
+                    if error:
+                        errors[key] = error
+                    else:
+                        errors.pop(key, None)
+                    continue
+                errors.pop(key, None)
+                # Old persisted error details must not make healthy polls noisy.
+                if status != "error":
+                    error = ""
+                previous = states.get(key)
+                # Readiness probes and partial group availability can wobble
+                # without the process exiting. Only a terminal state ends a
+                # launch; recovery from these probes is not another launch.
+                if previous and previous[0] == "running" and status in {
+                    "starting", "degraded", "stopping",
+                }:
+                    continue
+                current = (status, error)
+                if previous == current:
+                    continue
+                states[key] = current
+                event = None
+                level = logging.INFO
+                if status == "running" and (previous is None or previous[0] != "running"):
+                    event = "launched"
+                elif status == "error":
+                    event = "crashed" if previous and previous[0] == "running" else "error"
+                    level = logging.ERROR
+                elif status == "stopped" and previous and previous[0] in {
+                    "running", "starting", "stopping", "degraded",
+                }:
+                    desired = group.get("desired_state", deployment.get("desired_state"))
+                    event = "crashed" if desired == "running" else "stopped"
+                    if event == "crashed":
+                        level = logging.ERROR
+                if event:
+                    message = f"Deployment {name} {event}"
+                    if error:
+                        message += f": {error}"
+                    event_logger.log(level, message, extra={"deployment_event": event})
 
     async def register_manager_deployment(
         self, cluster: dict[str, Any],
@@ -3629,7 +3707,7 @@ class SparkDeckService:
                 self._link_cluster_record(
                     deployment, settings, mode, node_ids, cluster,
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Manager persists node-specific launch failures. Once linked,
                 # retaining the SQLite row makes that diagnostic durable and
                 # visible in Deployments. A preflight failure is handled by
@@ -3641,6 +3719,8 @@ class SparkDeckService:
                 )
                 if not linked:
                     self.store.delete_deployment(deployment.id)
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Deployment %s launch failed: %s", deployment.alias, exc)
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment.id, None)
@@ -5110,7 +5190,7 @@ class SparkDeckService:
             )
             arguments = (action, container_name, process.returncode, duration)
             if process.returncode:
-                logger.warning(message, *arguments)
+                logger.error(message, *arguments)
             else:
                 logger.info(message, *arguments)
         except asyncio.CancelledError:

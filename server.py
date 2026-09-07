@@ -139,14 +139,45 @@ async def _guard_stream(stream, watcher: asyncio.Task):
 # ---------- in-memory server log buffer ----------
 MAX_LOG_LINES = 5000
 _log_buffer: deque[str] = deque(maxlen=MAX_LOG_LINES)
+_activity_buffer: deque[dict] = deque(maxlen=MAX_LOG_LINES)
 
 
 class _DequeHandler(logging.Handler):
     """Appends formatted log records to the in-memory deque."""
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Uvicorn records may reach this handler directly and through root.
+            if getattr(record, "_sparkdeck_captured", False):
+                return
+            record._sparkdeck_captured = True
             msg = _redact_log(self.format(record))
             _log_buffer.append(msg)
+            event = getattr(record, "deployment_event", None)
+            is_http_error = (
+                record.name == "uvicorn.access"
+                and isinstance(record.args, tuple)
+                and len(record.args) == 5
+                and str(record.args[4]).isdigit()
+                and int(record.args[4]) >= 400
+            )
+            if record.levelno >= logging.ERROR or is_http_error or event in {
+                "launched", "stopped", "crashed",
+            }:
+                # Keep a separate buffer so routine traffic cannot evict events.
+                formatter = self.formatter or logging.Formatter()
+                entry = {
+                    "timestamp": formatter.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+                    "level": "error" if is_http_error else record.levelname.lower(),
+                    "source": record.name,
+                    "message": _redact_log(record.getMessage()),
+                }
+                if record.exc_info:
+                    entry["message"] += "\n" + _redact_log(
+                        formatter.formatException(record.exc_info)
+                    )
+                if event in {"launched", "stopped", "crashed"}:
+                    entry["event"] = event
+                _activity_buffer.append(entry)
         except Exception:
             pass
 
@@ -195,15 +226,39 @@ def _install_log_capture():
 _install_log_capture()
 
 
+async def _deployment_log_loop():
+    """Observe lifecycle changes even when no dashboard or Logs tab is open."""
+    last_error = None
+    while True:
+        try:
+            deployments = await sparkdeck.deployments()
+            sparkdeck._observe_deployment_events(deployments)
+            last_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A repeated discovery outage should produce one actionable error.
+            message = str(exc)
+            if message != last_error:
+                logging.getLogger("sparkdeck.lifecycle").error(
+                    "Could not refresh deployment activity: %s", message,
+                )
+                last_error = message
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
         uploader = asyncio.create_task(community_upload_loop())
+        deployment_logs = asyncio.create_task(_deployment_log_loop())
         try:
             yield
         finally:
             uploader.cancel()
+            deployment_logs.cancel()
+            await asyncio.gather(deployment_logs, return_exceptions=True)
             await sparkdeck.close()
             await manager.stop()
 
@@ -4135,6 +4190,12 @@ async def v1_completions(req: Request):
 
 
 # ---------- server logs ----------
+@app.get("/api/v1/logs")
+async def get_activity_logs(tail: int = 500):
+    """Deployment lifecycle events and errors, without routine server traffic."""
+    return {"entries": list(_activity_buffer)[-max(1, min(tail, MAX_LOG_LINES)):]}
+
+
 @app.get("/api/server-logs")
 async def get_server_logs(tail: int = 500):
     """Return the most recent server log lines from the in-memory buffer."""

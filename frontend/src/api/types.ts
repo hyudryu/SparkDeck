@@ -690,6 +690,7 @@ export interface SystemUpdateOverview {
 }
 
 export interface LogEntry {
+  event?: 'launched' | 'stopped' | 'crashed'
   timestamp?: string
   level?: string
   source?: string

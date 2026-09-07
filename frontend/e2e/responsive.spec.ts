@@ -89,6 +89,22 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
+test('shows only deployment activity and errors in Logs', async ({ page }) => {
+  await page.route('**/api/v1/logs', async (route) => route.fulfill({ json: { entries: [
+    { timestamp: '2026-09-06 12:00:00', level: 'info', source: 'sparkdeck.lifecycle', event: 'launched', message: 'Deployment My model (engine group 1) launched' },
+    { timestamp: '2026-09-06 12:01:00', level: 'error', source: 'sparkdeck.lifecycle', event: 'crashed', message: 'Deployment My model (engine group 1) crashed: Out of memory' },
+    { level: 'info', message: 'GET /api/state 200 OK' },
+  ] } }))
+  await page.goto('/logs')
+  await expect(page.getByText('Deployment My model (engine group 1) launched', { exact: true })).toBeVisible()
+  await expect(page.getByText('GET /api/state 200 OK')).toHaveCount(0)
+  await page.getByRole('combobox', { name: 'Event type' }).selectOption('error')
+  await expect(page.getByText('Deployment My model (engine group 1) launched', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Deployment My model (engine group 1) crashed: Out of memory', { exact: true })).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+})
+
 test('keeps every primary route within the viewport', async ({ page }) => {
   for (const route of routes) {
     await page.goto(route)

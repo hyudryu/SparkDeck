@@ -285,11 +285,13 @@ Update the whole cluster to the immutable commit currently at `origin/main`. Spa
 
 ## Logs
 
-Logs shows redacted application and runtime activity from the controller's SparkDeck service. Opening the UI through a joined worker still forwards this request to the controller; it does not show that worker's local service logs.
+Logs shows deployment launches, shutdowns, crashes, and errors from the controller's SparkDeck service. Routine requests, debug messages, and warnings are omitted. Opening the UI through a joined worker still forwards this request to the controller; it does not show that worker's local service logs.
 
 ![Logs with illustrative application and runtime events](screenshots/manual/logs-dark.png)
 
-Use the free-text search and severity selector to narrow the list. Refresh to fetch new entries and **Export** to download the visible diagnostic set. Review an export before sharing it even though SparkDeck redacts recognized secrets.
+Use the free-text search and event selector to narrow the list to deployment activity or errors. The list refreshes every five seconds; **Refresh** fetches the current entries immediately and **Export** downloads only the visible entries. Review an export before sharing it even though SparkDeck redacts recognized secrets.
+
+Lifecycle monitoring continues while this page is closed. Events reflect observed deployment state changes, so very short transitions between checks can be missed. Recent events are held in memory and reset when the controller restarts. For full container output, open a deployment's own logs from Models.
 
 ## Mobile navigation
 

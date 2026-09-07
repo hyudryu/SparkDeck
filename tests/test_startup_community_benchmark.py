@@ -113,6 +113,7 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["ignore_eos"])
         self.assertTrue(body["stream"])
         self.assertNotIn("messages", body)
+        self.assertTrue(self.service._proxy_registered.call_args.kwargs["startup_benchmark"])
         self.assertTrue(observed[0]["startup_benchmark"])
         self.assertEqual(observed[0]["generation"], 1)
         self.assertEqual(closed, [True])
@@ -292,3 +293,65 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertEqual(closed, [True])
         self.service._community_observation_end.assert_called_once()
+
+    async def test_seen_marker_only_persisted_after_successful_recording(self):
+        self.monitor.targets = AsyncMock(return_value=[self.target])
+        self.monitor._healthy = AsyncMock(return_value=True)
+        # A benchmark that records no eligible sample must not consume the boot.
+        self.monitor._benchmark = AsyncMock(return_value=False)
+        await self.monitor._attempt(self.target, dict(self.snapshot))
+        self.assertFalse(self.settings)
+        # A benchmark that records an eligible sample persists the seen marker.
+        self.monitor._benchmark = AsyncMock(return_value=True)
+        await self.monitor._attempt(self.target, dict(self.snapshot))
+        self.assertTrue(self.settings.get(self.monitor._seen_key(self.target.fingerprint)))
+
+    async def test_benchmark_returns_whether_a_sample_was_recorded(self):
+        observed = []
+        closed = []
+        async def stream():
+            try:
+                obs = self.service._community_observation.get()
+                obs["startup_recorded"] = True
+                observed.append(dict(obs))
+                yield "data: [DONE]\n\n"
+            finally:
+                closed.append(True)
+        self.service._proxy_registered = AsyncMock(return_value=stream())
+        self.assertTrue(await self.monitor._benchmark(self.target, self.snapshot))
+        self.assertTrue(observed[0].get("startup_recorded"))
+        self.assertEqual(closed, [True])
+        self.assertIsNone(self.service._community_observation.get())
+        self.service._community_observation_end.assert_called_once()
+
+    def test_startup_probe_suppresses_ordinary_usage_persistence(self):
+        manager = Manager.__new__(Manager)
+        manager._record_tokens = Mock()
+        manager._mark_deployment_used = Mock()
+        manager.deployments = []
+        manager._stats_cache = {}
+        # A synthetic startup probe must not pollute the token/throughput history.
+        manager._record_usage(
+            "model", {"prompt_tokens": 10, "completion_tokens": 200}, 1.0, 1.0,
+            startup_benchmark=True,
+        )
+        manager._record_tokens.assert_not_called()
+        # Ordinary requests still persist.
+        manager._record_usage("model", {"prompt_tokens": 10, "completion_tokens": 5}, 1.0, 1.0)
+        manager._record_tokens.assert_called_once()
+        # A startup probe must not refresh the deployment last-used timestamp.
+        manager._track_start("model", startup_benchmark=True)
+        manager._mark_deployment_used.assert_not_called()
+
+    async def test_tick_reports_progress_only_for_unseen_boots(self):
+        self.monitor.targets = AsyncMock(return_value=[self.target])
+        self.assertTrue(await self.monitor.tick())
+        for task in list(self.monitor._tasks.values()):
+            task.cancel()
+        await asyncio.gather(*list(self.monitor._tasks.values()), return_exceptions=True)
+        # A fresh monitor where the boot is already seen reports no progress.
+        restarted = StartupBenchmarkMonitor(self.service)
+        restarted.targets = AsyncMock(return_value=[self.target])
+        self.service.store.set_setting(restarted._seen_key(self.target.fingerprint), True)
+        self.assertFalse(await restarted.tick())
+        self.assertFalse(restarted._tasks)

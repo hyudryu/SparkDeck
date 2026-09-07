@@ -6188,6 +6188,7 @@ class Manager:
         cancel: asyncio.Event | None,
         *,
         caller_ip: str | None = None,
+        startup_benchmark: bool = False,
     ):
         """Send one request to a specific member without failover.
 
@@ -6223,6 +6224,7 @@ class Manager:
                     container_name=member.get("container_name"),
                     deployment_id=deployment_id,
                     caller_ip=caller_ip,
+                    **(self._startup_probe_kwargs(startup_benchmark) if startup_benchmark else {}),
                 )
                 if not body.get("stream"):
                     return result
@@ -6253,6 +6255,7 @@ class Manager:
                 model, deployment_id=deployment_id, caller_ip=caller_ip,
                 container_name=member.get("container_name"),
                 streaming=bool(body.get("stream")),
+                startup_benchmark=startup_benchmark,
             )
             member_released = False
 
@@ -10925,6 +10928,8 @@ class Manager:
         usage: dict | None,
         gen_time_s: float | None = None,
         pp_time_s: float | None = None,
+        *,
+        startup_benchmark: bool = False,
     ):
         """Record an OpenAI-style usage object {prompt_tokens, completion_tokens}.
 
@@ -10932,6 +10937,10 @@ class Manager:
         (OpenAI / vLLM prefix-cache hits).
         """
         if not usage:
+            return
+        if startup_benchmark:
+            # A synthetic startup probe must not pollute the user's ordinary
+            # token/throughput history. Admission tracking is unaffected.
             return
         prompt_tokens, cached = self._usage_prompt_counts(usage)
         self._record_tokens(
@@ -10942,6 +10951,11 @@ class Manager:
             cached_tokens=cached,
             pp_time_s=pp_time_s,
         )
+
+    @staticmethod
+    def _startup_probe_kwargs(startup_benchmark: bool) -> dict[str, bool]:
+        """Only forward the probe marker when a startup benchmark is active."""
+        return {"startup_benchmark": True} if startup_benchmark else {}
 
     @staticmethod
     def _usage_from_sse_line(line: str) -> dict | None:
@@ -11158,6 +11172,8 @@ class Manager:
         deployment_id: str | None = None,
         caller_ip: str | None = None,
         container_name: str | None = None,
+        *,
+        startup_benchmark: bool = False,
     ) -> int:
         if not hasattr(self, "_active_reqs"):
             self._active_reqs = {}
@@ -11184,7 +11200,10 @@ class Manager:
             "paused": False,
             "group": self._request_group(key, deployment_id, container_name),
         }
-        self._mark_deployment_used(deployment_id)
+        if not startup_benchmark:
+            # A synthetic startup probe must not refresh the deployment's
+            # "last used" timestamps or skew ordinary usage metrics.
+            self._mark_deployment_used(deployment_id)
         return rid
 
     def _track_prompt_processing(
@@ -17485,7 +17504,8 @@ class Manager:
                          cancel: asyncio.Event | None = None, *,
                          container_name: str | None = None,
                          deployment_id: str | None = None,
-                         caller_ip: str | None = None):
+                         caller_ip: str | None = None,
+                         startup_benchmark: bool = False):
         """Route /v1/chat/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -17498,7 +17518,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             await result.prepare()
             return result
@@ -17514,6 +17534,7 @@ class Manager:
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
                 container_name=container.get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
             try:
                 r = await self._await_or_cancel(
@@ -17521,7 +17542,9 @@ class Manager:
                 )
                 r.raise_for_status()
                 data = r.json()
-                self._record_usage(key, data.get("usage"))
+                self._record_usage(
+                    key, data.get("usage"), startup_benchmark=startup_benchmark,
+                )
                 return data
             finally:
                 self._track_end(rid)
@@ -17531,7 +17554,8 @@ class Manager:
                                 cancel: asyncio.Event | None = None, *,
                                 container_name: str | None = None,
                                 deployment_id: str | None = None,
-                                caller_ip: str | None = None):
+                                caller_ip: str | None = None,
+                                startup_benchmark: bool = False):
         """Route /v1/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -17544,7 +17568,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             await result.prepare()
             return result
@@ -17560,6 +17584,7 @@ class Manager:
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
                 container_name=container.get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
             try:
                 r = await self._await_or_cancel(
@@ -17567,7 +17592,9 @@ class Manager:
                 )
                 r.raise_for_status()
                 data = r.json()
-                self._record_usage(key, data.get("usage"))
+                self._record_usage(
+                    key, data.get("usage"), startup_benchmark=startup_benchmark,
+                )
                 return data
             finally:
                 self._track_end(rid)
@@ -17848,12 +17875,14 @@ class Manager:
                      requested_model: str | None = None, *,
                      container_name: str | None = None,
                      deployment_id: str | None = None,
-                     caller_ip: str | None = None):
+                     caller_ip: str | None = None,
+                     startup_benchmark: bool = False):
         lifecycle = {}
         result = PreparedAsyncStream(self._vllm_stream_events(
             url, body, key, cancel, container, requested_model,
             container_name=container_name, deployment_id=deployment_id,
             caller_ip=caller_ip, lifecycle=lifecycle,
+            startup_benchmark=startup_benchmark,
         ))
         result.inference_lifecycle = lifecycle
         return result
@@ -17867,6 +17896,7 @@ class Manager:
         deployment_id: str | None = None,
         caller_ip: str | None = None,
         lifecycle: dict | None = None,
+        startup_benchmark: bool = False,
     ):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
@@ -17917,6 +17947,7 @@ class Manager:
                 nudge_event=nudge_event,
                 deployment_id=(container or {}).get("deployment_id"),
                 container_name=(container or {}).get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
             def release_member():
                 callback = (lifecycle or {}).get("release_member")
@@ -18058,7 +18089,8 @@ class Manager:
                             else None
                         )
                         self._record_usage(
-                            key, latest_usage, gen_time, measured_pp_time
+                            key, latest_usage, gen_time, measured_pp_time,
+                            startup_benchmark=startup_benchmark,
                         )
                     return
                 except StreamNudge:

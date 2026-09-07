@@ -6741,9 +6741,19 @@ class SparkDeckService:
                 finally:
                     self._community_observation_end(observation)
 
+    @staticmethod
+    def _startup_probe_kwargs(startup_benchmark: bool) -> dict[str, bool]:
+        """Only forward the probe marker when a startup benchmark is active.
+
+        Ordinary requests must keep an unchanged proxy signature (no extra
+        keyword) so downstream call sites and call assertions are unaffected.
+        """
+        return {"startup_benchmark": True} if startup_benchmark else {}
+
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any, *,
                                 caller_ip: str | None = None,
+                                startup_benchmark: bool = False,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
@@ -6780,6 +6790,7 @@ class SparkDeckService:
         ):
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
         base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
@@ -6826,6 +6837,7 @@ class SparkDeckService:
     async def _proxy_managed(self, deployment: dict[str, Any], body: dict[str, Any],
                              endpoint: str, cancel: Any, *,
                              caller_ip: str | None = None,
+                             startup_benchmark: bool = False,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
         requested_model = str(body.get("model") or deployment["alias"])
@@ -6849,14 +6861,14 @@ class SparkDeckService:
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
                 if endpoint == "chat/completions"
                 else await self.manager._vllm_completions(
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
             )
         )
@@ -7202,9 +7214,12 @@ class SparkDeckService:
             consent = bool(self.store.get_setting("community_consent", False))
             self.store.add_benchmark(sample, queue=eligible and consent)
             return
-        self.store.add_benchmark_if_consented(
+        if self.store.add_benchmark_if_consented(
             sample, int(observation.get("generation") or 0)
-        )
+        ):
+            # Only an actually-persisted sample confirms a successful startup
+            # probe, so the seen marker is written only on real recording.
+            observation["startup_recorded"] = True
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
         _, runtime, _ = await self._legacy_model_identity(model)

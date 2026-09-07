@@ -13,6 +13,13 @@ from .stream_cleanup import close_async_stream
 
 log = logging.getLogger(__name__)
 
+# Inventory polling is expensive (full deployment reconciliation, Docker
+# inventory, cluster state, and health probes). Poll fast only while a new
+# boot is being discovered or benchmarked; back way off in the stable state
+# where every discovered boot is already seen.
+_POLL_INITIAL_INTERVAL = 2.0
+_POLL_MAX_INTERVAL = 30.0
+
 
 @dataclass
 class StartupTarget:
@@ -43,25 +50,35 @@ class StartupBenchmarkMonitor:
 
     async def run(self) -> None:
         try:
+            interval = _POLL_INITIAL_INTERVAL
             while True:
                 try:
-                    await self.tick()
+                    progress = await self.tick()
                 except Exception:
                     log.exception("Startup benchmark inventory failed")
-                await asyncio.sleep(2)
+                    progress = False
+                if progress:
+                    interval = _POLL_INITIAL_INTERVAL
+                else:
+                    # No unseen boot exists (or consent is off), so back off
+                    # rather than repeatedly running the expensive inventory.
+                    interval = min(interval * 2, _POLL_MAX_INTERVAL)
+                await asyncio.sleep(interval)
         finally:
             tasks = list(self._tasks.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def tick(self) -> None:
+    async def tick(self) -> bool:
+        """Discover and start benchmark tasks; return True if any new boot began."""
         snapshot = self.service.store.community_consent_snapshot()
         if not snapshot.get("enabled"):
             for task in self._tasks.values():
                 task.cancel()
-            return
+            return False
         targets = await self.targets()
+        progress = False
         for target in targets:
             key = target.fingerprint
             if key in self._tasks or self.service.store.get_setting(self._seen_key(key), False):
@@ -69,6 +86,8 @@ class StartupBenchmarkMonitor:
             task = asyncio.create_task(self._attempt(target, snapshot))
             self._tasks[key] = task
             task.add_done_callback(lambda done, key=key: self._tasks.pop(key, None))
+            progress = True
+        return progress
 
     @staticmethod
     def _seen_key(fingerprint: str) -> str:
@@ -183,12 +202,16 @@ class StartupBenchmarkMonitor:
                     return
                 if getattr(self.service, "_startup_benchmark_busy", lambda: False)():
                     return
-                self.service.store.set_setting(self._seen_key(target.fingerprint), True)
-                await asyncio.wait_for(self._benchmark(fresh, snapshot), timeout=120)
+                recorded = await asyncio.wait_for(self._benchmark(fresh, snapshot), timeout=120)
+                if recorded:
+                    # Persist the boot identity only once an eligible sample was
+                    # actually recorded; a transient failure must not lose the
+                    # only benchmark for this container boot.
+                    self.service.store.set_setting(self._seen_key(target.fingerprint), True)
         except Exception:
             log.debug("Startup benchmark skipped or failed", exc_info=True)
 
-    async def _benchmark(self, target: StartupTarget, snapshot: dict[str, Any]) -> None:
+    async def _benchmark(self, target: StartupTarget, snapshot: dict[str, Any]) -> bool:
         deployment = target.deployment
         model = deployment["model"]["repository"]
         observation = self.service._community_observation_start(
@@ -211,6 +234,7 @@ class StartupBenchmarkMonitor:
             if target.cluster:
                 upstream = await self.manager._proxy_cluster_member(
                     target.cluster, target.member, model, body, "completions", None,
+                    startup_benchmark=True,
                 )
                 async def hardware():
                     return await self.service._managed_hardware_snapshot(
@@ -222,7 +246,9 @@ class StartupBenchmarkMonitor:
                     revision=deployment["model"].get("revision"), hardware_resolver=hardware,
                 )
             else:
-                stream = await self.service._proxy_registered(deployment, body, "completions", None)
+                stream = await self.service._proxy_registered(
+                    deployment, body, "completions", None, startup_benchmark=True,
+                )
                 if deployment["runtime"] == "llama.cpp" and hasattr(stream, "__aiter__"):
                     # The normal HTTP relay deliberately treats arbitrary
                     # external endpoints as untrusted. This target has verified
@@ -244,3 +270,4 @@ class StartupBenchmarkMonitor:
             finally:
                 self.service._community_observation.reset(token)
                 self.service._community_observation_end(observation)
+        return bool(observation.get("startup_recorded"))

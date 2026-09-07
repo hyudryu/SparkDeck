@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api/client'
 import { LogsPage } from './LogsPage'
@@ -6,6 +6,7 @@ import { LogsPage } from './LogsPage'
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('LogsPage', () => {
@@ -42,6 +43,27 @@ describe('LogsPage', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Filter logs' }), { target: { value: 'shut down' } })
     expect(screen.getByText('Model shut down')).toBeInTheDocument()
     expect(screen.queryByText('Model launched')).not.toBeInTheDocument()
+  })
+
+  it('lets slow requests settle before scheduling another poll', async () => {
+    vi.useFakeTimers()
+    let finish!: (value: Awaited<ReturnType<typeof api.logs.list>>) => void
+    let signal!: AbortSignal
+    const list = vi.spyOn(api.logs, 'list').mockImplementation((requestSignal) => {
+      signal = requestSignal!
+      return new Promise((resolve) => { finish = resolve })
+    })
+    render(<LogsPage />)
+    await act(() => vi.advanceTimersByTimeAsync(15000))
+    expect(list).toHaveBeenCalledTimes(1)
+    expect(signal.aborted).toBe(false)
+    await act(async () => finish([{ event: 'launched', message: 'Slow response' }]))
+    expect(screen.getByText('Slow response')).toBeInTheDocument()
+    await act(() => vi.advanceTimersByTimeAsync(5000))
+    expect(list).toHaveBeenCalledTimes(2)
+    await act(() => vi.advanceTimersByTimeAsync(15000))
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(signal.aborted).toBe(false)
   })
 
   it('exports only the displayed events', async () => {

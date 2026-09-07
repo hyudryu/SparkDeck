@@ -512,6 +512,30 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_distinguishes_inventory_outage_from_removed_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "user-container", "model": "org/model", "engine": "vllm",
+                "managed": False, "status": "running", "port": 8000,
+            }
+            container["phase"] = {"phase": "ready"}
+            manager.list_containers.side_effect = [
+                [container], RuntimeError("Docker unavailable"), [container], [], [container],
+            ]
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                with self.assertLogs("sparkdeck.lifecycle", level="INFO") as captured:
+                    for _ in range(5):
+                        await service.deployments(observe_events=True)
+                self.assertEqual(
+                    [record.deployment_event for record in captured.records],
+                    ["launched", "stopped", "launched"],
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
     async def test_unmanaged_discovered_container_has_lifecycle_logs_and_remove(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()

@@ -142,3 +142,22 @@ def test_inventory_errors_are_deduplicated_without_losing_known_running_state(ca
         "launched", "error", "error",
     ]
     assert "Docker is unavailable" in records[1].getMessage()
+
+
+def test_removed_deployment_is_retired_only_after_confirmed_inventory(caplog):
+    caplog.set_level(logging.INFO)
+    service = observer()
+    row = {"id": "container:my-model", "status": "running"}
+    service._observe_deployment_events([row], inventory_complete=True)
+    service._observe_deployment_events([], inventory_complete=False)
+    service._observe_deployment_events([row], inventory_complete=True)
+    key = (row["id"], None)
+    service._deployment_log_errors[key] = "Prior discovery error"
+    service._observe_deployment_events([], inventory_complete=True)
+    assert not service._deployment_log_states
+    assert not service._deployment_log_errors
+    service._observe_deployment_events([], inventory_complete=True)
+    service._observe_deployment_events([row], inventory_complete=True)
+    assert [record.deployment_event for record in events(caplog)] == [
+        "launched", "stopped", "launched",
+    ]

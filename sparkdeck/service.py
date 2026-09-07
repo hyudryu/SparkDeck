@@ -976,7 +976,7 @@ class SparkDeckService:
             model["local_deployment_ids"] = [item["id"] for item in local]
         return {"model": model, "aggregates": []}
 
-    async def deployments(self) -> list[dict[str, Any]]:
+    async def deployments(self, *, observe_events: bool = False) -> list[dict[str, Any]]:
         raw_manager_deployments = getattr(self.manager, "deployments", [])
         registered = await self._adopt_unlinked_manager_deployments(
             raw_manager_deployments, skip_if_creating=True,
@@ -1263,9 +1263,13 @@ class SparkDeckService:
         for deployment in registered:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
+        if observe_events:
+            self._observe_deployment_events(registered, inventory_complete=not docker_unavailable)
         return registered
 
-    def _observe_deployment_events(self, deployments: list[dict[str, Any]]) -> None:
+    def _observe_deployment_events(
+        self, deployments: list[dict[str, Any]], *, inventory_complete: bool = False,
+    ) -> None:
         """Log actual lifecycle changes once, including independent engine groups.
 
         Missing inventory is not proof of a shutdown. Keep the last known state
@@ -1274,6 +1278,21 @@ class SparkDeckService:
         states = self._deployment_log_states
         errors = self._deployment_log_errors
         event_logger = logging.getLogger("sparkdeck.lifecycle")
+        if inventory_complete:
+            present_ids = {str(item.get("id") or "") for item in deployments}
+            for key in (states.keys() | errors.keys()):
+                if key[0] in present_ids:
+                    continue
+                previous = states.pop(key, None)
+                errors.pop(key, None)
+                if previous and previous[0] in {"running", "starting", "stopping", "degraded"}:
+                    name = key[0]
+                    if key[1] is not None:
+                        name += f" (engine group {key[1]})"
+                    event_logger.info(
+                        "Deployment %s stopped (removed from inventory)", name,
+                        extra={"deployment_event": "stopped"},
+                    )
         for deployment in deployments:
             deployment_id = str(deployment.get("id") or "")
             if not deployment_id:

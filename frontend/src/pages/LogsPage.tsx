@@ -6,11 +6,12 @@ import { useResource } from '../hooks/useResource'
 
 export function LogsPage() {
   const resource = useResource((signal) => api.logs.list(signal))
-  const { reload } = resource
+  const { reload, loading } = resource
   useEffect(() => {
-    const timer = window.setInterval(reload, 5000)
-    return () => window.clearInterval(timer)
-  }, [reload])
+    if (loading) return
+    const timer = window.setTimeout(reload, 5000)
+    return () => window.clearTimeout(timer)
+  }, [reload, loading])
   const [query, setQuery] = useState('')
   const [level, setLevel] = useState('')
   const activity = useMemo(() => (resource.data ?? []).filter((entry) => {

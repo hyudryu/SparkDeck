@@ -211,10 +211,12 @@ def _install_log_capture():
         "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
         datefmt="%H:%M:%S",
     )
-    handler = _DequeHandler()
+    root_logger = logging.getLogger()
+    handler = next((item for item in root_logger.handlers if isinstance(item, _DequeHandler)), None)
+    if handler is None:
+        handler = _DequeHandler()
     handler.setFormatter(fmt)
     # Capture all loggers
-    root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
     # Also capture uvicorn access logs
@@ -231,8 +233,7 @@ async def _deployment_log_loop():
     last_error = None
     while True:
         try:
-            deployments = await sparkdeck.deployments()
-            sparkdeck._observe_deployment_events(deployments)
+            await sparkdeck.deployments(observe_events=True)
             last_error = None
         except asyncio.CancelledError:
             raise
@@ -4296,6 +4297,9 @@ async def _serve_application() -> None:
         log_level="info",
         timeout_graceful_shutdown=10,
     ))
+
+    # Config applies Uvicorn logging and replaces its logger handlers.
+    _install_log_capture()
 
     async def watch_launcher_shutdown() -> None:
         while not instance.should_exit:

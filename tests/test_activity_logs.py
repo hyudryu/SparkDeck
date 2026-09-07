@@ -76,10 +76,18 @@ class ActivityLogTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_observed_lifecycle_reaches_the_logs_api_once(self):
         row = {"id": "model-1", "alias": "My model", "status": "running"}
-        refresh = AsyncMock(side_effect=[
+        snapshots = iter([
             [row], [row], [{**row, "status": "stopped", "desired_state": "stopped"}],
-            asyncio.CancelledError(),
         ])
+
+        async def refresh(*, observe_events=False):
+            try:
+                rows = next(snapshots)
+            except StopIteration:
+                raise asyncio.CancelledError()
+            if observe_events:
+                server.sparkdeck._observe_deployment_events(rows, inventory_complete=True)
+            return rows
         with patch.object(server.sparkdeck, "deployments", refresh), \
                 patch.object(server.sparkdeck, "_deployment_log_states", {}), \
                 patch.object(server.sparkdeck, "_deployment_log_errors", {}), \
@@ -95,3 +103,40 @@ class ActivityLogTests(unittest.IsolatedAsyncioTestCase):
             [entry["event"] for entry in response.json()["entries"]],
             ["launched", "stopped"],
         )
+
+
+    async def test_production_server_reinstalls_access_capture_after_uvicorn_config(self):
+        import uvicorn
+
+        names = ("", "uvicorn", "uvicorn.access", "uvicorn.error")
+        previous = {
+            name: (list(logging.getLogger(name).handlers), logging.getLogger(name).level,
+                   logging.getLogger(name).propagate)
+            for name in names
+        }
+
+        async def serve(instance):
+            access = logging.getLogger("uvicorn.access")
+            for status in (200, 404, 500):
+                access.info('%s - "%s %s HTTP/%s" %d',
+                            "127.0.0.1", "GET", "/api/missing", "1.1", status)
+            server._install_log_capture()
+            self.assertEqual(sum(isinstance(h, server._DequeHandler)
+                                 for h in access.handlers), 1)
+
+        try:
+            with patch.object(uvicorn.Server, "serve", serve), \
+                    patch.object(server, "_discard_shutdown_request"), \
+                    patch.object(server, "_shutdown_request_process_ids", return_value=set()):
+                await server._serve_application()
+            entries = list(server._activity_buffer)
+            self.assertEqual(len(entries), 2)
+            self.assertTrue(all(entry["level"] == "error" for entry in entries))
+            self.assertIn("404", entries[0]["message"])
+            self.assertIn("500", entries[1]["message"])
+        finally:
+            for name, (handlers, level, propagate) in previous.items():
+                logger = logging.getLogger(name)
+                logger.handlers = handlers
+                logger.setLevel(level)
+                logger.propagate = propagate

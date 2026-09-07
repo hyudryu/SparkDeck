@@ -1209,6 +1209,7 @@ class Manager:
             stats = await self.get_stats()
         disk = await self.get_disk()
         docker_ready, docker_status_message = await self._docker_runtime_status()
+        inventory_available = True
         try:
             if containers is None:
                 containers = await self.list_containers()
@@ -1228,6 +1229,7 @@ class Manager:
             ]
         except Exception:
             containers = []
+            inventory_available = False
         existing_names = {c.get("name") for c in containers}
         # Launch updates can arrive from a Docker worker thread while the
         # status endpoint is being serialized.
@@ -1270,6 +1272,7 @@ class Manager:
             "stats": stats,
             "disk": disk,
             "containers": containers,
+            "inventory_available": inventory_available,
             "llama_rpc": self.llama_rpc_status(),
         }
 
@@ -8756,9 +8759,15 @@ class Manager:
                         continue
                     container = next((item for item in node.get("containers") or []
                                       if item.get("name") == member.get("container_name")), None)
+                    if node.get("inventory_available") is False:
+                        continue
+                    if container is None and node.get("inventory_available") is not True:
+                        # Older agents can synthesize an empty inventory after
+                        # enumeration fails; absence needs explicit confirmation.
+                        continue
                     if container is None:
                         confirmed.append(member)
-                    elif (container.get("status") in {"exited", "stopped", "dead"}
+                    elif (container.get("status") in {"created", "exited", "stopped", "dead"}
                           and not member.get("failed_stop_error")):
                         confirmed.append(member)
                     else:
@@ -19472,6 +19481,10 @@ class Manager:
         # it would perform the same Docker container scan a second time for
         # every deployment snapshot.
         nodes = await self.cluster_nodes(stats, containers)
+        if containers_unavailable:
+            for node in nodes:
+                if node.get("local") or node.get("id") == LOCAL_NODE_ID:
+                    node["inventory_available"] = False
         local_docker_ready = next(
             (
                 bool(node.get("docker_ready"))
@@ -19503,6 +19516,11 @@ class Manager:
                 container = containers_by_node.get(member.get("node_id"), {}).get(
                     member.get("container_name")
                 )
+                member["has_live_container"] = bool(
+                    node.get("online") and node.get("docker_ready")
+                    and node.get("inventory_available") is True
+                    and container and container.get("status") in {"running", "restarting", "paused"}
+                )
                 if not node.get("online"):
                     # Offline nodes are treated as stopped for public runtime
                     # state; retain node connectivity separately from intent.
@@ -19522,6 +19540,11 @@ class Manager:
                                 "is offline; container is assumed stopped"
                             ),
                         }
+                elif node.get("inventory_available") is False:
+                    member["status"] = "unknown"
+                    member["status_message"] = "Container inventory is unavailable"
+                    member["phase"] = {"phase": "unknown", "message": member["status_message"]}
+                    member_inventory_unknown = True
                 elif container:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")

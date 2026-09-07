@@ -95,6 +95,8 @@ export interface DeploymentSettings {
 // One independent engine group of a grouped-sharded deployment.
 export interface DeploymentInstance {
   node_ids?: string[]
+  // Current node inventory confirms a live container in this group.
+  has_live_containers?: boolean
   instance_id: number
   status: string
   desired_state: 'running' | 'stopped'

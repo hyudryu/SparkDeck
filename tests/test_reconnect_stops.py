@@ -29,7 +29,7 @@ class ReconnectStopTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.deployments = [deployment]
         nodes = [{"id": member["node_id"], "online": True, "status": "online",
-                  "docker_ready": True, "containers": [{
+                  "docker_ready": True, "inventory_available": True, "containers": [{
                       "name": member["container_name"], "status": "running"}]}
                  for member in members]
         manager.cluster_nodes = AsyncMock(return_value=nodes)
@@ -152,3 +152,27 @@ class ReconnectStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(m.get("failed_stop_error") for m in deployment["members"]))
         self.assertTrue(all(m["status"] == "running" for m in deployment["members"]))
         self.assertFalse(manager._cluster_action_lock().locked())
+
+    async def test_legacy_empty_inventory_does_not_confirm_absence(self):
+        manager, deployment, nodes = self.fixture()
+        for node in nodes:
+            node.pop("inventory_available")
+            node["containers"] = []
+        before = copy.deepcopy(deployment)
+        await manager._reconcile_stopped_members()
+        self.assertEqual(deployment, before)
+        manager._member_action.assert_not_awaited()
+
+    async def test_created_container_is_not_stopped_on_every_tick(self):
+        manager, deployment, nodes = self.fixture()
+        for node in nodes:
+            node["containers"][0]["status"] = "created"
+        # Retry once to finish the failed stop and disarm restart policy.
+        await manager._reconcile_stopped_members()
+        self.assertEqual(manager._member_action.await_count, 2)
+        self.assertTrue(all(not m.get("failed_stop_error") for m in deployment["members"]))
+        manager._member_action.reset_mock()
+        manager._save_deployments.reset_mock()
+        await manager._reconcile_stopped_members()
+        manager._member_action.assert_not_awaited()
+        manager._save_deployments.assert_not_called()

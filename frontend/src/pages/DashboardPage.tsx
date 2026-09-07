@@ -37,7 +37,8 @@ const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'ready', 'starting', 'lau
 
 function runningDeploymentGroups(deployment: Deployment) {
   if (deployment.instances?.length) {
-    return deployment.instances.filter((group) => ACTIVE_DEPLOYMENT_STATUSES.has(group.status)).map((group) => ({
+    return deployment.instances.filter((group) => ACTIVE_DEPLOYMENT_STATUSES.has(group.status)
+      && (deployment.status !== 'error' || group.has_live_containers === true)).map((group) => ({
       key: `${deployment.id}:${group.instance_id}`,
       status: group.status,
       stopPending: group.desired_state === 'stopped' || deployment.desired_state === 'stopped',

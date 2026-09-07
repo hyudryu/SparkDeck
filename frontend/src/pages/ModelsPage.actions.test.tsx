@@ -339,6 +339,38 @@ describe('models page llama.cpp pull targets', () => {
 })
 
 describe('models page running actions', () => {
+  it.each([
+    { tensor: 4, ranks: undefined, layout: 'TP4' },
+    { tensor: 2, ranks: 4, layout: 'TP2 PP2 from the backend rank count' },
+  ])('launches a $layout clone on four nodes despite its saved two-node preference', async ({ tensor, ranks }) => {
+    const user = userEvent.setup()
+    const cloned = {
+      ...runningDeployment, status: 'saved', desired_state: 'stopped',
+      managed: true, deployment_mode: 'sharded', required_node_count: 2,
+      node_ids: ['local', 'worker-1'], settings: { tensor_parallel_size: tensor },
+      parallel_rank_count: ranks,
+    }
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [cloned] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/prepare/preflight')) return preparationResponse('org/model')
+      return fallback(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+    const dialog = await screen.findByRole('dialog')
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    expect(within(dialog).getByRole('button', { name: 'Launch on 3 nodes' })).toBeDisabled()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 4 nodes' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['local', 'worker-1', 'worker-2', 'worker-3'])
+    })
+  })
+
   it('disables nodes occupied by another group while keeping its inactive group nodes free', async () => {
     const original = fetchMock.getMockImplementation()!
     const target = { ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped' }

@@ -522,8 +522,7 @@ export function DeploymentPage() {
       ? editor.sg_tp_size
       : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1')
     const tensor = Number.isInteger(tp) && tp > 0 ? tp : 1
-    if (resource.data?.runtime !== 'vllm') return tensor
-    const pp = Number(editor.pipeline_parallel_size)
+    const pp = resource.data?.runtime === 'vllm' ? Number(editor.pipeline_parallel_size) : 1
     const pipeline = Number.isInteger(pp) && pp > 0 ? pp : 1
     const world = tensor * pipeline
     const savedCount = resource.data?.node_ids?.length ?? 0
@@ -537,6 +536,26 @@ export function DeploymentPage() {
     && resource.data?.managed === false
     && (resource.data.has_start_hook || resource.data.has_stop_hook || resource.data.direct_start)
   )
+
+  const runParallelRanks = () => {
+    if (!editor || resource.data?.deployment_mode !== 'sharded' || usesDirectLifecycle()) return 0
+    const runtime = resource.data?.runtime
+    if (runtime !== 'vllm' && runtime !== 'sglang') return 0
+    const tensor = Number(runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size)
+    const pipeline = runtime === 'vllm' ? Number(editor.pipeline_parallel_size || '1') : 1
+    const ranks = tensor * pipeline
+    return Number.isInteger(ranks) && ranks > 1 ? ranks : 0
+  }
+
+  const validParallelSelection = (ids: string[]) => {
+    const ranks = runParallelRanks()
+    if (ids.length < 2 || ranks % ids.length !== 0) return false
+    return ids.every((id) => {
+      const gpus = nodes.data?.find((node) => node.id === id)?.stats?.gpus
+      // Missing telemetry is checked by the backend's launch preflight.
+      return gpus === undefined || gpus.filter((gpu) => !gpu.error).length >= ranks / ids.length
+    })
+  }
 
   const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
@@ -722,15 +741,23 @@ export function DeploymentPage() {
     {runSelection && (() => {
       const directLifecycle = usesDirectLifecycle()
       const required = requiredRunNodes()
+      const ranks = runParallelRanks()
+      const flexibleParallel = ranks > 1
+      const selectedCount = flexibleParallel ? runSelection.length : required
+      const countHelp = flexibleParallel
+        ? `Select at least two nodes whose count divides the ${ranks} GPU ranks evenly. Each node must have enough GPUs for its share.`
+        : `Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}.`
       const tensor = Number(detail.runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size) || 1
-      const layoutDescription = detail.deployment_mode === 'sharded'
+      const layoutDescription = flexibleParallel
+        ? `TP${tensor} uses ${ranks} GPU ranks distributed evenly across the selected nodes.`
+        : detail.deployment_mode === 'sharded'
         ? `TP${tensor} is distributed across exactly ${required} ${required === 1 ? 'node' : 'nodes'}.`
         : detail.deployment_mode === 'replicated'
           ? `This replicated layout runs on exactly ${required} nodes.`
           : detail.deployment_mode === 'grouped_sharded'
             ? `This grouped layout runs ${detail.instances?.length ?? 2} independent engine group(s) on exactly ${required} nodes.`
             : `This single-node layout runs TP${tensor} on one physical node.`
-      const exactCount = runSelection.length === required
+      const exactCount = flexibleParallel ? validParallelSelection(runSelection) : runSelection.length === required
       const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
       const allSelectable = runSelection.every((id) => !occupied[id] && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
       const ready = !deployments.loading && !deployments.error && (directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable))
@@ -747,7 +774,7 @@ export function DeploymentPage() {
             selectedIds={runSelection}
             allowedIds={(nodes.data ?? []).filter((node) => !occupied[node.id]).map((node) => node.id)}
             unavailableReasons={occupied}
-            onChange={(next) => setRunSelection(next.length <= required ? next : runSelection)}
+            onChange={(next) => setRunSelection(next.length <= (flexibleParallel ? ranks : required) ? next : runSelection)}
             loading={nodes.loading}
             error={nodes.error}
             onRetry={nodes.reload}
@@ -755,10 +782,10 @@ export function DeploymentPage() {
             disabled={Boolean(busy)}
             primaryId={runSelection[0]}
             legend="Target nodes"
-            help={`Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}. The first selected node coordinates the deployment.`}
+            help={`${countHelp} The first selected node coordinates the deployment.`}
           />}
-          {!directLifecycle && !exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
-          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : directLifecycle ? 'Confirm start' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+          {!directLifecycle && !exactCount && <p className="field-note" role="status">{flexibleParallel ? countHelp : `Select exactly ${required} ${required === 1 ? 'node' : 'nodes'} to continue.`}</p>}
+          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : directLifecycle ? 'Confirm start' : `Start on ${selectedCount} ${selectedCount === 1 ? 'node' : 'nodes'}`}</Button></div>
         </section>
       </div>
     })()}

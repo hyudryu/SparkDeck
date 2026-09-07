@@ -2886,7 +2886,12 @@ class SparkDeckService:
         else:
             mode = "single"
             count = 1
-        return {"deployment_mode": mode, "required_node_count": count}
+        result = {"deployment_mode": mode, "required_node_count": count}
+        if mode == "sharded" and runtime in {
+            RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+        }:
+            result["parallel_rank_count"] = world
+        return result
 
     def _reject_sensitive_launch_args(self, extra_args: Any) -> None:
         """Apply Manager's credential-argv policy before anything is saved."""
@@ -3793,6 +3798,11 @@ class SparkDeckService:
         elif contract.get("deployment_mode") == "sharded":
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 result["instance_node_count"] = count
+            if (launch_settings or {}).get("engine", "vllm") in {"vllm", "sglang"}:
+                result["parallel_rank_count"] = (
+                    contract.get("tensor_parallel_size", 1)
+                    * contract.get("pipeline_parallel_size", 1)
+                )
         revision = contract.get("model_revision")
         if isinstance(revision, str) and revision.strip():
             result["model_revision"] = revision.strip()
@@ -3807,6 +3817,20 @@ class SparkDeckService:
             raise ValueError("node_ids must not contain duplicates")
         contract = self._layout_contract(launch_settings)
         required = contract.get("required_node_count")
+        ranks = contract.get("parallel_rank_count")
+        if (
+            contract.get("deployment_mode") == "sharded"
+            and isinstance(ranks, int) and ranks > 1
+        ):
+            # Saved hosts are a preference, not a cap on TP/PP placement.
+            # Manager preflight checks the actual GPUs per selected host
+            # before replacing any existing ranks.
+            if len(selected) < 2 or ranks % len(selected):
+                raise ValueError(
+                    f"{ranks} parallel GPU ranks must divide evenly across "
+                    "at least two selected nodes"
+                )
+            return selected
         if required is not None and len(selected) != required:
             raise ValueError(
                 f"this deployment requires exactly {required} node(s)"

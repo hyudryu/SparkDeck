@@ -1296,9 +1296,15 @@ export function ModelsPage() {
   const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
     const groups = selectableGroups(deployment, action)
     const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
-    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id]))
+    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id] || groupNodeUnavailable(id)))
     setGroupError(undefined)
     setGroupSelection({ deployment, action, instance: first?.instance_id ?? 'all' })
+  }
+
+  const groupNodeUnavailable = (id: string): string | undefined => {
+    if (nodes.loading || nodes.error) return 'Node availability has not been confirmed'
+    const node = nodes.data?.find((item) => item.id === id)
+    return !node || !isNodeSelectable(node) ? `${node?.name ?? id} is unavailable` : undefined
   }
 
   const requestStop = (deployment: Deployment) => {
@@ -1494,6 +1500,17 @@ export function ModelsPage() {
     if (deployment.deployment_mode === 'grouped_sharded' && deployment.instances?.length) {
       openGroupPicker(deployment, 'start')
       return
+    }
+    if (deployment.managed && deployment.deployment_mode === 'sharded'
+      && (deployment.runtime === 'vllm' || deployment.runtime === 'sglang')) {
+      const ranks = deployment.parallel_rank_count ?? ((deployment.settings.tensor_parallel_size ?? 1)
+        * (deployment.runtime === 'vllm' ? deployment.settings.pipeline_parallel_size ?? 1 : 1))
+      if (Number.isInteger(ranks) && ranks > 1) {
+        deployment = {
+          ...deployment, flexible_node_count: true, parallel_rank_count: ranks,
+          single_host_topology_replayable: false, distributed_host_topology_replayable: true,
+        }
+      }
     }
     if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
       setStartError(undefined)
@@ -2437,7 +2454,7 @@ export function ModelsPage() {
         const { deployment, action, instance } = groupSelection
         const groups = selectableGroups(deployment, action)
         const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id) : {}
-        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => occupied[id]).find(Boolean)
+        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => (action === 'start' ? groupNodeUnavailable(id) : undefined) || occupied[id]).find(Boolean)
         const allBlocked = (deployment.instances ?? []).some((group) => groupReason(group))
         const selectedBlocked = instance === 'all' ? allBlocked : groups.some((group) => group.instance_id === instance && groupReason(group))
         const label = action === 'stop' ? 'Stop' : 'Start'
@@ -2471,7 +2488,7 @@ export function ModelsPage() {
             : deployment.has_start_hook
               ? []
               : [nodes.data?.find((node) => node.id === 'local')?.name ?? localLabel]
-        const required = deploymentRequiredNodes(deployment)
+        const required = deployment.flexible_node_count ? nodeIds.length : deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
         const adoptingDirect = Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
         const preparableLaunch = savedLaunch || adoptingDirect
@@ -2567,7 +2584,7 @@ export function ModelsPage() {
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
-              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
+              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= (flexibleParallel ? deployment.parallel_rank_count ?? required : required) ? next : nodeIds })}
               loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}
@@ -2861,7 +2878,9 @@ export function ModelsPage() {
             >
               {!logData && logLoading
                 ? <span className="deployment-log-status">Loading logs…</span>
-                : <pre>{selectedLogMember?.logs || logData?.logs || 'No log output.'}</pre>}
+                : <pre>{selectedLogMember
+                  ? selectedLogMember.logs || selectedLogMember.error || 'No log output.'
+                  : logData?.logs || 'No log output.'}</pre>}
             </div>
             <div className="modal-actions">
               <Button type="button" variant={logTailing ? 'primary' : 'tertiary'} aria-pressed={logTailing} onClick={() => setLogTailing((current) => !current)}><ArrowDownToLine size={15} /> {logTailing ? 'Tailing' : 'Tail'}</Button>

@@ -89,9 +89,68 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         # user-level Git repository. Give the fixture an explicit process
         # revision instead of inheriting that unrelated repository's HEAD.
         self.service.runtime_revision = "a" * 40
+        self.compare_revisions = self.service._commits_behind
+        self.service._commits_behind = AsyncMock(return_value=None)
 
     async def asyncTearDown(self):
         self.temp.cleanup()
+
+    async def test_commit_distance_uses_target_as_base_and_caches_by_revision_pair(self):
+        self.manager.http.get.return_value = response(200, {"behind_by": 7, "ahead_by": 2})
+        self.assertEqual(await self.compare_revisions("a" * 40, "b" * 40), 7)
+        self.assertEqual(await self.compare_revisions("a" * 40, "b" * 40), 7)
+        self.manager.http.get.assert_awaited_once()
+        self.assertIn(f"/compare/{'b' * 40}...{'a' * 40}?per_page=1", self.manager.http.get.await_args.args[0])
+        self.assertEqual(await self.compare_revisions("a" * 40, "c" * 40), 7)
+        self.assertEqual(self.manager.http.get.await_count, 2)
+        await self.compare_revisions("a" * 40, "c" * 40, force=True)
+        self.assertEqual(self.manager.http.get.await_count, 3)
+
+    async def test_commit_distance_handles_identical_and_unknown_revisions_without_requests(self):
+        self.assertEqual(await self.compare_revisions("a" * 40, "a" * 40), 0)
+        for revision, target in [(None, "a" * 40), ("a" * 40, None), ("invalid", "b" * 40)]:
+            self.assertIsNone(await self.compare_revisions(revision, target))
+        self.manager.http.get.assert_not_awaited()
+
+    async def test_commit_distance_failure_and_malformed_counts_remain_unknown(self):
+        for status, payload in [(403, {}), (404, {}), (200, {}), (200, []),
+                                (200, {"behind_by": -1}), (200, {"behind_by": True}),
+                                (200, {"behind_by": "3"})]:
+            with self.subTest(status=status, payload=payload):
+                self.manager.http.get.return_value = response(status, payload)
+                self.assertIsNone(await self.compare_revisions("a" * 40, "b" * 40, force=True))
+        count = self.manager.http.get.await_count
+        self.assertIsNone(await self.compare_revisions("a" * 40, "b" * 40))
+        self.assertEqual(self.manager.http.get.await_count, count)
+
+    async def test_overview_exposes_live_node_distances_and_deduplicates_comparisons(self):
+        self.service._commits_behind = self.compare_revisions
+        self.manager.http.get.side_effect = [
+            response(200, {"sha": "b" * 40}),
+            response(200, {"behind_by": 4}),
+        ]
+        self.manager.cluster_node_liveness.return_value.extend([
+            {"id": "worker", "name": "Worker", "online": True, "app_revision": "a" * 40},
+            {"id": "latest", "name": "Latest", "online": True, "app_revision": "b" * 40},
+            {"id": "unknown", "name": "Unknown", "online": False},
+        ])
+        self.service._write(self.service.cluster_path, {
+            "phase": "succeeded", "target_revision": "a" * 40,
+            "nodes": [{"id": "worker", "phase": "succeeded", "current_revision": "a" * 40}],
+        })
+        with patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+        self.assertEqual([node["commits_behind"] for node in overview["nodes"]], [4, 4, 0, None])
+        self.assertEqual(self.manager.http.get.await_count, 2)
+
+    async def test_overview_uses_pinned_controller_revision_for_distance(self):
+        self.manager.http.get.return_value = response(200, {"sha": "b" * 40})
+        self.manager.cluster_node_liveness.return_value[0]["app_revision"] = "b" * 40
+        with patch("sparkdeck.updater.local_blockers", return_value=[]):
+            overview = await self.service.overview()
+        self.assertEqual(overview["nodes"][0]["current_revision"], "a" * 40)
+        self.assertFalse(overview["up_to_date"])
+        self.service._commits_behind.assert_awaited_once_with("a" * 40, "b" * 40, force=False)
 
     async def test_unavailable_main_is_an_honest_blocker(self):
         self.manager.http.get.return_value = response(404, {"message": "Not Found"})

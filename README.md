@@ -10,6 +10,100 @@ I built SparkDeck for my own GB10 cluster to answer those questions in one local
 
 The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
 
+## Features
+
+Click a feature to see a cropped view of the live UI. Every screenshot is illustrative demo data, not a measured hardware claim.
+
+<details>
+<summary><strong>Deploy &amp; stop inference servers across the cluster</strong></summary>
+
+> Manage vLLM, SGLang, and llama.cpp `llama-server` deployments and easily deploy or stop them across every node.
+
+![Deployment table with running and stop actions across the cluster](docs/screenshots/readme/feature-deployments.png)
+
+_Deployments of vLLM and SGLang, each with running/stop state, across the cluster. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Monitor nodes, temperatures, memory &amp; active inference</strong></summary>
+
+> Monitor temperatures, memory, and resource usage of each node, and see active inference requests plus output/thinking speeds.
+
+![Cluster node telemetry and current inference](docs/screenshots/readme/feature-cluster-monitoring.png)
+
+_Node CPU/GPU temperature, unified memory, and session telemetry per node, plus aggregate inference rate per active engine group. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Opt-in community performance sharing</strong></summary>
+
+> Optionally opt in to shared community results for inference speeds, to compare against evidence from comparable model configurations.
+
+![Community Run Models throughput and cluster-fit evidence](docs/screenshots/readme/feature-community-speeds.png)
+
+_Community throughput and per-node/replicated cluster-fit evidence, matched by model ID, quantization, prompt-length bucket, and tensor-parallel size. Illustrative demo data; estimates are evidence, not guarantees._
+</details>
+
+<details>
+<summary><strong>Multi-group routing with load balancing</strong></summary>
+
+> Route across multiple model groups with automatic load balancing, and guide cache-friendly session placement to improve the likelihood that repeated context is reused and throughput stays high.
+
+![Deployment table with target nodes and launch recipes for grouped engines](docs/screenshots/readme/feature-routing.png)
+
+_A single TP2 model served across Group 1 and Group 2, with per-group aggregate output and thinking inference rates. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Virtual NAS for fast weight transfers</strong></summary>
+
+> Quickly transfer model weights between nodes, using a configured fabric when one is set up (e.g. a 4 TB Spark + 1 TB GX10, or when you have a NAS), without re-downloading.
+
+![Virtual NAS node storage and queue a transfer](docs/screenshots/readme/feature-virtual-nas.png)
+
+_Node storage inventory plus a queue-a-transfer form to copy model weights to selected nodes. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Usage statistics</strong></summary>
+
+> See token activity, daily trends, and per-model usage across the cluster.
+
+![Usage stats with token activity, trends, and model usage](docs/screenshots/readme/feature-usage-stats.png)
+
+_Token activity, time-range heatmap, daily trend, and per-model usage breakdown. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Docker image manager</strong></summary>
+
+> Pull and manage runtime container images, and see cluster image availability per node.
+
+![Runtime images manager and pull form](docs/screenshots/readme/feature-docker-images.png)
+
+_Pull an image to chosen nodes and see cluster image availability per node. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Test chat to measure output speed</strong></summary>
+
+> Use a built-in test chat to measure real output tok/s and verify model behavior.
+
+![Chat workspace showing output tok/s measurement](docs/screenshots/readme/feature-chat-speed.png)
+
+_Chat workspace reporting live output tok/s for the selected model. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Hugging Face integration</strong></summary>
+
+> Use Hugging Face API keys to easily pull weights from Hugging Face onto nodes, including gated and private models.
+
+![Hugging Face API key configuration](docs/screenshots/readme/feature-huggingface.png)
+
+_Set one Hugging Face credential for gated and private models across the cluster. Illustrative demo data._
+</details>
+
 ## Documentation
 
 - **[QuickStart: connect two DGX Sparks over Tailscale](QUICKSTART.md)** — install Tailscale, find each node's private IP, pair the cluster, and deploy a first model.

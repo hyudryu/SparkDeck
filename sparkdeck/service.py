@@ -1099,6 +1099,10 @@ class SparkDeckService:
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
+            if cluster in (cluster_state.get("deployments") or []):
+                occupied = _observed_occupied_node_ids(cluster)
+                if occupied is not None:
+                    stored["occupied_node_ids"] = occupied
             stored.update(_deployment_launch_progress(cluster))
             stored["last_used_at"] = cluster.get("last_used_at")
             launch_controls = cluster.get("launch_controls")
@@ -1212,6 +1216,10 @@ class SparkDeckService:
                 # deployment's state and layout contract, not just this node's
                 # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
+                if owner in (cluster_state.get("deployments") or []):
+                    occupied = _observed_occupied_node_ids(owner)
+                    if occupied is not None:
+                        discovered["occupied_node_ids"] = occupied
                 discovered.update(self._layout_contract(owner.get("launch_settings")))
                 owner_node_ids = [
                     str(item) for item in owner.get("node_ids") or [] if str(item).strip()
@@ -3035,7 +3043,12 @@ class SparkDeckService:
         else:
             mode = "single"
             count = 1
-        return {"deployment_mode": mode, "required_node_count": count}
+        result = {"deployment_mode": mode, "required_node_count": count}
+        if mode == "sharded" and runtime in {
+            RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+        }:
+            result["parallel_rank_count"] = world
+        return result
 
     def _reject_sensitive_launch_args(self, extra_args: Any) -> None:
         """Apply Manager's credential-argv policy before anything is saved."""
@@ -3944,6 +3957,11 @@ class SparkDeckService:
         elif contract.get("deployment_mode") == "sharded":
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 result["instance_node_count"] = count
+            if (launch_settings or {}).get("engine", "vllm") in {"vllm", "sglang"}:
+                result["parallel_rank_count"] = (
+                    contract.get("tensor_parallel_size", 1)
+                    * contract.get("pipeline_parallel_size", 1)
+                )
         revision = contract.get("model_revision")
         if isinstance(revision, str) and revision.strip():
             result["model_revision"] = revision.strip()
@@ -3958,6 +3976,20 @@ class SparkDeckService:
             raise ValueError("node_ids must not contain duplicates")
         contract = self._layout_contract(launch_settings)
         required = contract.get("required_node_count")
+        ranks = contract.get("parallel_rank_count")
+        if (
+            contract.get("deployment_mode") == "sharded"
+            and isinstance(ranks, int) and ranks > 1
+        ):
+            # Saved hosts are a preference, not a cap on TP/PP placement.
+            # Manager preflight checks the actual GPUs per selected host
+            # before replacing any existing ranks.
+            if len(selected) < 2 or ranks % len(selected):
+                raise ValueError(
+                    f"{ranks} parallel GPU ranks must divide evenly across "
+                    "at least two selected nodes"
+                )
+            return selected
         if required is not None and len(selected) != required:
             raise ValueError(
                 f"this deployment requires exactly {required} node(s)"
@@ -4763,10 +4795,15 @@ class SparkDeckService:
             return current
         try:
             state = await self.manager.get_state()
-            cluster = next((
+            observed = next((
                 item for item in state.get("deployments", [])
                 if isinstance(item, dict) and item.get("id") == manager_id
-            ), cluster)
+            ), None)
+            if observed is not None:
+                cluster = observed
+                occupied = _observed_occupied_node_ids(cluster)
+                if occupied is not None:
+                    current["occupied_node_ids"] = occupied
         except Exception:
             # The action already succeeded. Preserve its durable state when
             # inventory is temporarily unavailable instead of failing it.
@@ -5069,6 +5106,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "start", str(start_command),
                     )
+                    self._record_external_lifecycle_intent(container, "start")
                 else:
                     await self.manager.start_container(
                         container, explicit=True, managed=False,
@@ -5084,6 +5122,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "stop", str(stop_command),
                     )
+                    self._record_external_lifecycle_intent(container, "stop")
                 else:
                     await self.manager.stop_container(
                         container, explicit=True, managed=False,
@@ -5095,6 +5134,18 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    def _record_external_lifecycle_intent(
+        self, container_name: str, action: str,
+    ) -> None:
+        """Mirror hook-backed Start/Stop intent in Manager's container ledger."""
+        stopped = getattr(self.manager, "_explicitly_stopped_containers", None)
+        if stopped is None:
+            stopped = self.manager._explicitly_stopped_containers = set()
+        if action == "stop":
+            stopped.add(container_name)
+        else:
+            stopped.discard(container_name)
 
     def _reject_external_lifecycle_in_flight(self, container_name: str) -> None:
         """Reject any action while a lifecycle hook runs for this container."""
@@ -7716,6 +7767,50 @@ def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> boo
         if isinstance(member, dict)
         and (instance is None or str(member.get("instance_id") or 0) == str(instance))
     )
+
+
+def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
+    """Reserve online live ranks without claiming stopped or offline peers.
+
+    Only call with a refreshed Manager inventory, never persisted members.
+    Offline nodes are treated as stopped and cannot be selected for starts.
+    Online stopped intent alone cannot prove a container stopped. In-flight
+    operations retain their online reservations.
+    """
+    members = cluster.get("members")
+    if not isinstance(members, list) or not members:
+        return None
+    occupied = set(cluster.get("node_ids") or [])
+    offline = {
+        member["node_id"] for member in members if member.get("node_id") and (
+            member.get("node_status") in {"offline", "unreachable", "disconnected"}
+            or member.get("status") == "unreachable"
+        )
+    }
+    if cluster.get("status") in {"launching", "starting", "stopping", "recovering"}:
+        return sorted((occupied | {
+            member["node_id"] for member in members if member.get("node_id")
+        }) - offline)
+    by_node: dict[str, list[dict[str, Any]]] = {}
+    for member in members:
+        if member.get("node_id"):
+            by_node.setdefault(member["node_id"], []).append(member)
+    for node_id, ranks in by_node.items():
+        idle = all(
+            member.get("status") in {"exited", "stopped", "dead", "missing"}
+            and not member.get("recreate_pending")
+            and not member.get("failed_stop_error")
+            and (
+                (member.get("desired_state") or cluster.get("desired_state")) == "stopped"
+                or cluster.get("status") == "stopped"
+            )
+            for member in ranks
+        )
+        if idle:
+            occupied.discard(node_id)
+        else:
+            occupied.add(node_id)
+    return sorted(occupied - offline)
 
 
 def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:

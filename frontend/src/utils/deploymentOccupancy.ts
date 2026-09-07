@@ -18,6 +18,12 @@ export function occupiedNodeReasons(deployments: Deployment[], exceptId?: string
   const reasons: Record<string, string> = {}
   for (const deployment of deployments) {
     if (deployment.id === exceptId || deployment.status === 'saved') continue
+    // Aggregate health can be degraded solely because unrelated peers are
+    // unreachable. Prefer the controller's per-member runtime reservations.
+    if (deployment.occupied_node_ids !== undefined) {
+      for (const id of deployment.occupied_node_ids) reasons[id] = `Already used by deployment ${deployment.alias}`
+      continue
+    }
     const groupOccupied = (group: DeploymentInstance) => ACTIVE.has(group.status)
       || (deployment.desired_state !== 'stopped' && group.desired_state === 'running')
     if (!ACTIVE.has(deployment.status) && !(deployment.desired_state === 'running' && deployment.instances?.some(groupOccupied))) continue

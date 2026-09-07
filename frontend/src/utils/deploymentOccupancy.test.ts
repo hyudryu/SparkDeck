@@ -11,6 +11,15 @@ const split = {
 } as Deployment
 
 describe('deployment node occupancy', () => {
+  it('uses observed reservations rather than assigning degraded health to every node', () => {
+    const offlinePeers = { ...split, status: 'degraded' as const, desired_state: 'stopped' as const, occupied_node_ids: ['n3', 'n4'] }
+    expect(Object.keys(occupiedNodeReasons([offlinePeers]))).toEqual(['n3', 'n4'])
+    expect(occupiedNodeReasons([{ ...offlinePeers, occupied_node_ids: [] }])).toEqual({})
+    expect(occupiedNodeReasons([offlinePeers], split.id)).toEqual({})
+  })
+  it('preserves actual runtime reservations despite a stopped aggregate status', () => {
+    expect(Object.keys(occupiedNodeReasons([{ ...split, status: 'stopped', desired_state: 'stopped', occupied_node_ids: ['n1'] }]))).toEqual(['n1'])
+  })
   it('reserves persisted remote topology while a saved launch awaits Manager linkage', () => {
     for (const node_ids of [undefined, []]) {
       const launching = { ...split, status: 'starting' as const, instances: undefined, node_ids, settings: { node_ids: ['remote-1', 'remote-2'] } }

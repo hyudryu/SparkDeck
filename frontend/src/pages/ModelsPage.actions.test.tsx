@@ -1744,6 +1744,57 @@ describe('deployment creator model and quantization pickers', () => {
 
 
 describe('deployment group controls', () => {
+  it.each([false, true])('keeps an online group available with offline peers while respecting active reservations (%s)', async (active) => {
+    const original = fetchMock.getMockImplementation()!
+    const target = {
+      ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped',
+      deployment_mode: 'grouped_sharded', node_ids: ['local', 'worker-3', 'worker-2', 'worker-1'],
+      instances: [
+        { instance_id: 0, status: 'stopped', desired_state: 'stopped', node_ids: ['local', 'worker-3'], node_names: ['Controller', 'Node 2'] },
+        { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-2', 'worker-1'], node_names: ['Node 3', 'Node 4'] },
+      ],
+    }
+    const peer = {
+      ...runningDeployment, status: 'degraded', desired_state: 'running',
+      node_ids: target.node_ids, occupied_node_ids: active ? ['local', 'worker-2', 'worker-1'] : ['worker-2', 'worker-1'],
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [peer, target] }), { headers: { 'Content-Type': 'application/json' } })
+      if (String(input) === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes.map((node) => ['worker-1', 'worker-2'].includes(node.id) ? { ...node, online: false, selectable: false } : node) }), { headers: { 'Content-Type': 'application/json' } })
+      return original(input, init)
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Backup' })
+    const healthy = within(dialog).getByRole('radio', { name: /Group 1:/ })
+    if (active) expect(healthy).toBeDisabled()
+    else {
+      expect(healthy).toBeEnabled()
+      expect(healthy).toBeChecked()
+      expect(within(dialog).getByRole('button', { name: 'Start selected group' })).toBeEnabled()
+    }
+    expect(within(dialog).getByRole('radio', { name: /Group 2:/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /All groups/ })).toBeDisabled()
+  })
+
+  it('blocks only the offline group even when there are no competing reservations', async () => {
+    const original = fetchMock.getMockImplementation()!
+    const target = { ...runningDeployment, status: 'stopped', desired_state: 'stopped', deployment_mode: 'grouped_sharded', instances: [
+      { instance_id: 0, status: 'stopped', desired_state: 'stopped', node_ids: ['local', 'worker-3'], node_names: ['Controller', 'Node 2'] },
+      { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-4'], node_names: ['Node 1'] },
+    ] }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [target] }), { headers: { 'Content-Type': 'application/json' } }) : original(input, init))
+    renderPage()
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByRole('radio', { name: /Group 1:/ })).toBeEnabled()
+    expect(within(dialog).getByRole('radio', { name: /Group 2:/ })).toBeDisabled()
+    expect(within(dialog).getByText('Node 1 is unavailable')).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /All groups/ })).toBeDisabled()
+  })
+
   const grouped = {
     ...runningDeployment,
     deployment_mode: 'grouped_sharded', required_node_count: 4,

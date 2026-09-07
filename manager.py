@@ -19353,7 +19353,9 @@ class Manager:
                     member.get("container_name")
                 )
                 if not node.get("online"):
-                    member["status"] = "unreachable"
+                    # Offline nodes are treated as stopped for public runtime
+                    # state; retain node connectivity separately from intent.
+                    member["status"] = "stopped"
                     if saved.get("status") == "recovering":
                         member["phase"] = {
                             "phase": "recovering",
@@ -19363,10 +19365,10 @@ class Manager:
                         }
                     else:
                         member["phase"] = {
-                            "phase": "unreachable",
+                            "phase": "stopped",
                             "message": (
                                 f"{member.get('node_name') or member.get('node_id')} "
-                                "is unreachable"
+                                "is offline; container is assumed stopped"
                             ),
                         }
                 elif container:
@@ -19385,8 +19387,11 @@ class Manager:
                     if primary_container is None or member.get("rank") == 0:
                         primary_container = container
                 elif (
-                    containers_unavailable
-                    and member.get("node_id") == LOCAL_NODE_ID
+                    (
+                        containers_unavailable
+                        and member.get("node_id") == LOCAL_NODE_ID
+                    )
+                    or node.get("docker_ready") is False
                 ):
                     member["status"] = "unknown"
                     member["status_message"] = "Docker is unavailable"
@@ -19401,13 +19406,43 @@ class Manager:
                         "phase": "missing",
                         "message": "Managed container is missing",
                     }
-                member["node_status"] = node.get("status", "unknown")
+                member["node_status"] = node.get("status", "unknown") if node.get("online") else "offline"
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
+                # A completed Stop is durable even when a node subsequently
+                # disconnects. Keep the member's offline node observation, but
+                # do not turn a stopped deployment into a degraded workload.
+                # Stop intent alone is not proof that its containers stopped.
+                confirmed_stopped = (
+                    saved.get("status") == "stopped"
+                    and saved.get("desired_state") != "running"
+                    and not saved.get("error")
+                    and all(
+                        state in {"stopped", "exited", "missing", "unreachable"}
+                        for state in member_states
+                    )
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        or member.get("error")
+                        for member in deployment["members"]
+                    )
+                )
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif confirmed_stopped:
+                    deployment["status"] = "stopped"
+                elif (
+                    member_states
+                    and all(state in {"stopped", "exited"} for state in member_states)
+                    and saved.get("status") not in {"recovering", "stopping", "launching"}
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        for member in deployment["members"]
+                    )
+                ):
+                    deployment["status"] = "stopped"
                 elif saved.get("mode") == "grouped_sharded":
                     failed_stops = [str(member["failed_stop_error"]) for member in deployment["members"] if member.get("failed_stop_error")]
                     if failed_stops:
@@ -19421,22 +19456,32 @@ class Manager:
                     elif saved.get("desired_state") == "stopped" or (
                         saved.get("desired_state") != "running" and saved.get("status") == "stopped"
                     ):
-                        deployment["status"] = "stopped"
+                        deployment["status"] = (
+                            "stopped" if all(
+                                state in {"stopped", "exited", "missing"}
+                                for state in member_states
+                            ) else "degraded"
+                        )
                     else:
                         deployment["status"] = self._grouped_deployment_status(deployment)
+                        if deployment["status"] == "stopped" and any(
+                            state not in {"stopped", "exited", "missing", "unreachable"}
+                            for state in member_states
+                        ):
+                            deployment["status"] = "degraded"
                         if deployment["status"] == "running":
                             deployment["error"] = None
                         if saved.get("status") == "recovering" and deployment["status"] == "degraded":
                             deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
-                    s in {"unreachable", "missing", "dead", "error"}
+                    s in {"stopped", "unreachable", "missing", "dead", "error"}
                     for s in member_states
                 ):
                     # Startup recovery owns this deployment and will retry when
                     # its selected nodes reconnect. Keep the public deployment
                     # active while its member phase carries the honest wait.
                     deployment["status"] = "recovering"
-                elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
+                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"

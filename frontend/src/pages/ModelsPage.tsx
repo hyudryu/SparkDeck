@@ -1296,9 +1296,15 @@ export function ModelsPage() {
   const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
     const groups = selectableGroups(deployment, action)
     const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
-    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id]))
+    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id] || groupNodeUnavailable(id)))
     setGroupError(undefined)
     setGroupSelection({ deployment, action, instance: first?.instance_id ?? 'all' })
+  }
+
+  const groupNodeUnavailable = (id: string): string | undefined => {
+    if (nodes.loading || nodes.error) return 'Node availability has not been confirmed'
+    const node = nodes.data?.find((item) => item.id === id)
+    return !node || !isNodeSelectable(node) ? `${node?.name ?? id} is unavailable` : undefined
   }
 
   const requestStop = (deployment: Deployment) => {
@@ -2448,7 +2454,7 @@ export function ModelsPage() {
         const { deployment, action, instance } = groupSelection
         const groups = selectableGroups(deployment, action)
         const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id) : {}
-        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => occupied[id]).find(Boolean)
+        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => (action === 'start' ? groupNodeUnavailable(id) : undefined) || occupied[id]).find(Boolean)
         const allBlocked = (deployment.instances ?? []).some((group) => groupReason(group))
         const selectedBlocked = instance === 'all' ? allBlocked : groups.some((group) => group.instance_id === instance && groupReason(group))
         const label = action === 'stop' ? 'Stop' : 'Start'

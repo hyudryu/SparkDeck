@@ -210,6 +210,76 @@ def test_other_group_action_preserves_failed_stop_marker(tmp_path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mode", ["sharded", "grouped_sharded"])
+@pytest.mark.parametrize("scenario, expected", [
+    ("completed_stop", "stopped"),
+    ("legacy_completed_stop", "stopped"),
+    ("running_intent", "stopped"),
+    ("stop_intent_only", "stopped"),
+    ("observed_running", "degraded"),
+    ("observed_unknown", "degraded"),
+    ("remote_docker_unavailable", "unknown"),
+    ("all_offline", "stopped"),
+    ("failed_stop", "error"),
+])
+def test_offline_peers_are_assumed_stopped_without_hiding_online_activity(tmp_path, mode, scenario, expected):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = partial_deployment()
+        deployment.update(mode=mode, status="stopped", desired_state="stopped")
+        for member in deployment["members"]:
+            member.update(status="stopped", desired_state="stopped")
+        if scenario == "legacy_completed_stop":
+            deployment.pop("desired_state")
+        elif scenario in {"running_intent", "all_offline"}:
+            deployment["desired_state"] = "running"
+            for member in deployment["members"]:
+                member["desired_state"] = "running"
+            if scenario == "all_offline":
+                deployment["status"] = "running"
+        elif scenario == "stop_intent_only":
+            deployment["status"] = "degraded"
+        elif scenario == "failed_stop":
+            deployment.update(status="error", error="Failed to stop offline ranks")
+        manager.deployments = [deployment]
+        original = copy.deepcopy(deployment)
+        nodes = []
+        for index, member in enumerate(deployment["members"]):
+            # The local rank and one peer remain connected; the other pair
+            # is unplugged after a previously completed Stop.
+            online = index in {1, 2} and scenario != "all_offline"
+            status = "exited"
+            if index == 2 and scenario in {"observed_running", "observed_unknown"}:
+                status = scenario.removeprefix("observed_")
+            nodes.append({
+                "id": member["node_id"], "online": online,
+                "status": "online" if online else "offline", "docker_ready": True,
+                "containers": [{"name": member["container_name"], "status": status}],
+            })
+            if index == 1 and scenario == "remote_docker_unavailable":
+                nodes[-1].update(docker_ready=False, containers=[])
+        manager.list_containers = AsyncMock(return_value=nodes[2]["containers"])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=nodes)
+        try:
+            public = (await manager.get_state())["deployments"][0]
+            assert public["status"] == expected
+            assert public["members"][0]["status"] == "stopped"
+            assert public["members"][3]["status"] == "stopped"
+            assert public["members"][0]["node_status"] == "offline"
+            assert public["members"][3]["node_status"] == "offline"
+            if scenario == "remote_docker_unavailable":
+                assert public["members"][1]["status"] == "unknown"
+                assert public["members"][1]["status_message"] == "Docker is unavailable"
+            assert deployment == original
+            if scenario == "failed_stop":
+                assert public["error"] == "Failed to stop offline ranks"
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
 def test_failed_user_stop_sets_marker_and_successful_whole_start_clears_it(tmp_path):
     async def run():
         manager = Manager(tmp_path)

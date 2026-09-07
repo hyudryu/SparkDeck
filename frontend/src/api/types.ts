@@ -133,6 +133,8 @@ export interface Deployment {
   last_deployed_at?: string | number
   node_ids?: string[]
   selected_nodes?: NodeSummary[]
+  // Authoritative runtime reservations; an empty array means no nodes are held.
+  occupied_node_ids?: string[]
   desired_state?: 'running' | 'stopped'
   launch_phase?: string
   launch_message?: string

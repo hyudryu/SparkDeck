@@ -1,5 +1,7 @@
 # SparkDeck
 
+> **Note:** SparkDeck is still in development and may contain bugs. Contributions and bug reports are greatly appreciated!
+
 **Built by a DGX Spark GB10 cluster owner, for other DGX Spark GB10 owners.**
 
 Running one DGX Spark is straightforward. The moment I added more, the practical questions multiplied: Which models actually fit? What inference speed should I expect? Which Spark has the weights? Is every node healthy? Which runtime and configuration really wins?

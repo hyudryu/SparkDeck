@@ -69,6 +69,14 @@ such as `192.0.2.10` and `192.0.2.20` in fixtures.
 - [ ] In a degraded replicated deployment, only healthy replicas are selectable.
   Stopped, offline, and unknown replicas cannot be enabled through either the UI
   or API, while a surviving replica remains usable.
+- [ ] A degraded single or sharded deployment is unavailable in the selector;
+  no independent healthy unit is inferred from its aggregate status.
+- [ ] Usage Refresh reloads both routing rules and target health. Recover a
+  target, fail it again, and edit a rule elsewhere; each refresh reflects the
+  current fixture state without resetting an unfinished routing form.
+- [ ] Restart single and sharded fixtures outside SparkDeck. Healthy observed
+  members permit enabling and inference even when saved status remains exited;
+  current stop intent, missing ranks, and topology changes still reject the pin.
 - [ ] Keyboard users can save, toggle, and remove rules; pending requests prevent
   duplicate actions and errors preserve the form.
 - [ ] At desktop and mobile widths, long model names and IPv6 addresses wrap,

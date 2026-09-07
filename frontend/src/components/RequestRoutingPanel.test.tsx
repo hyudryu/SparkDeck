@@ -77,6 +77,22 @@ describe('RequestRoutingPanel', () => {
     ])
   })
 
+  it('rejects a degraded indivisible sharded deployment', () => {
+    const [target] = inferenceRouteTargets([{
+      ...groupedDeployment,
+      status: 'degraded',
+      deployment_mode: 'sharded',
+      instances: undefined,
+      node_ids: ['node-1', 'node-2'],
+      selected_nodes: [
+        { id: 'node-1', name: 'Node 1' },
+        { id: 'node-2', name: 'Node 2' },
+      ],
+    }])
+
+    expect(target.available).toBe(false)
+  })
+
   it('offers the deployment alias and recognizes an API-saved alias rule', async () => {
     vi.mocked(api.inferenceRouting.list).mockResolvedValue([{
       source_ip: '10.0.0.10', requested_model: 'PRODUCTION DeepSeek', enabled: true,

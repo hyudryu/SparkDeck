@@ -3695,6 +3695,7 @@ class Manager:
         *,
         observed_replicas: list[dict] | None = None,
         observed_instances: list[dict] | None = None,
+        observed_members: list[dict] | None = None,
     ) -> dict:
         self._assert_source_ip_routing_config_valid()
         rule = self._normalize_source_ip_routing_rule(value)
@@ -3709,6 +3710,7 @@ class Manager:
                     **rule,
                     "_observed_replicas": observed_replicas,
                     "_observed_instances": observed_instances,
+                    "_observed_members": observed_members,
                 })
             except SourceRoutingUnavailable as exc:
                 raise ValueError(str(exc)) from exc
@@ -6143,6 +6145,7 @@ class Manager:
         # replica observations separately; these never enter persisted rules.
         observed_replicas = source_route.get("_observed_replicas")
         observed_instances = source_route.get("_observed_instances")
+        observed_members = source_route.get("_observed_members")
         if mode == "replicated" and observed_replicas is not None:
             replica = next((
                 row for row in observed_replicas
@@ -6167,6 +6170,23 @@ class Manager:
                 raise SourceRoutingUnavailable(
                     "source-IP routing target engine group is unavailable"
                 )
+            health_members = []
+        elif mode in {"single", "sharded"}:
+            identities = [(m.get("node_id"), m.get("rank"), m.get("container_name")) for m in unit]
+            if (
+                not isinstance(observed_members, list)
+                or [m.get("rank") for m in unit] != list(range(len(unit)))
+                or [(m.get("node_id"), m.get("rank"), m.get("container_name"))
+                    for m in observed_members if isinstance(m, dict)] != identities
+                or len(observed_members) != len(unit)
+                or not all(
+                    self._source_routing_member_available(m)
+                    and m.get("node_status") in {"online", "degraded"}
+                    and m.get("node_docker_ready") is True
+                    for m in observed_members
+                )
+            ):
+                raise SourceRoutingUnavailable("source-IP routing target member health is unavailable")
             health_members = []
         else:
             health_members = unit

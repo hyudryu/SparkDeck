@@ -17,7 +17,7 @@ interface InferenceRouteTarget {
 
 const targetKey = (deploymentId: string, instanceId: number | null, nodeIds: string[]) =>
   JSON.stringify([deploymentId, instanceId, nodeIds])
-const ROUTABLE_STATUSES = new Set(['running', 'ready', 'degraded'])
+const ROUTABLE_STATUSES = new Set(['running', 'ready'])
 
 function servedModels(deployment: Deployment) {
   const candidates = deployment.served_models?.length
@@ -95,9 +95,13 @@ const sameNodes = (left: string[], right: string[]) => {
   return left.length === right.length && left.every((node, index) => node === right[index])
 }
 
-export function RequestRoutingPanel() {
-  const deployments = useResource((signal) => api.deployments.list(signal))
-  const rules = useResource((signal) => api.inferenceRouting.list(signal))
+export function RequestRoutingPanel({ refreshGeneration = 0 }: { refreshGeneration?: number }) {
+  const deployments = useResource(
+    (signal) => api.deployments.list(signal), [refreshGeneration],
+  )
+  const rules = useResource(
+    (signal) => api.inferenceRouting.list(signal), [refreshGeneration],
+  )
   const [enabled, setEnabled] = useState(true)
   const [sourceIp, setSourceIp] = useState('')
   const [requestedModel, setRequestedModel] = useState('')

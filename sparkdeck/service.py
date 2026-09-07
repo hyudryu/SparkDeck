@@ -6863,16 +6863,19 @@ class SparkDeckService:
         normalized = self.manager._normalize_source_ip_routing_rule(value)
         observed_replicas = None
         observed_instances = None
+        observed_members = None
         if normalized["enabled"]:
             target = await self._source_routed_deployment(
                 normalized, normalized["requested_model"], validating=True,
             )
             observed_replicas = target.get("replicas")
             observed_instances = target.get("instances")
+            observed_members = target.get("_source_routing_members")
         return self.manager.upsert_source_ip_routing_rule(
             normalized,
             observed_replicas=observed_replicas,
             observed_instances=observed_instances,
+            observed_members=observed_members,
         )
 
     def delete_source_ip_routing_rule(
@@ -6975,6 +6978,13 @@ class SparkDeckService:
             live["replicas"] = _replica_summary(observed)
         elif mode == "grouped_sharded":
             live["instances"] = _grouped_instance_summary(observed)
+        if mode in {"single", "sharded"}:
+            live["_source_routing_members"] = [
+                {key: member.get(key) for key in (
+                    "node_id", "rank", "container_name", "status", "desired_state",
+                    "node_status", "node_docker_ready",
+                )} for member in observed_members
+            ]
         return [live]
 
     async def _refresh_source_routing_snapshot(self, key: str, stored: dict, rule: dict, signature: str) -> None:
@@ -7130,6 +7140,7 @@ class SparkDeckService:
                 **source_route,
                 "_observed_replicas": deployment.get("replicas"),
                 "_observed_instances": deployment.get("instances"),
+                "_observed_members": deployment.get("_source_routing_members"),
             }
         else:
             deployment = await self._live_deployment_for_model_id(

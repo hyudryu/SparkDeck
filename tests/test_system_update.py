@@ -984,6 +984,32 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["phase"], "succeeded")
         self.manager.virtual_nas.end_update.assert_called_once()
 
+    async def test_all_failed_preflights_finish_without_interrupting_active_transfers(self):
+        nas = VirtualNAS(self.root / "nas", lambda: self.root / "hub", None, lambda: True)
+        self.manager.virtual_nas = nas
+        nas._reserve_stream("org/running-transfer")
+        state = {
+            "active": True, "target_branch": "main", "target_revision": "b" * 40,
+            "nodes": [{"id": "worker", "name": "Worker", "local": False},
+                      {"id": "local", "name": "Controller", "local": True}],
+        }
+        self.manager.node_registry.request.side_effect = RuntimeError("worker preflight failed")
+        self.service.preflight_local = AsyncMock(side_effect=RuntimeError("controller preflight failed"))
+        self.service.start_local = AsyncMock()
+        with patch.object(nas, "reserve_update", wraps=nas.reserve_update) as reserve, \
+             patch.object(nas, "end_update", wraps=nas.end_update) as release:
+            await asyncio.wait_for(self.service._run_cluster(state), 1)
+        reserve.assert_not_called()
+        release.assert_not_called()
+        self.assertFalse(state["active"])
+        self.assertEqual(state["phase"], "failed")
+        self.assertTrue(all(node["phase"] == "failed" for node in state["nodes"]))
+        self.assertFalse(nas._update_reserved)
+        self.assertEqual(nas._streaming_models, {"org/running-transfer": 1})
+        self.service.start_local.assert_not_awaited()
+        self.manager.node_registry.request.assert_awaited_once()
+        nas._release_stream("org/running-transfer")
+
     async def test_pending_worker_transfers_do_not_consume_restart_timeout(self):
         state = {
             "active": True, "target_branch": "main", "target_revision": "b" * 40,

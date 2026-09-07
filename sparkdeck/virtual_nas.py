@@ -753,16 +753,20 @@ class VirtualNAS:
         self._dispatcher = asyncio.create_task(self._dispatch_loop())
         self._wake.set()
 
-    async def stop(self) -> None:
+    async def stop_dispatcher(self) -> None:
+        """Stop admitting queued work before application teardown begins."""
         dispatcher = self._dispatcher
         self._dispatcher = None
         if dispatcher and not dispatcher.done():
             dispatcher.cancel()
+        if dispatcher:
+            await asyncio.gather(dispatcher, return_exceptions=True)
+
+    async def stop(self) -> None:
+        await self.stop_dispatcher()
         active = list(self._active.values())
         for task in active:
             task.cancel()
-        if dispatcher:
-            await asyncio.gather(dispatcher, return_exceptions=True)
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()

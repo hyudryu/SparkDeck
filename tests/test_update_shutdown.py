@@ -25,6 +25,7 @@ class UpdateShutdownTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.service.close()
+        await self.nas.stop()
         self.temp.cleanup()
 
     async def test_shutdown_cancels_update_before_queue_teardown_unblocks_it(self):
@@ -32,6 +33,13 @@ class UpdateShutdownTests(unittest.IsolatedAsyncioTestCase):
         await self.service.start_local("main", "b" * 40)
         await asyncio.sleep(0)
         events = []
+        self.nas.jobs = [{
+            "id": "download", "kind": "download", "status": "queued",
+            "target_node_id": "local",
+        }]
+        self.nas._run_download = AsyncMock()
+        self.nas.start()
+        await asyncio.sleep(0)
 
         @asynccontextmanager
         async def session():
@@ -42,6 +50,12 @@ class UpdateShutdownTests(unittest.IsolatedAsyncioTestCase):
             self.nas._release_stream("org/model")
             await asyncio.sleep(0)
 
+        async def close_sparkdeck():
+            # Let the real dispatcher react to the updater releasing its guard.
+            # Teardown must not admit the queued download during this await.
+            await asyncio.sleep(0.01)
+            self.nas._run_download.assert_not_awaited()
+
         close_update = self.service.close
 
         async def stop_updater():
@@ -49,12 +63,13 @@ class UpdateShutdownTests(unittest.IsolatedAsyncioTestCase):
             events.append("updater")
 
         with patch.object(server, "updater", self.service), \
+                patch.object(server.manager, "virtual_nas", self.nas), \
                 patch.object(self.service, "close", side_effect=stop_updater), \
                 patch.object(server, "mcp_control", SimpleNamespace(
                     session_manager=SimpleNamespace(run=session))), \
                 patch.object(server.manager, "start", new=AsyncMock()), \
                 patch.object(server.manager, "stop", side_effect=stop_manager), \
-                patch.object(server.sparkdeck, "close", new=AsyncMock()), \
+                patch.object(server.sparkdeck, "close", side_effect=close_sparkdeck), \
                 patch.object(server, "community_upload_loop", side_effect=asyncio.Event().wait):
             async with server.lifespan(server.app):
                 pass
@@ -63,6 +78,8 @@ class UpdateShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.service._agent_task.done())
         self.assertEqual(self.service._read(self.service.agent_path)["phase"], "failed")
         self.assertFalse(self.nas._update_reserved)
+        self.assertIsNone(self.nas._dispatcher)
+        self.assertEqual(self.nas.jobs[0]["status"], "queued")
 
     async def test_shutdown_before_pending_task_starts_releases_reservation(self):
         self.nas._reserve_stream("org/model")

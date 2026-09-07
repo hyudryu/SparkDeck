@@ -884,6 +884,7 @@ class UpdateService:
 
     async def _run_cluster(self, state: dict) -> None:
         nas = getattr(self.manager, "virtual_nas", None)
+        reserved_transfers = False
         handed_to_local = False
         try:
             # Probe every node independently before mutating any of them. A node
@@ -917,10 +918,17 @@ class UpdateService:
                 node for node in state["nodes"]
                 if not node["local"] and node.get("phase") == "ready"
             ]
+            if not eligible_workers and not any(
+                node.get("local") and node.get("phase") == "ready"
+                for node in state["nodes"]
+            ):
+                self._finish_cluster_state(state)
+                return
             if nas is not None:
                 # The coordinator owns the full copy, including destination
                 # validation after the source stream has already closed.
                 nas.reserve_update()
+                reserved_transfers = True
                 self._cluster_update_reserved = True
                 state.update(
                     phase="pending_transfers",
@@ -1003,7 +1011,7 @@ class UpdateService:
             self._finish_cluster_state(state)
         finally:
             self._cluster_update_reserved = False
-            if nas is not None and not handed_to_local and not self._local_update_reserved:
+            if reserved_transfers and not handed_to_local and not self._local_update_reserved:
                 nas.end_update()
 
     async def preflight_local(self, branch: str, revision: str) -> dict:

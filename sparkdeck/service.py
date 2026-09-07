@@ -112,9 +112,7 @@ _LOCAL_ROUTING_KEYS = {
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-_COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
-_COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 _STREAM_OBSERVATION_QUEUE_SIZE = 256
 _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
@@ -436,6 +434,23 @@ class SparkDeckService:
             contextvars.ContextVar("sparkdeck_community_observation", default=None)
         )
         self._community_active_observations: dict[str, dict[str, Any]] = {}
+        # Callbacks invoked when community sharing is disabled so in-flight
+        # background work (e.g. startup synthetic probes) can be canceled
+        # promptly rather than waiting for the next polling tick.
+        self._consent_cancellers: list[Any] = []
+
+    def register_consent_canceller(self, canceller: Any) -> None:
+        """Register a callable invoked immediately when sharing is disabled."""
+        if canceller not in self._consent_cancellers:
+            self._consent_cancellers.append(canceller)
+
+    def _cancel_consent_work(self) -> None:
+        """Cancel background work that depends on active community consent."""
+        for canceller in list(self._consent_cancellers):
+            try:
+                canceller()
+            except Exception:
+                log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
         tasks = list(self._deployment_launch_tasks.values())
@@ -551,16 +566,23 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Serialize consent changes with benchmark queue mutations."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.set_community_consent, enabled, telemetry_cluster_id
             )
+            if not enabled:
+                # Cancel active synthetic startup probes immediately instead of
+                # waiting for the next polling tick.
+                self._cancel_consent_work()
+            return result
 
     async def revoke_community_membership(self) -> dict[str, Any]:
         """Disable sharing and forget a former controller's cluster identity."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.revoke_community_membership
             )
+            self._cancel_consent_work()
+            return result
 
     async def delete_benchmark(self, sample_id: str) -> bool:
         """Serialize deletion with queue mutations; the uploader re-reads the
@@ -6956,9 +6978,19 @@ class SparkDeckService:
                 finally:
                     self._community_observation_end(observation)
 
+    @staticmethod
+    def _startup_probe_kwargs(startup_benchmark: bool) -> dict[str, bool]:
+        """Only forward the probe marker when a startup benchmark is active.
+
+        Ordinary requests must keep an unchanged proxy signature (no extra
+        keyword) so downstream call sites and call assertions are unaffected.
+        """
+        return {"startup_benchmark": True} if startup_benchmark else {}
+
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any, *,
                                 caller_ip: str | None = None,
+                                startup_benchmark: bool = False,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
@@ -6995,6 +7027,7 @@ class SparkDeckService:
         ):
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
         base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
@@ -7041,6 +7074,7 @@ class SparkDeckService:
     async def _proxy_managed(self, deployment: dict[str, Any], body: dict[str, Any],
                              endpoint: str, cancel: Any, *,
                              caller_ip: str | None = None,
+                             startup_benchmark: bool = False,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
         requested_model = str(body.get("model") or deployment["alias"])
@@ -7064,14 +7098,14 @@ class SparkDeckService:
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
                 if endpoint == "chat/completions"
                 else await self.manager._vllm_completions(
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
             )
         )
@@ -7322,13 +7356,19 @@ class SparkDeckService:
                       completed_at: float | None = None) -> None:
         observation = self._community_observation.get()
         passive_observation = observation is not None
-        # Community sharing is the authority for passive inference telemetry.
-        # When it is off, do not even create a local sample row.
+        # Only the synthetic startup probe contributes automatic telemetry.
+        # Ordinary requests still track overlap, but never create sample rows.
         if passive_observation and (
-            not observation.get("enabled") or observation.get("contaminated")
+            not observation.get("startup_benchmark")
+            or not observation.get("enabled") or observation.get("contaminated")
             or not stream_timing_trusted
+            or getattr(self, "_startup_benchmark_busy", lambda: False)()
         ):
             return
+        if passive_observation and "manager_request_sequence" in observation:
+            expected = int(observation.get("manager_requests_expected", 1))
+            if getattr(self.manager, "_req_seq", 0) > observation["manager_request_sequence"] + expected:
+                return
         completed = time.monotonic() if completed_at is None else completed_at
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -7356,26 +7396,16 @@ class SparkDeckService:
         generation_tps = native_generation_tps or observed_generation_tps
         prompt_tps = native_prompt_tps or observed_prompt_tps
         public_model = _public_model_id(model)
-        measured_decode_seconds = (
-            generation_seconds
-            if first_token_at is not None
-            else (
-                output_tokens / native_generation_tps
-                if native_generation_tps and output_tokens else 0.0
-            )
-        )
-        passive_eligible = bool(
+        startup_eligible = bool(
             public_model != "local-model"
             and 0 < input_tokens < _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS
-            and output_tokens >= 32
-            and measured_decode_seconds >= _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS
+            and output_tokens == 200
+            and first_token_at is not None
+            and completed > first_token_at
             and generation_tps is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
             and tensor_parallel_size is not None
-            and self._community_sample_due(
-                public_model, quantization, tensor_parallel_size,
-            )
         )
         legacy_eligible = bool(
             public_model != "local-model" and input_tokens > 0
@@ -7385,13 +7415,16 @@ class SparkDeckService:
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
         )
-        eligible = passive_eligible if passive_observation else legacy_eligible
+        eligible = startup_eligible if passive_observation else legacy_eligible
         if passive_observation and not eligible:
             return
         # For community evidence this compatibility field represents observed
         # prompt occupancy, not the deployment's configured maximum context.
         if passive_observation:
             safe_settings["context_length"] = input_tokens
+            safe_settings["benchmark_concurrency"] = 1
+            safe_settings["benchmark_depth"] = 0
+            safe_settings["benchmark_source"] = "container_startup"
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
@@ -7418,49 +7451,14 @@ class SparkDeckService:
             consent = bool(self.store.get_setting("community_consent", False))
             self.store.add_benchmark(sample, queue=eligible and consent)
             return
-        inserted = self.store.add_benchmark_if_consented(
-            sample, int(observation.get("generation") or 0)
-        )
-        if inserted:
-            self.store.set_setting(
-                self._community_sample_setting(
-                    public_model, quantization, tensor_parallel_size,
-                ),
-                datetime.now(timezone.utc).isoformat(),
-            )
-
-    @staticmethod
-    def _community_sample_setting(
-        model: str, quantization: str, tensor_parallel_size: int = 1,
-    ) -> str:
-        quantization = canonical_quantization(quantization) or "UNKNOWN"
-        digest = hashlib.sha256(
-            (
-                f"{model.casefold()}\0{quantization.casefold()}"
-                f"\0tp:{tensor_parallel_size}"
-            ).encode("utf-8")
-        ).hexdigest()
-        return f"community_sampled_at:{digest}"
-
-    def _community_sample_due(
-        self, model: str, quantization: str, tensor_parallel_size: int = 1,
-    ) -> bool:
-        value = self.store.get_setting(
-            self._community_sample_setting(
-                model, quantization, tensor_parallel_size,
-            ), None
-        )
-        if not isinstance(value, str):
-            return True
-        try:
-            sampled_at = datetime.fromisoformat(value)
-            if sampled_at.tzinfo is None:
-                sampled_at = sampled_at.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return True
-        return (
-            datetime.now(timezone.utc) - sampled_at
-        ).total_seconds() >= _COMMUNITY_SAMPLE_INTERVAL_SECONDS
+        seen_key = observation.get("seen_key")
+        if self.store.add_benchmark_if_consented(
+            sample, int(observation.get("generation") or 0),
+            extra_settings={seen_key: True} if seen_key else None,
+        ):
+            # Only an actually-persisted sample confirms a successful startup
+            # probe; the seen marker is committed in the same transaction.
+            observation["startup_recorded"] = True
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
         _, runtime, _ = await self._legacy_model_identity(model)

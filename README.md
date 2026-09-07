@@ -37,27 +37,27 @@ _Node CPU/GPU temperature, unified memory, sessions, and current inference speed
 <details>
 <summary><strong>Opt-in community performance sharing</strong></summary>
 
-> Optionally opt in to shared community results for inference speeds to see expected performance on your hardware.
+> Optionally opt in to shared community results for inference speeds, to compare against evidence from comparable model configurations.
 
 ![Community Run Models throughput and cluster-fit evidence](docs/screenshots/readme/feature-community-speeds.png)
 
-_Community throughput and sharded cluster-fit evidence, matched by model ID and size. Illustrative demo data; estimates are evidence, not guarantees._
+_Community throughput and per-node/replicated cluster-fit evidence, matched by model ID, quantization, prompt-length bucket, and tensor-parallel size. Illustrative demo data; estimates are evidence, not guarantees._
 </details>
 
 <details>
 <summary><strong>Multi-group routing with load balancing</strong></summary>
 
-> Route across multiple model groups with automatic load balancing, keeping sessions cache-friendly so repeated context is reused and throughput stays high.
+> Route across multiple model groups with automatic load balancing, and guide cache-friendly session placement to improve the likelihood that repeated context is reused and throughput stays high.
 
-![Detailed routing accounting with aliases and merge groups](docs/screenshots/readme/feature-routing.png)
+![Deployment table with target nodes and launch recipes for grouped engines](docs/screenshots/readme/feature-routing.png)
 
-_Detailed accounting showing aliases, merge groups, input-miss vs cache-hit, and average speed per model. Illustrative demo data._
+_Deployments grouped by runtime and target node, plus launch recipes for choosing node groups when deploying. Illustrative demo data._
 </details>
 
 <details>
 <summary><strong>Virtual NAS for fast weight transfers</strong></summary>
 
-> Quickly transfer model weights between nodes over the fabric (e.g. a 4 TB Spark + 1 TB GX10, or when you have a NAS) without re-downloading.
+> Quickly transfer model weights between nodes, using a configured fabric when one is set up (e.g. a 4 TB Spark + 1 TB GX10, or when you have a NAS), without re-downloading.
 
 ![Virtual NAS node storage and queue a transfer](docs/screenshots/readme/feature-virtual-nas.png)
 

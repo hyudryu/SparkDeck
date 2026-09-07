@@ -357,6 +357,8 @@ async def lifespan(app: FastAPI):
         finally:
             uploader.cancel()
             deployment_logs.cancel()
+            await manager.virtual_nas.stop_dispatcher()
+            await updater.close()
             await asyncio.gather(deployment_logs, return_exceptions=True)
             await sparkdeck.close()
             await manager.stop()

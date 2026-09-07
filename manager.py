@@ -2530,17 +2530,20 @@ class Manager:
         # value) so the agent downloads as the same HF account the
         # controller used to resolve the revision, instead of falling back
         # to whatever worker-local token exists.
-        return await self.node_registry.request(
-            node_id, "POST",
-            f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
-            json_body={
-                "revision": revision,
-                "requested_revision": requested_revision or revision,
-                "hf_token": self._resolved_hf_token() or "",
-                "files": list(filenames),
-            },
-            timeout=24 * 60 * 60,
-        )
+        # Track controller-dispatched downloads even when the destination
+        # still runs an older agent without its own update admission guard.
+        with self.virtual_nas.transfer_operation(model_id):
+            return await self.virtual_nas._await_uncancelable(self.node_registry.request(
+                node_id, "POST",
+                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
+                json_body={
+                    "revision": revision,
+                    "requested_revision": requested_revision or revision,
+                    "hf_token": self._resolved_hf_token() or "",
+                    "files": list(filenames),
+                },
+                timeout=24 * 60 * 60,
+            ))
 
     async def node_transfer_model_files(
         self, source_node_id: str, target_node_id: str,

@@ -1264,11 +1264,23 @@ class SparkDeckService:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
         if observe_events:
-            self._observe_deployment_events(registered, inventory_complete=not docker_unavailable)
+            runtime_deployments = {
+                str(item["id"]): (
+                    cluster_by_id.get((item.get("settings") or {}).get("manager_deployment_id"))
+                    or cluster_by_record.get(item["id"])
+                    or cluster_by_container.get(item.get("container_name"))
+                    or {}
+                ) for item in registered
+            }
+            self._observe_deployment_events(
+                registered, inventory_complete=not docker_unavailable,
+                runtime_deployments=runtime_deployments,
+            )
         return registered
 
     def _observe_deployment_events(
         self, deployments: list[dict[str, Any]], *, inventory_complete: bool = False,
+        runtime_deployments: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Log actual lifecycle changes once, including independent engine groups.
 
@@ -1299,6 +1311,19 @@ class SparkDeckService:
                 continue
             label = str(deployment.get("alias") or deployment.get("name") or deployment_id)
             groups = deployment.get("instances") or [deployment]
+            if deployment.get("instances"):
+                # Recovery/action failures belong to the deployment, including
+                # degraded layouts whose healthy groups keep serving.
+                parent_error = str(deployment.get("last_error") or deployment.get("error") or "")
+                parent_key = (deployment_id, None)
+                if deployment.get("status") == "running":
+                    parent_error = ""
+                if parent_error and errors.get(parent_key) != parent_error:
+                    event_logger.error("Deployment %s error: %s", label, parent_error)
+                if parent_error:
+                    errors[parent_key] = parent_error
+                else:
+                    errors.pop(parent_key, None)
             for group in groups:
                 instance = group.get("instance_id")
                 key = (deployment_id, instance)
@@ -1324,11 +1349,28 @@ class SparkDeckService:
                     else:
                         errors.pop(key, None)
                     continue
-                errors.pop(key, None)
-                # Old persisted error details must not make healthy polls noisy.
-                if status != "error":
+                # Error details on degraded/recovering states are actionable;
+                # only healthy rows can carry irrelevant persisted errors.
+                if status == "running":
                     error = ""
                 previous = states.get(key)
+                runtime = (runtime_deployments or {}).get(deployment_id) or {}
+                process_lost = _deployment_process_lost(runtime, instance)
+                if status != "running" and process_lost and previous and previous[0] == "running":
+                    message = f"Deployment {name} crashed"
+                    if error:
+                        message += f": {error}"
+                    event_logger.error(message, extra={"deployment_event": "crashed"})
+                    states[key] = ("crashed", error)
+                    if error:
+                        errors[key] = error
+                    continue
+                if error and status != "error" and errors.get(key) != error:
+                    event_logger.error("Deployment %s error: %s", name, error)
+                if error:
+                    errors[key] = error
+                else:
+                    errors.pop(key, None)
                 # Readiness probes and partial group availability can wobble
                 # without the process exiting. Only a terminal state ends a
                 # launch; recovery from these probes is not another launch.
@@ -7606,6 +7648,30 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy"):
         return "error"
     return "unknown"
+
+
+def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Distinguish confirmed rank loss/health recovery from readiness or outages."""
+    if cluster.get("desired_state") == "stopped" or cluster.get("status") in {"stopped", "stopping"}:
+        return False
+    members = [
+        member for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    ]
+    expected = [member for member in members if member.get("desired_state") != "stopped"]
+    if any(member.get("status") in {"exited", "dead", "removed", "missing", "error"}
+           for member in expected):
+        return True
+    # Startup reconnects and environment migrations also use recovering. Only
+    # the health recovery path proves a broken generation. For grouped layouts
+    # require evidence in that group so healthy siblings never emit crashes.
+    if cluster.get("status") == "recovering" and cluster.get("health_issue"):
+        return instance is None or any(
+            member.get("status") in {"starting", "restarting", "stopped"}
+            for member in expected
+        )
+    return False
 
 
 def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:

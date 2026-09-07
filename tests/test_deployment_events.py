@@ -161,3 +161,129 @@ def test_removed_deployment_is_retired_only_after_confirmed_inventory(caplog):
     assert [record.deployment_event for record in events(caplog)] == [
         "launched", "stopped", "launched",
     ]
+
+
+def test_degraded_recovery_errors_are_reported_once_and_reset_when_healthy(caplog):
+    caplog.set_level(logging.INFO)
+    service = observer()
+    for status, error in [
+        ("running", ""), ("degraded", "Automatic recovery could not stop every rank"),
+        ("degraded", "Automatic recovery could not stop every rank"),
+        ("degraded", "Automatic recovery failed to start every rank"),
+        ("running", "Automatic recovery failed to start every rank"),
+        ("degraded", "Automatic recovery failed to start every rank"),
+    ]:
+        service._observe_deployment_events([deployment(status, last_error=error)])
+    records = events(caplog)
+    assert len(records) == 4
+    assert records[0].deployment_event == "launched"
+    assert all(record.levelno == logging.ERROR for record in records[1:])
+
+
+def test_grouped_parent_error_is_reported_even_while_groups_keep_serving(caplog):
+    caplog.set_level(logging.INFO)
+    service = observer()
+    groups = [{"instance_id": 0, "status": "running"}, {"instance_id": 1, "status": "starting"}]
+    row = deployment("degraded", instances=groups, last_error="Automatic recovery failed")
+    service._observe_deployment_events([row])
+    service._observe_deployment_events([row])
+    errors = [record for record in events(caplog) if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].getMessage() == "Deployment My model error: Automatic recovery failed"
+
+
+def test_health_recovery_ends_generation_and_success_announces_new_launch(caplog):
+    from sparkdeck.service import _deployment_status
+
+    caplog.set_level(logging.INFO)
+    service = observer()
+    for raw_status in ["ready", "recovering", "recovering", "starting", "ready"]:
+        runtime = {"status": raw_status, "desired_state": "running", "health_issue": "rank 1 exited"}
+        service._observe_deployment_events(
+            [deployment(_deployment_status(raw_status))],
+            runtime_deployments={"model-1": runtime},
+        )
+    assert [record.deployment_event for record in events(caplog)] == ["launched", "crashed", "launched"]
+
+
+def test_group_rank_loss_reports_only_affected_engine_and_relaunch(caplog):
+    from sparkdeck.service import _grouped_instance_summary
+
+    caplog.set_level(logging.INFO)
+    service = observer()
+    for rank_status in ["running", "missing", "missing", "running"]:
+        cluster = {
+            "status": "degraded" if rank_status == "missing" else "running",
+            "desired_state": "running",
+            "members": [
+                {"instance_id": group, "rank": rank, "desired_state": "running",
+                 "status": rank_status if group == 1 and rank == 1 else "running",
+                 "phase": {"phase": "ready"}}
+                for group in (0, 1) for rank in (0, 1)
+            ],
+        }
+        service._observe_deployment_events(
+            [deployment(cluster["status"], instances=_grouped_instance_summary(cluster))],
+            runtime_deployments={"model-1": cluster},
+        )
+    records = events(caplog)
+    assert [record.deployment_event for record in records] == ["launched", "launched", "crashed", "launched"]
+    assert all("engine group 1" in record.getMessage() for record in records[2:])
+
+
+@pytest.mark.parametrize("reason", ["readiness", "unreachable", "intentional_stop", "startup_recovery"])
+def test_readiness_outage_and_intentional_stop_do_not_invent_crashes(caplog, reason):
+    from sparkdeck.service import _grouped_instance_summary
+
+    caplog.set_level(logging.INFO)
+    service = observer()
+    member = {"instance_id": 0, "rank": 0, "status": "running", "phase": {"phase": "ready"}}
+    cluster = {"status": "running", "members": [member]}
+    service._observe_deployment_events([deployment("running", instances=_grouped_instance_summary(cluster))])
+    if reason == "readiness":
+        member["phase"] = {"phase": "starting"}
+    elif reason == "unreachable":
+        member["status"] = "unreachable"
+    elif reason == "intentional_stop":
+        member.update(status="exited", desired_state="stopped")
+    else:
+        cluster["status"] = "recovering"
+        member["status"] = "starting"
+    service._observe_deployment_events(
+        [deployment("degraded", instances=_grouped_instance_summary(cluster))],
+        runtime_deployments={"model-1": cluster},
+    )
+    assert all(record.deployment_event != "crashed" for record in events(caplog))
+
+
+def test_inventory_passes_raw_recovery_evidence_to_observer(caplog):
+    from unittest.mock import AsyncMock
+
+    caplog.set_level(logging.INFO)
+
+    async def scenario():
+        service = observer()
+        service.store = Mock()
+        service.registry = SimpleNamespace(kinds=[])
+        service._probe_external_endpoint = AsyncMock()
+        service._adopt_unlinked_manager_deployments = AsyncMock(side_effect=lambda *args, **kwargs: [
+            deployment("running", kind="managed", desired_state="running",
+                       settings={"manager_deployment_id": "cluster-1"}),
+        ])
+        runtime = {"id": "cluster-1", "sparkdeck_record_id": "model-1",
+                   "desired_state": "running", "status": "ready"}
+        service.manager = SimpleNamespace(
+            deployments=[runtime],
+            get_state=AsyncMock(side_effect=lambda: {
+                "deployments": [runtime], "docker_ready": True, "containers": [],
+            }),
+            cluster_nodes=AsyncMock(return_value=[]),
+        )
+        await service.deployments(observe_events=True)
+        runtime.update(status="recovering", health_issue="rank 1 exited")
+        await service.deployments(observe_events=True)
+        runtime.update(status="ready", health_issue=None)
+        await service.deployments(observe_events=True)
+
+    asyncio.run(scenario())
+    assert [record.deployment_event for record in events(caplog)] == ["launched", "crashed", "launched"]

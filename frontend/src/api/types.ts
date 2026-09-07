@@ -658,6 +658,7 @@ export interface SystemUpdateNode {
   local: boolean
   online: boolean
   current_revision?: string
+  commits_behind?: number | null
   phase?: string
   error?: string
   blockers: string[]

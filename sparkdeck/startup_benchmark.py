@@ -267,6 +267,9 @@ class StartupBenchmarkMonitor:
                 if recorded:
                     self._retry_after.pop(target.fingerprint, None)
                     self._retry_attempts.pop(target.fingerprint, None)
+                    self.service.store.set_setting(
+                        self._retry_key(target.fingerprint), None,
+                    )
                 else:
                     # No eligible sample was recorded. Back off this fingerprint
                     # so the synthetic probe is not retried on every poll.

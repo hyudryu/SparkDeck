@@ -347,6 +347,9 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.monitor._benchmark = AsyncMock(return_value=True)
         await self.monitor._attempt(self.target, dict(self.snapshot))
         self.assertNotIn(self.target.fingerprint, self.monitor._retry_after)
+        self.assertIsNone(self.service.store.get_setting(
+            self.monitor._retry_key(self.target.fingerprint),
+        ))
 
     async def test_failed_probe_persists_backoff_across_monitor_restart(self):
         self.monitor._healthy = AsyncMock(return_value=True)

@@ -1984,7 +1984,9 @@ describe('model deployments', () => {
     await user.click(await screen.findByRole('button', { name: 'Start' }))
 
     const dialog = await screen.findByRole('dialog', { name: 'Start Sharded model' })
-    expect(dialog).toHaveTextContent('TP2 requires exactly 2 nodes')
+    expect(dialog).toHaveTextContent(
+      'TP2 uses 2 GPU ranks and can run on exactly 2 nodes',
+    )
     // Exactly two nodes hold complete weights, so both start selected; a
     // partial cache entry does not count as usable weights.
     expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()

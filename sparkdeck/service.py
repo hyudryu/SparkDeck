@@ -7832,7 +7832,9 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             "node_names": [],
             "node_ids": [],
             "primary_ready": False,
+            "has_live_containers": False,
         })
+        entry["has_live_containers"] |= member.get("has_live_container") is True
         if member.get("node_id"):
             entry["node_ids"].append(str(member["node_id"]))
         entry["node_names"].append(

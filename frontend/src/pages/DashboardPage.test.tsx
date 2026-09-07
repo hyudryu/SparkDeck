@@ -95,6 +95,50 @@ describe('DashboardPage', () => {
     expect(screen.getByText('Group 2 · Node 1 + Node 2')).toBeInTheDocument()
   })
 
+  it('shows a still-running group with stopped intent despite a deployment error', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Failed stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'error', desired_state: 'stopped', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'running', desired_state: 'stopped', has_live_containers: true },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'stopped', desired_state: 'stopped' },
+        ],
+      }, {
+        id: 'stopped', alias: 'Stopped model', model: { repository: 'org/other' }, runtime: 'vllm', kind: 'managed',
+        status: 'stopped', settings: {},
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Failed stop')).toBeInTheDocument()
+    expect(screen.getByText('Group 1 · Node 3 + Node 4')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.getByText('Deployment status: error')).toBeInTheDocument()
+    expect(screen.getByText('1 of 2 deployments active')).toBeInTheDocument()
+    expect(screen.queryByText('Group 2 · Node 1 + Node 2')).not.toBeInTheDocument()
+    expect(screen.queryByText('Stopped model')).not.toBeInTheDocument()
+  })
+
+  it.each([false, undefined])('hides rolled-back groups without live inventory confirmation (%s)', async (hasLiveContainers) => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Failed launch', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'error', desired_state: 'running', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'starting', desired_state: 'running', has_live_containers: hasLiveContainers },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'running', desired_state: 'running', has_live_containers: hasLiveContainers },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('0 of 1 deployments active')).toBeInTheDocument()
+    expect(screen.queryByText('Failed launch')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Group 1/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Group 2/)).not.toBeInTheDocument()
+  })
+
   it('shows running models and inference separately for each engine group', async () => {
     const groups = [
       { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'running', desired_state: 'running' },

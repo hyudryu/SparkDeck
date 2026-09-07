@@ -1209,6 +1209,7 @@ class Manager:
             stats = await self.get_stats()
         disk = await self.get_disk()
         docker_ready, docker_status_message = await self._docker_runtime_status()
+        inventory_available = True
         try:
             if containers is None:
                 containers = await self.list_containers()
@@ -1228,6 +1229,7 @@ class Manager:
             ]
         except Exception:
             containers = []
+            inventory_available = False
         existing_names = {c.get("name") for c in containers}
         # Launch updates can arrive from a Docker worker thread while the
         # status endpoint is being serialized.
@@ -1270,6 +1272,7 @@ class Manager:
             "stats": stats,
             "disk": disk,
             "containers": containers,
+            "inventory_available": inventory_available,
             "llama_rpc": self.llama_rpc_status(),
         }
 
@@ -8718,7 +8721,97 @@ class Manager:
             + (deployment.get("error") or "split instance(s) restarted")
         )
 
+    async def _reconcile_stopped_members(self) -> None:
+        """Finish explicit stops when workers return, including failed stops.
+
+        Stop intent must survive an unreachable agent and Docker restarting
+        its containers. Serialize with Start and inspect intent under the lock
+        so a delayed reconciliation cannot undo a newer lifecycle action.
+        """
+        async with self._cluster_action_lock():
+            candidates = [
+                deployment for deployment in self.deployments
+                if deployment.get("members") and (
+                    deployment.get("desired_state") == "stopped"
+                    or (deployment.get("mode") == "grouped_sharded" and any(
+                        member.get("desired_state") == "stopped"
+                        for member in deployment["members"]
+                    )))
+            ]
+            if not candidates:
+                return
+            nodes = {node["id"]: node for node in await self.cluster_nodes()}
+            for deployment in candidates:
+                previous = copy.deepcopy(deployment)
+                previous_stop_error = "; ".join(dict.fromkeys(
+                    str(member["failed_stop_error"]) for member in deployment["members"]
+                    if member.get("failed_stop_error")
+                ))
+                whole_stop = deployment.get("desired_state") == "stopped"
+                selected = [member for member in deployment["members"]
+                            if whole_stop or member.get("desired_state") == "stopped"]
+                pending = []
+                confirmed = []
+                for member in selected:
+                    node = nodes.get(member.get("node_id"), {})
+                    if (not node.get("online") or not node.get("docker_ready")
+                            or not isinstance(node.get("containers"), list)):
+                        continue
+                    container = next((item for item in node.get("containers") or []
+                                      if item.get("name") == member.get("container_name")), None)
+                    if node.get("inventory_available") is False:
+                        continue
+                    if container is None and node.get("inventory_available") is not True:
+                        # Older agents can synthesize an empty inventory after
+                        # enumeration fails; absence needs explicit confirmation.
+                        continue
+                    if container is None:
+                        confirmed.append(member)
+                    elif (container.get("status") in {"created", "exited", "stopped", "dead"}
+                          and not member.get("failed_stop_error")):
+                        confirmed.append(member)
+                    else:
+                        # Reissue even for an exited container after a failed
+                        # stop: explicit stop also disarms its restart policy.
+                        pending.append(member)
+                results = await asyncio.gather(*(
+                    self._member_action(member, "stop") for member in pending
+                ), return_exceptions=True)
+                for member, result in zip(pending, results):
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                    errors = self._member_action_errors([result], "stop")
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        errors.append(str(result.get("error") or result.get("errors") or "Stop failed"))
+                    if errors:
+                        member["failed_stop_error"] = "; ".join(errors)
+                    else:
+                        confirmed.append(member)
+                for member in confirmed:
+                    member["status"] = "stopped"
+                    member["phase"] = {"phase": "stopped"}
+                    member.pop("failed_stop_error", None)
+                # Offline/unknown inventories never count as confirmation.
+                # Preserve their reservation and retry on the next health tick.
+                if whole_stop and len(confirmed) == len(selected):
+                    deployment["status"] = "stopped"
+                    deployment["error"] = None
+                    deployment.pop("status_message", None)
+                elif any(member.get("failed_stop_error") for member in selected):
+                    deployment["error"] = "; ".join(dict.fromkeys(
+                        str(member["failed_stop_error"]) for member in selected
+                        if member.get("failed_stop_error")
+                    ))
+                elif (len(confirmed) == len(selected) and previous_stop_error
+                      and deployment.get("error") == previous_stop_error):
+                    deployment["error"] = None
+                    if deployment.get("status") == "degraded":
+                        deployment["status"] = self._grouped_deployment_status(deployment)
+                if deployment != previous:
+                    self._save_deployments()
+
     async def _cluster_health_tick(self) -> None:
+        await self._reconcile_stopped_members()
         candidates = [
             deployment for deployment in list(self.deployments)
             if len(deployment.get("members") or []) >= 2
@@ -19388,6 +19481,10 @@ class Manager:
         # it would perform the same Docker container scan a second time for
         # every deployment snapshot.
         nodes = await self.cluster_nodes(stats, containers)
+        if containers_unavailable:
+            for node in nodes:
+                if node.get("local") or node.get("id") == LOCAL_NODE_ID:
+                    node["inventory_available"] = False
         local_docker_ready = next(
             (
                 bool(node.get("docker_ready"))
@@ -19419,6 +19516,11 @@ class Manager:
                 container = containers_by_node.get(member.get("node_id"), {}).get(
                     member.get("container_name")
                 )
+                member["has_live_container"] = bool(
+                    node.get("online") and node.get("docker_ready")
+                    and node.get("inventory_available") is True
+                    and container and container.get("status") in {"running", "restarting", "paused"}
+                )
                 if not node.get("online"):
                     # Offline nodes are treated as stopped for public runtime
                     # state; retain node connectivity separately from intent.
@@ -19438,6 +19540,11 @@ class Manager:
                                 "is offline; container is assumed stopped"
                             ),
                         }
+                elif node.get("inventory_available") is False:
+                    member["status"] = "unknown"
+                    member["status_message"] = "Container inventory is unavailable"
+                    member["phase"] = {"phase": "unknown", "message": member["status_message"]}
+                    member_inventory_unknown = True
                 elif container:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")

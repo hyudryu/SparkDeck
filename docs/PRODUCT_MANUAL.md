@@ -42,6 +42,23 @@ For a first installation, start with the [two-node QuickStart](../QUICKSTART.md)
 - **Node-targeted work:** downloads, image pulls, deployments, and model-weight transfers are assigned to explicit nodes.
 - **Local-first data:** operational state, settings, credentials, prompts, responses, and detailed benchmark history stay on the systems you control. Community sharing is optional and separately disclosed.
 
+### Automatic conversation routing
+
+For replicated and grouped-sharded deployments, SparkDeck automatically prefers
+the engine group that successfully handled an earlier matching conversation
+prefix. OpenAI-compatible chat harnesses do not need to send a session ID.
+New conversations use load balancing; shared system instructions, AGENTS.md,
+and tool definitions alone do not establish affinity. Later turns must extend
+a complete previously served prompt and contain assistant history. Tool and
+leading-message changes invalidate the match rather than imply a cache hit.
+
+Affinity yields when the preferred group has more than two additional active
+requests compared with the least-loaded group, and normal failover remains in
+effect. Hints contain hashes, expire after 30 minutes of inactivity, and reset
+on controller restart or tracked deployment changes. They predict cache
+locality, not guaranteed engine cache residency. Plain text completions and
+requests without usable conversation history retain ordinary load balancing.
+
 ## Dashboard
 
 The Dashboard is the cluster command center. It summarizes the current entry node and every paired node without combining per-machine telemetry into misleading cluster totals.

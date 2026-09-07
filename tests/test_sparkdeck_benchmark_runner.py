@@ -613,8 +613,11 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
+        observation = {"startup_benchmark": True, "contaminated": False}
+        service.sparkdeck._community_active_observations = {"probe": observation}
 
         async def fake_spawn(run):
+            self.assertTrue(observation["contaminated"])
             run.pop("_argv")
             run_dir = Path(run["_run_dir"])
             (run_dir / "report.json").write_text(

@@ -500,6 +500,34 @@ class SparkDeckStoreTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertIn("community_tensor_parallel_size", index_sql)
 
+    def test_add_benchmark_if_consented_commits_extra_settings_atomically(self):
+        self.store.set_setting("device_pairing", {"status": "paired"})
+        consent = self.store.set_community_consent(True)
+        sample = BenchmarkSample(
+            id="startup-boot", created_at="2026-09-01T00:00:00+00:00",
+            deployment_id="deployment", model=ModelIdentity("org/model"),
+            runtime=RuntimeKind.VLLM, runtime_version=None,
+            hardware={}, configuration={}, input_tokens=20, output_tokens=200,
+            latency_ms=1000, ttft_ms=100,
+            generation_tokens_per_second=30,
+            prompt_tokens_per_second=None, cold_start=False,
+            eligible_for_community=True,
+        )
+        seen_key = "community_startup_benchmark:boot"
+        self.assertTrue(self.store.add_benchmark_if_consented(
+            sample, consent["generation"], extra_settings={seen_key: True},
+        ))
+        # Both the sample and the extra setting committed in one transaction.
+        self.assertEqual(self.store.benchmarks()[1], 1)
+        self.assertTrue(self.store.get_setting(seen_key))
+        # A write rejected by the consent snapshot leaves the extra settings
+        # untouched, so no orphaned seen marker is committed.
+        self.assertFalse(self.store.add_benchmark_if_consented(
+            replace(sample, id="startup-boot-2"), consent["generation"] + 1,
+            extra_settings={"community_startup_benchmark:boot2": True},
+        ))
+        self.assertIsNone(self.store.get_setting("community_startup_benchmark:boot2"))
+
     def test_migration_discards_ownerless_legacy_upload_instructions(self):
         self.store.set_setting("device_pairing", {"status": "paired"})
         consent = self.store.set_community_consent(True)

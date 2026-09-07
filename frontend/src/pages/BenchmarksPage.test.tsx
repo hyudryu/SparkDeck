@@ -154,9 +154,9 @@ describe('BenchmarksPage community privacy', () => {
     expect(within(modelBDialog).queryByText('4K context')).not.toBeInTheDocument()
   })
 
-  it('discloses the exact shared fields and renders only contract-safe estimates', async () => {
-    let consent = false
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+  it('renders contract-safe estimates without duplicate sharing controls', async () => {
+    const consent = true
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
       let body: unknown
       if (path.includes('/api/v1/benchmark-history/models')) body = { items: [] }
@@ -174,14 +174,10 @@ describe('BenchmarksPage community privacy', () => {
         availability: 'available',
         evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
       }
-      else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
-        consent = (JSON.parse(String(init.body)) as { enabled: boolean }).enabled
-        body = {}
-      } else body = { consent, pairing: { status: 'paired' }, upload_configured: true, outbox: { pending: 0, synced: 2 } }
+      else body = { consent, pairing: { status: 'paired' }, upload_configured: true, outbox: { pending: 0, synced: 2 } }
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
-    const user = userEvent.setup()
     render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
 
     expect(await screen.findByText('42.5 tok/s')).toBeInTheDocument()
@@ -197,18 +193,9 @@ describe('BenchmarksPage community privacy', () => {
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Review & enable' }))
-    const dialog = screen.getByRole('dialog', { name: 'Enable community sharing?' })
-    expect(dialog).toHaveTextContent('Benchmark JSON: canonical model identifier, quantization, tensor-parallel (TP) size, prompt-length/context-occupancy bucket, measured inference tok/s')
-    expect(dialog).toHaveTextContent('only samples captured after you enable sharing can be uploaded; existing benchmark history stays local')
-    expect(dialog).toHaveTextContent('stable opaque telemetry cluster ID')
-    expect(dialog).toHaveTextContent('contains no account ID, hostname, node name, or endpoint alias')
-    expect(dialog).toHaveTextContent('Never in benchmark JSON: prompts or outputs')
-    expect(dialog).toHaveTextContent('at most one average per TP setting')
-    expect(dialog).toHaveTextContent('ordinary authenticated request and network metadata')
-    await user.click(within(dialog).getByRole('button', { name: /I understand, enable sharing/ }))
-    expect(await screen.findByText('Sharing enabled')).toBeInTheDocument()
-    expect(communityAccess.reload).toHaveBeenCalled()
+    expect(screen.queryByRole('heading', { name: 'Community sharing' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Review & enable' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Enable community sharing?' })).not.toBeInTheDocument()
   })
 
   it('refreshes model summaries and local aggregates after deleting a contributing benchmark', async () => {
@@ -295,9 +282,9 @@ describe('BenchmarksPage community privacy', () => {
 
     expect(await screen.findByText('Community estimates are locked')).toBeInTheDocument()
     expect(screen.getByText('Enable telemetry under Settings → Community Features to see community data.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Review sharing' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
     expect(screen.queryByText('42.5 tok/s')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Review & enable' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Review & enable' })).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([input]) => (
       String(input).endsWith('/api/v1/community/aggregates')
     ))).toBe(false)
@@ -337,49 +324,4 @@ describe('BenchmarksPage community privacy', () => {
     expect(within(history).getAllByText('—').length).toBeGreaterThanOrEqual(2)
   })
 
-  it('surfaces failed worker consent withdrawal and lets the user retry it', async () => {
-    let consent = true
-    let withdrawalAttempts = 0
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
-      const path = String(input)
-      let body: unknown
-      if (path.includes('/api/v1/benchmark-history/models')) {
-        body = { items: [], total: 0, limit: 100, offset: 0 }
-      } else if (path.endsWith('/api/v1/community/aggregates')) {
-        body = {
-          items: [], availability: 'available',
-          evidence_policy: { minimum_samples: 10, exact_match_dimensions: [], metric: 'inference_tokens_per_second' },
-        }
-      } else if (path.endsWith('/api/v1/community/consent') && init?.method === 'PUT') {
-        consent = false
-        withdrawalAttempts += 1
-        body = {
-          cluster: {
-            applied: ['Spark Two'], conflicts: [],
-            errors: withdrawalAttempts === 1 ? ['Spark Three: unreachable'] : [],
-          },
-        }
-      } else {
-        body = {
-          consent, pairing: { status: 'paired' }, upload_configured: true,
-          outbox: { pending: 0, synced: 0, failed: 0 },
-        }
-      }
-      return new Response(JSON.stringify(body), {
-        status: 200, headers: { 'Content-Type': 'application/json' },
-      })
-    }))
-    const user = userEvent.setup()
-
-    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
-    await user.click(await screen.findByRole('button', { name: 'Turn off' }))
-
-    expect(await screen.findByText('Sharing off')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('Spark Three: unreachable')
-    const retry = screen.getByRole('button', { name: 'Retry turn off everywhere' })
-    await user.click(retry)
-
-    expect(withdrawalAttempts).toBe(2)
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-  })
 })

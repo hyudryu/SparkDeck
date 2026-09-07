@@ -329,6 +329,11 @@ class BenchmarkRunnerService:
                 f"model {config['model_id']} is not currently served; load it first"
             )
 
+        # Local Benchy can use the runtime port directly. Invalidate startup
+        # probes before launching it so that overlap cannot become C1 evidence.
+        for observation in getattr(self.sparkdeck, "_community_active_observations", {}).values():
+            observation["contaminated"] = True
+
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)

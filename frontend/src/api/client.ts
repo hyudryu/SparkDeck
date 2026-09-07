@@ -361,6 +361,7 @@ export interface WireDeployment {
   instances?: Deployment['instances']
   required_node_count?: number
   instance_node_count?: number
+  occupied_node_ids?: string[]
   parallel_rank_count?: number
   flexible_node_count?: boolean
   single_host_topology_replayable?: boolean
@@ -442,6 +443,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     instances: item.instances,
     required_node_count: item.required_node_count,
     instance_node_count: item.instance_node_count,
+    occupied_node_ids: item.occupied_node_ids,
     parallel_rank_count: item.parallel_rank_count,
     flexible_node_count: item.flexible_node_count,
     single_host_topology_replayable: item.single_host_topology_replayable,

@@ -19,6 +19,7 @@ function shortRevision(value?: string) {
 function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
   const error = node.error || node.blockers?.join('; ')
   if (error) return { color: 'error', label: error }
+  if (node.phase === 'pending_transfers') return { color: 'starting', label: 'Waiting for transfers' }
   const latest = Boolean(targetRevision && node.current_revision?.toLowerCase() === targetRevision.toLowerCase())
   if (latest) return { color: 'running', label: 'Latest' }
   if (node.phase === 'succeeded') return { color: 'running', label: 'Succeeded' }
@@ -84,6 +85,8 @@ function SoftwareUpdatePanel() {
   const nodes = data?.job?.nodes ?? data?.nodes ?? []
   const targetRevision = data?.target?.revision
   const upToDate = Boolean(data?.up_to_date)
+  const waitingForTransfers = active && data?.job?.phase === 'pending_transfers'
+  const updateMessage = data?.job?.message || (waitingForTransfers ? 'Waiting for model transfers to finish before updating. Both source and destination nodes are protected.' : undefined)
   return (
     <><Panel id="software-update" className="settings-section software-update-section">
       <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every eligible cluster node to the latest commit on the main branch. Nodes that cannot update are reported and skipped.</p></div></div>
@@ -97,9 +100,9 @@ function SoftwareUpdatePanel() {
               <strong>Running {shortRevision(data.current_revision)}</strong>
               <span className="muted">origin/main {targetRevision ? shortRevision(targetRevision) : 'unavailable'} · {data.nodes?.length ?? 0} cluster node{data.nodes?.length === 1 ? '' : 's'}</span>
             </div>
-            <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
+            <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : waitingForTransfers ? 'Waiting for transfers' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
           </div>
-          {(data.job?.message || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || data.job?.message}</p>}
+          {(updateMessage || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || updateMessage}</p>}
           {blockers.length > 0 && <div className="update-blockers wide-field"><strong>{data.can_update ? 'Nodes that cannot update' : 'Update unavailable'}</strong><ul>{blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul></div>}
           {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => { const status = nodeUpdateStatus(node, targetRevision); return <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={status.color}>{status.label}</Status></div> })}</div>}
         </>}

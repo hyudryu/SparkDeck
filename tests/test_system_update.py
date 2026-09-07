@@ -31,6 +31,7 @@ from sparkdeck.updater import (
     assert_checkout_safe,
     local_blockers,
 )
+from sparkdeck.virtual_nas import VirtualNAS
 from sparkdeck.update_helper import (
     _prepare_frontend_bundle,
     _publish_frontend_bundle,
@@ -845,6 +846,42 @@ class UpdateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service._reconciled_agent_state()
         self.manager.virtual_nas.end_update.assert_called_once()
         self.assertFalse(self.service._local_update_reserved)
+
+    async def test_threaded_agent_status_wakes_transfer_queue_on_owning_loop(self):
+        loop = asyncio.get_running_loop()
+        loop.set_debug(True)
+        nas = VirtualNAS(self.root / "nas", lambda: self.root / "hub", None, lambda: True)
+        self.manager.virtual_nas = nas
+        nas.reserve_update()
+        nas._wake.clear()
+        waiting = asyncio.create_task(nas._wake.wait())
+        await asyncio.sleep(0)
+        self.service._local_update_reserved = True
+        self.service._write(self.service.agent_path, {"phase": "failed"})
+        with patch("sparkdeck.updater.local_blockers", return_value=[]):
+            status = await asyncio.to_thread(self.service.agent_status)
+        await asyncio.wait_for(waiting, 1)
+        self.assertEqual(status["phase"], "failed")
+        self.assertFalse(nas._update_reserved)
+        self.assertFalse(self.service._local_update_reserved)
+
+    async def test_deferred_thread_release_cannot_clear_a_new_reservation(self):
+        nas = VirtualNAS(self.root / "nas", lambda: self.root / "hub", None, lambda: True)
+        nas.reserve_update()
+        scheduled = threading.Event()
+
+        def release():
+            nas.end_update()
+            scheduled.set()
+
+        operation = asyncio.get_running_loop().run_in_executor(None, release)
+        # Hold this loop until the worker has queued its callback, then acquire
+        # a newer reservation before allowing that stale callback to execute.
+        self.assertTrue(scheduled.wait(1))
+        nas.reserve_update()
+        await operation
+        self.assertTrue(nas._update_reserved)
+        nas.end_update()
 
     async def test_old_local_success_cannot_release_new_cluster_reservation(self):
         self.manager.virtual_nas = SimpleNamespace(end_update=Mock())

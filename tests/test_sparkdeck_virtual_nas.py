@@ -1911,6 +1911,39 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((hub / "models--org--model").exists())
             self.assertEqual(list(hub.glob(".sparkdeck-vnas-stage-*")), [])
 
+    async def test_tree_cache_does_not_consume_transfer_entry_or_capacity_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "hub"
+            repository = create_cached_model(hub)
+            # Preserve model data under a snapshot directory named trees.
+            model_trees = repository / "snapshots" / "revision-1" / "trees"
+            model_trees.mkdir()
+            (model_trees / "weights.bin").write_bytes(b"model data")
+            registry = FakeRegistry()
+            nas = VirtualNAS(base / "data", lambda: hub, registry, lambda: True)
+            original = nas.inventory()[0]
+            tree_cache = repository / "trees"
+            tree_cache.mkdir()
+            for index in range(original["transfer_entry_count"] + 1):
+                (tree_cache / f"{index}.json").write_bytes(b"x" * 1000)
+            available = virtual_nas.transfer_required_free_bytes(original["size_bytes"])
+            registry.request = AsyncMock(return_value={"models": [], "free_size": available})
+
+            with patch.object(virtual_nas, "_FILE_STREAM_MAX_ENTRIES", original["transfer_entry_count"]):
+                current = nas.inventory()[0]
+                self.assertEqual(current["transfer_entry_count"], original["transfer_entry_count"])
+                self.assertEqual(current["size_bytes"], original["size_bytes"])
+                self.assertEqual(current["file_count"], original["file_count"])
+                self.assertIsNot(current.get("transferable"), False)
+                entries = nas._whole_model_stream_entries(repository, None)
+                self.assertEqual(len(entries), current["transfer_entry_count"])
+                self.assertEqual(sum(entry.get("size", 0) for entry in entries), current["size_bytes"])
+                nas.issue_direct_export_capability("org/model", "revision-1")
+                with patch.object(nas, "start"):
+                    result = await nas.queue_transfer("org/model", "local", ["worker-a"])
+                self.assertEqual(result["jobs"][0]["bytes_total"], original["size_bytes"])
+
     async def test_inventory_and_export_reject_over_budget_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"

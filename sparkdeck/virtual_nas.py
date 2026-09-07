@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -518,18 +519,8 @@ def _transfer_operation(method):
     """Keep downloads and relays admitted until all their nested work finishes."""
     @wraps(method)
     async def guarded(self, model_id, *args, **kwargs):
-        task = asyncio.current_task()
-        self._reserve_stream(model_id)
-        self._transfer_tasks[task] = self._transfer_tasks.get(task, 0) + 1
-        try:
+        with self.transfer_operation(model_id):
             return await method(self, model_id, *args, **kwargs)
-        finally:
-            remaining = self._transfer_tasks[task] - 1
-            if remaining:
-                self._transfer_tasks[task] = remaining
-            else:
-                self._transfer_tasks.pop(task, None)
-            self._release_stream(model_id)
     return guarded
 
 
@@ -564,6 +555,8 @@ class VirtualNAS:
         self._last_progress_save: dict[str, float] = {}
         self._streaming_models: dict[str, int] = {}
         self._update_reserved = False
+        self._update_loop: asyncio.AbstractEventLoop | None = None
+        self._update_generation = 0
         self._transfer_tasks: dict[asyncio.Task, int] = {}
         self._download_locks: dict[str, threading.Lock] = {}
         self._download_locks_guard = threading.Lock()
@@ -590,10 +583,14 @@ class VirtualNAS:
             # not reject work belonging to an already running transfer.
             self._transfer_tasks[task] = self._transfer_tasks.get(task, 0) + 1
         try:
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                return await task
+            while True:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Repeated caller cancellation must not cancel a remote
+                    # download or release its update reservation prematurely.
+                    if task.done():
+                        return task.result()
         finally:
             if admitted:
                 remaining = self._transfer_tasks[task] - 1
@@ -1273,6 +1270,10 @@ class VirtualNAS:
             transfer_entry_count = 1
             last_modified = 0.0
             for root, directories, files in os.walk(repository, followlinks=False):
+                if Path(root) == repository:
+                    # Match export's exclusion before counting entries/bytes:
+                    # API listing caches consume neither wire nor staging space.
+                    directories[:] = [name for name in directories if name != "trees"]
                 transfer_entry_count += len(directories) + len(files)
                 directories[:] = [
                     name for name in directories
@@ -2984,6 +2985,22 @@ class VirtualNAS:
             for job in self.jobs
         )
 
+    @contextmanager
+    def transfer_operation(self, model_id: str):
+        """Admit controller operations outside the durable transfer queue."""
+        task = asyncio.current_task()
+        self._reserve_stream(model_id)
+        self._transfer_tasks[task] = self._transfer_tasks.get(task, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._transfer_tasks[task] - 1
+            if remaining:
+                self._transfer_tasks[task] = remaining
+            else:
+                self._transfer_tasks.pop(task, None)
+            self._release_stream(model_id)
+
     def _reserve_stream(self, model_id: str) -> None:
         try:
             task = asyncio.current_task()
@@ -3005,6 +3022,8 @@ class VirtualNAS:
 
     def reserve_update(self) -> None:
         """Atomically stop admitting new work before waiting for current copies."""
+        self._update_loop = asyncio.get_running_loop()
+        self._update_generation += 1
         self._update_reserved = True
         self._wake.set()
 
@@ -3016,6 +3035,25 @@ class VirtualNAS:
             await asyncio.sleep(0.1)
 
     def end_update(self) -> None:
+        """Release on the owning loop, including status checks in worker threads."""
+        owner = self._update_loop
+        generation = self._update_generation
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if owner is not None and owner is not current:
+            try:
+                owner.call_soon_threadsafe(self._end_update_on_loop, generation)
+            except RuntimeError:
+                if not owner.is_closed():
+                    raise
+            return
+        self._end_update_on_loop(generation)
+
+    def _end_update_on_loop(self, generation: int) -> None:
+        if generation != self._update_generation:
+            return
         self._update_reserved = False
         self._wake.set()
 

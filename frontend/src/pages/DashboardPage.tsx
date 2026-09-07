@@ -40,12 +40,15 @@ function runningDeploymentGroups(deployment: Deployment) {
     return deployment.instances.filter((group) => ACTIVE_DEPLOYMENT_STATUSES.has(group.status)).map((group) => ({
       key: `${deployment.id}:${group.instance_id}`,
       status: group.status,
+      stopPending: group.desired_state === 'stopped' || deployment.desired_state === 'stopped',
       label: `Group ${group.instance_id + 1} · ${group.node_names.join(' + ')}`,
     }))
   }
+  if (!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)) return []
   return [{
     key: deployment.id,
     status: deployment.status,
+    stopPending: deployment.desired_state === 'stopped',
     label: (deployment.selected_nodes?.map((node) => node.name || node.id) ?? deployment.node_ids ?? []).join(' + '),
   }]
 }
@@ -253,8 +256,8 @@ export function DashboardPage() {
   // can prove work exists, but an empty feed cannot prove the cluster is idle.
   const inferenceAvailable = stats !== undefined || activeRequests.length > 0
   const inferenceComplete = stats !== undefined && admissionForSessions !== undefined
-  const activeDeployments = deployments.filter((item) => ACTIVE_DEPLOYMENT_STATUSES.has(item.status))
-  const activeDeploymentGroups = activeDeployments.flatMap((deployment) => runningDeploymentGroups(deployment).map((group) => ({ deployment, group })))
+  const activeDeploymentGroups = deployments.flatMap((deployment) => runningDeploymentGroups(deployment).map((group) => ({ deployment, group })))
+  const activeDeploymentCount = new Set(activeDeploymentGroups.map(({ deployment }) => deployment.id)).size
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
   const allClusterNodes = nodesResource.data ?? []
   const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
@@ -357,7 +360,7 @@ export function DashboardPage() {
           <div className="dashboard-grid">
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${activeDeployments.length} of ${deployments.length} deployments active`}</p></div></div>
+                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${activeDeploymentCount} of ${deployments.length} deployments active`}</p></div></div>
                 <Link className="text-link" to="/models">Manage</Link>
               </div>
               {deploymentsResource.error && deploymentsResource.data && <p className="dashboard-stale" role="status">Deployment refresh paused: {deploymentsResource.error}</p>}
@@ -373,7 +376,7 @@ export function DashboardPage() {
                     <div className="dashboard-list-row" key={group.key}>
                       <span className={`status-dot status-${group.status}`} aria-hidden="true" />
                       <span className="sr-only">Status: {group.status}</span>
-                      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}</div>
+                      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}{group.stopPending && <small>Stop pending</small>}{!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}</div>
                       <RuntimeMark runtime={deployment.runtime} />
                     </div>
                   ))}

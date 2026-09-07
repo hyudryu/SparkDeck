@@ -8718,7 +8718,91 @@ class Manager:
             + (deployment.get("error") or "split instance(s) restarted")
         )
 
+    async def _reconcile_stopped_members(self) -> None:
+        """Finish explicit stops when workers return, including failed stops.
+
+        Stop intent must survive an unreachable agent and Docker restarting
+        its containers. Serialize with Start and inspect intent under the lock
+        so a delayed reconciliation cannot undo a newer lifecycle action.
+        """
+        async with self._cluster_action_lock():
+            candidates = [
+                deployment for deployment in self.deployments
+                if deployment.get("members") and (
+                    deployment.get("desired_state") == "stopped"
+                    or (deployment.get("mode") == "grouped_sharded" and any(
+                        member.get("desired_state") == "stopped"
+                        for member in deployment["members"]
+                    )))
+            ]
+            if not candidates:
+                return
+            nodes = {node["id"]: node for node in await self.cluster_nodes()}
+            for deployment in candidates:
+                previous = copy.deepcopy(deployment)
+                previous_stop_error = "; ".join(dict.fromkeys(
+                    str(member["failed_stop_error"]) for member in deployment["members"]
+                    if member.get("failed_stop_error")
+                ))
+                whole_stop = deployment.get("desired_state") == "stopped"
+                selected = [member for member in deployment["members"]
+                            if whole_stop or member.get("desired_state") == "stopped"]
+                pending = []
+                confirmed = []
+                for member in selected:
+                    node = nodes.get(member.get("node_id"), {})
+                    if (not node.get("online") or not node.get("docker_ready")
+                            or not isinstance(node.get("containers"), list)):
+                        continue
+                    container = next((item for item in node.get("containers") or []
+                                      if item.get("name") == member.get("container_name")), None)
+                    if container is None:
+                        confirmed.append(member)
+                    elif (container.get("status") in {"exited", "stopped", "dead"}
+                          and not member.get("failed_stop_error")):
+                        confirmed.append(member)
+                    else:
+                        # Reissue even for an exited container after a failed
+                        # stop: explicit stop also disarms its restart policy.
+                        pending.append(member)
+                results = await asyncio.gather(*(
+                    self._member_action(member, "stop") for member in pending
+                ), return_exceptions=True)
+                for member, result in zip(pending, results):
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                    errors = self._member_action_errors([result], "stop")
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        errors.append(str(result.get("error") or result.get("errors") or "Stop failed"))
+                    if errors:
+                        member["failed_stop_error"] = "; ".join(errors)
+                    else:
+                        confirmed.append(member)
+                for member in confirmed:
+                    member["status"] = "stopped"
+                    member["phase"] = {"phase": "stopped"}
+                    member.pop("failed_stop_error", None)
+                # Offline/unknown inventories never count as confirmation.
+                # Preserve their reservation and retry on the next health tick.
+                if whole_stop and len(confirmed) == len(selected):
+                    deployment["status"] = "stopped"
+                    deployment["error"] = None
+                    deployment.pop("status_message", None)
+                elif any(member.get("failed_stop_error") for member in selected):
+                    deployment["error"] = "; ".join(dict.fromkeys(
+                        str(member["failed_stop_error"]) for member in selected
+                        if member.get("failed_stop_error")
+                    ))
+                elif (len(confirmed) == len(selected) and previous_stop_error
+                      and deployment.get("error") == previous_stop_error):
+                    deployment["error"] = None
+                    if deployment.get("status") == "degraded":
+                        deployment["status"] = self._grouped_deployment_status(deployment)
+                if deployment != previous:
+                    self._save_deployments()
+
     async def _cluster_health_tick(self) -> None:
+        await self._reconcile_stopped_members()
         candidates = [
             deployment for deployment in list(self.deployments)
             if len(deployment.get("members") or []) >= 2

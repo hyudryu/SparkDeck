@@ -63,6 +63,24 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.temp.cleanup()
 
+    async def test_disabling_consent_cancels_registered_startup_probes(self):
+        canceller = Mock()
+        self.service.register_consent_canceller(canceller)
+        with patch.object(self.service.store, "set_community_consent",
+                          return_value={"enabled": True}):
+            await self.service.set_community_consent(True)
+            canceller.assert_not_called()
+            await self.service.set_community_consent(False)
+        canceller.assert_called_once()
+
+    async def test_revoking_membership_cancels_registered_startup_probes(self):
+        canceller = Mock()
+        self.service.register_consent_canceller(canceller)
+        with patch.object(self.service.store, "revoke_community_membership",
+                          return_value={"enabled": False}):
+            await self.service.revoke_community_membership()
+        canceller.assert_called_once()
+
     def _record_startup_sample(
         self, *, model="org/model", settings=None, input_tokens=400,
         output_tokens=200, decode_seconds=2.5,

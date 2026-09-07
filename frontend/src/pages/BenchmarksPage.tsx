@@ -112,7 +112,7 @@ export function BenchmarksPage() {
       <div className="section-heading"><div><h2>Local history</h2><p>One latest result per identified model. Eligible results stay local while signed out and upload after Community sign-in when sharing is enabled.</p></div></div>
       {samples.loading && <LoadingState label="Loading benchmark history" />}
       {samples.error && <ErrorState message={samples.error} onRetry={samples.reload} />}
-      {!samples.loading && !samples.error && samples.data?.length === 0 && <EmptyState title="No identified benchmark models yet" description="Chat with or compare a running model to capture your first identified measurement." />}
+      {!samples.loading && !samples.error && samples.data?.length === 0 && <EmptyState title="No identified benchmark models yet" description="Local history is captured from consented startup benchmarks and coordinated (parallel) benchmarks. Start a consented model or run a coordinated benchmark to produce a measurement." />}
       {samples.data && samples.data.length > 0 && <Panel className="table-panel"><div className="responsive-table benchmark-table" role="table" aria-label="Local benchmark history">
         <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Runtime</span><span role="columnheader">Speed</span><span role="columnheader">TTFT</span><span role="columnheader">Sync</span><span role="columnheader">Actions</span></div>
         {samples.data.map((sample) => <div className="table-row" role="row" tabIndex={0} key={sample.model_id}>

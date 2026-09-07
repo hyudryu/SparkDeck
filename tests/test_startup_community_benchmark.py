@@ -56,14 +56,18 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.monitor._benchmark = AsyncMock()
         await self.monitor._attempt(self.target, dict(self.snapshot))
         self.monitor._benchmark.assert_not_awaited()
-        self.assertFalse(self.settings)
+        self.assertFalse(self.settings.get(
+            self.monitor._seen_key(self.target.fingerprint), False,
+        ))
         self.monitor._healthy.return_value = True
         await self.monitor.tick()
         await asyncio.gather(*list(self.monitor._tasks.values()))
         await asyncio.sleep(0)
         await self.monitor.tick()
         self.monitor._benchmark.assert_awaited_once()
-        # Persisted boot identity survives reconstruction of the monitor.
+        # A recorded boot persists its seen marker atomically with the sample;
+        # simulate that storage commit so the boot identity survives restart.
+        self.service.store.set_setting(self.monitor._seen_key(self.target.fingerprint), True)
         restarted = StartupBenchmarkMonitor(self.service)
         restarted.targets = AsyncMock(return_value=[self.target])
         await restarted.tick()
@@ -206,6 +210,31 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
             result = await server.agent_inference_health(Request())
             self.assertEqual(result, {"ready": True, "model": "org/model", "health_status": 200})
 
+    async def test_agent_inference_forwards_remote_startup_marker(self):
+        import server
+
+        class Request:
+            headers = {}
+
+        async def completions(model, body, stream, cancel, **kwargs):
+            return {"choices": [], "usage": {}}
+
+        with patch.object(server, "_require_agent"), \
+             patch.object(server, "read_limited_json", return_value={
+                 "model": "org/model", "stream": False,
+                 "_sparkdeck_startup_benchmark": True,
+                 "_sparkdeck_container_name": "rank-0",
+             }), \
+             patch.object(server.manager, "_vllm_completions",
+                          AsyncMock(side_effect=completions)) as manager_call:
+            result = await server.agent_inference("completions", Request())
+        self.assertEqual(result["choices"], [])
+        self.assertEqual(manager_call.call_args.kwargs["startup_benchmark"], True)
+        # The internal marker is consumed by the agent, not forwarded upstream.
+        forwarded_body = manager_call.call_args.args[1]
+        self.assertNotIn("_sparkdeck_startup_benchmark", forwarded_body)
+        self.assertEqual(forwarded_body["model"], "org/model")
+
     async def test_grouped_inventory_selects_coordinators_and_tracks_all_rank_boots(self):
         self.deployment["settings"]["manager_deployment_id"] = "cluster"
         members = [
@@ -294,17 +323,41 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed, [True])
         self.service._community_observation_end.assert_called_once()
 
-    async def test_seen_marker_only_persisted_after_successful_recording(self):
+    async def test_no_sample_recording_enters_retry_backoff(self):
         self.monitor.targets = AsyncMock(return_value=[self.target])
         self.monitor._healthy = AsyncMock(return_value=True)
         # A benchmark that records no eligible sample must not consume the boot.
         self.monitor._benchmark = AsyncMock(return_value=False)
         await self.monitor._attempt(self.target, dict(self.snapshot))
-        self.assertFalse(self.settings)
-        # A benchmark that records an eligible sample persists the seen marker.
+        self.assertFalse(self.settings.get(
+            self.monitor._seen_key(self.target.fingerprint), False,
+        ))
+        self.assertIn(self.target.fingerprint, self.monitor._retry_after)
+        persisted = self.service.store.get_setting(
+            self.monitor._retry_key(self.target.fingerprint), {},
+        )
+        self.assertEqual(persisted["attempts"], 1)
+        # While the fingerprint backs off, it is not re-attempted on the next tick.
+        self.monitor._benchmark.reset_mock()
+        self.monitor.targets = AsyncMock(return_value=[self.target])
+        self.assertFalse(await self.monitor.tick())
+        self.monitor._benchmark.assert_not_awaited()
+        self.assertFalse(self.monitor._tasks)
+        # A successful record clears the retry state instead of re-queuing.
         self.monitor._benchmark = AsyncMock(return_value=True)
         await self.monitor._attempt(self.target, dict(self.snapshot))
-        self.assertTrue(self.settings.get(self.monitor._seen_key(self.target.fingerprint)))
+        self.assertNotIn(self.target.fingerprint, self.monitor._retry_after)
+
+    async def test_failed_probe_persists_backoff_across_monitor_restart(self):
+        self.monitor._healthy = AsyncMock(return_value=True)
+        self.monitor.targets = AsyncMock(return_value=[self.target])
+        self.monitor._benchmark = AsyncMock(side_effect=TimeoutError("probe timed out"))
+        await self.monitor._attempt(self.target, dict(self.snapshot))
+
+        restarted = StartupBenchmarkMonitor(self.service)
+        restarted.targets = AsyncMock(return_value=[self.target])
+        self.assertFalse(await restarted.tick())
+        self.assertFalse(restarted._tasks)
 
     async def test_benchmark_returns_whether_a_sample_was_recorded(self):
         observed = []
@@ -340,8 +393,25 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         manager._record_usage("model", {"prompt_tokens": 10, "completion_tokens": 5}, 1.0, 1.0)
         manager._record_tokens.assert_called_once()
         # A startup probe must not refresh the deployment last-used timestamp.
-        manager._track_start("model", startup_benchmark=True)
+        startup_rid = manager._track_start("model", deployment_id="dep", startup_benchmark=True)
+        manager._track_end(startup_rid)
         manager._mark_deployment_used.assert_not_called()
+        # Ordinary requests still refresh at completion.
+        manager._track_start("model", deployment_id="dep")
+        manager._mark_deployment_used.assert_called()
+
+    async def test_cancel_active_cancels_inflight_probes(self):
+        started = asyncio.Event()
+        async def idle():
+            started.set()
+            await asyncio.Event().wait()
+        task = asyncio.create_task(idle())
+        self.monitor._tasks["boot"] = task
+        await started.wait()
+        self.monitor.cancel_active()
+        await asyncio.sleep(0)
+        self.assertTrue(task.cancelled())
+        self.assertIn("boot", self.monitor._tasks)
 
     async def test_tick_reports_progress_only_for_unseen_boots(self):
         self.monitor.targets = AsyncMock(return_value=[self.target])

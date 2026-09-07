@@ -6249,6 +6249,10 @@ class Manager:
                 "_sparkdeck_container_name": member.get("container_name"),
                 "_sparkdeck_deployment_id": deployment_id,
             }
+            if startup_benchmark:
+                # Signal the remote agent that this is a synthetic startup probe
+                # so it suppresses ordinary usage persistence on its side too.
+                remote_body["_sparkdeck_startup_benchmark"] = True
             if caller_ip:
                 remote_body["_sparkdeck_caller_ip"] = caller_ip
             request_id = self._track_start(
@@ -11198,6 +11202,7 @@ class Manager:
             "deployment_id": deployment_id,
             "caller_ip": caller_ip,
             "paused": False,
+            "startup_benchmark": startup_benchmark,
             "group": self._request_group(key, deployment_id, container_name),
         }
         if not startup_benchmark:
@@ -11230,7 +11235,10 @@ class Manager:
     def _track_end(self, rid: int):
         rec = self._active_reqs.pop(rid, None)
         if rec:
-            self._mark_deployment_used(rec.get("deployment_id"))
+            if not rec.get("startup_benchmark"):
+                # A synthetic startup probe must not refresh the deployment's
+                # "last used" timestamps at completion either.
+                self._mark_deployment_used(rec.get("deployment_id"))
 
     def _transfer_inference_ownership(
         self, admission=None, request_id=None, *,

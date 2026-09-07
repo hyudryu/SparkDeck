@@ -202,7 +202,9 @@ async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
         uploader = asyncio.create_task(community_upload_loop())
-        startup_benchmarks = asyncio.create_task(StartupBenchmarkMonitor(sparkdeck).run())
+        startup_benchmark_monitor = StartupBenchmarkMonitor(sparkdeck)
+        sparkdeck.register_consent_canceller(startup_benchmark_monitor.cancel_active)
+        startup_benchmarks = asyncio.create_task(startup_benchmark_monitor.run())
         try:
             yield
         finally:
@@ -1230,6 +1232,7 @@ async def agent_inference(endpoint: str, req: Request):
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
     caller_ip = _normalized_caller_ip(body.pop("_sparkdeck_caller_ip", None))
+    startup_benchmark = bool(body.pop("_sparkdeck_startup_benchmark", False))
     cancel = asyncio.Event()
     watcher = _watch_disconnect(req, cancel)
     stream = False
@@ -1238,13 +1241,13 @@ async def agent_inference(endpoint: str, req: Request):
             await manager._vllm_chat(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             if endpoint == "chat/completions"
             else await manager._vllm_completions(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
         )
         stream = hasattr(result, "__aiter__")

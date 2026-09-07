@@ -20,6 +20,14 @@ log = logging.getLogger(__name__)
 _POLL_INITIAL_INTERVAL = 2.0
 _POLL_MAX_INTERVAL = 30.0
 
+# A probe that completes without recording an eligible sample (e.g. an older
+# llama.cpp/SGLang endpoint that cannot stream terminal usage, a short output,
+# or a timeout) must not be re-attempted every poll. Back off exponentially
+# per fingerprint so a non-transient incompatibility cannot become a permanent
+# synthetic GPU workload, while still allowing transient failures to retry.
+_RETRY_BACKOFF_BASE = 60.0
+_RETRY_BACKOFF_MAX = 3600.0
+
 
 @dataclass
 class StartupTarget:
@@ -47,6 +55,15 @@ class StartupBenchmarkMonitor:
         self.manager = service.manager
         self._tasks: dict[str, asyncio.Task] = {}
         self._serial = asyncio.Lock()
+        # Per-fingerprint retry/backoff state so a probe that records no sample
+        # is not re-attempted on every poll.
+        self._retry_after: dict[str, float] = {}
+        self._retry_attempts: dict[str, int] = {}
+
+    def cancel_active(self) -> None:
+        """Cancel every in-flight startup probe immediately (consent withdrew)."""
+        for task in list(self._tasks.values()):
+            task.cancel()
 
     async def run(self) -> None:
         try:
@@ -83,6 +100,11 @@ class StartupBenchmarkMonitor:
             key = target.fingerprint
             if key in self._tasks or self.service.store.get_setting(self._seen_key(key), False):
                 continue
+            retry_after = max(
+                self._retry_after.get(key, 0.0), self._retry_deadline(key),
+            )
+            if time.time() < retry_after:
+                continue
             task = asyncio.create_task(self._attempt(target, snapshot))
             self._tasks[key] = task
             task.add_done_callback(lambda done, key=key: self._tasks.pop(key, None))
@@ -92,6 +114,37 @@ class StartupBenchmarkMonitor:
     @staticmethod
     def _seen_key(fingerprint: str) -> str:
         return "community_startup_benchmark:" + fingerprint
+
+    @staticmethod
+    def _retry_key(fingerprint: str) -> str:
+        return "community_startup_benchmark_retry:" + fingerprint
+
+    def _retry_deadline(self, fingerprint: str) -> float:
+        """Return the persisted wall-clock deadline for the next probe."""
+        state = self.service.store.get_setting(self._retry_key(fingerprint), {})
+        if not isinstance(state, dict):
+            return 0.0
+        try:
+            return float(state.get("retry_after") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _back_off(self, fingerprint: str) -> None:
+        """Persist exponential retry state so restarts cannot create a probe loop."""
+        state = self.service.store.get_setting(self._retry_key(fingerprint), {})
+        try:
+            previous = int(state.get("attempts") or 0) if isinstance(state, dict) else 0
+        except (TypeError, ValueError):
+            previous = 0
+        attempts = previous + 1
+        delay = min(_RETRY_BACKOFF_BASE * (2 ** (attempts - 1)), _RETRY_BACKOFF_MAX)
+        retry_after = time.time() + delay
+        self._retry_attempts[fingerprint] = attempts
+        self._retry_after[fingerprint] = retry_after
+        self.service.store.set_setting(
+            self._retry_key(fingerprint),
+            {"attempts": attempts, "retry_after": retry_after},
+        )
 
     async def targets(self) -> list[StartupTarget]:
         deployments = await self.service.deployments()
@@ -202,12 +255,22 @@ class StartupBenchmarkMonitor:
                     return
                 if getattr(self.service, "_startup_benchmark_busy", lambda: False)():
                     return
-                recorded = await asyncio.wait_for(self._benchmark(fresh, snapshot), timeout=120)
+                try:
+                    recorded = await asyncio.wait_for(
+                        self._benchmark(fresh, snapshot), timeout=120,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("Startup benchmark measurement failed", exc_info=True)
+                    recorded = False
                 if recorded:
-                    # Persist the boot identity only once an eligible sample was
-                    # actually recorded; a transient failure must not lose the
-                    # only benchmark for this container boot.
-                    self.service.store.set_setting(self._seen_key(target.fingerprint), True)
+                    self._retry_after.pop(target.fingerprint, None)
+                    self._retry_attempts.pop(target.fingerprint, None)
+                else:
+                    # No eligible sample was recorded. Back off this fingerprint
+                    # so the synthetic probe is not retried on every poll.
+                    self._back_off(target.fingerprint)
         except Exception:
             log.debug("Startup benchmark skipped or failed", exc_info=True)
 
@@ -219,6 +282,7 @@ class StartupBenchmarkMonitor:
         )
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
+            seen_key=self._seen_key(target.fingerprint),
             manager_request_sequence=getattr(self.manager, "_req_seq", 0),
             manager_requests_expected=int(bool(target.cluster) or deployment["runtime"] in {"vllm", "sglang"}),
         )

@@ -432,6 +432,23 @@ class SparkDeckService:
             contextvars.ContextVar("sparkdeck_community_observation", default=None)
         )
         self._community_active_observations: dict[str, dict[str, Any]] = {}
+        # Callbacks invoked when community sharing is disabled so in-flight
+        # background work (e.g. startup synthetic probes) can be canceled
+        # promptly rather than waiting for the next polling tick.
+        self._consent_cancellers: list[Any] = []
+
+    def register_consent_canceller(self, canceller: Any) -> None:
+        """Register a callable invoked immediately when sharing is disabled."""
+        if canceller not in self._consent_cancellers:
+            self._consent_cancellers.append(canceller)
+
+    def _cancel_consent_work(self) -> None:
+        """Cancel background work that depends on active community consent."""
+        for canceller in list(self._consent_cancellers):
+            try:
+                canceller()
+            except Exception:
+                log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
         tasks = list(self._deployment_launch_tasks.values())
@@ -547,16 +564,23 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Serialize consent changes with benchmark queue mutations."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.set_community_consent, enabled, telemetry_cluster_id
             )
+            if not enabled:
+                # Cancel active synthetic startup probes immediately instead of
+                # waiting for the next polling tick.
+                self._cancel_consent_work()
+            return result
 
     async def revoke_community_membership(self) -> dict[str, Any]:
         """Disable sharing and forget a former controller's cluster identity."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.revoke_community_membership
             )
+            self._cancel_consent_work()
+            return result
 
     async def delete_benchmark(self, sample_id: str) -> bool:
         """Serialize deletion with queue mutations; the uploader re-reads the
@@ -7214,11 +7238,13 @@ class SparkDeckService:
             consent = bool(self.store.get_setting("community_consent", False))
             self.store.add_benchmark(sample, queue=eligible and consent)
             return
+        seen_key = observation.get("seen_key")
         if self.store.add_benchmark_if_consented(
-            sample, int(observation.get("generation") or 0)
+            sample, int(observation.get("generation") or 0),
+            extra_settings={seen_key: True} if seen_key else None,
         ):
             # Only an actually-persisted sample confirms a successful startup
-            # probe, so the seen marker is written only on real recording.
+            # probe; the seen marker is committed in the same transaction.
             observation["startup_recorded"] = True
 
     async def _runtime_for_legacy_model(self, model: str) -> str:

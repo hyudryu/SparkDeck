@@ -8,6 +8,18 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('uses the source IP and requested model as the routing-rule delete key', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.inferenceRouting.remove('2001:db8::1', 'org/model name')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/inference-routing-rules?source_ip=2001%3Adb8%3A%3A1&requested_model=org%2Fmodel+name',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
   it('streams split reasoning, output, usage, and per-response metrics', async () => {
     const encoder = new TextEncoder()
     const payload = [

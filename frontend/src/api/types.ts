@@ -107,6 +107,8 @@ export interface Deployment {
   id: string
   alias: string
   model_id: string
+  served_model?: string
+  served_models?: string[]
   model_revision?: string
   runtime: RuntimeKind
   status: DeploymentStatus
@@ -1075,6 +1077,15 @@ export interface UsageSummary {
   total: UsageCounters
   routing_rules?: Record<string, string>
   merge_groups?: Record<string, string>
+}
+
+export interface InferenceRoutingRule {
+  source_ip: string
+  requested_model: string
+  enabled: boolean
+  deployment_id: string
+  instance_id: number | null
+  node_ids: string[]
 }
 
 export interface HourlyUsagePoint {

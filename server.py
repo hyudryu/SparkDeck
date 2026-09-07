@@ -24,7 +24,9 @@ import httpx
 import jwt
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
-from manager import Manager, ClientAbort, FanSettingsConflict
+from manager import (
+    Manager, ClientAbort, FanSettingsConflict, SourceRoutingUnavailable,
+)
 from cluster import (
     AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
@@ -2500,6 +2502,49 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
+@app.get("/api/v1/inference-routing-rules")
+async def v1_inference_routing_rules():
+    return {"items": sparkdeck.source_ip_routing_rules()}
+
+
+@app.put("/api/v1/inference-routing-rules")
+async def v1_upsert_inference_routing_rule(req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "source_ip", "requested_model", "enabled", "deployment_id",
+        "instance_id", "node_ids",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        return await sparkdeck.upsert_source_ip_routing_rule(body)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/v1/inference-routing-rules")
+async def v1_delete_inference_routing_rule(
+    source_ip: str = Query(...), requested_model: str = Query(...),
+):
+    try:
+        deleted = sparkdeck.delete_source_ip_routing_rule(
+            source_ip, requested_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not deleted:
+        raise HTTPException(404, "source-IP routing rule was not found")
+    return {"ok": True}
+
+
 @app.post("/api/v1/runtime-flags/preview")
 async def v1_runtime_flags_preview(req: Request):
     """Preview the exact editable argv after backend normalization."""
@@ -4269,6 +4314,8 @@ async def v1_chat_completions(req: Request):
     except ClientAbort:
         # Client left; upstream request was aborted too. Nothing to send.
         return Response(status_code=499)
+    except SourceRoutingUnavailable as e:
+        raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except TimeoutError as e:
@@ -4306,6 +4353,8 @@ async def v1_completions(req: Request):
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         return Response(status_code=499)
+    except SourceRoutingUnavailable as e:
+        raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except TimeoutError as e:

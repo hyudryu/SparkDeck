@@ -6843,18 +6843,108 @@ class SparkDeckService:
         stored, live = matches[0]
         return {**stored, **live}
 
+    def source_ip_routing_rules(self) -> list[dict[str, Any]]:
+        return self.manager.list_source_ip_routing_rules()
+
+    async def upsert_source_ip_routing_rule(
+        self, value: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Structural validation happens in Manager so disk reload and API
+        # writes share one contract. Enabled routes additionally require a
+        # live deployment which currently owns the exact request model.
+        normalized = self.manager._normalize_source_ip_routing_rule(value)
+        if normalized["enabled"]:
+            await self._source_routed_deployment(
+                normalized, normalized["requested_model"], validating=True,
+            )
+        return self.manager.upsert_source_ip_routing_rule(normalized)
+
+    def delete_source_ip_routing_rule(
+        self, source_ip: str, requested_model: str,
+    ) -> bool:
+        return self.manager.delete_source_ip_routing_rule(
+            source_ip, requested_model,
+        )
+
+    async def _source_routed_deployment(
+        self,
+        rule: dict[str, Any],
+        requested_model: str,
+        *,
+        validating: bool = False,
+    ) -> dict[str, Any]:
+        from manager import SourceRoutingUnavailable
+
+        stable_id = str(rule.get("deployment_id") or "")
+        stored = self.store.deployment(stable_id, include_private=True)
+        live = next((
+            deployment for deployment in await self.deployments()
+            if deployment.get("id") == stable_id
+        ), None)
+        error_type = LookupError if validating else SourceRoutingUnavailable
+        if stored is None or live is None:
+            raise error_type("source-IP routing target deployment is unavailable")
+        deployment = {**stored, **live}
+        if not self._deployment_can_serve_inference(deployment):
+            raise error_type("source-IP routing target deployment is unavailable")
+        if (
+            deployment.get("kind") != DeploymentKind.MANAGED.value
+            or deployment.get("runtime") not in {
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+            }
+        ):
+            raise error_type(
+                "source-IP routing target is not a supported managed runtime"
+            )
+        owned_models = set(self._deployment_public_model_ids(deployment))
+        alias = str(deployment.get("alias") or "").strip()
+        if alias:
+            owned_models.add(alias)
+        if requested_model not in owned_models:
+            raise error_type(
+                "source-IP routing target does not own the requested model"
+            )
+        settings = deployment.get("settings") or {}
+        manager_deployment = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict)
+            and item.get("sparkdeck_record_id") == stable_id
+        ), None)
+        if manager_deployment is None:
+            raise error_type("source-IP routing target deployment is unavailable")
+        manager_id = str(manager_deployment.get("id") or "")
+        configured_manager_id = str(settings.get("manager_deployment_id") or "")
+        if configured_manager_id and configured_manager_id != manager_id:
+            raise error_type(
+                "source-IP routing target deployment generation changed"
+            )
+        deployment["settings"] = {
+            **settings, "manager_deployment_id": manager_id,
+        }
+        return deployment
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
+        route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
+        source_route = (
+            route_lookup(caller_ip, requested_model)
+            if callable(route_lookup) else None
+        )
         stored_deployment = self.store.deployment(
             requested_model, include_private=True,
         )
-        deployment = await self._live_deployment_for_model_id(
-            requested_model
-        )
-        if deployment is None:
-            deployment = stored_deployment
+        if source_route is not None:
+            deployment = await self._source_routed_deployment(
+                source_route, requested_model,
+            )
+        else:
+            deployment = await self._live_deployment_for_model_id(
+                requested_model
+            )
+            if deployment is None:
+                deployment = stored_deployment
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )
@@ -6862,8 +6952,12 @@ class SparkDeckService:
         streaming = False
         try:
             if deployment:
+                route_kwargs = (
+                    {"source_route": source_route} if source_route else {}
+                )
                 result = await self._proxy_registered(
                     deployment, body, endpoint, cancel, caller_ip=caller_ip,
+                    **route_kwargs,
                 )
             else:
                 # Compatibility for existing vLLM/SGLang containers. Resolve the
@@ -6991,6 +7085,7 @@ class SparkDeckService:
                                 endpoint: str, cancel: Any, *,
                                 caller_ip: str | None = None,
                                 startup_benchmark: bool = False,
+                                source_route: dict | None = None,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
@@ -7012,6 +7107,11 @@ class SparkDeckService:
                 or manager_desired == "stopped"
             )
         ):
+            if source_route is not None:
+                from manager import SourceRoutingUnavailable
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target deployment is unavailable"
+                )
             raise RuntimeError(
                 "deployment is stopped; start it before sending inference requests"
             )
@@ -7025,9 +7125,13 @@ class SparkDeckService:
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
             )
         ):
+            route_kwargs = (
+                {"source_route": source_route} if source_route else {}
+            )
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,
                 startup_benchmark=startup_benchmark,
+                **route_kwargs,
             )
         base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
@@ -7075,6 +7179,7 @@ class SparkDeckService:
                              endpoint: str, cancel: Any, *,
                              caller_ip: str | None = None,
                              startup_benchmark: bool = False,
+                             source_route: dict | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
         requested_model = str(body.get("model") or deployment["alias"])
@@ -7086,10 +7191,14 @@ class SparkDeckService:
         manager_id = settings.get("manager_deployment_id")
         route_observation: dict[str, Any] = {}
         caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
+        route_kwargs = (
+            {"source_route": source_route} if source_route else {}
+        )
         result = (
             await self.manager.proxy_cluster_inference(
                 manager_id, model, upstream_body, endpoint, cancel,
                 route_observation=route_observation,
+                **route_kwargs,
                 **caller_kwargs,
             )
             if manager_id

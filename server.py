@@ -2504,7 +2504,10 @@ async def v1_deployments():
 
 @app.get("/api/v1/inference-routing-rules")
 async def v1_inference_routing_rules():
-    return {"items": sparkdeck.source_ip_routing_rules()}
+    try:
+        return {"items": sparkdeck.source_ip_routing_rules()}
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @app.put("/api/v1/inference-routing-rules")
@@ -2524,6 +2527,8 @@ async def v1_upsert_inference_routing_rule(req: Request):
         raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
     try:
         return await sparkdeck.upsert_source_ip_routing_rule(body)
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
@@ -2538,6 +2543,8 @@ async def v1_delete_inference_routing_rule(
         deleted = sparkdeck.delete_source_ip_routing_rule(
             source_ip, requested_model,
         )
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not deleted:

@@ -813,6 +813,7 @@ class Manager:
         self.source_ip_routing_rules_path = (
             self.data_dir / "source_ip_routing_rules.json"
         )
+        self.source_ip_routing_rules_error: str | None = None
         self.source_ip_routing_rules: dict[str, dict] = (
             self._load_source_ip_routing_rules()
         )
@@ -3590,27 +3591,63 @@ class Manager:
 
     def _load_source_ip_routing_rules(self) -> dict[str, dict]:
         path = self.source_ip_routing_rules_path
-        if not path.exists():
+        self.source_ip_routing_rules_error = None
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration cannot be inspected: {exc}"
+            )
+            return {}
+        if not exists:
             return {}
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict) or payload.get("version") != 1:
-                return {}
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration cannot be read: {exc}"
+            )
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration is not valid JSON: {exc}"
+            )
+            return {}
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("root must be an object")
+            if payload.get("version") != 1:
+                raise ValueError(
+                    f"unsupported version {payload.get('version')!r}"
+                )
             rows = payload.get("rules")
             if not isinstance(rows, list):
-                return {}
+                raise ValueError("rules must be an array")
             result: dict[str, dict] = {}
-            for row in rows:
+            for index, row in enumerate(rows):
                 try:
                     rule = self._normalize_source_ip_routing_rule(row)
-                except ValueError:
-                    continue
-                result[self._source_routing_key(
+                except ValueError as exc:
+                    raise ValueError(f"rule {index} is invalid: {exc}") from exc
+                key = self._source_routing_key(
                     rule["source_ip"], rule["requested_model"]
-                )] = rule
+                )
+                if key in result:
+                    raise ValueError(f"rule {index} duplicates an earlier rule")
+                result[key] = rule
             return result
-        except (OSError, ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration is invalid: {exc}"
+            )
             return {}
+
+    def _assert_source_ip_routing_config_valid(self) -> None:
+        error = getattr(self, "source_ip_routing_rules_error", None)
+        if error:
+            raise SourceRoutingUnavailable(error)
 
     def _save_source_ip_routing_rules(
         self, rules_by_key: dict[str, dict] | None = None,
@@ -3627,8 +3664,10 @@ class Manager:
             self.source_ip_routing_rules_path,
             {"version": 1, "rules": rules},
         )
+        self.source_ip_routing_rules_error = None
 
     def list_source_ip_routing_rules(self) -> list[dict]:
+        self._assert_source_ip_routing_config_valid()
         return [
             dict(rule) for rule in sorted(
                 getattr(self, "source_ip_routing_rules", {}).values(),
@@ -3639,6 +3678,7 @@ class Manager:
     def source_ip_routing_rule(
         self, source_ip: Any, requested_model: Any,
     ) -> dict | None:
+        self._assert_source_ip_routing_config_valid()
         try:
             canonical_ip = self._canonical_source_routing_ip(source_ip)
             exact_model = self._source_routing_model(requested_model)
@@ -3649,7 +3689,10 @@ class Manager:
         )
         return dict(rule) if rule and rule.get("enabled") is True else None
 
-    def upsert_source_ip_routing_rule(self, value: Any) -> dict:
+    def upsert_source_ip_routing_rule(
+        self, value: Any, *, observed_replicas: list[dict] | None = None,
+    ) -> dict:
+        self._assert_source_ip_routing_config_valid()
         rule = self._normalize_source_ip_routing_rule(value)
         # Re-derive the serving unit from the current Manager topology.  The
         # request's node list is only a fingerprint and is never authoritative.
@@ -3657,6 +3700,12 @@ class Manager:
             deployment, derived_nodes = self.source_ip_routing_target(
                 rule["deployment_id"], rule["instance_id"], rule["node_ids"]
             )
+            try:
+                self._source_route_candidates(deployment, {
+                    **rule, "_observed_replicas": observed_replicas,
+                })
+            except SourceRoutingUnavailable as exc:
+                raise ValueError(str(exc)) from exc
             rule["deployment_id"] = str(
                 deployment.get("sparkdeck_record_id") or ""
             )
@@ -3672,6 +3721,7 @@ class Manager:
     def delete_source_ip_routing_rule(
         self, source_ip: Any, requested_model: Any,
     ) -> bool:
+        self._assert_source_ip_routing_config_valid()
         canonical_ip = self._canonical_source_routing_ip(source_ip)
         exact_model = self._source_routing_model(requested_model)
         key = self._source_routing_key(canonical_ip, exact_model)
@@ -6041,6 +6091,16 @@ class Manager:
         rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
         return [chosen, *rest]
 
+    @staticmethod
+    def _source_routing_member_available(member: dict) -> bool:
+        return (
+            member.get("desired_state") != "stopped"
+            and str(member.get("status") or "").casefold() in {"running", "ready"}
+            and str(member.get("node_status") or "").casefold()
+            not in {"offline", "unreachable", "unknown", "disconnected"}
+            and member.get("node_docker_ready") is not False
+        )
+
     def _source_route_candidates(
         self, deployment: dict, source_route: dict,
     ) -> list[dict]:
@@ -6072,14 +6132,29 @@ class Manager:
             unit = [m for m in members if m.get("node_id") == derived_nodes[0]]
         else:
             unit = members
-        unavailable_statuses = {
-            "stopped", "error", "exited", "dead", "removed", "missing",
-            "unreachable",
-        }
+        # get_state decorates copies: persisted container status can remain
+        # exited after an external restart. Service supplies trusted live
+        # replica observations separately; these never enter persisted rules.
+        observed = source_route.get("_observed_replicas")
+        if mode == "replicated" and observed is not None:
+            replica = next((row for row in observed if row.get("node_id") == derived_nodes[0]), None)
+            if replica is None or replica.get("available") is not True:
+                raise SourceRoutingUnavailable("source-IP routing target replica is unavailable")
+            health_members = []
+        else:
+            health_members = unit
         if current.get("desired_state") == "stopped" or any(
             member.get("desired_state") == "stopped"
-            or str(member.get("status") or "").casefold() in unavailable_statuses
             for member in unit
+        ) or any(
+            str(member.get("status") or "").casefold() in {
+                "stopped", "error", "exited", "dead", "removed", "missing", "unreachable",
+            }
+            or str(member.get("node_status") or "").casefold() in {
+                "offline", "unreachable", "unknown", "disconnected",
+            }
+            or member.get("node_docker_ready") is False
+            for member in health_members
         ):
             raise SourceRoutingUnavailable(
                 "source-IP routing target serving unit is unavailable"

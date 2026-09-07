@@ -362,6 +362,7 @@ export interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   instances?: Deployment['instances']
+  replicas?: Deployment['replicas']
   required_node_count?: number
   instance_node_count?: number
   occupied_node_ids?: string[]
@@ -446,6 +447,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     },
     deployment_mode: item.deployment_mode,
     instances: item.instances,
+    replicas: item.replicas,
     required_node_count: item.required_node_count,
     instance_node_count: item.instance_node_count,
     occupied_node_ids: item.occupied_node_ids,

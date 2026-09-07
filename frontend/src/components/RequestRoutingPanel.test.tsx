@@ -62,6 +62,35 @@ describe('RequestRoutingPanel', () => {
     expect(targets[0].key).not.toBe(targets[1].key)
   })
 
+  it.each(['replicated', undefined] as const)('uses per-replica health when a degraded deployment has mode %s', (deployment_mode) => {
+    const targets = inferenceRouteTargets([{
+      ...groupedDeployment, status: 'degraded', deployment_mode, instances: undefined,
+      replicas: [
+        { node_id: 'node-1', node_name: 'Node 1', rank: 0, status: 'running', desired_state: 'running', online: true, available: true },
+        { node_id: 'node-2', node_name: 'Node 2', rank: 1, status: 'stopped', desired_state: 'stopped', online: false, available: false },
+      ],
+    }])
+
+    expect(targets.map(({ nodeIds, available }) => ({ nodeIds, available }))).toEqual([
+      { nodeIds: ['node-1'], available: true },
+      { nodeIds: ['node-2'], available: false },
+    ])
+  })
+
+  it('offers the deployment alias and recognizes an API-saved alias rule', async () => {
+    vi.mocked(api.inferenceRouting.list).mockResolvedValue([{
+      source_ip: '10.0.0.10', requested_model: 'PRODUCTION DeepSeek', enabled: true,
+      deployment_id: 'deployment-a', instance_id: 0, node_ids: ['node-1', 'node-2'],
+    }])
+    render(<RequestRoutingPanel />)
+
+    const modelSelect = await screen.findByLabelText('Requested model')
+    expect(within(modelSelect).getByRole('option', { name: 'shared-model' })).toBeInTheDocument()
+    expect(within(modelSelect).getByRole('option', { name: 'PRODUCTION DeepSeek' })).toBeInTheDocument()
+    expect(await screen.findByText('10.0.0.10')).toBeInTheDocument()
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument()
+  })
+
   it('keeps a stale rule visible and allows disabling and removing it', async () => {
     const user = userEvent.setup()
     let rules: InferenceRoutingRule[] = [{

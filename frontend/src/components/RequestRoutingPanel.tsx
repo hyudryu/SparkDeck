@@ -20,10 +20,11 @@ const targetKey = (deploymentId: string, instanceId: number | null, nodeIds: str
 const ROUTABLE_STATUSES = new Set(['running', 'ready', 'degraded'])
 
 function servedModels(deployment: Deployment) {
+  const candidates = deployment.served_models?.length
+    ? [...deployment.served_models, deployment.alias]
+    : [deployment.served_model, deployment.alias, deployment.model_id]
   return [...new Set(
-    (deployment.served_models?.length
-      ? deployment.served_models
-      : [deployment.served_model, deployment.alias, deployment.model_id])
+    candidates
       .map((model) => model?.trim())
       .filter((model): model is string => Boolean(model)),
   )]
@@ -53,18 +54,27 @@ export function inferenceRouteTargets(deployments: Deployment[]): InferenceRoute
     })
 
     const selectedNodes = deployment.selected_nodes ?? []
-    if (deployment.deployment_mode === 'replicated') return selectedNodes.map((node) => {
-      const nodeIds = [node.id]
-      return {
-        key: targetKey(deployment.id, null, nodeIds),
-        deploymentId: deployment.id,
-        instanceId: null,
-        nodeIds,
-        label: `${deployment.alias} - ${node.name || node.id}`,
-        models,
-        available: targetAvailable(deployment.status, deployment.desired_state),
-      }
-    })
+    if (deployment.deployment_mode === 'replicated' || deployment.replicas !== undefined) {
+      const replicas = deployment.replicas?.length
+        ? [...deployment.replicas].sort((left, right) => left.rank - right.rank)
+        : selectedNodes.map((node, rank) => ({
+            node_id: node.id, node_name: node.name || node.id, rank,
+            status: 'unknown', desired_state: 'running' as const,
+            online: false, available: false,
+          }))
+      return replicas.map((replica) => {
+        const nodeIds = [replica.node_id]
+        return {
+          key: targetKey(deployment.id, null, nodeIds),
+          deploymentId: deployment.id,
+          instanceId: null,
+          nodeIds,
+          label: `${deployment.alias} - ${replica.node_name || replica.node_id}`,
+          models,
+          available: deployment.desired_state !== 'stopped' && replica.available === true,
+        }
+      })
+    }
 
     const nodeIds = deployment.node_ids ?? selectedNodes.map((node) => node.id)
     const names = selectedNodes.map((node) => node.name || node.id)

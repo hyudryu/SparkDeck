@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api } from './client'
+import { api, deploymentFromWire } from './client'
 import type { ChatStreamUpdate } from './types'
 
 afterEach(() => {
@@ -8,6 +8,21 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('preserves explicit served names and per-replica routing health', () => {
+    const replicas = [{
+      node_id: 'node-1', node_name: 'Node 1', rank: 0, status: 'running',
+      desired_state: 'running' as const, online: true, available: true,
+    }]
+
+    expect(deploymentFromWire({
+      id: 'replicas', alias: 'Replica pool', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, served_models: ['public-model'],
+      status: 'running', deployment_mode: 'replicated', replicas,
+    })).toEqual(expect.objectContaining({
+      served_models: ['public-model'], replicas,
+    }))
+  })
+
   it('uses the source IP and requested model as the routing-rule delete key', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }))
     vi.stubGlobal('fetch', fetchMock)

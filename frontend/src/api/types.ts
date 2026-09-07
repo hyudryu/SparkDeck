@@ -103,6 +103,16 @@ export interface DeploymentInstance {
   node_names: string[]
 }
 
+export interface DeploymentReplica {
+  node_id: string
+  node_name: string
+  rank: number
+  status: string
+  desired_state: 'running' | 'stopped'
+  online: boolean
+  available: boolean
+}
+
 export interface Deployment {
   id: string
   alias: string
@@ -124,6 +134,7 @@ export interface Deployment {
   settings: DeploymentSettings
   deployment_mode?: string
   instances?: DeploymentInstance[]
+  replicas?: DeploymentReplica[]
   required_node_count?: number
   // Nodes one more engine group of a tensor-parallel deployment occupies.
   instance_node_count?: number

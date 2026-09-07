@@ -1147,6 +1147,8 @@ class SparkDeckService:
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             if cluster.get("mode") == "grouped_sharded":
                 stored["instances"] = _grouped_instance_summary(cluster)
+            elif cluster.get("mode") == "replicated":
+                stored["replicas"] = _replica_summary(cluster)
             served_models = cluster.get("served_models")
             if isinstance(served_models, list):
                 stored["served_models"] = list(served_models)
@@ -6853,11 +6855,15 @@ class SparkDeckService:
         # writes share one contract. Enabled routes additionally require a
         # live deployment which currently owns the exact request model.
         normalized = self.manager._normalize_source_ip_routing_rule(value)
+        observed_replicas = None
         if normalized["enabled"]:
-            await self._source_routed_deployment(
+            target = await self._source_routed_deployment(
                 normalized, normalized["requested_model"], validating=True,
             )
-        return self.manager.upsert_source_ip_routing_rule(normalized)
+            observed_replicas = target.get("replicas")
+        return self.manager.upsert_source_ip_routing_rule(
+            normalized, observed_replicas=observed_replicas,
+        )
 
     def delete_source_ip_routing_rule(
         self, source_ip: str, requested_model: str,
@@ -6885,8 +6891,23 @@ class SparkDeckService:
         if stored is None or live is None:
             raise error_type("source-IP routing target deployment is unavailable")
         deployment = {**stored, **live}
-        if not self._deployment_can_serve_inference(deployment):
+        replicas = deployment.get("replicas") or []
+        replicated = deployment.get("deployment_mode") == "replicated" or "replicas" in deployment
+        healthy_replica = (
+            replicated
+            and deployment.get("status") == "degraded"
+            and deployment.get("desired_state") != "stopped"
+            and any(replica.get("available") is True for replica in replicas)
+        )
+        if not self._deployment_can_serve_inference(deployment) and not healthy_replica:
             raise error_type("source-IP routing target deployment is unavailable")
+        if replicated:
+            selected = next((
+                replica for replica in replicas
+                if [replica.get("node_id")] == rule.get("node_ids")
+            ), None)
+            if selected is None or selected.get("available") is not True:
+                raise error_type("source-IP routing target replica is unavailable")
         if (
             deployment.get("kind") != DeploymentKind.MANAGED.value
             or deployment.get("runtime") not in {
@@ -6939,6 +6960,7 @@ class SparkDeckService:
             deployment = await self._source_routed_deployment(
                 source_route, requested_model,
             )
+            source_route = {**source_route, "_observed_replicas": deployment.get("replicas")}
         else:
             deployment = await self._live_deployment_for_model_id(
                 requested_model
@@ -7918,6 +7940,28 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
         else:
             occupied.add(node_id)
     return sorted(occupied - offline)
+
+
+def _replica_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose observed replica health without leaking private member metadata."""
+    from manager import Manager
+
+    return [
+        {
+            "node_id": member.get("node_id"),
+            "node_name": member.get("node_name") or member.get("node_id"),
+            "rank": member.get("rank"),
+            "status": member.get("status") or "unknown",
+            "desired_state": member.get("desired_state") or cluster.get("desired_state"),
+            "online": str(member.get("node_status") or "").casefold()
+            in {"online", "degraded"},
+            "available": cluster.get("desired_state") != "stopped"
+            and str(member.get("node_status") or "").casefold() in {"online", "degraded"}
+            and Manager._source_routing_member_available(member),
+        }
+        for member in cluster.get("members") or []
+        if isinstance(member, dict) and member.get("node_id")
+    ]
 
 
 def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:

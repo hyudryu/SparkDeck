@@ -118,6 +118,116 @@ class SourceRoutingPersistenceTests(unittest.TestCase):
                 "2001:0db8::1", "shared-model",
             ))
 
+    def test_malformed_enabled_row_blocks_listing_and_inference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            malformed = _rule(enabled="yes")
+            manager.source_ip_routing_rules_path.write_text(json.dumps({
+                "version": 1,
+                "rules": [_rule(node_ids=["node-b"]), malformed],
+            }), encoding="utf-8")
+
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            self.assertEqual(manager.source_ip_routing_rules, {})
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "rule 1 is invalid: enabled",
+            ):
+                manager.list_source_ip_routing_rules()
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "rule 1 is invalid: enabled",
+            ):
+                manager.source_ip_routing_rule("2001:db8::1", "shared-model")
+
+    def test_invalid_json_and_version_block_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            cases = (
+                ("{broken", "not valid JSON"),
+                (json.dumps({"version": 2, "rules": []}), "unsupported version"),
+            )
+            for contents, message in cases:
+                with self.subTest(message=message):
+                    manager.source_ip_routing_rules_path.write_text(
+                        contents, encoding="utf-8",
+                    )
+                    manager.source_ip_routing_rules = (
+                        manager._load_source_ip_routing_rules()
+                    )
+                    with self.assertRaisesRegex(
+                        SourceRoutingUnavailable, message,
+                    ):
+                        manager.source_ip_routing_rule(
+                            "2001:db8::1", "shared-model",
+                        )
+
+    def test_read_error_blocks_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules_path.write_text(
+                json.dumps({"version": 1, "rules": []}), encoding="utf-8",
+            )
+            with patch.object(
+                Path, "read_text", side_effect=OSError("access denied"),
+            ):
+                manager.source_ip_routing_rules = (
+                    manager._load_source_ip_routing_rules()
+                )
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "cannot be read: access denied",
+            ):
+                manager.list_source_ip_routing_rules()
+
+    def test_invalid_utf8_blocks_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules_path.write_bytes(b"\xff\xfe\xfa")
+
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "cannot be read",
+            ):
+                manager.source_ip_routing_rule(
+                    "2001:db8::1", "shared-model",
+                )
+
+    def test_absent_file_keeps_ordinary_routing_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            self.assertEqual(manager.list_source_ip_routing_rules(), [])
+            self.assertIsNone(manager.source_ip_routing_rule(
+                "2001:db8::1", "shared-model",
+            ))
+
+    def test_invalid_config_blocks_mutation_until_valid_file_is_reloaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            corrupt = b'{"version":1,"rules":[{"enabled":"broken"}]}'
+            manager.source_ip_routing_rules_path.write_bytes(corrupt)
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            with self.assertRaises(SourceRoutingUnavailable):
+                manager.upsert_source_ip_routing_rule(_rule())
+            with self.assertRaises(SourceRoutingUnavailable):
+                manager.delete_source_ip_routing_rule(
+                    "2001:db8::1", "shared-model",
+                )
+            self.assertEqual(manager.source_ip_routing_rules, {})
+            self.assertEqual(
+                manager.source_ip_routing_rules_path.read_bytes(), corrupt,
+            )
+
+            valid = _rule(source_ip="2001:db8::1")
+            manager.source_ip_routing_rules_path.write_text(json.dumps({
+                "version": 1, "rules": [valid],
+            }), encoding="utf-8")
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+            self.assertEqual(manager.list_source_ip_routing_rules(), [valid])
+
 
 class SourceRoutingPlacementTests(unittest.IsolatedAsyncioTestCase):
     async def test_pins_secondary_replica_and_skips_balancing_and_affinity(self):
@@ -406,3 +516,34 @@ class SourceRoutingApiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["detail"], "pinned group offline")
+
+    async def test_list_maps_invalid_persisted_configuration_to_503(self):
+        with patch.object(
+            self.server.sparkdeck, "source_ip_routing_rules",
+            side_effect=SourceRoutingUnavailable("routing file is invalid"),
+        ):
+            response = await self.client.get("/api/v1/inference-routing-rules")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "routing file is invalid")
+
+    async def test_mutations_map_invalid_persisted_configuration_to_503(self):
+        error = SourceRoutingUnavailable("routing file is invalid")
+        with patch.object(
+            self.server.sparkdeck, "upsert_source_ip_routing_rule",
+            AsyncMock(side_effect=error),
+        ), patch.object(
+            self.server.sparkdeck, "delete_source_ip_routing_rule",
+            side_effect=error,
+        ):
+            put = await self.client.put(
+                "/api/v1/inference-routing-rules", json=_rule(),
+            )
+            deleted = await self.client.delete(
+                "/api/v1/inference-routing-rules",
+                params={
+                    "source_ip": "2001:db8::1",
+                    "requested_model": "shared-model",
+                },
+            )
+        self.assertEqual(put.status_code, 503)
+        self.assertEqual(deleted.status_code, 503)

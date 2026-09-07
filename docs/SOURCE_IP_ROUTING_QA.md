@@ -28,6 +28,10 @@ such as `192.0.2.10` and `192.0.2.20` in fixtures.
 - [ ] Canonical IPv6 forms match consistently; invalid IPs, CIDRs, hostnames,
   zone identifiers, invalid booleans, and malformed targets are rejected.
 - [ ] A failed save preserves the previous rule both in memory and on disk.
+- [ ] In the disposable fixture, corrupt the saved JSON, version, or an enabled
+  row, then restart. Listing rules and inference return an explicit unavailable
+  error; requests never fall back to ordinary routing. Restore the fixture file
+  and restart to verify recovery. A first run without a rules file works normally.
 - [ ] An unavailable or deleted target remains visible and can still be disabled
   or removed; it is never silently replaced by another target.
 
@@ -53,6 +57,11 @@ such as `192.0.2.10` and `192.0.2.20` in fixtures.
 ## UI and regression checks
 
 - [ ] Target labels distinguish deployment names, group numbers, and node names.
+- [ ] A deployment with explicit served names also offers its alias; an existing
+  alias rule stays selectable and can be toggled.
+- [ ] In a degraded replicated deployment, only healthy replicas are selectable.
+  Stopped, offline, and unknown replicas cannot be enabled through either the UI
+  or API, while a surviving replica remains usable.
 - [ ] Keyboard users can save, toggle, and remove rules; pending requests prevent
   duplicate actions and errors preserve the form.
 - [ ] At desktop and mobile widths, long model names and IPv6 addresses wrap,

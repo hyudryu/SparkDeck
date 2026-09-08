@@ -6,6 +6,7 @@ import type { AppSettings, SystemUpdateNode } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
+import { RequestRoutingPanel } from '../components/RequestRoutingPanel'
 import { LegalDialog } from '../components/LegalDialog'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
@@ -119,6 +120,7 @@ function SoftwareUpdatePanel() {
 function editableSettingsFingerprint(settings: AppSettings) {
   return JSON.stringify({
     theme: settings.theme ?? 'system',
+    max_concurrent_prompt_processing: settings.max_concurrent_prompt_processing ?? 1,
   })
 }
 
@@ -375,7 +377,7 @@ export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
   const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const auth = useAuth()
-  const [form, setForm] = useState<AppSettings>({ theme: storedTheme() })
+  const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), max_concurrent_prompt_processing: 1 })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
@@ -518,6 +520,12 @@ export function SettingsPage() {
             <label className="field"><span>Appearance</span><select value={form.theme} onChange={(event) => setForm({ ...form, theme: event.target.value as AppSettings['theme'] })}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
           </div>
         </Panel>
+        <Panel className="settings-section" aria-labelledby="load-balancer-title">
+          <div className="settings-heading"><span><Network size={18} /></span><div><h2 id="load-balancer-title">Load Balancer</h2><p>Limit simultaneous prompt processing across the router.</p></div></div>
+          <div className="settings-fields">
+            <label className="field wide-field"><span>Concurrent prompt processing streams</span><input aria-label="Concurrent prompt processing streams" type="number" min="1" step="1" required inputMode="numeric" value={Number.isNaN(form.max_concurrent_prompt_processing) ? '' : form.max_concurrent_prompt_processing ?? 1} onChange={(event) => setForm({ ...form, max_concurrent_prompt_processing: event.target.valueAsNumber })} aria-describedby="prompt-processing-help" /><small id="prompt-processing-help">Additional requests wait in the queue until an active request produces its first generated token. With a limit of 1, one prompt is processed at a time; responses can continue generating while the next prompt begins. Non-streaming requests keep their slot until the response finishes.</small></label>
+          </div>
+        </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><Network size={18} /></span><div><h2>DGX Spark cluster</h2><p>Connect nodes privately over Tailscale for targeted pulls and deployments.</p></div></div>
           <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster Management</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
@@ -592,6 +600,7 @@ export function SettingsPage() {
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
+      <RequestRoutingPanel />
       <SoftwareUpdatePanel />
       <Panel className="settings-section support-legal-section">
         <div className="settings-heading"><span><ShieldCheck size={18} /></span><div><h2>Support & legal</h2><p>Review how Community Features handle data, read the service terms, or report a problem.</p></div></div>

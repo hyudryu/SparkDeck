@@ -96,11 +96,12 @@ const sameNodes = (left: string[], right: string[]) => {
 }
 
 export function RequestRoutingPanel({ refreshGeneration = 0 }: { refreshGeneration?: number }) {
+  const [refresh, setRefresh] = useState(0)
   const deployments = useResource(
-    (signal) => api.deployments.list(signal), [refreshGeneration],
+    (signal) => api.deployments.list(signal), [refreshGeneration, refresh],
   )
   const rules = useResource(
-    (signal) => api.inferenceRouting.list(signal), [refreshGeneration],
+    (signal) => api.inferenceRouting.list(signal), [refreshGeneration, refresh],
   )
   const [enabled, setEnabled] = useState(true)
   const [sourceIp, setSourceIp] = useState('')
@@ -144,7 +145,7 @@ export function RequestRoutingPanel({ refreshGeneration = 0 }: { refreshGenerati
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not remove the request routing rule') } finally { setBusy(undefined) }
   }
 
-  return <Panel className="usage-routing-panel request-routing-panel" aria-labelledby="request-routing-title"><div className="usage-panel-heading"><div><h2 id="request-routing-title">Request routing</h2><p>Send an exact client IP and requested model to one deployment group.</p><p>Enabled rules stay on the selected group; unavailable targets return an error. Disabled rules use normal routing.</p></div></div>
+  return <Panel className="usage-routing-panel request-routing-panel" aria-labelledby="request-routing-title"><div className="usage-panel-heading"><div><h2 id="request-routing-title">IP routing rules</h2><p>Send an exact client IP and requested model to one deployment group.</p><p>Enabled rules stay on the selected group; unavailable targets return an error. Disabled rules use normal routing.</p></div><Button type="button" onClick={() => setRefresh((value) => value + 1)}>Refresh IP routing rules</Button></div>
     {(deployments.error || rules.error) && <div className="request-routing-load-error"><span>{deployments.error || rules.error}</span><Button type="button" variant="tertiary" onClick={() => { deployments.reload(); rules.reload() }}>Retry request routing</Button></div>}
     <form className="request-routing-form" aria-label="Add request routing rule" onSubmit={(event) => void save(event)}>
       <label className="field request-routing-toggle"><span>Enabled</span><span className="request-toggle-control"><span>Off</span><input type="checkbox" role="switch" aria-label="Enabled" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span className="request-toggle-track" aria-hidden="true"><span /></span><span>On</span></span></label>

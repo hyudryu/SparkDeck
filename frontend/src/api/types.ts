@@ -648,6 +648,7 @@ export interface ImagePullResult {
 }
 
 export interface AppSettings {
+  max_concurrent_prompt_processing?: number
   theme?: 'system' | 'light' | 'dark'
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.

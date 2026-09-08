@@ -27,6 +27,66 @@ class FakeManager:
         self._unsloth_loaded_model = AsyncMock(return_value=None)
 
 
+class AwaitOrCancelCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_owner_cancellation_waits_for_upstream_cleanup(self):
+        for trigger in ("disconnect", "owner", "owner_without_watchers"):
+            with self.subTest(trigger=trigger):
+                started = asyncio.Event()
+                cleaning = asyncio.Event()
+                finish = asyncio.Event()
+                closed = asyncio.Event()
+                cancel = None if trigger == "owner_without_watchers" else asyncio.Event()
+
+                async def upstream():
+                    try:
+                        started.set()
+                        await asyncio.Event().wait()
+                    finally:
+                        cleaning.set()
+                        await finish.wait()
+                        closed.set()
+
+                owner = asyncio.create_task(Manager._await_or_cancel(upstream(), cancel))
+                await asyncio.wait_for(started.wait(), 1)
+                if trigger == "disconnect":
+                    cancel.set()
+                else:
+                    owner.cancel()
+                await asyncio.wait_for(cleaning.wait(), 1)
+                try:
+                    for _ in range(3):
+                        owner.cancel()
+                        for _ in range(3):
+                            await asyncio.sleep(0)
+                        self.assertFalse(owner.done())
+                        self.assertFalse(closed.is_set())
+                finally:
+                    finish.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(owner, 1)
+                self.assertTrue(closed.is_set())
+
+    async def test_disconnect_keeps_client_abort_after_cleanup(self):
+        cancel = asyncio.Event()
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def upstream():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                closed.set()
+
+        owner = asyncio.create_task(Manager._await_or_cancel(upstream(), cancel))
+        await asyncio.wait_for(started.wait(), 1)
+        cancel.set()
+        with self.assertRaises(ClientAbort):
+            await asyncio.wait_for(owner, 1)
+        self.assertTrue(closed.is_set())
+
+
 class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicitly_stopped_registered_deployment_cannot_auto_wake(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1131,9 +1191,11 @@ class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_nonstream_request_is_cancelled_on_disconnect(self):
         closed = asyncio.Event()
+        started = asyncio.Event()
         blocker = asyncio.Event()
 
         async def post(*_args, **_kwargs):
+            started.set()
             try:
                 await blocker.wait()
             finally:
@@ -1155,7 +1217,7 @@ class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 {"model": "external", "messages": [], "stream": False},
                 "chat/completions", cancel,
             ))
-            await asyncio.sleep(0)
+            await asyncio.wait_for(started.wait(), timeout=2)
             cancel.set()
 
             with self.assertRaises(ClientAbort):

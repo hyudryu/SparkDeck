@@ -8,7 +8,8 @@ import json
 import anyio
 from collections import deque
 from contextlib import suppress
-from typing import Callable
+from typing import Callable, Hashable
+from weakref import WeakValueDictionary
 
 from sparkdeck.stream_cleanup import close_async_stream
 
@@ -51,7 +52,7 @@ class PromptLease:
 
 
 class PromptGate:
-    """One event-loop-local gate shared by every inference route in a service."""
+    """One event-loop-local gate shared by requests to a serving group."""
     def __init__(self, limit: Callable[[], int] = lambda: 1):
         self.limit = limit
         self.active = 0
@@ -121,6 +122,31 @@ class PromptGate:
                 except BaseException:
                     pass
                 lease.release()
+
+
+class PromptGates:
+    """Independent serving-group gates with a shared, live concurrency limit."""
+
+    def __init__(self, limit: Callable[[], int] = lambda: 1):
+        self.limit = limit
+        # Running requests, queued acquires, and stream leases own their gate.
+        # Retired groups do not need to remain in the registry indefinitely.
+        self._gates: WeakValueDictionary[Hashable, PromptGate] = WeakValueDictionary()
+
+    def get(self, key: Hashable) -> PromptGate:
+        gate = self._gates.get(key)
+        if gate is None:
+            gate = PromptGate(self.limit)
+            self._gates[key] = gate
+        return gate
+
+    async def run(self, key: Hashable, factory, cancel=None):
+        return await self.get(key).run(factory, cancel)
+
+    def refresh(self):
+        """Apply setting increases to waiters in every active serving group."""
+        for gate in list(self._gates.values()):
+            gate.refresh()
 
 
 class _OutputDetector:

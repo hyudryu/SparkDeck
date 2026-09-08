@@ -415,7 +415,7 @@ test('keeps storage inventory and transfer controls touch friendly', async ({ pa
 
 test('edits the Load Balancer limit and keeps IP rules in Settings', async ({ page }, testInfo) => {
   await page.goto('/settings')
-  const limit = page.getByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+  const limit = page.getByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
   await expect(limit).toHaveValue('1')
   await limit.fill('2')
   await page.getByRole('button', { name: 'Save settings' }).click()

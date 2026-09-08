@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from sparkdeck.service import SparkDeckService
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 
 
 class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -14,21 +15,37 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         self.service = SparkDeckService(SimpleNamespace(http=None), Path(self.directory.name))
         self.addAsyncCleanup(self.service.close)
+        self.configure_target()
+
+    def configure_target(self):
+        self.deployment = self.persist_target("serving-target")
+        self.service._live_deployment_for_model_id = AsyncMock(return_value=self.deployment)
+
+    def persist_target(self, name):
+        if self.service.store.deployment(name) is None:
+            self.service.store.add_deployment(Deployment(
+                id=name, alias=name, runtime=RuntimeKind.LLAMA_CPP,
+                kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            ), base_url="http://localhost:8000")
+        return self.service.store.deployment(name, include_private=True)
+
+    async def close_stream(self, stream):
+        await stream.aclose()
 
     async def wait_for_queue(self, count):
         async def wait():
-            while len(self.service.prompt_gate._waiting) != count:
+            while len(self.service.prompt_gate.get(("deployment", self.deployment["id"]))._waiting) != count:
                 await asyncio.sleep(0)
         await asyncio.wait_for(wait(), 2)
 
-    async def test_models_and_endpoints_share_fifo_until_first_generated_output(self):
+    async def test_target_aliases_endpoints_and_callers_share_fifo_until_first_generated_output(self):
         chunks = {name: asyncio.Queue() for name in ("first", "second", "third")}
         entered = []
         closed = []
 
-        async def upstream(body, endpoint, cancel, *, caller_ip):
+        async def upstream(deployment, body, endpoint, cancel, **kwargs):
             name = body["model"]
-            entered.append((name, endpoint, caller_ip))
+            entered.append((name, endpoint, kwargs["caller_ip"]))
 
             async def stream():
                 try:
@@ -41,11 +58,11 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
                     closed.append(name)
             return stream()
 
-        self.service._proxy_unlimited = AsyncMock(side_effect=upstream)
+        self.service._proxy_registered_unlimited = AsyncMock(side_effect=upstream)
         first = await self.service.proxy(
             {"model": "first", "stream": True}, "chat/completions", caller_ip="192.0.2.1",
         )
-        self.addAsyncCleanup(first.aclose)
+        self.addAsyncCleanup(self.close_stream, first)
         second_task = asyncio.create_task(self.service.proxy(
             {"model": "second", "stream": True}, "completions", caller_ip="192.0.2.2",
         ))
@@ -67,7 +84,7 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         await chunks["first"].put(token)
         self.assertEqual(await asyncio.wait_for(anext(first), 2), token)
         second = await asyncio.wait_for(second_task, 2)
-        self.addAsyncCleanup(second.aclose)
+        self.addAsyncCleanup(self.close_stream, second)
         self.assertNotIn("first", closed)
         self.assertFalse(third_task.done())
         await chunks["first"].put(token)
@@ -78,7 +95,7 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         await chunks["second"].put(completion)
         self.assertEqual(await asyncio.wait_for(anext(second), 2), completion)
         third = await asyncio.wait_for(third_task, 2)
-        self.addAsyncCleanup(third.aclose)
+        self.addAsyncCleanup(self.close_stream, third)
         self.assertEqual(entered, [
             ("first", "chat/completions", "192.0.2.1"),
             ("second", "completions", "192.0.2.2"),
@@ -86,21 +103,47 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(closed, [])
 
+    async def test_different_serving_targets_process_prompts_concurrently(self):
+        targets = {name: self.persist_target(name) for name in ('a', 'b')}
+        self.service._live_deployment_for_model_id = AsyncMock(
+            side_effect=lambda model: targets[model],
+        )
+        entered = {name: asyncio.Event() for name in targets}
+        finish = asyncio.Event()
+
+        async def upstream(deployment, body, endpoint, cancel, **kwargs):
+            entered[deployment['id']].set()
+            await finish.wait()
+            return {'model': body['model']}
+
+        self.service._proxy_registered_unlimited = AsyncMock(side_effect=upstream)
+        tasks = [
+            asyncio.create_task(self.service.proxy({'model': name}, 'completions'))
+            for name in targets
+        ]
+        for task in tasks:
+            self.addCleanup(task.cancel)
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), 2)
+        self.assertTrue(all(not task.done() for task in tasks))
+        finish.set()
+        self.assertEqual(await asyncio.gather(*tasks), [{'model': 'a'}, {'model': 'b'}])
+
     async def test_saved_limit_survives_restart_and_bounds_nonstream_requests(self):
         self.service.store.set_setting("max_concurrent_prompt_processing", 2)
         await self.service.close()
         self.service = SparkDeckService(SimpleNamespace(http=None), Path(self.directory.name))
         self.addAsyncCleanup(self.service.close)
+        self.configure_target()
         entered = asyncio.Queue()
         release = {name: asyncio.Event() for name in ("first", "second", "third")}
 
-        async def upstream(body, endpoint, cancel, *, caller_ip):
+        async def upstream(deployment, body, endpoint, cancel, **kwargs):
             name = body["model"]
             await entered.put(name)
             await release[name].wait()
             return {"model": name}
 
-        self.service._proxy_unlimited = AsyncMock(side_effect=upstream)
+        self.service._proxy_registered_unlimited = AsyncMock(side_effect=upstream)
         tasks = []
         for name in release:
             task = asyncio.create_task(self.service.proxy({"model": name}, "completions"))
@@ -116,4 +159,4 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         for event in release.values():
             event.set()
         await asyncio.wait_for(asyncio.gather(*tasks), 2)
-        self.assertEqual(self.service.prompt_gate.active, 0)
+        self.assertEqual(self.service.prompt_gate.get(("deployment", self.deployment["id"])).active, 0)

@@ -1,13 +1,73 @@
 import asyncio
+import gc
 import unittest
+import weakref
 
 from manager import ClientAbort
-from sparkdeck.prompt_gate import PromptGate
+from sparkdeck.prompt_gate import PromptGate, PromptGates
 
 
 async def turns():
     for _ in range(5):
         await asyncio.sleep(0)
+
+
+class PromptGatesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_each_group_runs_one_request_and_queues_its_next_request(self):
+        gates = PromptGates()
+        started = {key: asyncio.Event() for key in ('a1', 'a2', 'b1', 'b2')}
+        finish = {key: asyncio.Event() for key in started}
+
+        async def response(key):
+            started[key].set()
+            await finish[key].wait()
+            return key
+
+        tasks = {
+            key: asyncio.create_task(gates.run(key[0], lambda key=key: response(key)))
+            for key in started
+        }
+        await asyncio.wait_for(asyncio.gather(started['a1'].wait(), started['b1'].wait()), 1)
+        self.assertFalse(started['a2'].is_set())
+        self.assertFalse(started['b2'].is_set())
+        finish['a1'].set()
+        await asyncio.wait_for(started['a2'].wait(), 1)
+        self.assertFalse(started['b2'].is_set())
+        finish['b1'].set()
+        await asyncio.wait_for(started['b2'].wait(), 1)
+        for event in finish.values():
+            event.set()
+        self.assertEqual(await asyncio.gather(*tasks.values()), list(started))
+
+    async def test_refresh_applies_live_limit_to_all_groups(self):
+        limit = [1]
+        gates = PromptGates(lambda: limit[0])
+        group_gates = [gates.get(('recipe', key)) for key in ('a', 'b')]
+        active = [await gate.acquire() for gate in group_gates]
+        queued = [asyncio.create_task(gate.acquire()) for gate in group_gates]
+        await turns()
+        self.assertTrue(all(not task.done() for task in queued))
+        limit[0] = 2
+        gates.refresh()
+        admitted = await asyncio.wait_for(asyncio.gather(*queued), 1)
+        self.assertEqual([gate.active for gate in group_gates], [2, 2])
+        for lease in active + admitted:
+            lease.release()
+
+    async def test_same_key_shares_gate_and_idle_gate_is_collectable(self):
+        gates = PromptGates()
+        gate = gates.get(('recipe', 'group'))
+        self.assertIs(gate, gates.get(('recipe', 'group')))
+        reference = weakref.ref(gate)
+        lease = await gate.acquire()
+        del gate
+        gc.collect()
+        self.assertIs(gates.get(('recipe', 'group')), lease.gate)
+        lease.release()
+        del lease
+        gc.collect()
+        self.assertIsNone(reference())
+        self.assertEqual(len(gates._gates), 0)
 
 
 class PromptGateTests(unittest.IsolatedAsyncioTestCase):

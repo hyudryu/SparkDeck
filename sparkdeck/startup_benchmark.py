@@ -255,11 +255,22 @@ class StartupBenchmarkMonitor:
                               if item.fingerprint == target.fingerprint), None)
                 if fresh is None or not await self._healthy(fresh):
                     return
-                scopes = self.service._community_observation_scopes(fresh.deployment, fresh.deployment["id"])
+                scopes = self.service._community_observation_scopes(
+                    fresh.deployment, fresh.deployment["id"], member=fresh.member,
+                )
                 if any(scopes.intersection(item.get("scopes") or ())
                        for item in self.service._community_active_observations.values()):
                     return
-                if getattr(self.manager, "_active_reqs", {}):
+                # Direct manager requests also compete for hardware. An active
+                # request on an independent group must not defer this probe.
+                if any(
+                    not (request.get("group") or {}).get("node_ids")
+                    or scopes.intersection(
+                        f"node:{node_id}"
+                        for node_id in request["group"]["node_ids"]
+                    )
+                    for request in getattr(self.manager, "_active_reqs", {}).values()
+                ):
                     return
                 if getattr(self.service, "_startup_benchmark_busy", lambda: False)():
                     return
@@ -289,12 +300,14 @@ class StartupBenchmarkMonitor:
         deployment = target.deployment
         model = deployment["model"]["repository"]
         observation = self.service._community_observation_start(
-            self.service._community_observation_scopes(deployment, deployment["id"]),
+            self.service._community_observation_scopes(
+                deployment, deployment["id"], member=target.member,
+            ),
+            deferred=True,
         )
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
             seen_key=self._seen_key(target.fingerprint),
-            manager_request_sequence=getattr(self.manager, "_req_seq", 0),
             manager_requests_expected=int(bool(target.cluster) or deployment["runtime"] in {"vllm", "sglang"}),
         )
         token = self.service._community_observation.set(observation)

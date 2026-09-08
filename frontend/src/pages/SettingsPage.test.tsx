@@ -60,7 +60,7 @@ describe('settings page', () => {
     }))
     const user = userEvent.setup()
     const visit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
-    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
     expect(field).toHaveValue(1)
     expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
     await user.clear(field)
@@ -70,7 +70,7 @@ describe('settings page', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())
     visit.unmount()
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
-    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Concurrent prompt processing streams' })).toHaveValue(3))
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })).toHaveValue(3))
   })
 
   it('rejects empty, zero, and fractional prompt-processing limits before saving', async () => {
@@ -79,7 +79,7 @@ describe('settings page', () => {
       new Response(JSON.stringify({ theme: 'system', items: [] }), { headers: { 'Content-Type': 'application/json' } })))
     const user = userEvent.setup()
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
-    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
     for (const value of ['', '0', '1.5']) {
       await user.clear(field)
       if (value) await user.type(field, value)

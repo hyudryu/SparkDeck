@@ -411,3 +411,23 @@ test('keeps storage inventory and transfer controls touch friendly', async ({ pa
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)
 })
+
+
+test('edits the Load Balancer limit and keeps IP rules in Settings', async ({ page }, testInfo) => {
+  await page.goto('/settings')
+  const limit = page.getByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+  await expect(limit).toHaveValue('1')
+  await limit.fill('2')
+  await page.getByRole('button', { name: 'Save settings' }).click()
+  await expect(page.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+  await page.reload()
+  await expect(limit).toHaveValue('2')
+  await page.getByRole('region', { name: 'Load Balancer' }).screenshot({ path: testInfo.outputPath('load-balancer.png') })
+  const routing = page.getByRole('region', { name: 'IP routing rules' })
+  await routing.scrollIntoViewIfNeeded()
+  await expect(routing.getByLabel('Source IP')).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  await routing.screenshot({ path: testInfo.outputPath('ip-routing-rules.png') })
+  await page.goto('/usage')
+  await expect(page.getByRole('heading', { name: 'IP routing rules' })).toHaveCount(0)
+})

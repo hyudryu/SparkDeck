@@ -47,6 +47,100 @@ async function submitCommunitySignOut(user: ReturnType<typeof userEvent.setup>, 
 }
 
 describe('settings page', () => {
+  it('saves the prompt-processing limit and restores it on the next visit', async () => {
+    let limit = 1
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') limit = JSON.parse(String(init.body)).max_concurrent_prompt_processing
+        body = { theme: 'system', max_concurrent_prompt_processing: limit }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    const visit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+    expect(field).toHaveValue(1)
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+    await user.clear(field)
+    await user.type(field, '3')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(limit).toBe(3))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())
+    visit.unmount()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Concurrent prompt processing streams' })).toHaveValue(3))
+  })
+
+  it('rejects empty, zero, and fractional prompt-processing limits before saving', async () => {
+    const update = vi.spyOn(api.settings, 'update')
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ theme: 'system', items: [] }), { headers: { 'Content-Type': 'application/json' } })))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams' })
+    for (const value of ['', '0', '1.5']) {
+      await user.clear(field)
+      if (value) await user.type(field, value)
+      expect(field).toBeInvalid()
+      await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    }
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('refreshes request-routing health and rules with the Settings routing refresh action', async () => {
+    const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })
+    let state = 0
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) return json({ items: [{
+        id: 'deployment-a', alias: 'PRODUCTION DeepSeek', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'deepseek/repo' }, served_models: ['shared-model'],
+        status: state === 1 ? 'running' : 'degraded', desired_state: 'running',
+        settings: {}, deployment_mode: 'grouped_sharded',
+        instances: [{
+          instance_id: 0, status: state === 1 ? 'running' : 'starting', desired_state: 'running',
+          node_ids: ['node-1', 'node-2'], node_names: ['Node 1', 'Node 2'],
+        }],
+      }] })
+      if (path.includes('/api/v1/inference-routing-rules')) return json({ items: [{
+        source_ip: state === 0 ? '10.0.0.1' : '10.0.0.2', requested_model: 'shared-model', enabled: true,
+        deployment_id: 'deployment-a', instance_id: 0, node_ids: ['node-1', 'node-2'],
+      }] })
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json({ theme: 'system', max_concurrent_prompt_processing: 1 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('10.0.0.1')).toBeInTheDocument()
+    expect(screen.getByText('Unavailable')).toBeInTheDocument()
+
+    state = 1
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    expect(await screen.findByText('10.0.0.2')).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByText('10.0.0.1')).not.toBeInTheDocument())
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Source IP'), '192.0.2.50')
+    await user.selectOptions(screen.getByLabelText('Requested model'), 'shared-model')
+    const target = screen.getByRole('option', { name: /Group 1/ })
+    await user.selectOptions(screen.getByLabelText('Target deployment group'), target)
+    const deploymentCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/api/v1/deployments')).length
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/api/v1/deployments')).length).toBeGreaterThan(deploymentCalls))
+    expect(screen.getByLabelText('Source IP')).toHaveValue('192.0.2.50')
+    expect(screen.getByLabelText('Requested model')).toHaveValue('shared-model')
+    expect(screen.getByLabelText('Target deployment group')).toHaveValue(target.getAttribute('value'))
+
+    state = 2
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument()
+  })
   it('checks the latest main commit on every settings mount', async () => {
     let revision = 'b'.repeat(40)
     const paths: string[] = []

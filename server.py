@@ -2868,6 +2868,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 
 
 _APP_SETTING_DEFAULTS = {
+    "max_concurrent_prompt_processing": 1,
     "theme": "system",
     "default_runtime": "vllm",
     "default_context_length": 8192,
@@ -2909,7 +2910,14 @@ async def v1_update_settings(req: Request):
         raise HTTPException(400, "default_context_length must be an integer") from e
     if not 256 <= default_context_length <= 10_000_000:
         raise HTTPException(400, "default_context_length must be between 256 and 10000000")
+    prompt_limit = body.get(
+        "max_concurrent_prompt_processing",
+        sparkdeck.store.get_setting("max_concurrent_prompt_processing", 1),
+    )
+    if type(prompt_limit) is not int or prompt_limit < 1:
+        raise HTTPException(400, "max_concurrent_prompt_processing must be a positive integer")
     values = {
+        "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
         "default_runtime": default_runtime,
         "default_context_length": default_context_length,
@@ -2924,6 +2932,7 @@ async def v1_update_settings(req: Request):
                 raise HTTPException(400, "hf_token is not valid")
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
+    sparkdeck.prompt_gate.refresh()
     if credential:
         await manager.update_settings({"hf_token": credential})
     values["vllm_image"] = manager.settings.get("vllm_image")

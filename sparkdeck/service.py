@@ -45,6 +45,7 @@ from .envfile_settings import (
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtime_file_mounts import normalize_runtime_file_mounts
 from .stream_cleanup import close_async_stream
+from .prompt_gate import PromptGate
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -404,6 +405,9 @@ class SparkDeckService:
         self.manager = manager
         self._data_dir = Path(data_dir)
         self.store = SparkDeckStore(self._data_dir / "sparkdeck.sqlite3")
+        self.prompt_gate = PromptGate(
+            lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
+        )
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
             manager.http,
@@ -7123,6 +7127,14 @@ class SparkDeckService:
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
+        return await self.prompt_gate.run(
+            lambda: self._proxy_unlimited(body, endpoint, cancel, caller_ip=caller_ip),
+            cancel=cancel,
+        )
+
+    async def _proxy_unlimited(self, body: dict[str, Any], endpoint: str,
+                              cancel: Any = None, *, caller_ip: str | None = None,
+                              ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
         route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
         source_route = (

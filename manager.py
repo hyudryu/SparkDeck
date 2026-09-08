@@ -11559,8 +11559,6 @@ class Manager:
         interrupt: asyncio.Event | None = None,
     ):
         """Await a coroutine, aborting it on disconnect or a stream nudge."""
-        if cancel is None and interrupt is None:
-            return await coro
         t = asyncio.create_task(coro)
         cw = asyncio.create_task(cancel.wait()) if cancel is not None else None
         iw = (
@@ -11568,23 +11566,34 @@ class Manager:
             if interrupt is not None else None
         )
         watchers = {task for task in (cw, iw) if task is not None}
-        done, _ = await asyncio.wait(
-            {t, *watchers}, return_when=asyncio.FIRST_COMPLETED,
-        )
-        for watcher in watchers:
-            watcher.cancel()
-        if t in done:
-            return t.result()
-        t.cancel()
         try:
-            await t
-        except BaseException:
-            pass
-        if cw is not None and cw in done:
+            done, _ = await asyncio.wait(
+                {t, *watchers}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if t in done:
+                return t.result()
+            if cw is not None and cw in done:
+                raise ClientAbort("client disconnected")
+            if iw is not None and iw in done:
+                raise StreamNudge("stream selected for transparent replay")
             raise ClientAbort("client disconnected")
-        if iw is not None and iw in done:
-            raise StreamNudge("stream selected for transparent replay")
-        raise ClientAbort("client disconnected")
+        finally:
+            # The prompt gate may cancel this owner before its own disconnect
+            # watcher wins. Always join upstream cleanup before releasing it.
+            for task in {t, *watchers}:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            cleanup = asyncio.gather(t, *watchers, return_exceptions=True)
+            cancelled = None
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    # A second disconnect cancellation must not interrupt the
+                    # transport's finally block. Propagate it after cleanup.
+                    cancelled = exc
+            if cancelled is not None:
+                raise cancelled
 
     @staticmethod
     async def _aiter_lines_cancellable(

@@ -60,6 +60,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
+            "max_concurrent_prompt_processing": 1,
             "theme": "dark",
             "default_runtime": "sglang",
             "default_context_length": 24576,
@@ -93,6 +94,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
+            "max_concurrent_prompt_processing": 1,
             "theme": "light",
             "default_runtime": "sglang",
             "default_context_length": 32768,
@@ -102,10 +104,40 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(sentinel, response.text)
         update_settings.assert_awaited_once_with({"hf_token": sentinel})
         self.assertEqual(set_setting.call_args_list, [
+            call("max_concurrent_prompt_processing", 1),
             call("theme", "light"),
             call("default_runtime", "sglang"),
             call("default_context_length", 32768),
         ])
+
+    async def test_prompt_limit_requires_positive_integer_without_partial_writes(self):
+        with patch.object(server.sparkdeck.store, "set_setting") as save:
+            for value in [0, -1, True, 1.5, "2", None]:
+                response = await self.client.put("/api/v1/settings", json={
+                    "theme": "dark", "max_concurrent_prompt_processing": value,
+                })
+                self.assertEqual(response.status_code, 400, value)
+            save.assert_not_called()
+
+    async def test_prompt_limit_persists_and_omitted_value_is_preserved(self):
+        stored = {}
+        with (
+            patch.object(server.sparkdeck.store, "get_setting",
+                         side_effect=lambda key, default: stored.get(key, default)),
+            patch.object(server.sparkdeck.store, "set_setting",
+                         side_effect=lambda key, value: stored.update({key: value})),
+            patch.object(server.sparkdeck.prompt_gate, "refresh") as refresh,
+        ):
+            response = await self.client.put("/api/v1/settings", json={
+                "max_concurrent_prompt_processing": 3,
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
+            refresh.assert_called_once()
+            response = await self.client.put("/api/v1/settings", json={"theme": "light"})
+            self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
+            response = await self.client.get("/api/v1/settings")
+            self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
 
     async def test_invalid_deployment_defaults_are_rejected_without_saving(self):
         with patch.object(server.sparkdeck.store, "set_setting") as set_setting:

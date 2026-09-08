@@ -1660,7 +1660,14 @@ async def agent_container_state(name: str, req: Request, check_ready: bool = Fal
         ready = container.get("status") == "running" and await manager._check_ready(
             container, strict_health=True,
         )
-    return {"name": name, "status": container.get("status"), "ready": ready}
+    state = {"name": name, "status": container.get("status"), "ready": ready}
+    # Report the names observed on this container, not pending launch settings.
+    # Targeted routing needs these to address the currently running engine.
+    if isinstance(container.get("served_models"), list):
+        state["served_models"] = list(container["served_models"])
+    if container.get("served_model"):
+        state["served_model"] = container["served_model"]
+    return state
 
 
 @app.get("/api/agent/containers/{name}/logs")

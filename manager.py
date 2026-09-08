@@ -3591,6 +3591,7 @@ class Manager:
 
     def _load_source_ip_routing_rules(self) -> dict[str, dict]:
         path = self.source_ip_routing_rules_path
+        self._index_source_ip_routing_rules({})
         self.source_ip_routing_rules_error = None
         try:
             exists = path.exists()
@@ -3637,6 +3638,7 @@ class Manager:
                 if key in result:
                     raise ValueError(f"rule {index} duplicates an earlier rule")
                 result[key] = rule
+            self._index_source_ip_routing_rules(result)
             return result
         except (ValueError, TypeError) as exc:
             self.source_ip_routing_rules_error = (
@@ -3673,6 +3675,29 @@ class Manager:
                 getattr(self, "source_ip_routing_rules", {}).values(),
                 key=lambda row: (row["source_ip"], row["requested_model"]),
             )
+        ]
+
+    def _index_source_ip_routing_rules(self, rules: dict[str, dict]) -> None:
+        by_source: dict[str, list[dict]] = {}
+        for rule in rules.values():
+            by_source.setdefault(rule["source_ip"], []).append(rule)
+        self._source_ip_routing_rules_by_source = by_source
+        self._source_ip_routing_index_rules = rules
+
+    def source_ip_routing_rules_for_source(self, source_ip: Any) -> list[dict]:
+        """Return configured rows, including disabled rows, without a global scan."""
+        self._assert_source_ip_routing_config_valid()
+        try:
+            canonical_ip = self._canonical_source_routing_ip(source_ip)
+        except ValueError:
+            return []
+        rules = getattr(self, "source_ip_routing_rules", {})
+        # Also support replacing the rule snapshot outside the persistence API.
+        if getattr(self, "_source_ip_routing_index_rules", None) is not rules:
+            self._index_source_ip_routing_rules(rules)
+        return [
+            dict(rule) for rule in
+            self._source_ip_routing_rules_by_source.get(canonical_ip, ())
         ]
 
     def source_ip_routing_rule(
@@ -3724,6 +3749,7 @@ class Manager:
         )] = rule
         self._save_source_ip_routing_rules(rules)
         self.source_ip_routing_rules = rules
+        self._index_source_ip_routing_rules(rules)
         return dict(rule)
 
     def delete_source_ip_routing_rule(
@@ -3739,6 +3765,7 @@ class Manager:
         rules.pop(key)
         self._save_source_ip_routing_rules(rules)
         self.source_ip_routing_rules = rules
+        self._index_source_ip_routing_rules(rules)
         return True
 
     def source_ip_routing_target(

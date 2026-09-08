@@ -6905,9 +6905,12 @@ class SparkDeckService:
             "served_model": linked.get("served_model"),
             "served_models": linked.get("served_models"),
             "launch_settings": linked.get("launch_settings"),
+            "settings_dirty": linked.get("settings_dirty"),
             "desired_state": linked.get("desired_state"),
             "members": [(m.get("node_id"), m.get("rank"), m.get("instance_id"),
-                         m.get("container_name"), m.get("desired_state")) for m in linked.get("members") or []],
+                         m.get("container_name"), m.get("container_id"),
+                         m.get("launch_settings_fingerprint"), m.get("desired_state"))
+                        for m in linked.get("members") or []],
         }, sort_keys=True, default=str)
 
     async def _source_routing_member_state(self, deployment: dict, member: dict, coordinator: bool) -> dict:
@@ -6920,30 +6923,38 @@ class SparkDeckService:
             ready = bool(container and container.get("status") == "running")
             if ready and coordinator:
                 ready = await self.manager._check_ready(container, strict_health=True)
-            return {"status": (container or {}).get("status", "missing"), "ready": ready}
+            return {"status": (container or {}).get("status", "missing"), "ready": ready,
+                    "served_models": (container or {}).get("served_models")
+                    or ([(container or {})["served_model"]] if (container or {}).get("served_model") else [])}
         try:
-            return await self.manager.node_registry.request(
+            state = await self.manager.node_registry.request(
                 node_id, "GET", f"/api/agent/containers/{name}/state?check_ready={'true' if coordinator else 'false'}",
                 timeout=8,
             )
+            if state.get("served_model") and not state.get("served_models"):
+                state = {**state, "served_models": [state["served_model"]]}
+            if not (deployment.get("settings_dirty") and coordinator) or state.get("served_models"):
+                return state
         except NodeAgentResponseError as exc:
             if exc.status_code != 404:
                 raise
-            # Older agents lack the targeted endpoint. Compatibility work is
-            # restricted to this selected node; never inspect sibling groups.
-            status = await self.manager.node_registry.request(node_id, "GET", "/api/agent/status", timeout=8)
-            if status.get("docker_ready") is not True or status.get("inventory_available") is False:
-                raise RuntimeError("selected node container inventory is unavailable")
-            container = next((row for row in status.get("containers") or [] if row.get("name") == name), {})
-            ready = container.get("status") == "running"
-            if ready and coordinator:
-                health = await self.manager.node_registry.request(
-                    node_id, "POST", "/api/agent/inference/health", timeout=8,
-                    json_body={"model": deployment.get("model"), "_sparkdeck_container_name": name,
-                               "_sparkdeck_deployment_id": deployment["id"], "strict_health": True},
-                )
-                ready = health.get("ready") is True and health.get("health_status") == 200
-            return {"status": container.get("status", "missing"), "ready": ready}
+        # Older agents lack the endpoint or its served-name metadata. Inspect
+        # only this selected node, never global inventory or sibling groups.
+        status = await self.manager.node_registry.request(node_id, "GET", "/api/agent/status", timeout=8)
+        if status.get("docker_ready") is not True or status.get("inventory_available") is False:
+            raise RuntimeError("selected node container inventory is unavailable")
+        container = next((row for row in status.get("containers") or [] if row.get("name") == name), {})
+        ready = container.get("status") == "running"
+        if ready and coordinator:
+            health = await self.manager.node_registry.request(
+                node_id, "POST", "/api/agent/inference/health", timeout=8,
+                json_body={"model": deployment.get("model"), "_sparkdeck_container_name": name,
+                           "_sparkdeck_deployment_id": deployment["id"], "strict_health": True},
+            )
+            ready = health.get("ready") is True and health.get("health_status") == 200
+        return {"status": container.get("status", "missing"), "ready": ready,
+                "served_models": container.get("served_models")
+                or ([container["served_model"]] if container.get("served_model") else [])}
 
     async def _observe_source_routing_target(self, stored: dict, rule: dict) -> list[dict]:
         deployment, nodes = self.manager.source_ip_routing_target(
@@ -6978,6 +6989,15 @@ class SparkDeckService:
         live = {**stored, "status": "running" if healthy else "unknown", "deployment_mode": mode,
                 "desired_state": deployment.get("desired_state"), "managed": True,
                 "served_models": self.manager._deployment_served_models(deployment)}
+        observed_names = list(dict.fromkeys(
+            str(name) for member, state in zip(members, observations)
+            if mode == "replicated" or int(member.get("rank") or 0) == 0
+            for name in state.get("served_models") or [] if name
+        ))
+        if observed_names:
+            live["served_models"] = observed_names
+        elif deployment.get("settings_dirty"):
+            raise RuntimeError("selected serving unit's active model names are unavailable")
         if mode == "replicated":
             live["replicas"] = _replica_summary(observed)
         elif mode == "grouped_sharded":
@@ -7098,6 +7118,7 @@ class SparkDeckService:
                 "source-IP routing target is not a supported managed runtime"
             )
         owned_models = set(self._deployment_public_model_ids(deployment))
+        owned_models.add(stable_id)
         alias = str(deployment.get("alias") or "").strip()
         if alias:
             owned_models.add(alias)
@@ -7124,6 +7145,84 @@ class SparkDeckService:
         }
         return deployment
 
+    async def _pin_source_route(
+        self, source_route: dict[str, Any], requested_model: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve and decorate a validated source-IP routing rule."""
+        deployment = await self._source_routed_deployment(
+            source_route, requested_model,
+        )
+        pinned = {
+            **source_route,
+            "_observed_replicas": deployment.get("replicas"),
+            "_observed_instances": deployment.get("instances"),
+            "_observed_members": deployment.get("_source_routing_members"),
+        }
+        return pinned, deployment
+
+    async def _source_rule_for_request(
+        self, caller_ip: str | None, requested_model: str,
+    ) -> dict[str, Any] | None:
+        """Resolve pins from persisted ownership before live model selection."""
+        if not caller_ip:
+            return None
+        source_rules = getattr(self.manager, "source_ip_routing_rules_for_source", None)
+        if not callable(source_rules):
+            return None
+        rules = source_rules(caller_ip)
+        exact = next((rule for rule in rules if rule.get("requested_model") == requested_model), None)
+        if exact is not None:
+            # An explicitly disabled exact rule restores ordinary routing;
+            # another naming form must not silently re-enable its pin.
+            return exact if exact.get("enabled") is True else None
+        matches = []
+        owners = {}
+        observed_targets = {}
+        for rule in rules:
+            if rule.get("enabled") is not True:
+                continue
+            stable_id = str(rule.get("deployment_id") or "")
+            if stable_id not in owners:
+                owners[stable_id] = self.store.deployment(stable_id, include_private=True)
+            stored = owners[stable_id]
+            if stored is None:
+                continue
+            # Ownership survives an absent Manager runtime just as it does
+            # for a saved launch bookmark. Resolve its persisted launch names
+            # without requiring the deployment to appear in live inventory.
+            owned_models = set(self._deployment_public_model_ids({**stored, "status": "saved"}))
+            owned_models.add(stable_id)
+            alias = str(stored.get("alias") or "").strip()
+            if alias:
+                owned_models.add(alias)
+            linked = next((item for item in getattr(self.manager, "deployments", [])
+                           if item.get("sparkdeck_record_id") == stable_id), {})
+            if requested_model not in owned_models and linked.get("settings_dirty"):
+                # Saved settings describe the next launch. Inspect only this
+                # caller's pinned serving unit for names its current runtime
+                # still owns; unavailable observations must never fail open.
+                target = (stable_id, rule.get("instance_id"), tuple(rule.get("node_ids") or []))
+                if target not in observed_targets:
+                    observed_targets[target] = await self._source_routing_snapshot(stored, rule)
+                for live in observed_targets[target]:
+                    if live.get("id") == stable_id:
+                        owned_models.update(self._deployment_public_model_ids(live))
+            if requested_model in owned_models:
+                matches.append(rule)
+        if not matches:
+            return None
+        targets = {
+            (rule["deployment_id"], rule.get("instance_id"), tuple(rule.get("node_ids") or []))
+            for rule in matches
+        }
+        if len(targets) != 1:
+            from manager import SourceRoutingUnavailable
+
+            raise SourceRoutingUnavailable(
+                "source-IP routing has conflicting alternate-name pins; configure an exact rule"
+            )
+        return min(matches, key=lambda rule: rule["requested_model"])
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
@@ -7141,19 +7240,15 @@ class SparkDeckService:
             route_lookup(caller_ip, requested_model)
             if callable(route_lookup) else None
         )
+        if source_route is None:
+            source_route = await self._source_rule_for_request(caller_ip, requested_model)
         stored_deployment = self.store.deployment(
             requested_model, include_private=True,
         )
         if source_route is not None:
-            deployment = await self._source_routed_deployment(
+            source_route, deployment = await self._pin_source_route(
                 source_route, requested_model,
             )
-            source_route = {
-                **source_route,
-                "_observed_replicas": deployment.get("replicas"),
-                "_observed_instances": deployment.get("instances"),
-                "_observed_members": deployment.get("_source_routing_members"),
-            }
         else:
             deployment = await self._live_deployment_for_model_id(
                 requested_model

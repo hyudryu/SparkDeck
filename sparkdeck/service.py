@@ -45,7 +45,7 @@ from .envfile_settings import (
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from .runtime_file_mounts import normalize_runtime_file_mounts
 from .stream_cleanup import close_async_stream
-from .prompt_gate import PromptGate
+from .prompt_gate import PromptGates
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -405,9 +405,10 @@ class SparkDeckService:
         self.manager = manager
         self._data_dir = Path(data_dir)
         self.store = SparkDeckStore(self._data_dir / "sparkdeck.sqlite3")
-        self.prompt_gate = PromptGate(
+        self.prompt_gate = PromptGates(
             lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
         )
+        self.manager.prompt_gate = self.prompt_gate
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
             manager.http,
@@ -7226,14 +7227,6 @@ class SparkDeckService:
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
-        return await self.prompt_gate.run(
-            lambda: self._proxy_unlimited(body, endpoint, cancel, caller_ip=caller_ip),
-            cancel=cancel,
-        )
-
-    async def _proxy_unlimited(self, body: dict[str, Any], endpoint: str,
-                              cancel: Any = None, *, caller_ip: str | None = None,
-                              ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
         route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
         source_route = (
@@ -7275,14 +7268,14 @@ class SparkDeckService:
                 # arbitrary served alias as the model identity.
                 started = time.monotonic()
                 caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
-                result = (
-                    await self.manager.proxy_chat_completions(
+                result = await self.prompt_gate.run(
+                    ("legacy", requested_model),
+                    lambda: self.manager.proxy_chat_completions(
                         body, cancel, **caller_kwargs,
                     )
                     if endpoint == "chat/completions"
-                    else await self.manager.proxy_completions(
-                        body, cancel, **caller_kwargs,
-                    )
+                    else self.manager.proxy_completions(body, cancel, **caller_kwargs),
+                    cancel=cancel,
                 )
                 model, runtime, settings = await self._legacy_model_identity(
                     requested_model
@@ -7397,6 +7390,26 @@ class SparkDeckService:
                                 startup_benchmark: bool = False,
                                 source_route: dict | None = None,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
+        factory = lambda: self._proxy_registered_unlimited(
+            deployment, body, endpoint, cancel, caller_ip=caller_ip,
+            startup_benchmark=startup_benchmark, source_route=source_route,
+        )
+        if (deployment.get("settings") or {}).get("manager_deployment_id") and (
+            deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            and deployment.get("kind") == DeploymentKind.MANAGED.value
+        ):
+            # Manager acquires the selected group's slot, including failover.
+            return await factory()
+        return await self.prompt_gate.run(
+            ("deployment", deployment["id"]), factory, cancel=cancel,
+        )
+
+    async def _proxy_registered_unlimited(self, deployment: dict[str, Any], body: dict[str, Any],
+                                         endpoint: str, cancel: Any, *,
+                                         caller_ip: str | None = None,
+                                         startup_benchmark: bool = False,
+                                         source_route: dict | None = None,
+                                         ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
             "manager_deployment_id"

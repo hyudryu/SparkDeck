@@ -6621,6 +6621,66 @@ class Manager:
         raise LookupError("cluster deployment has no inference member")
 
     async def _proxy_cluster_member(
+        self, deployment: dict, member: dict, model: str, body: dict,
+        endpoint: str, cancel: asyncio.Event | None, *,
+        caller_ip: str | None = None, startup_benchmark: bool = False,
+    ):
+        from sparkdeck.prompt_gate import PromptGates
+
+        gates = getattr(self, "prompt_gate", None)
+        if not isinstance(gates, PromptGates):
+            return await self._proxy_cluster_member_unlimited(
+                deployment, member, model, body, endpoint, cancel,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+            )
+        member = dict(member)
+        deployment_id = str(deployment.get("id") or "")
+        if deployment.get("mode") == "grouped_sharded":
+            key = ("cluster", deployment_id, "group", int(member.get("instance_id") or 0))
+        elif deployment.get("mode") == "replicated":
+            key = ("cluster", deployment_id, "replica", member.get("node_id"))
+        else:
+            key = ("cluster", deployment_id)
+        # Include queued PP requests in normal balancing. Transfer this
+        # reservation to the transport's existing accounting when dispatched.
+        self._acquire_cluster_member(deployment_id, member)
+        waiting = True
+        pending = getattr(self, "_prompt_waiting_requests", None)
+        if pending is None:
+            pending = self._prompt_waiting_requests = {}
+        ticket = object()
+        pending[ticket] = {
+            "model": model, "created_at": time.monotonic(),
+            "group": self._request_group(model, deployment_id, member.get("container_name")),
+        }
+
+        async def dispatch():
+            nonlocal waiting
+            self._release_cluster_member(deployment_id, member)
+            waiting = False
+            pending.pop(ticket, None)
+            current = self._deployment(deployment_id)
+            selected = next((candidate for candidate in (current or {}).get("members") or []
+                             if all(candidate.get(field) == member.get(field)
+                                    for field in ("node_id", "instance_id", "rank", "container_name"))), None)
+            if current is None or selected is None or any(
+                selected.get(field) != member.get(field)
+                for field in ("container_id", "launch_settings_fingerprint")
+            ):
+                raise ClusterReplicaUnavailable("engine group changed while waiting for prompt processing")
+            return await self._proxy_cluster_member_unlimited(
+                current, selected, model, body, endpoint, cancel,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+            )
+
+        try:
+            return await gates.run(key, dispatch, cancel=cancel)
+        finally:
+            pending.pop(ticket, None)
+            if waiting:
+                self._release_cluster_member(deployment_id, member)
+
+    async def _proxy_cluster_member_unlimited(
         self,
         deployment: dict,
         member: dict,
@@ -12001,7 +12061,11 @@ class Manager:
             model = admission.get("model")
             if not model:
                 continue
-            group = self._admission_store().get(target, {}).get("group") or self._request_group(model)
+            group = {
+                key: admission[key]
+                for key in ("group_id", "model", "deployment_id", "instance_id", "node_names")
+                if key in admission
+            } if admission.get("group_id") else self._request_group(model)
             entry_key = group["group_id"] if _grouped else model
             e = out.setdefault(entry_key, {
                 "connections": 0, "decoded_tokens": 0,
@@ -12361,6 +12425,36 @@ class Manager:
             if state.get("nudger"):
                 snapshot["nudger"] = dict(state["nudger"])
             out[target] = snapshot
+        # PP waiters have not acquired total-inference admission yet. Merge
+        # them into their engine's queue, never its running count.
+        groups = {
+            snapshot["group_id"]: snapshot
+            for snapshot in out.values() if snapshot.get("group_id")
+        }
+        for waiter in getattr(self, "_prompt_waiting_requests", {}).values():
+            group = waiter["group"]
+            group_id = group["group_id"]
+            snapshot = groups.get(group_id)
+            if snapshot is None:
+                # Unlimited total concurrency creates no admission state;
+                # dispatched streams still contribute to the active count.
+                running = sum(
+                    1 for rec in getattr(self, "_active_reqs", {}).values()
+                    if not rec.get("paused") and (
+                        rec.get("group") or self._request_group(rec["key"])
+                    )["group_id"] == group_id
+                )
+                snapshot = {
+                    **group, "limit": None, "running": running,
+                    "queued": 0, "oldest_wait_seconds": 0.0,
+                }
+                groups[group_id] = snapshot
+                out[f"prompt:{group_id}"] = snapshot
+            snapshot["queued"] += 1
+            snapshot["oldest_wait_seconds"] = max(
+                snapshot["oldest_wait_seconds"],
+                round(max(0.0, now - waiter["created_at"]), 1),
+            )
         return out
 
     def _inference_nudger_tick(self, now: float | None = None) -> None:

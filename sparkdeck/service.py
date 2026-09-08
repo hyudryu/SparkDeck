@@ -7120,6 +7120,53 @@ class SparkDeckService:
         }
         return deployment
 
+    async def _pin_source_route(
+        self, source_route: dict[str, Any], requested_model: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve and decorate a validated source-IP routing rule."""
+        deployment = await self._source_routed_deployment(
+            source_route, requested_model,
+        )
+        pinned = {
+            **source_route,
+            "_observed_replicas": deployment.get("replicas"),
+            "_observed_instances": deployment.get("instances"),
+            "_observed_members": deployment.get("_source_routing_members"),
+        }
+        return pinned, deployment
+
+    def _source_rule_owning_deployment(
+        self, caller_ip: str | None, deployment: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the source-IP rule pinning a caller to this deployment.
+
+        Rules match on an exact request id, so a client that sends a
+        different id form for the same deployment (canonical repository or
+        plain name instead of the alias) would otherwise never match. This
+        re-matches by deployment so such a request still obeys the rule and
+        does not fall through to cache-affinity routing.
+        """
+        if not caller_ip:
+            return None
+        list_rules = getattr(self.manager, "list_source_ip_routing_rules", None)
+        if not callable(list_rules):
+            return None
+        try:
+            source_ip = self.manager._canonical_source_routing_ip(caller_ip)
+        except ValueError:
+            return None
+        record_id = str(
+            deployment.get("sparkdeck_record_id") or deployment.get("id") or ""
+        )
+        for rule in list_rules():
+            if rule.get("source_ip") != source_ip:
+                continue
+            if rule.get("enabled") is not True:
+                continue
+            if str(rule.get("deployment_id") or "") == record_id:
+                return rule
+        return None
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
@@ -7133,21 +7180,27 @@ class SparkDeckService:
             requested_model, include_private=True,
         )
         if source_route is not None:
-            deployment = await self._source_routed_deployment(
+            source_route, deployment = await self._pin_source_route(
                 source_route, requested_model,
             )
-            source_route = {
-                **source_route,
-                "_observed_replicas": deployment.get("replicas"),
-                "_observed_instances": deployment.get("instances"),
-                "_observed_members": deployment.get("_source_routing_members"),
-            }
         else:
             deployment = await self._live_deployment_for_model_id(
                 requested_model
             )
             if deployment is None:
                 deployment = stored_deployment
+            # The routing rule must take precedence over cache-affinity
+            # routing for every naming form a client may use. Re-match by the
+            # deployment that owns the request id so an alias-vs-canonical
+            # difference cannot bypass the pin and fall through to the hash.
+            if deployment is not None:
+                source_route = self._source_rule_owning_deployment(
+                    caller_ip, deployment,
+                )
+            if source_route is not None:
+                source_route, deployment = await self._pin_source_route(
+                    source_route, requested_model,
+                )
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )

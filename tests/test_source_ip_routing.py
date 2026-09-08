@@ -395,6 +395,28 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_source_route_pins_alternate_naming_for_same_deployment(self):
+        # A rule keyed on one request id form must still pin a client that
+        # sends another id for the same deployment (here the served name vs
+        # the alias). Without the deployment-ownership re-match the request
+        # bypasses the rule and cache-affinity routing can send it to another
+        # group.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                instance_id=1, node_ids=["node-c", "node-d"],
+            ))
+            pinned = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            self.assertEqual(pinned["selected_node"], "node-c")
+            await manager.http.aclose()
+            await service.close()
+
     async def test_selected_group_uses_observed_health_not_stale_saved_status(self):
         with tempfile.TemporaryDirectory() as directory:
             cluster = _grouped_deployment()

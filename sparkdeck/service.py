@@ -7135,17 +7135,10 @@ class SparkDeckService:
         }
         return pinned, deployment
 
-    def _source_rule_owning_deployment(
-        self, caller_ip: str | None, deployment: dict[str, Any],
+    def _source_rule_for_request(
+        self, caller_ip: str | None, requested_model: str,
     ) -> dict[str, Any] | None:
-        """Return the source-IP rule pinning a caller to this deployment.
-
-        Rules match on an exact request id, so a client that sends a
-        different id form for the same deployment (canonical repository or
-        plain name instead of the alias) would otherwise never match. This
-        re-matches by deployment so such a request still obeys the rule and
-        does not fall through to cache-affinity routing.
-        """
+        """Resolve pins from persisted ownership before live model selection."""
         if not caller_ip:
             return None
         list_rules = getattr(self.manager, "list_source_ip_routing_rules", None)
@@ -7155,17 +7148,41 @@ class SparkDeckService:
             source_ip = self.manager._canonical_source_routing_ip(caller_ip)
         except ValueError:
             return None
-        record_id = str(
-            deployment.get("sparkdeck_record_id") or deployment.get("id") or ""
-        )
-        for rule in list_rules():
-            if rule.get("source_ip") != source_ip:
-                continue
+        rules = [rule for rule in list_rules() if rule.get("source_ip") == source_ip]
+        exact = next((rule for rule in rules if rule.get("requested_model") == requested_model), None)
+        if exact is not None:
+            # An explicitly disabled exact rule restores ordinary routing;
+            # another naming form must not silently re-enable its pin.
+            return exact if exact.get("enabled") is True else None
+        matches = []
+        for rule in rules:
             if rule.get("enabled") is not True:
                 continue
-            if str(rule.get("deployment_id") or "") == record_id:
-                return rule
-        return None
+            stored = self.store.deployment(str(rule.get("deployment_id") or ""), include_private=True)
+            if stored is None:
+                continue
+            # Ownership survives an absent Manager runtime just as it does
+            # for a saved launch bookmark. Resolve its persisted launch names
+            # without requiring the deployment to appear in live inventory.
+            owned_models = set(self._deployment_public_model_ids({**stored, "status": "saved"}))
+            alias = str(stored.get("alias") or "").strip()
+            if alias:
+                owned_models.add(alias)
+            if requested_model in owned_models:
+                matches.append(rule)
+        if not matches:
+            return None
+        targets = {
+            (rule["deployment_id"], rule.get("instance_id"), tuple(rule.get("node_ids") or []))
+            for rule in matches
+        }
+        if len(targets) != 1:
+            from manager import SourceRoutingUnavailable
+
+            raise SourceRoutingUnavailable(
+                "source-IP routing has conflicting alternate-name pins; configure an exact rule"
+            )
+        return min(matches, key=lambda rule: rule["requested_model"])
 
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
@@ -7176,6 +7193,8 @@ class SparkDeckService:
             route_lookup(caller_ip, requested_model)
             if callable(route_lookup) else None
         )
+        if source_route is None:
+            source_route = self._source_rule_for_request(caller_ip, requested_model)
         stored_deployment = self.store.deployment(
             requested_model, include_private=True,
         )
@@ -7189,18 +7208,6 @@ class SparkDeckService:
             )
             if deployment is None:
                 deployment = stored_deployment
-            # The routing rule must take precedence over cache-affinity
-            # routing for every naming form a client may use. Re-match by the
-            # deployment that owns the request id so an alias-vs-canonical
-            # difference cannot bypass the pin and fall through to the hash.
-            if deployment is not None:
-                source_route = self._source_rule_owning_deployment(
-                    caller_ip, deployment,
-                )
-            if source_route is not None:
-                source_route, deployment = await self._pin_source_route(
-                    source_route, requested_model,
-                )
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model)
         )

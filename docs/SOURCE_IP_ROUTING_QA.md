@@ -47,10 +47,23 @@ such as `192.0.2.10` and `192.0.2.20` in fixtures.
 - [ ] Conflicting alternate-name pins fail closed instead of choosing whichever
   rule is listed first. Unrelated or unsupported model names do not match.
 
-Alternate names come from current saved deployment metadata. Removing the runtime
+Alternate names include stable deployment IDs and saved deployment metadata.
+While launch settings are dirty, the pinned unit's observed active served names
+remain eligible until relaunch. If these names cannot be observed, routing fails
+closed rather than allowing an uncertain owner to bypass the pin. Removing the runtime
 preserves that ownership; fully deleting the deployment record removes it. Rules
 do not retain historical alternate names after deletion. An exact enabled rule
 still returns unavailable for its deleted target.
+
+- [ ] A request using the stable deployment ID obeys an alias-keyed pin and exact
+  stable-ID rules pass target ownership validation.
+- [ ] Edit a running deployment's served name without relaunching. Requests for
+  the old name still reach the pinned group, even with a duplicate healthy owner.
+  After relaunch, the old name no longer matches this deployment's alternate pin.
+- [ ] Older agents recover active names from only the selected node's inventory;
+  missing name metadata fails closed while saved settings are dirty.
+- [ ] Requests from an unconfigured source do not enumerate/sort the global rule
+  list; several same-owner rules read that deployment's stored metadata once.
 
 - [ ] Exercise both `/v1/chat/completions` and `/v1/completions`, with streaming
   enabled and disabled, through the controller's public router.

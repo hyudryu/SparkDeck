@@ -459,6 +459,84 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
+    async def test_alias_pin_covers_stable_deployment_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [_grouped_deployment()])
+            try:
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="alias-record-1",
+                    instance_id=1, node_ids=["node-c", "node-d"],
+                ))
+                response = await service.proxy(
+                    {"model": "record-1", "stream": False}, "chat/completions",
+                    caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-c")
+                service.deployments.assert_not_awaited()
+                # An exact stable-ID rule also passes downstream ownership validation.
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="record-1",
+                    instance_id=0, node_ids=["node-a", "node-b"],
+                ))
+                response = await service.proxy(
+                    {"model": "record-1"}, "completions", caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-a")
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_dirty_running_name_keeps_alias_pin_before_duplicate_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _grouped_deployment("manager-1", "record-1")
+            second = _grouped_deployment("manager-2", "record-2")
+            manager, service = await self._service(directory, [first, second])
+            try:
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="alias-record-1",
+                    instance_id=1, node_ids=["node-c", "node-d"],
+                ))
+                first["settings_dirty"] = True
+                first["launch_settings"]["extra_args"] = ["--served-model-name", "next-name"]
+                response = await service.proxy(
+                    {"model": "shared-model"}, "completions", caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-c")
+                self.assertEqual(manager._proxy_cluster_member.await_args.args[0]["id"], "manager-1")
+                service.deployments.assert_not_awaited()
+                # Failed observation cannot turn this dirty pin into ordinary routing.
+                service._source_routing_snapshot.side_effect = SourceRoutingUnavailable("unavailable")
+                with self.assertRaises(SourceRoutingUnavailable):
+                    await service.proxy({"model": "shared-model"}, "completions", caller_ip="10.0.0.1")
+                self.assertEqual(manager._proxy_cluster_member.await_count, 1)
+                # Once relaunched, the old name no longer belongs to this pin.
+                first["settings_dirty"] = False
+                self.assertIsNone(await service._source_rule_for_request("10.0.0.1", "shared-model"))
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_alternate_lookup_skips_admin_listing_and_reads_each_owner_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [_grouped_deployment()])
+            try:
+                for name in ("alias-record-1", "shared-model", "record-1"):
+                    manager.upsert_source_ip_routing_rule(_rule(
+                        source_ip="10.0.0.1", requested_model=name,
+                        instance_id=1, node_ids=["node-c", "node-d"],
+                    ))
+                with (
+                    patch.object(manager, "list_source_ip_routing_rules", side_effect=AssertionError("admin scan")),
+                    patch.object(service.store, "deployment", wraps=service.store.deployment) as lookup,
+                ):
+                    self.assertIsNone(await service._source_rule_for_request("10.0.0.2", "unrelated"))
+                    lookup.assert_not_called()
+                    self.assertIsNone(await service._source_rule_for_request("10.0.0.1", "unrelated"))
+                    lookup.assert_called_once_with("record-1", include_private=True)
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
     async def test_exact_disabled_rule_suppresses_enabled_alternate_name(self):
         with tempfile.TemporaryDirectory() as directory:
             manager, service = await self._service(
@@ -547,13 +625,13 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     instance_id=1, node_ids=["node-c", "node-d"],
                 ))
 
-            resolved = service._source_rule_for_request(
+            resolved = await service._source_rule_for_request(
                 "10.0.0.1", "shared-model",
             )
 
             self.assertEqual(resolved["requested_model"], "alias-record-1")
             self.assertEqual(
-                service._source_rule_for_request(
+                await service._source_rule_for_request(
                     "10.0.0.1", "shared-model",
                 ),
                 resolved,
@@ -613,7 +691,7 @@ class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(response["selected_node"], "node-c")
                     self.assertIsNone(
-                        service._source_rule_for_request("10.0.0.1", "shared"),
+                        await service._source_rule_for_request("10.0.0.1", "shared"),
                     )
                     await manager.http.aclose()
                     await service.close()

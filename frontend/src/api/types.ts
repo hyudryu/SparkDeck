@@ -103,10 +103,22 @@ export interface DeploymentInstance {
   node_names: string[]
 }
 
+export interface DeploymentReplica {
+  node_id: string
+  node_name: string
+  rank: number
+  status: string
+  desired_state: 'running' | 'stopped'
+  online: boolean
+  available: boolean
+}
+
 export interface Deployment {
   id: string
   alias: string
   model_id: string
+  served_model?: string
+  served_models?: string[]
   model_revision?: string
   runtime: RuntimeKind
   status: DeploymentStatus
@@ -122,6 +134,7 @@ export interface Deployment {
   settings: DeploymentSettings
   deployment_mode?: string
   instances?: DeploymentInstance[]
+  replicas?: DeploymentReplica[]
   required_node_count?: number
   // Nodes one more engine group of a tensor-parallel deployment occupies.
   instance_node_count?: number
@@ -1075,6 +1088,15 @@ export interface UsageSummary {
   total: UsageCounters
   routing_rules?: Record<string, string>
   merge_groups?: Record<string, string>
+}
+
+export interface InferenceRoutingRule {
+  source_ip: string
+  requested_model: string
+  enabled: boolean
+  deployment_id: string
+  instance_id: number | null
+  node_ids: string[]
 }
 
 export interface HourlyUsagePoint {

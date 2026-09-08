@@ -3,6 +3,7 @@ import { ArrowDown, ArrowRight, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight,
 import { api } from '../api/client'
 import type { DailyUsagePoint, UsageCounters, UsageGroup, UsageMember, UsagePricing, UsageSummary } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
+import { RequestRoutingPanel } from '../components/RequestRoutingPanel'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 
@@ -230,6 +231,7 @@ export function UsagePage() {
   const summary = useResource((signal) => api.usage.get(signal))
   const analysis = useResource((signal) => api.usage.analysis(daysAgo(364), daysAgo(0), signal))
   const [range, setRange] = useState<RangeDays>(30)
+  const [routingRefreshGeneration, setRoutingRefreshGeneration] = useState(0)
   const [meterBaseline, setMeterBaseline] = useState<UsageSummary>()
   const [meterCurrent, setMeterCurrent] = useState<UsageSummary>()
   const [meterRunning, setMeterRunning] = useState(false)
@@ -246,7 +248,11 @@ export function UsagePage() {
   const meter = useMemo(() => usageMeterDifference(meterCurrent, meterBaseline), [meterBaseline, meterCurrent])
   const meterModels = useMemo(() => [...meter.models].sort((left, right) => totalTokens(right.counters) - totalTokens(left.counters) || left.model.localeCompare(right.model, undefined, { numeric: true, sensitivity: 'base' })), [meter.models])
   const setSort = (next: SortKey) => { if (next === sortKey) setSortAscending((value) => !value); else { setSortKey(next); setSortAscending(next === 'model') } }
-  const reload = () => { summary.reload(); analysis.reload() }
+  const reload = () => {
+    summary.reload()
+    analysis.reload()
+    setRoutingRefreshGeneration((value) => value + 1)
+  }
   useEffect(() => {
     if (!meterRunning) return
     let active = true
@@ -343,6 +349,7 @@ export function UsagePage() {
     {actionError && !editing && <p className="inline-error" role="alert">{actionError}</p>}{notice && <p className="inline-success" role="status">{notice}</p>}
     {(summary.loading || analysis.loading) && !summary.data && <LoadingState label="Loading usage stats" />}{summary.error && !summary.data && <ErrorState message={summary.error} onRetry={reload} />}
     {analysis.error && <ErrorState message={`Historical usage: ${analysis.error}`} onRetry={analysis.reload} />}
+    <RequestRoutingPanel refreshGeneration={routingRefreshGeneration} />
     {summary.data && <><Panel className="usage-overview-metrics" aria-label="Usage overview"><div><strong>{formatTokens(totals.input + totals.cached + totals.output)}</strong><span>Total tokens</span></div><div><strong>{formatTokens(peak)}</strong><span>Peak day</span></div><div><strong>{streaks.activeDays}</strong><span>Active days</span></div><div><strong>{streaks.current} d</strong><span>Current streak</span></div><div><strong>{streaks.longest} d</strong><span>Longest streak</span></div></Panel>
       <Panel className="usage-activity-panel"><div className="usage-panel-heading"><div><h2>Token activity</h2><p>Daily usage over the last year</p></div></div><ActivityHeatmap points={daily} /></Panel>
       <div className="usage-time-heading"><h2>Time range</h2><div className="segmented-control" aria-label="Usage time range"><button aria-pressed={range === 7} onClick={() => setRange(7)}>Last 7 days</button><button aria-pressed={range === 30} onClick={() => setRange(30)}>Last 30 days</button></div></div>

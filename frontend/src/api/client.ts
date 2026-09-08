@@ -51,6 +51,7 @@ import type {
   RuntimeFileMount,
   UsageAnalysis,
   UsageSummary,
+  InferenceRoutingRule,
   SystemUpdateOverview,
   SystemUpdateJob,
   RouterOSConnectionInput,
@@ -350,6 +351,8 @@ export interface WireDeployment {
   runtime: RuntimeKind
   kind: 'managed' | 'external'
   model: { repository: string; revision?: string; artifact?: string; quantization?: string }
+  served_model?: string
+  served_models?: string[]
   status: Deployment['status']
   container_name?: string
   settings?: Deployment['settings']
@@ -359,6 +362,7 @@ export interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   instances?: Deployment['instances']
+  replicas?: Deployment['replicas']
   required_node_count?: number
   instance_node_count?: number
   occupied_node_ids?: string[]
@@ -425,6 +429,8 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     id: item.id,
     alias: item.alias,
     model_id: item.model.repository,
+    served_model: item.served_model,
+    served_models: item.served_models,
     model_revision: item.model_revision ?? item.model.revision,
     runtime: item.runtime,
     status: item.status,
@@ -441,6 +447,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     },
     deployment_mode: item.deployment_mode,
     instances: item.instances,
+    replicas: item.replicas,
     required_node_count: item.required_node_count,
     instance_node_count: item.instance_node_count,
     occupied_node_ids: item.occupied_node_ids,
@@ -1013,6 +1020,28 @@ export const api = {
       `/api/token-stats/${encodeURIComponent(model)}`,
       { method: 'DELETE' },
     ),
+  },
+  inferenceRouting: {
+    list: async (signal?: AbortSignal) => {
+      const data = await request<{ items: InferenceRoutingRule[] }>(
+        '/api/v1/inference-routing-rules', { signal },
+      )
+      return data.items
+    },
+    save: (rule: InferenceRoutingRule) =>
+      request<InferenceRoutingRule>('/api/v1/inference-routing-rules', {
+        method: 'PUT',
+        body: JSON.stringify(rule),
+      }),
+    remove: (sourceIp: string, requestedModel: string) => {
+      const query = new URLSearchParams({
+        source_ip: sourceIp,
+        requested_model: requestedModel,
+      })
+      return request<void>(`/api/v1/inference-routing-rules?${query}`, {
+        method: 'DELETE',
+      })
+    },
   },
   settings: {
     get: (signal?: AbortSignal) => requestWithFallback<AppSettings>('/api/v1/settings', '/api/settings', { signal }),

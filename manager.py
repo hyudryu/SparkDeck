@@ -6668,6 +6668,9 @@ class Manager:
                 for field in ("container_id", "launch_settings_fingerprint")
             ):
                 raise ClusterReplicaUnavailable("engine group changed while waiting for prompt processing")
+            observation_dispatch = getattr(self, "_prompt_observation_dispatch", None)
+            if callable(observation_dispatch):
+                observation_dispatch(current, selected)
             return await self._proxy_cluster_member_unlimited(
                 current, selected, model, body, endpoint, cancel,
                 caller_ip=caller_ip, startup_benchmark=startup_benchmark,
@@ -11763,7 +11766,7 @@ class Manager:
                        container_name: str | None = None) -> dict:
         """Identify the selected engine, including all of its shard nodes."""
         metadata = {"model": model, "deployment_id": deployment_id,
-                    "instance_id": None, "node_names": []}
+                    "instance_id": None, "node_ids": ["local"], "node_names": []}
         for deployment in getattr(self, "deployments", []):
             if deployment_id and deployment.get("id") != deployment_id:
                 continue
@@ -11781,6 +11784,7 @@ class Manager:
                 group = members
             metadata.update(
                 deployment_id=deployment.get("id"), instance_id=instance,
+                node_ids=list(dict.fromkeys(str(m["node_id"]) for m in group if m.get("node_id"))),
                 node_names=list(dict.fromkeys(
                     str(m.get("node_name") or m.get("node_id") or "This node")
                     for m in group)),
@@ -11828,6 +11832,12 @@ class Manager:
             "startup_benchmark": startup_benchmark,
             "group": self._request_group(key, deployment_id, container_name),
         }
+        sequences = getattr(self, "_inference_scope_sequences", None)
+        if sequences is None:
+            sequences = self._inference_scope_sequences = {}
+        for node_id in self._active_reqs[rid]["group"].get("node_ids") or ["local"]:
+            scope = f"node:{node_id}"
+            sequences[scope] = sequences.get(scope, 0) + 1
         if not startup_benchmark:
             # A synthetic startup probe must not refresh the deployment's
             # "last used" timestamps or skew ordinary usage metrics.

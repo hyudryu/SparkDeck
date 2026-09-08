@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from sparkdeck.service import SparkDeckService
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 
 
 class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -17,8 +18,16 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.configure_target()
 
     def configure_target(self):
-        self.deployment = {"id": "serving-target", "settings": {}}
+        self.deployment = self.persist_target("serving-target")
         self.service._live_deployment_for_model_id = AsyncMock(return_value=self.deployment)
+
+    def persist_target(self, name):
+        if self.service.store.deployment(name) is None:
+            self.service.store.add_deployment(Deployment(
+                id=name, alias=name, runtime=RuntimeKind.LLAMA_CPP,
+                kind=DeploymentKind.EXTERNAL, model=ModelIdentity("org/model"),
+            ), base_url="http://localhost:8000")
+        return self.service.store.deployment(name, include_private=True)
 
     async def close_stream(self, stream):
         await stream.aclose()
@@ -95,7 +104,7 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed, [])
 
     async def test_different_serving_targets_process_prompts_concurrently(self):
-        targets = {name: {"id": name, "settings": {}} for name in ('a', 'b')}
+        targets = {name: self.persist_target(name) for name in ('a', 'b')}
         self.service._live_deployment_for_model_id = AsyncMock(
             side_effect=lambda model: targets[model],
         )

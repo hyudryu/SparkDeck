@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from manager import Manager
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.service import SparkDeckService
 
 from sparkdeck.startup_benchmark import StartupBenchmarkMonitor, StartupTarget, startup_fingerprint
@@ -101,6 +102,34 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.monitor._benchmark.assert_not_awaited()
         self.assertFalse(self.settings)
 
+    async def test_independent_group_activity_does_not_defer_startup(self):
+        member = {"node_id": "n1", "instance_id": 1}
+        target = StartupTarget(self.deployment, "group1", {"id": "cluster"}, member)
+        self.monitor.targets = AsyncMock(return_value=[target])
+        self.monitor._healthy = AsyncMock(return_value=True)
+        self.monitor._benchmark = AsyncMock(return_value=True)
+        self.service._community_observation_scopes.return_value = frozenset({"node:n1", "node:n2"})
+        self.service._community_active_observations["user"] = {"scopes": {"node:n3", "node:n4"}}
+        self.manager._active_reqs = {1: {"group": {"node_ids": ["n3", "n4"]}}}
+
+        await self.monitor._attempt(target, dict(self.snapshot))
+
+        self.monitor._benchmark.assert_awaited_once_with(target, self.snapshot)
+        self.service._community_observation_scopes.assert_called_once_with(
+            self.deployment, self.deployment["id"], member=member,
+        )
+
+    async def test_manager_activity_on_same_shard_defers_startup(self):
+        self.monitor.targets = AsyncMock(return_value=[self.target])
+        self.monitor._healthy = AsyncMock(return_value=True)
+        self.monitor._benchmark = AsyncMock(return_value=True)
+        self.service._community_observation_scopes.return_value = frozenset({"node:n1", "node:n2"})
+        for group in ({"node_ids": ["n2"]}, {}):
+            with self.subTest(group=group):
+                self.manager._active_reqs = {1: {"group": group}}
+                await self.monitor._attempt(self.target, dict(self.snapshot))
+                self.monitor._benchmark.assert_not_awaited()
+
     async def test_request_is_200_tokens_no_context_and_stream_is_closed(self):
         observed = []
         closed = []
@@ -123,6 +152,9 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed, [True])
         self.assertIsNone(self.service._community_observation.get())
         self.service._community_observation_end.assert_called_once()
+        self.service._community_observation_start.assert_called_once_with(
+            frozenset({"node:local"}), deferred=True,
+        )
     async def test_real_manager_health_requires_200_without_models_fallback(self):
         manager = Manager.__new__(Manager)
         manager.deployments = []
@@ -152,9 +184,18 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         manager.ensure_loaded.assert_not_awaited()
 
     async def test_real_local_llama_stream_adds_one_trusted_startup_sample(self):
+        await self._local_llama_startup_sample(overlap=False)
+
+    async def test_transient_direct_manager_request_invalidates_local_llama_startup(self):
+        await self._local_llama_startup_sample(overlap=True)
+
+    async def _local_llama_startup_sample(self, *, overlap):
         class Stream(httpx.AsyncByteStream):
             async def __aiter__(self):
                 yield b'data: {"choices":[{"text":"garden"}]}\n\n'
+                if overlap:
+                    rid = manager._track_start("other-model")
+                    manager._track_end(rid)
                 await asyncio.sleep(0.01)
                 yield b'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":200}}\n\n'
                 yield b'data: [DONE]\n\n'
@@ -165,6 +206,7 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, stream=Stream())
         manager = Manager.__new__(Manager)
         manager.deployments = []
+        manager._mark_deployment_used = Mock()
         manager._stats_cache = {"gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}]}
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             manager.http = client
@@ -172,14 +214,20 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
                 service = SparkDeckService(manager, Path(directory))
                 try:
                     service.store.set_community_consent(True)
-                    deployment = {
-                        **self.deployment, "runtime": "llama.cpp", "alias": "garden",
-                        "_base_url": "http://localhost:8080", "settings": {"tensor_parallel_size": 1},
-                    }
+                    service.store.add_deployment(Deployment(
+                        id=self.deployment["id"], alias="garden", runtime=RuntimeKind.LLAMA_CPP,
+                        kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                        container_name="engine", settings={"tensor_parallel_size": 1},
+                    ), base_url="http://localhost:8080")
+                    deployment = service.store.deployment(self.deployment["id"], include_private=True)
                     await StartupBenchmarkMonitor(service)._benchmark(
                         StartupTarget(deployment, "boot"), service.store.community_consent_snapshot(),
                     )
                     samples, total = service.store.benchmarks()
+                    if overlap:
+                        self.assertEqual(total, 0)
+                        self.assertFalse(manager._active_reqs)
+                        return
                     self.assertEqual(total, 1)
                     self.assertEqual(samples[0]["output_tokens"], 200)
                     self.assertTrue(samples[0]["eligible_for_community"])
@@ -273,6 +321,12 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(args[1], member)
         self.assertEqual(args[4], "completions")
         self.assertIn("hardware_resolver", self.service._observe_stream.call_args.kwargs)
+        self.service._community_observation_scopes.assert_called_once_with(
+            self.deployment, self.deployment["id"], member=member,
+        )
+        self.service._community_observation_start.assert_called_once_with(
+            frozenset({"node:local"}), deferred=True,
+        )
 
     def test_fingerprint_requires_start_evidence_and_changes_on_restart(self):
         self.assertIsNone(startup_fingerprint([("local", {"name": "engine"})]))

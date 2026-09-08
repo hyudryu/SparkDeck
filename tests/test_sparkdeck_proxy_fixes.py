@@ -331,6 +331,10 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            manager.list_containers.return_value = [
+                {"name": "live", "id": "live-id", "runtime": "vllm",
+                 "status": "running", "model": "org/live", "port": 8000},
+            ]
             service = SparkDeckService(manager, Path(directory))
             service.store.add_deployment(Deployment(
                 id="stopped-record", alias="shared-name",
@@ -368,6 +372,12 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            manager.list_containers.return_value = [
+                {"name": "one", "id": "one-id", "runtime": "vllm",
+                 "status": "running", "model": "org/one", "port": 8000},
+                {"name": "two", "id": "two-id", "runtime": "vllm",
+                 "status": "running", "model": "org/two", "port": 8000},
+            ]
             service = SparkDeckService(manager, Path(directory))
             service.deployments = AsyncMock(return_value=[
                 {

@@ -409,6 +409,7 @@ class SparkDeckService:
             lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
         )
         self.manager.prompt_gate = self.prompt_gate
+        self.manager._prompt_observation_dispatch = self._activate_group_observation
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
             manager.http,
@@ -7249,7 +7250,7 @@ class SparkDeckService:
             if deployment is None:
                 deployment = stored_deployment
         observation = self._community_observation_start(
-            self._community_observation_scopes(deployment, requested_model)
+            self._community_observation_scopes(deployment, requested_model), deferred=True,
         )
         context_token = self._community_observation.set(observation)
         streaming = False
@@ -7268,14 +7269,14 @@ class SparkDeckService:
                 # arbitrary served alias as the model identity.
                 started = time.monotonic()
                 caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
-                result = await self.prompt_gate.run(
+                result = await self._run_service_prompt_gate(
                     ("legacy", requested_model),
-                    lambda: self.manager.proxy_chat_completions(
+                    lambda _deployment: self.manager.proxy_chat_completions(
                         body, cancel, **caller_kwargs,
                     )
                     if endpoint == "chat/completions"
                     else self.manager.proxy_completions(body, cancel, **caller_kwargs),
-                    cancel=cancel,
+                    cancel=cancel, model=requested_model,
                 )
                 model, runtime, settings = await self._legacy_model_identity(
                     requested_model
@@ -7299,6 +7300,7 @@ class SparkDeckService:
 
     def _community_observation_scopes(
         self, deployment: dict[str, Any] | None, requested_model: str,
+        *, member: dict[str, Any] | None = None,
     ) -> frozenset[str]:
         """Return private in-memory identities for potentially shared hardware."""
         if deployment:
@@ -7308,6 +7310,8 @@ class SparkDeckService:
                 item for item in getattr(self.manager, "deployments", [])
                 if isinstance(item, dict) and item.get("id") == manager_id
             ), None)
+            if member is not None and linked is not None:
+                return self._engine_observation_scopes(linked, member)
             node_ids = {
                 str(node_id)
                 for source in (
@@ -7335,6 +7339,7 @@ class SparkDeckService:
 
     def _community_observation_start(
         self, scopes: frozenset[str] | None = None,
+        *, deferred: bool = False,
     ) -> dict[str, Any] | None:
         snapshot = self.store.community_consent_snapshot()
         scopes = scopes or frozenset({"unspecified"})
@@ -7348,12 +7353,56 @@ class SparkDeckService:
             "scopes": scopes,
             "contaminated": False,
         }
+        if not deferred:
+            self._community_observation_activate(observation)
+        return observation
+
+    @staticmethod
+    def _engine_observation_scopes(deployment: dict, member: dict) -> frozenset[str]:
+        if deployment.get("mode") == "grouped_sharded":
+            members = [item for item in deployment.get("members") or []
+                       if item.get("instance_id") == member.get("instance_id")]
+        elif deployment.get("mode") == "replicated":
+            members = [member]
+        else:
+            members = deployment.get("members") or [member]
+        return frozenset(f"node:{item['node_id']}" for item in members if item.get("node_id"))
+
+    def _activate_group_observation(self, deployment: dict, member: dict) -> None:
+        self._community_observation_activate(
+            self._community_observation.get(), self._engine_observation_scopes(deployment, member),
+        )
+
+    def _community_manager_requests_overlap(self, scopes: frozenset[str]) -> bool:
+        for rec in getattr(self.manager, "_active_reqs", {}).values():
+            if rec.get("paused"):
+                continue
+            nodes = (rec.get("group") or {}).get("node_ids")
+            if not nodes or scopes.intersection(f"node:{node}" for node in nodes):
+                return True
+        return False
+
+    def _community_observation_activate(
+        self, observation: dict | None, scopes: frozenset[str] | None = None,
+    ) -> None:
+        if observation is None:
+            return
+        if scopes is not None:
+            observation["scopes"] = scopes
+        scopes = observation["scopes"]
+        if observation.get("startup_benchmark") and "manager_scope_sequences" not in observation:
+            sequences = getattr(self.manager, "_inference_scope_sequences", {})
+            observation["manager_scope_sequences"] = {scope: sequences.get(scope, 0) for scope in scopes}
+            observation.setdefault("manager_requests_expected", 1)
+            if self._community_manager_requests_overlap(scopes):
+                observation["contaminated"] = True
         for active in self._community_active_observations.values():
+            if active is observation:
+                continue
             if scopes.intersection(active.get("scopes") or ()):
                 observation["contaminated"] = True
                 active["contaminated"] = True
         self._community_active_observations[observation["id"]] = observation
-        return observation
 
     def _community_observation_end(self, observation: dict[str, Any] | None) -> None:
         if observation is not None and observation.get("id"):
@@ -7362,11 +7411,18 @@ class SparkDeckService:
     async def _community_observed_stream(
         self, stream: AsyncIterator[str], observation: dict[str, Any] | None,
     ) -> AsyncIterator[str]:
-        token = self._community_observation.set(observation)
         try:
-            async for chunk in stream:
+            while True:
+                token = self._community_observation.set(observation)
+                try:
+                    chunk = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                finally:
+                    self._community_observation.reset(token)
                 yield chunk
         finally:
+            token = self._community_observation.set(observation)
             try:
                 await close_async_stream(stream)
             finally:
@@ -7384,14 +7440,79 @@ class SparkDeckService:
         """
         return {"startup_benchmark": True} if startup_benchmark else {}
 
+    async def _run_service_prompt_gate(
+        self, key: Any, factory: Any, *, cancel: Any, model: str,
+        deployment: dict[str, Any] | None = None,
+    ) -> Any:
+        """Publish service waiters and revalidate their target before dispatch."""
+        deployment_id = str((deployment or {}).get("id") or "")
+        discovered = deployment_id.startswith("container:")
+        original = None
+        container = None
+        credential = None
+        if deployment is not None:
+            if discovered:
+                container = copy.deepcopy(await self._resolve_discovered_container(deployment_id))
+            else:
+                original = copy.deepcopy(self.store.deployment(deployment_id, include_private=True))
+                if original is None or original.get("id") != deployment_id:
+                    raise LookupError("deployment is unavailable")
+                credential = self._get_credential(deployment_id, original.get("_credential_ref"))
+        group_resolver = getattr(self.manager, "_request_group", None)
+        group = (
+            group_resolver(model, deployment_id or None, (deployment or {}).get("container_name"))
+            if callable(group_resolver) else {
+                "model": model, "deployment_id": deployment_id or None,
+                "group_id": deployment_id or model, "instance_id": None, "node_names": [],
+            }
+        )
+        pending = getattr(self.manager, "_prompt_waiting_requests", None)
+        if pending is None:
+            pending = self.manager._prompt_waiting_requests = {}
+        ticket = object()
+        pending[ticket] = {"model": model, "created_at": time.monotonic(), "group": group}
+
+        async def dispatch():
+            pending.pop(ticket, None)
+            current = deployment
+            if discovered:
+                live = await self._resolve_discovered_container(deployment_id)
+                if any(live.get(field) != container.get(field) for field in (
+                    "id", "container_id", "name", "runtime", "port", "model",
+                    "served_model", "load_settings", "started_at",
+                )) or live.get("status") != "running":
+                    raise LookupError("container changed while waiting for prompt processing")
+                current = self._discovered_deployment(
+                    live, deployment["runtime"], deployment["model"]["repository"],
+                )
+            elif original is not None:
+                stored = self.store.deployment(deployment_id, include_private=True)
+                fields = ("id", "created_at", "alias", "kind", "runtime", "model",
+                          "settings", "container_name", "_base_url", "_credential_ref", "desired_state")
+                if stored is None or any(stored.get(field) != original.get(field) for field in fields):
+                    raise LookupError("deployment changed while waiting for prompt processing")
+                if self._get_credential(deployment_id, stored.get("_credential_ref")) != credential:
+                    raise LookupError("deployment credentials changed while waiting for prompt processing")
+                current = {**deployment, **stored}
+            self._community_observation_activate(
+                self._community_observation.get(),
+                self._community_observation_scopes(current, model),
+            )
+            return await factory(current)
+
+        try:
+            return await self.prompt_gate.run(key, dispatch, cancel=cancel)
+        finally:
+            pending.pop(ticket, None)
+
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any, *,
                                 caller_ip: str | None = None,
                                 startup_benchmark: bool = False,
                                 source_route: dict | None = None,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
-        factory = lambda: self._proxy_registered_unlimited(
-            deployment, body, endpoint, cancel, caller_ip=caller_ip,
+        factory = lambda current: self._proxy_registered_unlimited(
+            current, body, endpoint, cancel, caller_ip=caller_ip,
             startup_benchmark=startup_benchmark, source_route=source_route,
         )
         if (deployment.get("settings") or {}).get("manager_deployment_id") and (
@@ -7399,9 +7520,10 @@ class SparkDeckService:
             and deployment.get("kind") == DeploymentKind.MANAGED.value
         ):
             # Manager acquires the selected group's slot, including failover.
-            return await factory()
-        return await self.prompt_gate.run(
+            return await factory(deployment)
+        return await self._run_service_prompt_gate(
             ("deployment", deployment["id"]), factory, cancel=cancel,
+            model=str(body.get("model") or deployment.get("alias") or ""), deployment=deployment,
         )
 
     async def _proxy_registered_unlimited(self, deployment: dict[str, Any], body: dict[str, Any],
@@ -7800,6 +7922,12 @@ class SparkDeckService:
         if passive_observation and "manager_request_sequence" in observation:
             expected = int(observation.get("manager_requests_expected", 1))
             if getattr(self.manager, "_req_seq", 0) > observation["manager_request_sequence"] + expected:
+                return
+        if passive_observation and "manager_scope_sequences" in observation:
+            sequences = getattr(self.manager, "_inference_scope_sequences", {})
+            expected = observation.get("manager_requests_expected", 1)
+            if any(sequences.get(scope, 0) > count + expected
+                   for scope, count in observation["manager_scope_sequences"].items()):
                 return
         completed = time.monotonic() if completed_at is None else completed_at
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))

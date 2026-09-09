@@ -152,6 +152,13 @@ MEMBER_LOG_TIMEOUT_SECONDS = 5.0
 # Member-label modes that run one rank of a distributed engine: host
 # networking, fabric environment, and per-rank VRAM fitting all apply.
 _SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
+# Agent/Docker replies that prove a member container does not exist. For
+# stop and remove that absence is the desired end state, not a failure.
+_MEMBER_ABSENT_ERROR_MARKERS = (
+    "cluster member not found",
+    "managed container not found",
+    "no such container",
+)
 
 
 def _grouped_sharded_topology(body: dict, node_count: int) -> tuple[int, int]:
@@ -7663,25 +7670,31 @@ class Manager:
         return lock
 
     @staticmethod
+    def _member_action_already_absent(message: str) -> bool:
+        lowered = message.lower()
+        return any(
+            marker in lowered for marker in _MEMBER_ABSENT_ERROR_MARKERS
+        )
+
+    @staticmethod
     def _member_action_errors(results: list[Any], action: str) -> list[str]:
-        """Return actionable member errors, keeping DELETE idempotent.
+        """Return actionable member errors, keeping absence idempotent.
 
         Older node agents return 404 after a cluster member has already been
         removed. That is the desired end state for a remove action, so it must
-        not leave an undeletable deployment card behind.
+        not leave an undeletable deployment card behind. The same applies to
+        stop: a rank whose container was never created (for example a launch
+        that failed at image pull) is already stopped, and Docker's 404 must
+        not persist as the deployment's error.
         """
         errors = []
         for result in results:
             if not isinstance(result, Exception):
                 continue
             message = str(result)
-            already_absent = action == "remove" and any(
-                marker in message.lower()
-                for marker in (
-                    "cluster member not found",
-                    "managed container not found",
-                    "no such container",
-                )
+            already_absent = (
+                action in {"stop", "remove"}
+                and Manager._member_action_already_absent(message)
             )
             if not already_absent:
                 errors.append(message)
@@ -7806,6 +7819,49 @@ class Manager:
                 f"instance must be between 0 and {instances - 1}"
             )
         return requested
+
+    @staticmethod
+    def _fold_headless_member_phases(members: list[dict]) -> None:
+        """Fold headless sharded workers into their group's readiness.
+
+        A rank > 0 TP worker runs headless: it exposes no HTTP API and never
+        logs the rank-0 uvicorn startup marker, so log scraping leaves it at
+        "starting…" forever. Once the group's rank-0 coordinator reports
+        ready and the worker's own container is running, the worker is
+        serving as part of that group and should display ready. Honest
+        failure signals (error/dead/missing/…) are never overwritten.
+        """
+        ready_groups = {
+            int(member.get("instance_id") or 0)
+            for member in members
+            if isinstance(member, dict)
+            and int(member.get("rank") or 0) == 0
+            and str(member.get("status") or "") == "running"
+            and isinstance(member.get("phase"), dict)
+            and member["phase"].get("phase") == "ready"
+        }
+        if not ready_groups:
+            return
+        for member in members:
+            if (
+                not isinstance(member, dict)
+                or int(member.get("rank") or 0) == 0
+                or int(member.get("instance_id") or 0) not in ready_groups
+                or str(member.get("status") or "") != "running"
+            ):
+                continue
+            phase = member.get("phase")
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            if str(phase_name or "").casefold() in {
+                "ready", "error", "dead", "unreachable", "missing",
+                "unknown", "failed",
+            }:
+                continue
+            member["phase"] = {
+                "phase": "ready",
+                "progress": 1.0,
+                "message": "Group engine is ready (headless rank)",
+            }
 
     @staticmethod
     def _grouped_deployment_status(deployment: dict) -> str:
@@ -8282,6 +8338,14 @@ class Manager:
             for member, result in zip(targeted_members, results):
                 if isinstance(result, Exception):
                     if action == "stop":
+                        if self._member_action_already_absent(str(result)):
+                            # Stopping a rank whose container was never created
+                            # (e.g. its launch failed at image pull) has reached
+                            # the desired end state; the 404 is not a stop
+                            # failure and must not pin the deployment as errored.
+                            member.pop("failed_stop_error", None)
+                            member["status"] = "stopped"
+                            continue
                         member["failed_stop_error"] = str(result)
                     continue
                 member.pop("failed_stop_error", None)
@@ -15164,6 +15228,10 @@ class Manager:
     )
     _RE_LOAD_PCT = re.compile(r"Loading.*?(\d{1,3})\s*%")
     _RE_ERROR = re.compile(r"\b(Error|Traceback|OutOfMemoryError|CUDA out of memory|RuntimeError)\b")
+    # Backtrace frames ("frame #0: c10::Error::Error(...) + 0xc8") mention
+    # error symbols without reporting an error. A real Python traceback ends
+    # with its exception line, which is not a frame line.
+    _RE_STACK_FRAME = re.compile(r"^\s*(?:frame\s+)?#\d+\b")
 
     def _parse_phase(self, logs: str) -> dict:
         if not logs:
@@ -15209,17 +15277,33 @@ class Manager:
                 "message": f"loading {pct}%",
             }
 
-        # Error detection
-        if self._RE_ERROR.search(tail):
-            err_line = next(
-                (l for l in reversed(lines) if self._RE_ERROR.search(l)),
-                "",
+        # Error detection. A running engine logs handled faults (rejected
+        # requests, transient NCCL/c10 backtraces) and keeps serving, so any
+        # single matching line is not proof of failure — the caller already
+        # reports exited/dead containers from Docker status, and a real
+        # startup crash ends the log with its exception. Only treat log text
+        # as a failure while the error is the container's latest output or
+        # distinct error lines repeat in the recent tail.
+        error_lines = [
+            l for l in lines
+            if self._RE_ERROR.search(l) and not self._RE_STACK_FRAME.search(l)
+        ]
+        if error_lines:
+            last_is_error = bool(
+                self._RE_ERROR.search(lines[-1])
+                and not self._RE_STACK_FRAME.search(lines[-1])
             )
-            return {
-                "phase": "error",
-                "progress": None,
-                "message": err_line.strip()[:240] or "error in startup logs",
-            }
+            recent = lines[-10:]
+            repeated = len({
+                l.strip()[:120] for l in error_lines if l in recent
+            }) >= 2
+            if last_is_error or repeated:
+                return {
+                    "phase": "error",
+                    "progress": None,
+                    "message": error_lines[-1].strip()[:240]
+                    or "error in startup logs",
+                }
 
         # Pre-load init signals
         if "Initializing" in tail or "Starting vLLM" in tail or "engine" in tail.lower():
@@ -20140,6 +20224,10 @@ class Manager:
                 member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
+            if saved.get("mode") in _SHARDED_MEMBER_MODES:
+                # Headless ranks have no readiness endpoint of their own;
+                # derive their phase from the group coordinator's readiness.
+                self._fold_headless_member_phases(deployment["members"])
             if saved.get("status") != "error":
                 # A completed Stop is durable even when a node subsequently
                 # disconnects. Keep the member's offline node observation, but

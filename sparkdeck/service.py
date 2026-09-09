@@ -1155,7 +1155,11 @@ class SparkDeckService:
                 public_settings["max_concurrency"] = launch_controls["max_concurrency"]
             stored["settings"] = public_settings
             if cluster.get("error"):
-                stored["last_error"] = str(cluster["error"])
+                cluster_error = str(cluster["error"])
+                if _stale_missing_container_error(cluster, cluster_error):
+                    stored["last_error"] = None
+                else:
+                    stored["last_error"] = cluster_error
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             if cluster.get("mode") == "grouped_sharded":
                 stored["instances"] = _grouped_instance_summary(cluster)
@@ -8278,6 +8282,33 @@ def _deployment_status(value: Any) -> str:
     if status in ("error", "unhealthy"):
         return "error"
     return "unknown"
+
+
+_MISSING_CONTAINER_ERROR_MARKERS = (
+    "no such container",
+    "managed container not found",
+    "cluster member not found",
+)
+
+
+def _missing_container_error(error: Any) -> bool:
+    text = str(error or "").casefold()
+    return any(marker in text for marker in _MISSING_CONTAINER_ERROR_MARKERS)
+
+
+def _stale_missing_container_error(cluster: dict[str, Any], error: str) -> bool:
+    """Whether a recorded error only reports an absent container for a
+    stopped deployment that never successfully launched.
+
+    Such a deployment owns no containers, so a Docker/agent 404 from probing
+    or stopping one is the expected state, not a persistent error worth
+    surfacing on the card.
+    """
+    return (
+        _missing_container_error(error)
+        and cluster.get("desired_state") == "stopped"
+        and not cluster.get("last_deployed_at")
+    )
 
 
 def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> bool:

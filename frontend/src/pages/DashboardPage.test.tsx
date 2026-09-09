@@ -532,6 +532,44 @@ describe('DashboardPage', () => {
     expect(screen.getByText('2 from 192.0.2.10 · 1 from 192.0.2.20')).toBeInTheDocument()
   })
 
+  it('shows live prompt processing, output, and thinking token rates per stage', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': {
+          connections: 1,
+          pp_tok_s: 2400,
+          output_tok_s: 12.5,
+          thinking_tok_s: 4,
+        },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('Prompt processing')).toBeInTheDocument()
+    expect(screen.getByText('2400.0 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Output')).toBeInTheDocument()
+    expect(screen.getByText('12.5 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Thinking')).toBeInTheDocument()
+    expect(screen.getByText('4.0 tok/s')).toBeInTheDocument()
+  })
+
+  it('shows measuring placeholders when prompt processing speed is not yet available', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': { connections: 1, pp_tok_s: null, output_tok_s: 0, thinking_tok_s: 0 },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getAllByText('Measuring…')).toHaveLength(3)
+  })
+
   it('prefers fresh local stats over retained local node telemetry', () => {
     const snapshot = clusterResourceSnapshot([{
       id: 'local', name: 'This node', local: true, online: true,

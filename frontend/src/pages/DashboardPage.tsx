@@ -371,8 +371,13 @@ function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, po
   return resource
 }
 
+function stageRate(value: number | null | undefined, waiting: boolean) {
+  if (waiting) return 'Waiting'
+  if (value == null || value <= 0) return 'Measuring…'
+  return `${value.toFixed(1)} tok/s`
+}
+
 function SessionRow({ model, request }: { model: string; request: ActiveRequestStats }) {
-  const rate = (request.thinking_tok_s ?? 0) + (request.output_tok_s ?? 0)
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
@@ -385,7 +390,11 @@ function SessionRow({ model, request }: { model: string; request: ActiveRequestS
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
-      <span className="session-rate">{waiting ? 'Waiting' : rate > 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'}</span>
+      <div className="session-stages" role="group" aria-label="Token rate by stage">
+        <span className="session-stage"><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{stageRate(request.pp_tok_s, waiting)}</span></span>
+        <span className="session-stage"><span className="session-stage-label">Output</span><span className="session-stage-value">{stageRate(request.output_tok_s, waiting)}</span></span>
+        <span className="session-stage"><span className="session-stage-label">Thinking</span><span className="session-stage-value">{stageRate(request.thinking_tok_s, waiting)}</span></span>
+      </div>
     </div>
   )
 }

@@ -15,7 +15,7 @@ class RequestBodyTooLarge(ValueError):
 
 
 def is_inference_request_path(path: str) -> bool:
-    return path in {"/v1/chat/completions", "/v1/completions"} or path.startswith(
+    return path in {"/v1/chat/completions", "/v1/completions", "/v1/responses"} or path.startswith(
         "/api/agent/inference/"
     )
 

@@ -41,6 +41,7 @@ from sparkdeck.service import (
     _public_community_aggregates,
 )
 from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.responses import to_chat_request, from_chat_response, stream_chat_response
 from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
@@ -4372,6 +4373,49 @@ async def v1_chat_completions(req: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     return result
+
+
+@app.post("/v1/responses")
+async def v1_responses(req: Request):
+    body = await _inference_json(req)
+    try:
+        chat_body = to_chat_request(body)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(exc), "type": "invalid_request_error", "code": None,
+        }})
+    cancel = asyncio.Event()
+    watcher = _watch_disconnect(req, cancel)
+    streaming = False
+    try:
+        result = await sparkdeck.proxy(
+            chat_body, "chat/completions", cancel,
+            caller_ip=_inference_caller_ip(req),
+        )
+        if hasattr(result, "__aiter__"):
+            streaming = True
+            return StreamingResponse(
+                _guard_stream(stream_chat_response(result, body), watcher),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        try:
+            return from_chat_response(result, body)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(502, "invalid upstream chat response") from exc
+    except ClientAbort:
+        return Response(status_code=499)
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, exc.response.text[:500]) from exc
+    finally:
+        if not streaming:
+            watcher.cancel()
 
 
 @app.post("/v1/completions")

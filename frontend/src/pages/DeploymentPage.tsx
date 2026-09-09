@@ -123,6 +123,9 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   dspark_num_speculative_tokens: detail.launch_controls.dspark_num_speculative_tokens?.toString() ?? '',
   max_cudagraph_capture_size: detail.launch_controls.max_cudagraph_capture_size?.toString() ?? '',
   max_num_batched_tokens: detail.launch_controls.max_num_batched_tokens?.toString() ?? '',
+  sg_speculative_num_draft_tokens: detail.launch_controls.sg_speculative_num_draft_tokens?.toString() ?? '',
+  sg_cuda_graph_max_bs: detail.launch_controls.sg_cuda_graph_max_bs?.toString() ?? '',
+  sg_chunked_prefill_size: detail.launch_controls.sg_chunked_prefill_size?.toString() ?? '',
   gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
   gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
   sg_tp_size: detail.sg_tp_size?.toString() ?? '',
@@ -316,6 +319,9 @@ function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias 
       dspark_num_speculative_tokens: optionalNumber(editor.dspark_num_speculative_tokens),
       max_cudagraph_capture_size: optionalNumber(editor.max_cudagraph_capture_size),
       max_num_batched_tokens: optionalNumber(editor.max_num_batched_tokens),
+      sg_speculative_num_draft_tokens: optionalNumber(editor.sg_speculative_num_draft_tokens),
+      sg_cuda_graph_max_bs: optionalNumber(editor.sg_cuda_graph_max_bs),
+      sg_chunked_prefill_size: optionalNumber(editor.sg_chunked_prefill_size),
     },
     gpu_memory_utilization: optionalNumber(editor.gpu_memory_utilization),
     gpu_memory_gb: optionalNumber(editor.gpu_memory_gb),
@@ -684,9 +690,14 @@ export function DeploymentPage() {
           <label className="field"><span>Speculative method</span><select disabled={disabled} value={editor.speculative_method} onChange={(event) => set('speculative_method', event.target.value)}><option value="">Auto / unset</option>{editor.speculative_method && !SPECULATIVE_METHODS.includes(editor.speculative_method) && <option value={editor.speculative_method}>{editor.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
           <label className="field"><span>Draft sample method</span><select disabled={disabled} value={editor.draft_sample_method} onChange={(event) => set('draft_sample_method', event.target.value)}><option value="">Default</option>{editor.draft_sample_method && !DRAFT_SAMPLE_METHODS.includes(editor.draft_sample_method) && <option value={editor.draft_sample_method}>{editor.draft_sample_method}</option>}{DRAFT_SAMPLE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
         </>}
-        {!envFileMode && <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>}
-        {!envFileMode && <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>}
-        <label className="field"><span>Max batched tokens</span><input disabled={envControlDisabled('max_num_batched_tokens')} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} />{envControlHint('max_num_batched_tokens')}</label>
+        {!envFileMode && detail.runtime !== 'sglang' && <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>}
+        {!envFileMode && detail.runtime !== 'sglang' && <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>}
+        {(detail.runtime !== 'sglang' || envFileMode) && <label className="field"><span>Max batched tokens</span><input disabled={envControlDisabled('max_num_batched_tokens')} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} />{envControlHint('max_num_batched_tokens')}</label>}
+        {detail.runtime === 'sglang' && !envFileMode && <>
+          <label className="field"><span>Speculative draft tokens</span><input disabled={disabled} type="number" min="1" value={editor.sg_speculative_num_draft_tokens} onChange={(event) => set('sg_speculative_num_draft_tokens', event.target.value)} /></label>
+          <label className="field"><span>CUDA graph max batch size</span><input disabled={disabled} type="number" min="1" value={editor.sg_cuda_graph_max_bs} onChange={(event) => set('sg_cuda_graph_max_bs', event.target.value)} /></label>
+          <label className="field"><span>Chunked prefill size</span><input disabled={disabled} type="number" min="1" value={editor.sg_chunked_prefill_size} onChange={(event) => set('sg_chunked_prefill_size', event.target.value)} /></label>
+        </>}
         {(detail.runtime === 'vllm' || envFileMode) && <label className="field"><span>GPU memory utilization</span><input disabled={envControlDisabled('gpu_memory_utilization')} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} />{envControlHint('gpu_memory_utilization')}</label>}
         {detail.runtime === 'vllm' && !envFileMode && <>
           <label className="field"><span>Tensor parallel size</span><input disabled={disabled} type="number" min="1" value={editor.tensor_parallel_size} onChange={(event) => set('tensor_parallel_size', event.target.value)} /></label>

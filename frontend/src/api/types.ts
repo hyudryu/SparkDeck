@@ -187,6 +187,9 @@ export interface DeploymentLaunchControls {
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null
+  sg_speculative_num_draft_tokens?: number | null
+  sg_cuda_graph_max_bs?: number | null
+  sg_chunked_prefill_size?: number | null
 }
 
 // One KEY=VALUE line of a hook-backed deployment's settings env file.
@@ -1011,6 +1014,9 @@ export interface LaunchControls {
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null
+  sg_speculative_num_draft_tokens?: number | null
+  sg_cuda_graph_max_bs?: number | null
+  sg_chunked_prefill_size?: number | null
 }
 
 export interface SavedConfigurationDetail extends SavedConfiguration {

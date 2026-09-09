@@ -107,7 +107,7 @@ _Set one Hugging Face credential for gated and private models across the cluster
 <details>
 <summary><strong>Pull Hugging Face weights straight from Explore</strong></summary>
 
-> Search the Hugging Face catalog on the **Explore** tab, expand a model such as `deepseek-ai/DeepSeek-V4-Flash-0731`, and press **Pull weights**: SparkDeck downloads once to the first selected node, then automatically transfers the copy to the rest through Virtual NAS. No manual download or `huggingface-cli` step.
+> Search the Hugging Face catalog on the **Explore** tab, expand a model such as `deepseek-ai/DeepSeek-V4-Flash-0731`, and press **Pull weights**: SparkDeck downloads once to a seed node, then automatically transfers the copy to the other selected, transfer-eligible nodes through Virtual NAS; a node that already holds a partial cache resumes from Hugging Face independently. Pulling requires Virtual NAS to be enabled (it is off by default). No manual download or `huggingface-cli` step.
 
 ![Explore pull-weights dialog for deepseek-ai/DeepSeek-V4-Flash-0731 across four cluster nodes](docs/screenshots/readme/feature-explore-pull.png)
 
@@ -124,7 +124,7 @@ _Pulling `deepseek-ai/DeepSeek-V4-Flash-0731` (155 GB weights) to all four nodes
 
 ![SparkDeck dark-mode dashboard showing a four-node DGX Spark cluster](docs/screenshots/readme/sparkdeck-dashboard-dark.png)
 
-_A four-node SparkDeck dashboard in dark mode. Every value shown in this README is illustrative demo data, not a measured hardware claim._
+_A four-node SparkDeck dashboard in dark mode. The values in this image are illustrative demo data, not measured hardware claims._
 
 ## Why I built it
 

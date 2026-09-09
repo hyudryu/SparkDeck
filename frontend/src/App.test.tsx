@@ -2418,4 +2418,74 @@ describe('model deployments', () => {
     expect(payload.gpu_memory_utilization).toBe(0.9)
     expect(await screen.findByText('Saved.')).toBeInTheDocument()
   })
+
+  it('shows SGLang-compatible launch fields in the recipe arguments editor', async () => {
+    const user = userEvent.setup()
+    const detail = {
+      id: 'recipe-sglang', name: 'SGLang config', model: 'org/model', engine: 'sglang',
+      deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+      pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 7,
+      extra_args: [
+        '--speculative-algorithm', 'NEXTN', '--speculative-num-draft-tokens', '6',
+        '--cuda-graph-max-bs', '160', '--chunked-prefill-size', '8192',
+      ],
+      launch_controls: {
+        context_window: 32768, max_concurrency: 8, thinking_mode: 'default',
+        sg_speculative_num_draft_tokens: 6, sg_cuda_graph_max_bs: 160,
+        sg_chunked_prefill_size: 8192,
+      },
+      sg_tp_size: 2, sg_mem_fraction: 0.88,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/recipes/recipe-sglang' && init?.method === 'PUT') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes/recipe-sglang') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-sglang', name: 'SGLang config', model: 'org/model', engine: 'sglang',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 7,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Arguments' }))
+
+    // SGLang-native fields replace the vLLM-only structured controls.
+    expect(await screen.findByRole('spinbutton', { name: 'Speculative draft tokens' })).toHaveValue(6)
+    expect(screen.getByRole('spinbutton', { name: 'CUDA graph max batch size' })).toHaveValue(160)
+    expect(screen.getByRole('spinbutton', { name: 'Chunked prefill size' })).toHaveValue(8192)
+    expect(screen.getByRole('spinbutton', { name: 'TP size' })).toHaveValue(2)
+    expect(screen.queryByRole('spinbutton', { name: 'Speculative tokens' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Cudagraph capture size' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Batched tokens' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Speculative method' })).not.toBeInTheDocument()
+
+    const draftTokens = screen.getByRole('spinbutton', { name: 'Speculative draft tokens' })
+    await user.clear(draftTokens)
+    await user.type(draftTokens, '4')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-sglang',
+      expect.objectContaining({ method: 'PUT' }),
+    ))
+    const putCall = fetchMock.mock.calls.find(([input, init]) => String(input) === '/api/v1/recipes/recipe-sglang' && init?.method === 'PUT')
+    const payload = JSON.parse(String(putCall?.[1]?.body))
+    expect(payload.launch_controls.sg_speculative_num_draft_tokens).toBe(4)
+    expect(payload.launch_controls.sg_cuda_graph_max_bs).toBe(160)
+    expect(payload.launch_controls.sg_chunked_prefill_size).toBe(8192)
+    expect(payload.sg_tp_size).toBe(2)
+    expect(payload.sg_mem_fraction).toBe(0.88)
+    expect(await screen.findByText('Saved.')).toBeInTheDocument()
+  })
 })

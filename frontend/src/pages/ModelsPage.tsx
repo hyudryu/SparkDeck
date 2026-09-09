@@ -351,6 +351,9 @@ const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
     dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens?.toString() ?? '',
     max_cudagraph_capture_size: controls.max_cudagraph_capture_size?.toString() ?? '',
     max_num_batched_tokens: controls.max_num_batched_tokens?.toString() ?? '',
+    sg_speculative_num_draft_tokens: controls.sg_speculative_num_draft_tokens?.toString() ?? '',
+    sg_cuda_graph_max_bs: controls.sg_cuda_graph_max_bs?.toString() ?? '',
+    sg_chunked_prefill_size: controls.sg_chunked_prefill_size?.toString() ?? '',
     gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
     gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
     sg_tp_size: detail.sg_tp_size?.toString() ?? '',
@@ -1897,6 +1900,9 @@ export function ModelsPage() {
         dspark_num_speculative_tokens: numeric(editorForm.dspark_num_speculative_tokens),
         max_cudagraph_capture_size: numeric(editorForm.max_cudagraph_capture_size),
         max_num_batched_tokens: numeric(editorForm.max_num_batched_tokens),
+        sg_speculative_num_draft_tokens: numeric(editorForm.sg_speculative_num_draft_tokens),
+        sg_cuda_graph_max_bs: numeric(editorForm.sg_cuda_graph_max_bs),
+        sg_chunked_prefill_size: numeric(editorForm.sg_chunked_prefill_size),
       },
       gpu_memory_utilization: numeric(editorForm.gpu_memory_utilization),
       gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
@@ -2319,6 +2325,9 @@ export function ModelsPage() {
                         {!isVllm && <>
                           <label className="field"><span>TP size</span><input type="number" min="1" value={editor.form.sg_tp_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_tp_size: event.target.value } })} /></label>
                           <label className="field"><span>Mem fraction (static)</span><input type="number" step="0.01" min="0.01" max="1" value={editor.form.sg_mem_fraction} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_mem_fraction: event.target.value } })} /></label>
+                          <label className="field"><span>Speculative draft tokens</span><input type="number" min="1" value={editor.form.sg_speculative_num_draft_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_speculative_num_draft_tokens: event.target.value } })} /></label>
+                          <label className="field"><span>CUDA graph max batch size</span><input type="number" min="1" value={editor.form.sg_cuda_graph_max_bs} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_cuda_graph_max_bs: event.target.value } })} /></label>
+                          <label className="field"><span>Chunked prefill size</span><input type="number" min="1" value={editor.form.sg_chunked_prefill_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_chunked_prefill_size: event.target.value } })} /></label>
                         </>}
                       </div>
                       <label className="field"><span>Other flags</span><textarea rows={3} value={editor.form.remaining_flags} spellCheck={false} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, remaining_flags: event.target.value } })} /></label>

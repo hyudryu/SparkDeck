@@ -4403,6 +4403,9 @@ class Manager:
                 "dspark_num_speculative_tokens": None,
                 "max_cudagraph_capture_size": None,
                 "max_num_batched_tokens": None,
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
             }
         return {
             "context_window": context_window,
@@ -4435,6 +4438,18 @@ class Manager:
             ),
             "max_num_batched_tokens": cls._cli_option(
                 args, {"--max-num-batched-tokens"}, int
+            ),
+            "sg_speculative_num_draft_tokens": (
+                cls._cli_option(args, {"--speculative-num-draft-tokens"}, int)
+                if engine == "sglang" else None
+            ),
+            "sg_cuda_graph_max_bs": (
+                cls._cli_option(args, {"--cuda-graph-max-bs"}, int)
+                if engine == "sglang" else None
+            ),
+            "sg_chunked_prefill_size": (
+                cls._cli_option(args, {"--chunked-prefill-size"}, int)
+                if engine == "sglang" else None
             ),
         }
 
@@ -4624,6 +4639,21 @@ class Manager:
                 flags = self._replace_command_option(
                     flags, {"--speculative-config"}, speculative_value
                 )
+
+        if engine == "sglang":
+            # SGLang-native equivalents of the vLLM-only structured controls.
+            # As with the gated vLLM keys above, an absent key means the caller
+            # did not submit the control (leave the flag untouched); only an
+            # explicit null clears it.
+            for control_key, flag in (
+                ("sg_speculative_num_draft_tokens", "--speculative-num-draft-tokens"),
+                ("sg_cuda_graph_max_bs", "--cuda-graph-max-bs"),
+                ("sg_chunked_prefill_size", "--chunked-prefill-size"),
+            ):
+                if control_key in controls:
+                    flags = self._replace_command_option(
+                        flags, {flag}, positive_int(control_key),
+                    )
 
         try:
             return shlex.split(flags)

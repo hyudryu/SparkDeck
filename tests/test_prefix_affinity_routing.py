@@ -28,7 +28,8 @@ def setup(mode='replicated'):
     if mode == 'grouped_sharded':
         members = [
             {'node_id': f'node-{group}-{rank}', 'container_name': f'engine-{group}-{rank}',
-             'container_id': f'container-{group}-{rank}', 'instance_id': group, 'rank': rank}
+             'container_id': f'container-{group}-{rank}', 'instance_id': group, 'rank': rank,
+             'status': 'running'}
             for group in range(2) for rank in range(2)
         ]
     deployment = {'id': 'd', 'mode': mode, 'members': members}

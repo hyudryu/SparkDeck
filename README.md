@@ -12,7 +12,7 @@ The cluster stays yours. Management remains local, community sharing is opt-in, 
 
 ## Features
 
-Click a feature to see a cropped view of the live UI. Every screenshot is illustrative demo data, not a measured hardware claim.
+Click a feature to see a cropped view of the live UI. Screenshots are either real captures from the author's own cluster or illustrative demo data, as noted under each one; demo values are not measured hardware claims.
 
 <details>
 <summary><strong>Deploy &amp; stop inference servers across the cluster</strong></summary>
@@ -31,7 +31,7 @@ _Deployments of vLLM and SGLang, each with running/stop state, across the cluste
 
 ![Cluster node telemetry and current inference](docs/screenshots/readme/feature-cluster-monitoring.png)
 
-_Node CPU/GPU temperature, unified memory, and session telemetry per node, plus aggregate inference rate per active engine group. Illustrative demo data._
+_Node CPU/GPU temperature, unified memory, and session telemetry per node, plus running engine groups and current inference. Real capture from the author's four-node cluster._
 </details>
 
 <details>
@@ -71,7 +71,7 @@ _Node storage inventory plus a queue-a-transfer form to copy model weights to se
 
 ![Usage stats with token activity, trends, and model usage](docs/screenshots/readme/feature-usage-stats.png)
 
-_Token activity, time-range heatmap, daily trend, and per-model usage breakdown. Illustrative demo data._
+_Token activity, one-year heatmap, daily trend, and per-model usage breakdown. Real capture from the author's cluster — DeepSeek V4 Flash workloads dominate the token share._
 </details>
 
 <details>
@@ -102,6 +102,16 @@ _Chat workspace reporting live output tok/s for the selected model. Illustrative
 ![Hugging Face API key configuration](docs/screenshots/readme/feature-huggingface.png)
 
 _Set one Hugging Face credential for gated and private models across the cluster. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Pull Hugging Face weights straight from Explore</strong></summary>
+
+> Search the Hugging Face catalog on the **Explore** tab, expand a model such as `deepseek-ai/DeepSeek-V4-Flash-0731`, and press **Pull weights**: SparkDeck downloads once to the first selected node, then automatically transfers the copy to the rest through Virtual NAS. No manual download or `huggingface-cli` step.
+
+![Explore pull-weights dialog for deepseek-ai/DeepSeek-V4-Flash-0731 across four cluster nodes](docs/screenshots/readme/feature-explore-pull.png)
+
+_Pulling `deepseek-ai/DeepSeek-V4-Flash-0731` (155 GB weights) to all four nodes, with gx10-node-1 as the download seed. Real capture from the author's cluster._
 </details>
 
 ## Documentation

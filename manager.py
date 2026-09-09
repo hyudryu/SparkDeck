@@ -414,6 +414,10 @@ TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
 
+# Maximum time an inference request may wait in the controller admission
+# queue before it is rejected instead of lingering as a stale entry.
+INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS = 120.0
+
 FAN_MODE_DEFAULTS = {
     "curve": {
         "curve_points": [[40.0, 0.0], [60.0, 30.0], [75.0, 60.0], [90.0, 100.0]],
@@ -5727,14 +5731,17 @@ class Manager:
         return tied[index]
 
     def _grouped_coordinators(self, deployment: dict) -> list[dict]:
-        """Rank-0 coordinator of each started engine group, group order."""
+        """Rank-0 coordinator of each running engine group, group order."""
         by_instance: dict[int, dict] = {}
         for member in self._cluster_members_sorted(deployment):
             if int(member.get("rank") or 0) != 0:
                 continue
             if str(member.get("desired_state") or "") == "stopped":
                 continue
-            if str(member.get("status") or "") in {"stopped", "error"}:
+            # Only a group whose engine is actually running may take traffic;
+            # starting/queued/creating groups cannot serve yet, and unknown
+            # or unreachable ones are just as unable.
+            if str(member.get("status") or "") != "running":
                 continue
             instance = int(member.get("instance_id") or 0)
             by_instance.setdefault(instance, member)
@@ -5748,14 +5755,18 @@ class Manager:
         the least busy replicas first. Sharded ranks form a single engine,
         so only the rank-0 coordinator may serve a request. Grouped-sharded
         deployments balance across the running engine groups: each group's
-        rank-0 coordinator carries the group's requests, and stopped or
-        failed groups drop out of the candidate set.
+        rank-0 coordinator carries the group's requests, and stopped, failed,
+        or still-starting groups drop out of the candidate set. When no group
+        is running, the empty route order rejects the request rather than
+        sending it to a group that cannot serve yet.
         """
         members = self._cluster_members_sorted(deployment)
         if deployment.get("mode") == "grouped_sharded":
             coordinators = self._grouped_coordinators(deployment)
             if not coordinators:
-                return members[:1]
+                # No engine group is running. Reject the request instead of
+                # falling back to a still-starting group that cannot serve.
+                return []
             chosen = self._balanced_cluster_member(deployment, coordinators)
             rest = [m for m in coordinators if m is not chosen]
             rest.sort(key=lambda m: self._cluster_member_active(
@@ -10477,17 +10488,26 @@ class Manager:
 
         cancel_waiter: asyncio.Task | None = None
         try:
-            if cancel is None:
-                await waiter["future"]
-            else:
+            pending_on: set = {waiter["future"]}
+            if cancel is not None:
                 cancel_waiter = asyncio.create_task(cancel.wait())
-                done, _ = await asyncio.wait(
-                    {waiter["future"], cancel_waiter},
-                    return_when=asyncio.FIRST_COMPLETED,
+                pending_on.add(cancel_waiter)
+            done, _ = await asyncio.wait(
+                pending_on,
+                timeout=INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # The slot never freed up (stalled or still-starting target).
+                # Reject the request instead of letting it linger in the
+                # queue forever as a stale entry.
+                raise TimeoutError(
+                    f"inference queue wait for '{stats_key}' exceeded "
+                    f"{int(INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS)}s"
                 )
-                if cancel_waiter in done:
-                    raise ClientAbort("client disconnected while queued")
-                await waiter["future"]
+            if cancel_waiter is not None and cancel_waiter in done:
+                raise ClientAbort("client disconnected while queued")
+            await waiter["future"]
             return target
         except BaseException:
             if waiter["granted"]:

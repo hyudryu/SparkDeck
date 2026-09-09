@@ -8386,9 +8386,16 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
             by_node.setdefault(member["node_id"], []).append(member)
     for node_id, ranks in by_node.items():
         idle = all(
-            member.get("status") in {"exited", "stopped", "dead", "missing"}
+            # "error" is a persisted launch-failure marker: the rank's
+            # container was never created (or was rolled back), so with stopped
+            # intent it holds no reservation. Its stale failed-stop bookkeeping
+            # (for example a pre-fix phantom 404) must not pin the node either.
+            member.get("status") in {"exited", "stopped", "dead", "missing", "error"}
             and not member.get("recreate_pending")
-            and not member.get("failed_stop_error")
+            and (
+                not member.get("failed_stop_error")
+                or member.get("status") == "error"
+            )
             and (
                 (member.get("desired_state") or cluster.get("desired_state")) == "stopped"
                 or cluster.get("status") == "stopped"

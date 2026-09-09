@@ -449,6 +449,96 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         listed = await self.service.deployments()
         self.assertNotIn("occupied_node_ids", listed[0])
 
+    async def test_failed_launch_record_with_stopped_intent_reserves_no_nodes(self):
+        """A stopped record whose only launch failed owns no containers and
+        must not occupy its nodes — a sibling profile needs them to start."""
+        deployment = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": "error", "desired_state": "stopped",
+            "mode": "sharded", "node_ids": ["local", "worker-1"],
+            "error": "image pull failed",
+            "members": [
+                {
+                    "node_id": "local", "status": "error",
+                    "error": "Launch failed: image pull failed",
+                },
+                {
+                    "node_id": "worker-1", "status": "error",
+                    # Stale bookkeeping from stopping a rank whose container
+                    # was never created must not pin the node either.
+                    "failed_stop_error": (
+                        '404 Client Error ("No such container: '
+                        'cluster-old-manager-r1-model")'
+                    ),
+                },
+            ],
+        }
+        self.manager.deployments = [deployment]
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], [])
+
+    async def test_stopped_same_name_duplicate_records_free_their_shared_nodes(self):
+        """Two stopped same-model records (a stale failed-launch record and
+        the edited replacement) must not block each other's nodes at start."""
+        stale = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": "error", "desired_state": "stopped",
+            "mode": "sharded", "node_ids": ["local", "worker-1"],
+            "served_model": "qwen-old-name",
+            "members": [
+                {"node_id": "local", "status": "error"},
+                {"node_id": "worker-1", "status": "error"},
+            ],
+        }
+        current = {
+            "id": "new-manager", "sparkdeck_record_id": "record-2",
+            "status": "stopped", "desired_state": "stopped",
+            "mode": "sharded", "node_ids": ["local", "worker-1"],
+            "served_model": "qwen-new-name",
+            "members": [
+                {"node_id": "local", "status": "stopped"},
+                {"node_id": "worker-1", "status": "stopped"},
+            ],
+        }
+        self.service.store.add_deployment(Deployment(
+            id="record-2", alias="friendly (edited)", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"node_ids": ["local", "worker-1"],
+                      "manager_deployment_id": "new-manager"},
+        ), None)
+        self.manager.deployments = [stale, current]
+        self.manager.get_state = AsyncMock(
+            return_value={"deployments": [stale, current]},
+        )
+
+        listed = await self.service.deployments()
+
+        by_id = {item["id"]: item for item in listed}
+        self.assertEqual(by_id["record-1"]["occupied_node_ids"], [])
+        self.assertEqual(by_id["record-2"]["occupied_node_ids"], [])
+
+    async def test_live_ranks_still_reserve_nodes_despite_stopped_peer_records(self):
+        """Occupancy release is scoped to idle ranks: a live container on a
+        stopped-intent record keeps its node reserved."""
+        deployment = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": "degraded", "desired_state": "stopped",
+            "mode": "sharded", "node_ids": ["local", "worker-1"],
+            "members": [
+                {"node_id": "local", "status": "running"},
+                {"node_id": "worker-1", "status": "error"},
+            ],
+        }
+        self.manager.deployments = [deployment]
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], ["local"])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.manager = FakeManager()

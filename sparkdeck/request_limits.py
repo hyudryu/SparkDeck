@@ -15,9 +15,13 @@ class RequestBodyTooLarge(ValueError):
 
 
 def is_inference_request_path(path: str) -> bool:
-    return path in {"/v1/chat/completions", "/v1/completions", "/v1/responses"} or path.startswith(
-        "/api/agent/inference/"
-    )
+    # Workers accept these routes through the framework's trailing-slash
+    # redirect as well, so a joined worker must bound the same payloads on the
+    # `/v1/responses/` form too. Normalize only the exact-match set so the
+    # `/api/agent/inference/` prefix still matches its own trailing slash.
+    if path.rstrip("/") in {"/v1/chat/completions", "/v1/completions", "/v1/responses"}:
+        return True
+    return path.startswith("/api/agent/inference/")
 
 
 async def read_limited_request_body(request: Any, max_bytes: int) -> bytes:

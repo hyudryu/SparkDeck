@@ -171,3 +171,50 @@ def test_refusal_and_null_usage_details():
 def test_nonstream_missing_finish_is_not_reported_as_success():
     with pytest.raises(ValueError, match="finish reason"):
         from_chat_response({"choices": [{"message": {"content": "partial"}}]}, {"model": "local"})
+
+
+def test_refusal_roundtrips_into_chat_content():
+    # A full-history client replays the adapter's own refusal output part; that
+    # must be accepted rather than rejected as an unsupported content type.
+    request = to_chat_request({"model": "local", "input": [
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "declined"}]},
+    ]})
+    assert request["messages"][0]["content"] == [{"type": "text", "text": "declined"}]
+
+
+def test_nonstream_truncated_custom_call_stays_incomplete():
+    result = from_chat_response({"choices": [{"message": {"tool_calls": [
+        {"id": "c1", "function": {"name": "apply_patch", "arguments": '{"input":"pat'}}
+    ]}, "finish_reason": "length"}], "usage": {"prompt_tokens": 8, "completion_tokens": 3}},
+        {"model": "local", "tools": [{"type": "custom", "name": "apply_patch"}]})
+    assert result["status"] == "incomplete"
+    assert result["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert result["output"][0]["type"] == "custom_tool_call"
+    assert result["output"][0]["status"] == "incomplete"
+    assert result["output"][0]["input"] == '{"input":"pat'
+
+
+def test_stream_truncated_custom_call_is_incomplete_not_failed():
+    result = events([
+        frame({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "apply_patch", "arguments": '{"input":"pat'}}]}),
+        frame(finish="length"),
+    ], {"model": "local", "tools": [{"type": "custom", "name": "apply_patch"}]})
+    assert result[-1]["type"] == "response.incomplete"
+    output = result[-1]["response"]["output"][0]
+    assert output["type"] == "custom_tool_call"
+    assert output["status"] == "incomplete"
+    assert output["input"] == '{"input":"pat'
+
+
+def test_stream_null_tool_delta_fields_are_normalized():
+    result = events([
+        frame({"tool_calls": [{"index": 0, "id": "call_", "function": {"name": "re", "arguments": '{"'}}]}),
+        frame({"tool_calls": [{"index": 0, "id": None, "function": {"name": None, "arguments": None}}]}),
+        frame({"tool_calls": [{"index": 0, "function": {"name": "ad", "arguments": 'path":"a"}'}}]}),
+        frame(finish="tool_calls"), "data: [DONE]\n\n",
+    ])
+    item = result[-1]["response"]["output"][0]
+    assert item["call_id"] == "call_"
+    assert item["name"] == "read"
+    assert json.loads(item["arguments"]) == {"path": "a"}
+    assert any(event["type"] == "response.function_call_arguments.delta" for event in result)

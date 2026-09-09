@@ -53,6 +53,11 @@ def _content(content, *, tool_output=False):
                 raise ValueError("input_image requires image_url; uploaded files are not supported")
             parts.append({"type": "image_url", "image_url": {
                 "url": part["image_url"], "detail": part.get("detail", "auto")}})
+        elif kind == "refusal":
+            # The adapter emits refusal content parts for refused assistant
+            # turns. A full-history client replays them, so accept the adapter's
+            # own representation instead of rejecting the round-trip.
+            parts.append({"type": "text", "text": part["refusal"]})
         else:
             raise ValueError(f"Unsupported Responses content type: {kind}")
     if tool_output:
@@ -174,7 +179,7 @@ def _response(request: dict) -> dict:
             "parallel_tool_calls": request.get("parallel_tool_calls", True), "store": False}
 
 
-def _call_item(call: dict, custom: set[str], status="completed") -> dict:
+def _call_item(call: dict, custom: set[str], status="completed", *, truncated=False) -> dict:
     function = call.get("function", {})
     name = function.get("name", "")
     arguments = function.get("arguments", "")
@@ -186,7 +191,14 @@ def _call_item(call: dict, custom: set[str], status="completed") -> dict:
             if not isinstance(value, str):
                 raise ValueError("Custom tool input must be a string")
         except (ValueError, KeyError, TypeError) as exc:
-            raise ValueError(f"Invalid arguments from custom tool {name}") from exc
+            # A token-limit truncation can cut the JSON wrapper around the custom
+            # input before it closes. That is an incomplete call, not an upstream
+            # failure, so preserve the partial feed and keep `incomplete` status.
+            if not truncated:
+                raise ValueError(f"Invalid arguments from custom tool {name}") from exc
+            item.update(type="custom_tool_call", input=arguments, status="incomplete")
+            del item["arguments"]
+            return item
         item.update(type="custom_tool_call", input=value)
         del item["arguments"]
     return item
@@ -215,6 +227,7 @@ def _from_chat_response(result: dict, original_request: dict) -> dict:
         raise ValueError("Upstream chat response has no finish reason")
     message = choice.get("message", {})
     status = "incomplete" if choice.get("finish_reason") in ("length", "content_filter") else "completed"
+    truncated = choice.get("finish_reason") == "length"
     if message.get("content") is not None:
         response["output"].append({"id": _id("msg_"), "type": "message", "role": "assistant",
                                    "status": status, "content": [{"type": "output_text", "text": message["content"], "annotations": []}]})
@@ -222,7 +235,7 @@ def _from_chat_response(result: dict, original_request: dict) -> dict:
         response["output"].append({"id": _id("msg_"), "type": "message", "role": "assistant",
                                    "status": status, "content": [{"type": "refusal", "refusal": message["refusal"]}]})
     for call in message.get("tool_calls", []):
-        response["output"].append(_restore_namespace(_call_item(call, _custom_names(original_request), status), original_request))
+        response["output"].append(_restore_namespace(_call_item(call, _custom_names(original_request), status, truncated=truncated), original_request))
     response.update(status=status, usage=_usage(result.get("usage")))
     if status == "incomplete":
         response["incomplete_details"] = {"reason": "max_output_tokens" if choice["finish_reason"] == "length" else "content_filter"}
@@ -299,17 +312,21 @@ async def stream_chat_response(upstream: AsyncIterator[str], original_request: d
                 for call_delta in delta.get("tool_calls", []):
                     index = call_delta.get("index", 0)
                     state = calls.setdefault(index, {"id": "", "function": {"name": "", "arguments": ""}, "item": None})
-                    state["id"] += call_delta.get("id", "")
-                    function = call_delta.get("function", {})
-                    state["function"]["name"] += function.get("name", "")
-                    state["function"]["arguments"] += function.get("arguments", "")
+                    # Backends serialize absent optional tool-call fields as
+                    # JSON null on later chunks; treat null as empty so the
+                    # accumulated id/name/arguments stay strings.
+                    state["id"] += call_delta.get("id") or ""
+                    function = call_delta.get("function") or {}
+                    state["function"]["name"] += function.get("name") or ""
+                    state["function"]["arguments"] += function.get("arguments") or ""
         if finish is None:
             raise ValueError("Upstream stream ended before a finish reason")
         status = "incomplete" if finish in ("length", "content_filter") else "completed"
+        truncated = finish == "length"
         # Tool metadata may itself be fragmented, so publish after assembly.
         # This also permits lossless conversion of custom-tool JSON arguments.
         for state in calls.values():
-            item = _restore_namespace(_call_item(state, custom, "in_progress"), original_request)
+            item = _restore_namespace(_call_item(state, custom, "in_progress", truncated=truncated), original_request)
             field = "input" if item["type"] == "custom_tool_call" else "arguments"
             value = item[field]
             item[field] = ""

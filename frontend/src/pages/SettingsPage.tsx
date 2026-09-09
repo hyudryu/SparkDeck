@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
 import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, SystemUpdateNode } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
+import { RequestRoutingPanel } from '../components/RequestRoutingPanel'
 import { LegalDialog } from '../components/LegalDialog'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
@@ -16,22 +17,45 @@ function shortRevision(value?: string) {
   return value ? value.slice(0, 8) : 'Unknown'
 }
 
-function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string) {
+function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string, active = false) {
   const error = node.error || node.blockers?.join('; ')
-  if (error) return { color: 'error', label: error }
+  if (active && error) return { color: 'error', label: error }
+  if (active && node.phase === 'pending_transfers') return { color: 'starting', label: 'Waiting for transfers' }
   const latest = Boolean(targetRevision && node.current_revision?.toLowerCase() === targetRevision.toLowerCase())
   if (latest) return { color: 'running', label: 'Latest' }
-  if (node.phase === 'succeeded') return { color: 'running', label: 'Succeeded' }
   if (node.online === false) return { color: 'stopped', label: 'Offline' }
+  if (!active) {
+    if (typeof node.commits_behind === 'number' && node.commits_behind > 0) {
+      return { color: 'starting', label: `${node.commits_behind} commit${node.commits_behind === 1 ? '' : 's'} behind` }
+    }
+    return { color: 'starting', label: 'Version unknown' }
+  }
   return { color: 'starting', label: node.phase === 'ready' ? 'Queued' : node.phase === 'up_to_date' ? 'Ready' : node.phase || 'Ready' }
 }
 
 function SoftwareUpdatePanel() {
   const { confirm, confirmationDialog } = useConfirmDialog()
-  const resource = useResource((signal) => api.updates.overview(signal))
+  const checkedMain = useRef(false)
+  const resource = useResource(async (signal) => {
+    // Every visit checks GitHub again; active rollout polling can reuse the
+    // cached target. An aborted initial request must not consume the check.
+    const data = await api.updates.overview(signal, !checkedMain.current)
+    if (!signal.aborted) checkedMain.current = true
+    return data
+  })
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState<string>()
   const active = Boolean(resource.data?.job?.active)
+  const location = useLocation()
+
+  useEffect(() => {
+    if (location.hash !== '#software-update') return
+    // The update banner deep-links here; wait a frame so the panel is
+    // mounted before scrolling.
+    requestAnimationFrame(() => {
+      document.getElementById('software-update')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [location.hash])
 
   useEffect(() => {
     if (!active || resource.loading) return
@@ -64,11 +88,13 @@ function SoftwareUpdatePanel() {
 
   const data = resource.data
   const blockers = data?.blockers ?? []
-  const nodes = data?.job?.nodes ?? data?.nodes ?? []
+  const nodes = (active ? data?.job?.nodes : data?.nodes) ?? []
   const targetRevision = data?.target?.revision
   const upToDate = Boolean(data?.up_to_date)
+  const waitingForTransfers = active && data?.job?.phase === 'pending_transfers'
+  const updateMessage = data?.job?.message || (waitingForTransfers ? 'Waiting for model transfers to finish before updating. Both source and destination nodes are protected.' : undefined)
   return (
-    <><Panel className="settings-section software-update-section">
+    <><Panel id="software-update" className="settings-section software-update-section">
       <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2>Software update</h2><p>Update every eligible cluster node to the latest commit on the main branch. Nodes that cannot update are reported and skipped.</p></div></div>
       <div className="settings-fields">
         {resource.loading && !data && <LoadingState label="Checking for updates" />}
@@ -80,11 +106,11 @@ function SoftwareUpdatePanel() {
               <strong>Running {shortRevision(data.current_revision)}</strong>
               <span className="muted">origin/main {targetRevision ? shortRevision(targetRevision) : 'unavailable'} · {data.nodes?.length ?? 0} cluster node{data.nodes?.length === 1 ? '' : 's'}</span>
             </div>
-            <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
+            <Button type="button" variant="primary" disabled={!data.can_update || !targetRevision || upToDate || starting || active} onClick={() => void start()}>{active ? <RefreshCw className="spin" size={16} /> : <DownloadCloud size={16} />} {starting ? 'Starting…' : waitingForTransfers ? 'Waiting for transfers' : active ? 'Updating…' : upToDate ? 'Up to date' : 'Update to main'}</Button>
           </div>
-          {(data.job?.message || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || data.job?.message}</p>}
+          {(updateMessage || data.job?.error || actionError) && <p className={data.job?.error || actionError ? 'form-error wide-field' : 'muted wide-field'} role="status" aria-live="polite">{data.job?.error || actionError || updateMessage}</p>}
           {blockers.length > 0 && <div className="update-blockers wide-field"><strong>{data.can_update ? 'Nodes that cannot update' : 'Update unavailable'}</strong><ul>{blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul></div>}
-          {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => { const status = nodeUpdateStatus(node, targetRevision); return <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={status.color}>{status.label}</Status></div> })}</div>}
+          {nodes.length > 0 && <div className="update-node-list wide-field" aria-label="Cluster update status">{nodes.map((node) => { const status = nodeUpdateStatus(node, targetRevision, active); return <div className="update-node" key={node.id}><span><strong>{node.name}</strong><small>{shortRevision(node.current_revision)}</small></span><Status status={status.color}>{status.label}</Status></div> })}</div>}
         </>}
       </div>
     </Panel>{confirmationDialog}</>
@@ -94,6 +120,7 @@ function SoftwareUpdatePanel() {
 function editableSettingsFingerprint(settings: AppSettings) {
   return JSON.stringify({
     theme: settings.theme ?? 'system',
+    max_concurrent_prompt_processing: settings.max_concurrent_prompt_processing ?? 1,
   })
 }
 
@@ -350,7 +377,7 @@ export function SettingsPage() {
   const resource = useResource((signal) => api.settings.get(signal))
   const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
   const auth = useAuth()
-  const [form, setForm] = useState<AppSettings>({ theme: storedTheme() })
+  const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), max_concurrent_prompt_processing: 1 })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
@@ -493,6 +520,12 @@ export function SettingsPage() {
             <label className="field"><span>Appearance</span><select value={form.theme} onChange={(event) => setForm({ ...form, theme: event.target.value as AppSettings['theme'] })}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
           </div>
         </Panel>
+        <Panel className="settings-section" aria-labelledby="load-balancer-title">
+          <div className="settings-heading"><span><Network size={18} /></span><div><h2 id="load-balancer-title">Load Balancer</h2><p>Limit simultaneous prompt processing (PP / prefill) independently for each serving group.</p></div></div>
+          <div className="settings-fields">
+            <label className="field wide-field"><span>Concurrent prompt processing streams per group</span><input aria-label="Concurrent prompt processing streams per group" type="number" min="1" step="1" required inputMode="numeric" value={Number.isNaN(form.max_concurrent_prompt_processing) ? '' : form.max_concurrent_prompt_processing ?? 1} onChange={(event) => setForm({ ...form, max_concurrent_prompt_processing: event.target.valueAsNumber })} aria-describedby="prompt-processing-help" /><small id="prompt-processing-help">Each group has its own limit. With a limit of 1 and two groups, each group can process one prompt at the same time. Additional requests wait until a slot is available in their group. A streaming request releases its slot on its first generated token; streams already generating tokens do not count toward this limit. Non-streaming requests keep their slot until the response finishes.</small></label>
+          </div>
+        </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><Network size={18} /></span><div><h2>DGX Spark cluster</h2><p>Connect nodes privately over Tailscale for targeted pulls and deployments.</p></div></div>
           <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster Management</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
@@ -521,7 +554,7 @@ export function SettingsPage() {
             <div className="community-consent-control wide-field">
               <div>
                 <strong>Community telemetry</strong>
-                <span id="community-telemetry-description" className="muted">Share canonical model name, quantization, tensor-parallel (TP) size, C1 output speed, prompt-length/context-occupancy bucket, concurrency, and a stable opaque cluster ID. The authenticated account defines one equal-weight contributor with at most one average per TP setting. Only samples captured after opt-in are eligible. Prompts and responses never leave your cluster.</span>
+                <span id="community-telemetry-description" className="muted">Run a short benchmark after a started container becomes healthy: a 200-token generation request at context depth 0 and concurrency 1 (C1). Share canonical model name, quantization, tensor-parallel (TP) size, C1 output speed, prompt-length/context-occupancy bucket, concurrency, and a stable opaque cluster ID. The authenticated account defines one equal-weight contributor with at most one average per TP setting. Only samples captured after opt-in are eligible. Prompts and responses never leave your cluster.</span>
                 {communitySync.data && <small>{communitySync.data.pending_count} pending · {communitySync.data.synced_count} synced</small>}
               </div>
               <label className="settings-toggle">
@@ -567,6 +600,7 @@ export function SettingsPage() {
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
+      <RequestRoutingPanel />
       <SoftwareUpdatePanel />
       <Panel className="settings-section support-legal-section">
         <div className="settings-heading"><span><ShieldCheck size={18} /></span><div><h2>Support & legal</h2><p>Review how Community Features handle data, read the service terms, or report a problem.</p></div></div>
@@ -582,7 +616,7 @@ export function SettingsPage() {
         <section><h3>Local-first by default</h3><p>SparkDeck's core app runs on systems you control. It keeps benchmark history, runtime details, settings, and operational records locally on your device or cluster. Local storage is not collection by SparkDeck's hosted Community Features service.</p><p>If you do not create or sign in to a Community Features account, SparkDeck does not send account data or benchmark telemetry to the Community Features service.</p></section>
         <section><h3>Community account and authentication</h3><p>SparkDeck and Community Features are intended only for people age 18 or older. Sign-up and sign-in are handled by Amazon Cognito. The account information used by SparkDeck is your email address as username and Cognito account identifier. SparkDeck's Community Features servers do not store your password. Cognito processes credentials and authentication data. Your browser removes its token copy after pairing, while each paired SparkDeck node privately stores a refresh credential so signed-in status can be shared across your joined cluster without returning that credential to the browser.</p></section>
         <section><h3>Where information is stored</h3><p>Core SparkDeck data, including prompts, model outputs, runtime records, settings, and local benchmark history, is stored on the SparkDeck device or cluster you control. SparkDeck's default hosted account and Community Features services store and process data on Amazon Web Services infrastructure in the US East (Ohio) Region (us-east-2), including account profile data in Amazon Cognito and consented benchmark telemetry received by the Community Features API. AWS may process limited service, security, backup, and diagnostic records under its applicable service terms. Development, fork, or operator-configured deployments can replace the authentication or Community Features endpoints; in that case, data is stored and processed in the locations selected by that deployment's operator, whose privacy disclosures should be reviewed.</p></section>
-        <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly enable it under Community Features in Settings. Only samples captured after you enable sharing are eligible for upload; existing benchmark history stays local and is never queued retroactively. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>canonical model identifier;</li><li>model quantization;</li><li>tensor-parallel (TP) size;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>prompt-length/context-occupancy bucket; and</li><li>a stable opaque telemetry cluster identifier.</li></ul><p>The authenticated account defines one equal-weight contributor with at most one average per TP setting; the cluster identifier is a separate routing and compatibility field. The opaque identifier is randomly generated and does not contain an account ID, hostname, node name, or endpoint alias. Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
+        <section><h3>Optional benchmark telemetry</h3><p>Telemetry is off unless you sign in and explicitly enable it under Community Features in Settings. When enabled, SparkDeck runs a short synthetic benchmark after a started container becomes healthy, requesting 200 output tokens at context depth 0 and concurrency 1 (C1). Successful startup measurements update your average for the same model, quantization, and TP size before contributing to the community average. Only samples captured after you enable sharing are eligible for upload; existing benchmark history stays local and is never queued retroactively. If an update expands these upload fields, SparkDeck disables the prior consent and asks you to review and opt in again. The benchmark JSON is limited to:</p><ul><li>canonical model identifier;</li><li>model quantization;</li><li>tensor-parallel (TP) size;</li><li>measured inference speed in tokens per second;</li><li>request concurrency, when recorded;</li><li>prompt-length/context-occupancy bucket; and</li><li>a stable opaque telemetry cluster identifier.</li></ul><p>The authenticated account defines one equal-weight contributor with at most one average per TP setting; the cluster identifier is a separate routing and compatibility field. The opaque identifier is randomly generated and does not contain an account ID, hostname, node name, or endpoint alias. Endpoint aliases, prompt text, system messages, retrieved context, uploaded content, and model output are never included in benchmark telemetry or stored by the Community Features service.</p></section>
         <section><h3>How information is used</h3><p>Account information authenticates Community Features. Benchmark telemetry is used to group comparable results, show expected performance for the same model and configuration, detect invalid submissions, and operate the service. Published results may be aggregated with other users' results.</p><p>Telemetry uploads use a node-scoped credential and idempotency identifier. Hosting and network providers may also process ordinary connection metadata such as IP address, request time, and user agent for security and service operation. This metadata is not part of the benchmark JSON.</p></section>
         <section><h3>AI features and processing</h3><p>SparkDeck is software for running and interacting with artificial intelligence models. When you submit a prompt, the model runtime you select processes the prompt and generates its response on infrastructure you operate or choose. SparkDeck's hosted Community Features service does not receive prompts, model responses, uploaded content, or retrieved context, and it does not use account information or submitted benchmark telemetry to train generative AI models. Community benchmark comparisons are based on aggregated performance measurements; they are not automated decisions that determine access to employment, credit, housing, insurance, health care, or other similarly significant services.</p></section>
         <section><h3>Your controls, deletion, and retention</h3><p>You can turn telemetry off at any time. This stops future uploads and removes unsent queued uploads; it does not delete local benchmark history or recall data already received. Account information and received telemetry are retained only while reasonably needed to provide Community Features, protect the service, meet legal obligations, or maintain aggregated benchmark results.</p><p>You may request access, correction, or deletion of your hosted account and associated Community Features data through the <a href="https://github.com/hyudryu/SparkDeck/issues">SparkDeck GitHub issue tracker</a>. In a public issue, state only that you want a privacy or deletion request and do not include your email address, credentials, or other sensitive information; private verification instructions will be provided. A deletion request may require identity verification. SparkDeck will delete or de-identify covered hosted data unless retention is required or permitted by law, and will confirm the outcome. Data stored locally on your own device or cluster remains under your control and must be removed there. Backup records may persist for a limited period, and aggregated records may remain where they can no longer reasonably be linked to an account.</p></section>

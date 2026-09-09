@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import os
 import re
 import shutil
 import sys
@@ -328,6 +329,11 @@ class BenchmarkRunnerService:
                 f"model {config['model_id']} is not currently served; load it first"
             )
 
+        # Local Benchy can use the runtime port directly. Invalidate startup
+        # probes before launching it so that overlap cannot become C1 evidence.
+        for observation in getattr(self.sparkdeck, "_community_active_observations", {}).values():
+            observation["contaminated"] = True
+
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -419,6 +425,7 @@ class BenchmarkRunnerService:
                     stdout=log_file,
                     stderr=log_file,
                     stdin=asyncio.subprocess.DEVNULL,
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 )
         except OSError as exc:
             run["status"] = "failed"
@@ -437,10 +444,12 @@ class BenchmarkRunnerService:
         progress_path = run_dir / "progress.jsonl"
         report_path = run_dir / "report.json"
         offset = 0
+        log_offset = 0
         deadline = time.monotonic() + MAX_RUN_SECONDS
         try:
             while True:
                 offset = self._consume_progress(run, progress_path, offset)
+                log_offset = self._consume_output(run, run_dir / "output.log", log_offset)
                 if process is None or process.returncode is not None:
                     break
                 if time.monotonic() > deadline:
@@ -450,6 +459,7 @@ class BenchmarkRunnerService:
             returncode = await process.wait() if process else -1
             self._processes.pop(run_id, None)
             self._consume_progress(run, progress_path, offset)
+            self._consume_output(run, run_dir / "output.log", log_offset, final=True)
             run["finished_at"] = _utcnow()
             started = _parse_ts(run["started_at"])
             finished = _parse_ts(run["finished_at"])
@@ -522,79 +532,56 @@ class BenchmarkRunnerService:
         except OSError:
             return offset
         progress = run.get("progress") or {}
-        log_lines = list(progress.get("log_lines") or [])
-        for line in raw.decode(errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        # Retain incomplete JSONL records until the next poll.
+        complete = raw.rfind(b"\n") + 1
+        offset -= len(raw) - complete
+        for line in raw[:complete].decode(errors="replace").splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
-            event_type = event.get("type")
-            request_id = event.get("request_id")
-            if event_type == "header":
-                version = str(event.get("llama_benchy_version") or "unknown")
-                log_lines.append(f"llama-benchy v{version} initialized")
-            elif event_type == "latency_measured":
-                try:
-                    latency_ms = float(event.get("latency_s") or 0) * 1000
-                except (TypeError, ValueError):
-                    latency_ms = 0
-                mode = str(event.get("mode") or "unknown")
-                log_lines.append(
-                    f"Latency probe complete: {latency_ms:.1f} ms ({mode})"
-                )
-            elif event_type == "request_start":
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "request_start":
                 progress["current"] = {
                     "prompt_size": event.get("prompt_size"),
                     "response_size": event.get("response_size"),
                     "context_depth": event.get("context_size"),
                     "concurrency": event.get("concurrency"),
                 }
-                run_index = event.get("run_index")
-                run_number = run_index + 1 if isinstance(run_index, int) else "?"
-                log_lines.append(
-                    f"Request #{request_id} started: "
-                    f"PP {event.get('prompt_size')} -> TG {event.get('response_size')}, "
-                    f"depth {event.get('context_size')}, C{event.get('concurrency')}, "
-                    f"run {run_number}"
-                )
-            elif event_type == "request_first_token":
-                try:
-                    ttft_ms = float(event.get("ttft_s") or 0) * 1000
-                except (TypeError, ValueError):
-                    ttft_ms = 0
-                log_lines.append(
-                    f"Request #{request_id} received first token in {ttft_ms:.1f} ms"
-                )
-            elif event_type == "request_end":
-                if event.get("error"):
-                    progress["requests_failed"] = int(progress.get("requests_failed") or 0) + 1
-                    log_lines.append(f"Request #{request_id} failed")
-                else:
-                    progress["requests_done"] = int(progress.get("requests_done") or 0) + 1
-                    try:
-                        total_tokens = int(event.get("total_tokens"))
-                    except (TypeError, ValueError):
-                        total_tokens = None
-                    token_summary = (
-                        f"{total_tokens} tokens"
-                        if total_tokens is not None else "token count unavailable"
-                    )
-                    log_lines.append(
-                        f"Request #{request_id} completed: "
-                        f"{token_summary}"
-                    )
-            elif event_type == "bench_complete":
-                log_lines.append(
-                    f"Benchmark stream finished: {str(event.get('status') or 'unknown')}"
-                )
-            # Deliberately ignore tokens events: their snippet field contains
-            # generated model output and is both noisy and unsafe to echo.
-        progress["log_lines"] = log_lines[-200:]
+            elif event.get("type") == "request_end":
+                counter = "requests_failed" if event.get("error") else "requests_done"
+                progress[counter] = int(progress.get(counter) or 0) + 1
+            # JSONL describes individual requests, not benchmark stages. In
+            # particular, context load and inference share a run index, whose
+            # warmup convention differs between upstream versions. Use the
+            # native console below for stage labels and measured run numbers.
         run["progress"] = progress
         return offset
+
+    def _consume_output(
+        self, run: dict[str, Any], output_path: Path, offset: int, *, final: bool = False,
+    ) -> int:
+        try:
+            with output_path.open("rb") as handle:
+                handle.seek(offset)
+                raw = handle.read()
+        except OSError:
+            return offset
+        complete = len(raw) if final else raw.rfind(b"\n") + 1
+        progress = run.setdefault("progress", {})
+        lines = list(progress.get("log_lines") or [])
+        for line in raw[:complete].decode(errors="replace").splitlines():
+            if line.startswith("Benchmarking model:"):
+                # Use already-public run identity, never an upstream URL that
+                # may contain credentials or query parameters.
+                status = f"Benchmarking model: {run.get('model', 'unknown')}"
+            else:
+                status = _benchy_status_line(line)
+            if status is not None:
+                lines.append(status)
+        progress["log_lines"] = lines[-200:]
+        return offset + complete
 
     async def cancel_run(self, run_id: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
@@ -899,3 +886,34 @@ def _log_tail(path: Path, limit: int = 800) -> str:
     except OSError:
         return "no output was captured"
     return f"output tail: {text[-limit:]}" if text else "no output was captured"
+
+
+def _benchy_status_line(line: str) -> str | None:
+    """Expose native stages without forwarding prompts, responses or raw errors."""
+    text = line.strip()
+    if text.startswith(("Loading text from cache:", "Saved text to cache:")):
+        return text.split(":", 1)[0]  # The host cache path is not UI data.
+    if text.startswith("Coherence test FAILED"):
+        return "Coherence test FAILED."  # Upstream may append generated content.
+    if text.startswith("Warmup failed:"):
+        return "Warmup failed."
+    patterns = (
+        r"llama-benchy \([\w.+-]+\)",
+        r"Date: [\d :.-]+",
+        r"Concurrency levels: \[[\d, ]+\]",
+        r"Total tokens available in text corpus: \d+",
+        r"Warming up\.\.\.",
+        r"Warmup complete\.",
+        r"Warmup \((?:User only|System\+Probe)\) complete\. Delta: -?\d+ tokens "
+        r"\(Server: \d+, Local(?: context)?: \d+(?:, Probe: \d+)?\)",
+        r"Warmup \(User only\) complete \(no usage stats found\)\.",
+        r"Running coherence test\.\.\.",
+        r"Coherence test PASSED\.",
+        r"Measuring latency using mode: (?:api|generation|ping)\.\.\.",
+        r"Average latency \((?:api|generation|ping)\): [\d.]+ ms",
+        r"Running test: pp=\d+, tg=\d+, depth=\d+, concurrency=\d+",
+        r"(?:Warmup|Run \d+/\d+) \((?:(?:Context Load|Inference), )?batch size \d+\)\.\.\.",
+    )
+    if any(re.fullmatch(pattern, text) for pattern in patterns):
+        return line.rstrip()
+    return None

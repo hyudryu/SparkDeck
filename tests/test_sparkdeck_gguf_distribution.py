@@ -154,8 +154,17 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.nas = VirtualNAS(
+            Path(self.temp.name), lambda: Path(self.temp.name) / "hub",
+            Mock(), lambda: True,
+        )
+
     async def test_remote_seed_forwards_the_controller_credential(self):
         manager = Manager.__new__(Manager)
+        manager.virtual_nas = self.nas
         manager.node_registry = Mock()
         manager.node_registry.get = Mock(return_value={
             "id": "worker-1", "capabilities": ["virtual-nas-files-download-v1"],
@@ -171,6 +180,60 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
             manager.node_registry.request.await_args.kwargs["json_body"]["hf_token"],
             "hf-controller-token",
         )
+
+    def remote_manager(self, request):
+        manager = Manager.__new__(Manager)
+        manager.virtual_nas = self.nas
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "worker-1", "capabilities": ["virtual-nas-files-download-v1"],
+        }
+        manager.node_registry.request = request
+        manager._resolved_hf_token = Mock(return_value=None)
+        return manager
+
+    async def test_remote_seed_refused_after_update_reservation(self):
+        request = AsyncMock()
+        manager = self.remote_manager(request)
+        self.nas.reserve_update()
+        with self.assertRaisesRegex(RuntimeError, "update is pending"):
+            await manager.node_download_model_files(
+                "worker-1", "org/model", "a" * 40, ["model.gguf"],
+            )
+        request.assert_not_awaited()
+
+    async def test_remote_seed_holds_update_until_response_even_if_canceled(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def request(*args, **kwargs):
+            started.set()
+            await finish.wait()
+            return {"ok": True}
+
+        manager = self.remote_manager(AsyncMock(side_effect=request))
+        download = asyncio.create_task(manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["model.gguf"],
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        self.nas.reserve_update()
+        waiting = asyncio.create_task(self.nas.wait_for_transfers())
+        for _ in range(2):
+            download.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(download.done())
+            self.assertFalse(waiting.done())
+        finish.set()
+        self.assertEqual(await download, {"ok": True})
+        await asyncio.wait_for(waiting, timeout=1)
+
+    async def test_failed_remote_seed_releases_update_wait(self):
+        manager = self.remote_manager(AsyncMock(side_effect=RuntimeError("worker failed")))
+        with self.assertRaisesRegex(RuntimeError, "worker failed"):
+            await manager.node_download_model_files(
+                "worker-1", "org/model", "a" * 40, ["model.gguf"],
+            )
+        self.nas.reserve_update()
+        await asyncio.wait_for(self.nas.wait_for_transfers(), timeout=1)
 
     async def test_remote_seed_without_capability_fails_instead_of_whole_repo(self):
         manager = Manager.__new__(Manager)

@@ -200,6 +200,7 @@ class NodeRegistry:
         self.connection_resolver = connection_resolver
         self.nodes = self._load()
         self._status_cache: dict[str, tuple[float, dict]] = {}
+        self._status_generations: dict[str, int] = {}
 
     async def _connection_targets(
         self, agent_url: str, path: str,
@@ -236,6 +237,13 @@ class NodeRegistry:
         if node_id == LOCAL_NODE_ID:
             return {"id": LOCAL_NODE_ID, "name": "This node", "local": True}
         return next((n for n in self.nodes if n.get("id") == node_id), None)
+
+    def cached_status(self, node_id: str) -> dict | None:
+        """Read a recent connectivity observation without probing the node."""
+        cached = self._status_cache.get(node_id)
+        if cached and time.monotonic() - cached[0] < 4.0:
+            return cached[1]
+        return None
 
     async def pair_remote(
         self,
@@ -568,10 +576,16 @@ class NodeRegistry:
             f"could not contact {node.get('name', node_id)}: {last_error}"
         ) from last_error
 
+    def invalidate_status(self, node_id: str) -> None:
+        """Discard lifecycle-stale inventory, including in-flight probes."""
+        self._status_cache.pop(node_id, None)
+        self._status_generations[node_id] = self._status_generations.get(node_id, 0) + 1
+
     async def probe(
         self, node: dict, *, force: bool = False, details: bool = True,
     ) -> dict:
         node_id = node["id"]
+        generation = self._status_generations.get(node_id, 0)
         cached = self._status_cache.get(node_id)
         cached_has_details = bool(cached and "docker_ready" in cached[1])
         if (
@@ -656,6 +670,10 @@ class NodeRegistry:
                     "last_seen": previous.get("last_seen"),
                     "status_message": str(exc),
                 }
+        if generation != self._status_generations.get(node_id, 0):
+            # A lifecycle action settled while this snapshot was being read.
+            # Do not publish or cache pre-action readiness for that node.
+            return await self.probe(node, force=True, details=details)
         self._status_cache[node_id] = (time.monotonic(), result)
         return result
 

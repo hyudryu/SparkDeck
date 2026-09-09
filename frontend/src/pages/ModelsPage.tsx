@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import { ArrowDownToLine, Bookmark, Check, ChevronDown, ChevronRight, Copy, FolderPlus, HardDrive, Pencil, Play, Plus, ScrollText, Server, Settings2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, NodeInventoryItem, RecipeUpdateInput, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import type { AppSettings, CreateDeploymentInput, Deployment, DeploymentLogsResponse, NodeInventoryItem, RecipeUpdateInput, RuntimeFileMount, RuntimeKind, SavedConfiguration, SavedConfigurationDetail, StorageTransferPreflightTarget } from '../api/types'
+import { RuntimeFileMountsEditor } from '../components/RuntimeFileMountsEditor'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, SplitButton, Status, Tooltip } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
@@ -10,6 +11,7 @@ import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components
 import { useResource } from '../hooks/useResource'
 import { formatEnvironment, parseEnvironment } from '../utils/environment'
 import { formatBytes } from '../utils/format'
+import { groupNodeIds, occupiedNodeReasons } from '../utils/deploymentOccupancy'
 import { artifactFilesDownloaded, ggufArtifactOptions, type GgufArtifactOption, type GgufQuantization } from '../utils/gguf'
 
 const initialForm: CreateDeploymentInput = {
@@ -189,17 +191,20 @@ const SORT_STORAGE_KEY = 'sparkdeck:models-sort'
 type SortMode = 'recent' | 'name-asc' | 'name-desc'
 
 const ACTIVE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'stopping'])
-const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready'])
+const STOPPABLE_DEPLOYMENT_STATUSES = new Set<Deployment['status']>(['launching', 'starting', 'running', 'ready', 'degraded'])
 const PRE_CONTAINER_LAUNCH_PHASES = new Set(['queued', 'preparing', 'checking_image', 'pulling_image', 'creating_container'])
 const FINISHED_LAUNCH_PHASES = new Set(['ready', 'error', 'failed', 'stopped', 'exited'])
 
 const deploymentNeedsPoll = (deployment: Deployment) => (
   ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)
   || Boolean(deployment.launch_phase && !FINISHED_LAUNCH_PHASES.has(deployment.launch_phase))
+  || Boolean(deployment.instances?.some((instance) => (
+    ['launching', 'starting', 'stopping'].includes(instance.status)
+  )))
 )
 
 const showLaunchDetails = (deployment: Deployment) => !(
-  deployment.status === 'stopped' && deployment.launch_phase === 'exited'
+  deployment.status === 'stopped' && ['stopped', 'exited'].includes(deployment.launch_phase ?? '')
 )
 
 const formatLaunchPhase = (phase: string) => phase
@@ -346,6 +351,9 @@ const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
     dspark_num_speculative_tokens: controls.dspark_num_speculative_tokens?.toString() ?? '',
     max_cudagraph_capture_size: controls.max_cudagraph_capture_size?.toString() ?? '',
     max_num_batched_tokens: controls.max_num_batched_tokens?.toString() ?? '',
+    sg_speculative_num_draft_tokens: controls.sg_speculative_num_draft_tokens?.toString() ?? '',
+    sg_cuda_graph_max_bs: controls.sg_cuda_graph_max_bs?.toString() ?? '',
+    sg_chunked_prefill_size: controls.sg_chunked_prefill_size?.toString() ?? '',
     gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
     gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
     sg_tp_size: detail.sg_tp_size?.toString() ?? '',
@@ -438,6 +446,9 @@ export function ModelsPage() {
   const [logTailing, setLogTailing] = useState(false)
   const logPanelRef = useRef<HTMLDivElement>(null)
   const [startSelection, setStartSelection] = useState<{ deployment: Deployment; nodeIds: string[] }>()
+  const [groupSelection, setGroupSelection] = useState<{ deployment: Deployment; action: 'start' | 'stop'; instance: number | 'all' }>()
+  const [groupError, setGroupError] = useState<string>()
+  const [groupActionRevision, setGroupActionRevision] = useState(0)
   const [startError, setStartError] = useState<string>()
   const [startNotice, setStartNotice] = useState<string>()
   const [editingDeployment, setEditingDeployment] = useState<Deployment>()
@@ -470,11 +481,48 @@ export function ModelsPage() {
   )
   const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
   const [additionalError, setAdditionalError] = useState<string>()
+  const [addInstanceLaunch, setAddInstanceLaunch] = useState<{ deployment: Deployment; nodeIds: string[] }>()
+  const [addInstanceError, setAddInstanceError] = useState<string>()
+  useEffect(() => {
+    const trim = (ids: string[], exceptId?: string) => {
+      const occupied = occupiedNodeReasons(resource.data ?? [], exceptId)
+      return ids.filter((id) => !occupied[id])
+    }
+    setStartSelection((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setRecipeDeployment((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setAddInstanceLaunch((current) => {
+      if (!current) return current
+      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
+    })
+    setAdditionalLaunch((current) => {
+      if (!current) return current
+      const additionalIds = trim(current.additionalIds, current.deployment.id)
+      return additionalIds.length === current.additionalIds.length ? current : { ...current, additionalIds }
+    })
+  }, [resource.data])
+
+  const assertNodesUnoccupied = async (ids: string[], exceptId?: string) => {
+    const latest = await api.deployments.list()
+    resource.setData(latest)
+    const occupied = occupiedNodeReasons(latest, exceptId)
+    const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
+    if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
+  }
   const [argsEditors, setArgsEditors] = useState<Record<string, ArgsEditorState>>({})
   const [launchArgsOpen, setLaunchArgsOpen] = useState(false)
   const [extraFlags, setExtraFlags] = useState('')
   const [gpuMemoryUtil, setGpuMemoryUtil] = useState('')
   const [runtimeEnvironment, setRuntimeEnvironment] = useState('')
+  const [runtimeFileMounts, setRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
   const defaultsApplied = useRef(false)
   const runtimeTouched = useRef(false)
   const contextLengthTouched = useRef(false)
@@ -505,20 +553,26 @@ export function ModelsPage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       setNow(Date.now() / 1000)
-      // Running rows otherwise stop polling, which would freeze the
-      // last-inference age at whatever the page first loaded.
-      if (resource.data?.some((deployment) => deployment.status === 'running')) {
-        reloadDeployments()
-      }
+      // Refresh stable rows too: a partially running deployment can be
+      // degraded, and actions on another client can start stopped groups.
+      if (!resource.loading) reloadDeployments()
     }, 30_000)
     return () => window.clearInterval(timer)
-  }, [resource.data, reloadDeployments])
+  }, [resource.loading, reloadDeployments])
 
   useEffect(() => {
     if (resource.loading || !resource.data?.some(deploymentNeedsPoll)) return
     const timer = window.setTimeout(reloadDeployments, 2000)
     return () => window.clearTimeout(timer)
   }, [resource.data, resource.loading, reloadDeployments])
+
+  useEffect(() => {
+    if (!groupActionRevision) return
+    // A successful action can return before the runtime probe reflects its
+    // transition, including when the aggregate status is still degraded.
+    const timer = window.setTimeout(reloadDeployments, 2000)
+    return () => window.clearTimeout(timer)
+  }, [groupActionRevision, reloadDeployments])
 
   useEffect(() => {
     if (!recipeDeployment) return
@@ -1095,6 +1149,7 @@ export function ModelsPage() {
     setExtraFlags('')
     setGpuMemoryUtil('')
     setRuntimeEnvironment('')
+    setRuntimeFileMounts([])
     resetSelectionProvenance()
     setFormError(undefined)
     setCreating(true)
@@ -1106,6 +1161,7 @@ export function ModelsPage() {
     setExtraFlags((deployment.settings.extra_args ?? []).map(shellQuote).join(' '))
     setGpuMemoryUtil(deployment.settings.gpu_memory_utilization?.toString() ?? '')
     setRuntimeEnvironment(formatEnvironment(deployment.settings.environment))
+    setRuntimeFileMounts((deployment.settings.runtime_file_mounts ?? []).map((mount) => ({ ...mount })))
     setForm({
       alias: deployment.alias,
       model_id: deployment.model_id,
@@ -1139,12 +1195,21 @@ export function ModelsPage() {
     try {
       const settings = {
         ...form.settings,
+        runtime_file_mounts: form.managed && form.runtime === 'vllm'
+          ? (runtimeFileMounts.length || editing
+              ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+              : undefined)
+          : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
         environment: form.managed && form.runtime === 'vllm'
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
           : undefined,
+      }
+      if (settings.runtime_file_mounts?.some((mount) => !mount.source || !mount.target)) {
+        setLaunchArgsOpen(true)
+        throw new Error('Each runtime file mount needs a host file path and a container file path.')
       }
       const utilization = Number(gpuMemoryUtil)
       if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
@@ -1172,6 +1237,7 @@ export function ModelsPage() {
           artifact: settings.artifact ?? null,
           extra_args: settings.extra_args ?? [],
           environment: settings.environment,
+          runtime_file_mounts: settings.runtime_file_mounts,
           gpu_memory_utilization: settings.gpu_memory_utilization ?? null,
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
@@ -1189,6 +1255,7 @@ export function ModelsPage() {
       setExtraFlags('')
       setGpuMemoryUtil('')
       setRuntimeEnvironment('')
+      setRuntimeFileMounts([])
       setForm(deploymentDefaults(appSettings.data, localNodeId ?? 'local'))
       resource.reload()
     } catch (reason) {
@@ -1218,6 +1285,67 @@ export function ModelsPage() {
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update deployment')
       if (action === 'stop') resource.reload()
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const selectableGroups = (deployment: Deployment, action: 'start' | 'stop') => (
+    (deployment.instances ?? []).filter((instance) => action === 'start'
+      ? deployment.desired_state === 'stopped' || deployment.status === 'stopped' || instance.desired_state === 'stopped'
+      : deployment.desired_state !== 'stopped' && deployment.status !== 'stopped' && instance.desired_state !== 'stopped')
+  )
+
+  const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
+    const groups = selectableGroups(deployment, action)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id] || groupNodeUnavailable(id)))
+    setGroupError(undefined)
+    setGroupSelection({ deployment, action, instance: first?.instance_id ?? 'all' })
+  }
+
+  const groupNodeUnavailable = (id: string): string | undefined => {
+    if (nodes.loading || nodes.error) return 'Node availability has not been confirmed'
+    const node = nodes.data?.find((item) => item.id === id)
+    return !node || !isNodeSelectable(node) ? `${node?.name ?? id} is unavailable` : undefined
+  }
+
+  const requestStop = (deployment: Deployment) => {
+    if (deployment.deployment_mode === 'grouped_sharded' && deployment.instances?.length) {
+      openGroupPicker(deployment, 'stop')
+    } else {
+      void act(deployment, 'stop')
+    }
+  }
+
+  const confirmGroupAction = async () => {
+    if (!groupSelection) return
+    const { deployment, action, instance } = groupSelection
+    setBusy(deployment.id)
+    setGroupError(undefined)
+    try {
+      if (action === 'start') await assertNodesUnoccupied((deployment.instances ?? [])
+        .filter((group) => instance === 'all' || group.instance_id === instance)
+        .flatMap((group) => groupNodeIds(deployment, group)), deployment.id)
+      const updated = await api.deployments.action(deployment.id, action, undefined, undefined, false,
+        instance === 'all' ? undefined : instance)
+      setGroupSelection(undefined)
+      // The action response includes the new per-group desired states. Use
+      // it immediately so another stopped group can be started without
+      // waiting for the next catalog probe.
+      if (updated) {
+        const fields = Object.fromEntries(Object.entries(updated).filter(([, value]) => value !== undefined))
+        const settings = Object.fromEntries(Object.entries(updated.settings).filter(([, value]) => value !== undefined))
+        resource.setData((current) => current?.map((item) => item.id === updated.id
+          ? { ...item, ...fields, settings: { ...item.settings, ...settings } }
+          : item))
+        setGroupActionRevision((revision) => revision + 1)
+      } else {
+        resource.reload()
+      }
+    } catch (reason) {
+      setGroupError(reason instanceof Error ? reason.message : 'Could not update deployment group')
+      resource.reload()
     } finally {
       setBusy(undefined)
     }
@@ -1340,6 +1468,7 @@ export function ModelsPage() {
       }
       const promote = canPromoteDiscovered(deployment)
       const adoptingDirect = promote && deployment.direct_start
+      await assertNodesUnoccupied(directLifecycle ? deployment.node_ids ?? [] : nodeIds, deployment.id)
       await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
       setActionNotice(directLifecycle
         ? `Starting ${deployment.alias} on its existing fixed target.`
@@ -1371,6 +1500,21 @@ export function ModelsPage() {
   }
 
   const openStartPicker = (deployment: Deployment) => {
+    if (deployment.deployment_mode === 'grouped_sharded' && deployment.instances?.length) {
+      openGroupPicker(deployment, 'start')
+      return
+    }
+    if (deployment.managed && deployment.deployment_mode === 'sharded'
+      && (deployment.runtime === 'vllm' || deployment.runtime === 'sglang')) {
+      const ranks = deployment.parallel_rank_count ?? ((deployment.settings.tensor_parallel_size ?? 1)
+        * (deployment.runtime === 'vllm' ? deployment.settings.pipeline_parallel_size ?? 1 : 1))
+      if (Number.isInteger(ranks) && ranks > 1) {
+        deployment = {
+          ...deployment, flexible_node_count: true, parallel_rank_count: ranks,
+          single_host_topology_replayable: false, distributed_host_topology_replayable: true,
+        }
+      }
+    }
     if (isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)) {
       setStartError(undefined)
       setStartNotice(undefined)
@@ -1381,7 +1525,8 @@ export function ModelsPage() {
     const required = deploymentRequiredNodes(deployment)
     // Saved node preferences are the default selection even before weights
     // exist; the launch flow can prepare missing nodes via Virtual NAS.
-    const selectableNodes = (nodes.data ?? []).filter(isNodeSelectable)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const selectableNodes = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id])
     const selectableIds = selectableNodes.map((node) => node.id)
     const saved = (deployment.node_ids ?? []).filter((id) => selectableIds.includes(id))
     const flexibleCounts = directParallelHostCounts(deployment, selectableNodes)
@@ -1392,7 +1537,7 @@ export function ModelsPage() {
     let nodeIds = saved.slice(0, targetCount)
     if (nodeIds.length < targetCount) {
       const candidates = deployment.managed
-        ? nodes.data?.filter((node) => deploymentWeightedNodes(deployment).has(node.id) && isNodeSelectable(node)) ?? []
+        ? selectableNodes.filter((node) => deploymentWeightedNodes(deployment).has(node.id))
         : [...selectableNodes].sort((left, right) => (
           (usableGpuCount(right) ?? 0) - (usableGpuCount(left) ?? 0)
         ))
@@ -1435,10 +1580,11 @@ export function ModelsPage() {
 
   const confirmAdditionalLaunch = async () => {
     if (!additionalLaunch) return
-    const { deployment, additionalIds } = additionalLaunch
+    const { deployment, currentIds, additionalIds } = additionalLaunch
     setBusy(deployment.id)
     setAdditionalError(undefined)
     try {
+      await assertNodesUnoccupied([...currentIds, ...additionalIds], deployment.id)
       await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
       setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
       setAdditionalLaunch(undefined)
@@ -1447,6 +1593,53 @@ export function ModelsPage() {
       // Render inside the dialog: the page-level alert sits behind the
       // modal backdrop where the user cannot see it.
       setAdditionalError(reason instanceof Error ? reason.message : 'Could not launch on additional nodes')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  // Start-another-deployment grows a tensor-parallel deployment with one more
+  // independent engine group on nodes it does not occupy. Replicated layouts
+  // grow through the additional-nodes flow instead (a full copy per node).
+  const supportsAnotherInstance = (deployment: Deployment) => (
+    deployment.managed
+    && (deployment.runtime === 'vllm' || deployment.runtime === 'sglang')
+    && (deployment.deployment_mode === 'grouped_sharded'
+      || deployment.deployment_mode === 'sharded')
+    && !isControllerArtifact(deployment)
+    && (deployment.instance_node_count ?? 0) > 0
+  )
+
+  const openAddInstancePicker = (deployment: Deployment) => {
+    const required = deployment.instance_node_count ?? 0
+    const occupied = new Set(deployment.node_ids ?? [])
+    const free = (nodes.data ?? []).filter(
+      (node) => isNodeSelectable(node) && !occupied.has(node.id) && !occupiedNodeReasons(resource.data ?? [], deployment.id)[node.id],
+    )
+    setAddInstanceError(undefined)
+    // Preselect the first free nodes so Confirm is one click away; every
+    // free combination stays selectable.
+    setAddInstanceLaunch({
+      deployment,
+      nodeIds: free.slice(0, required).map((node) => node.id),
+    })
+  }
+
+  const confirmAddInstance = async () => {
+    if (!addInstanceLaunch) return
+    const { deployment, nodeIds } = addInstanceLaunch
+    setBusy(deployment.id)
+    setAddInstanceError(undefined)
+    try {
+      await assertNodesUnoccupied(nodeIds, deployment.id)
+      await api.deployments.action(deployment.id, 'add_instance', nodeIds)
+      setActionNotice(`Starting another deployment of ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}. Requests load-balance across every engine group.`)
+      setAddInstanceLaunch(undefined)
+      resource.reload()
+    } catch (reason) {
+      // Render inside the dialog: the page-level alert sits behind the
+      // modal backdrop where the user cannot see it.
+      setAddInstanceError(reason instanceof Error ? reason.message : 'Could not start another deployment')
     } finally {
       setBusy(undefined)
     }
@@ -1707,6 +1900,9 @@ export function ModelsPage() {
         dspark_num_speculative_tokens: numeric(editorForm.dspark_num_speculative_tokens),
         max_cudagraph_capture_size: numeric(editorForm.max_cudagraph_capture_size),
         max_num_batched_tokens: numeric(editorForm.max_num_batched_tokens),
+        sg_speculative_num_draft_tokens: numeric(editorForm.sg_speculative_num_draft_tokens),
+        sg_cuda_graph_max_bs: numeric(editorForm.sg_cuda_graph_max_bs),
+        sg_chunked_prefill_size: numeric(editorForm.sg_chunked_prefill_size),
       },
       gpu_memory_utilization: numeric(editorForm.gpu_memory_utilization),
       gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
@@ -1749,7 +1945,7 @@ export function ModelsPage() {
     setRecipeError(undefined)
     setRecipeTransferNotice(undefined)
     setRecipeSeedNodeId(undefined)
-    setRecipeDeployment({ recipe, nodeIds })
+    setRecipeDeployment({ recipe, nodeIds: nodeIds.filter((id) => !occupiedNodeReasons(resource.data ?? [])[id]) })
   }
 
   const prepareRecipeWeights = async () => {
@@ -1831,6 +2027,7 @@ export function ModelsPage() {
     setActionNotice(undefined)
     setRecipeError(undefined)
     try {
+      await assertNodesUnoccupied(nodeIds)
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
       setRecipeDeployment(undefined)
@@ -1986,6 +2183,11 @@ export function ModelsPage() {
                         </>
                       )}
                     </span>
+                    {deployment.deployment_mode === 'grouped_sharded' && Boolean(deployment.instances?.length) && (
+                      <small className="deployment-launch-message">
+                        {deployment.status === 'stopped' || deployment.desired_state === 'stopped' ? 0 : deployment.instances!.filter((group) => group.status === 'running' && group.desired_state !== 'stopped').length} of {deployment.instances!.length} groups running
+                      </small>
+                    )}
                     {deployment.status === 'running' && deployment.last_used_at !== undefined && (
                       <small className="deployment-launch-message">
                         {deployment.last_used_at
@@ -2003,15 +2205,35 @@ export function ModelsPage() {
                     {(deployment.managed || deployment.controllable) && (deployment.status === 'stopping'
                       ? <Button variant="tertiary" disabled>Stopping…</Button>
                       : deployment.desired_state !== 'stopped' && STOPPABLE_DEPLOYMENT_STATUSES.has(deployment.status)
-                      ? (supportsAdditionalNodes(deployment)
+                      ? (deployment.deployment_mode === 'grouped_sharded' && selectableGroups(deployment, 'start').length > 0
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id}
+                            mainDisabled={Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
+                            onMainAction={() => requestStop(deployment)}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[
+                              { key: 'start-group', label: 'Start group', onSelect: () => openGroupPicker(deployment, 'start') },
+                              ...(supportsAnotherInstance(deployment) ? [{ key: 'add-instance', label: 'Start another deployment…', disabled: Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase)), onSelect: () => openAddInstancePicker(deployment) }] : []),
+                            ]}
+                          />
+                        : supportsAnotherInstance(deployment)
                         ? <SplitButton
                             label="Stop"
                             disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
-                            onMainAction={() => void act(deployment, 'stop')}
+                            onMainAction={() => requestStop(deployment)}
+                            toggleAriaLabel={`More actions for ${deployment.alias}`}
+                            items={[{ key: 'add-instance', label: 'Start another deployment…', onSelect: () => { if (busy !== deployment.id) openAddInstancePicker(deployment) } }]}
+                          />
+                        : supportsAdditionalNodes(deployment)
+                        ? <SplitButton
+                            label="Stop"
+                            disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))}
+                            onMainAction={() => requestStop(deployment)}
                             toggleAriaLabel={`More actions for ${deployment.alias}`}
                             items={[{ key: 'additional', label: 'Launch on additional nodes…', onSelect: () => openAdditionalPicker(deployment) }]}
                           />
-                        : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => void act(deployment, 'stop')}>Stop</Button>)
+                        : <Button variant="tertiary" disabled={busy === deployment.id || Boolean(deployment.launch_phase && PRE_CONTAINER_LAUNCH_PHASES.has(deployment.launch_phase))} onClick={() => requestStop(deployment)}>Stop</Button>)
                       : <Button variant="tertiary" disabled={busy === deployment.id} onClick={() => openStartPicker(deployment)}>{deployment.status === 'saved' ? 'Launch' : canPromoteDiscovered(deployment) && !deployment.direct_start ? 'Make managed' : 'Start'}</Button>)}
                     {deployment.managed && deployment.status === 'saved' && (
                       <Button variant="tertiary" disabled={busy === deployment.id} aria-label={`Edit ${deployment.alias}`} title="Edit deployment" onClick={() => openEditor(deployment)}><Settings2 size={16} /></Button>
@@ -2103,6 +2325,9 @@ export function ModelsPage() {
                         {!isVllm && <>
                           <label className="field"><span>TP size</span><input type="number" min="1" value={editor.form.sg_tp_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_tp_size: event.target.value } })} /></label>
                           <label className="field"><span>Mem fraction (static)</span><input type="number" step="0.01" min="0.01" max="1" value={editor.form.sg_mem_fraction} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_mem_fraction: event.target.value } })} /></label>
+                          <label className="field"><span>Speculative draft tokens</span><input type="number" min="1" value={editor.form.sg_speculative_num_draft_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_speculative_num_draft_tokens: event.target.value } })} /></label>
+                          <label className="field"><span>CUDA graph max batch size</span><input type="number" min="1" value={editor.form.sg_cuda_graph_max_bs} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_cuda_graph_max_bs: event.target.value } })} /></label>
+                          <label className="field"><span>Chunked prefill size</span><input type="number" min="1" value={editor.form.sg_chunked_prefill_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_chunked_prefill_size: event.target.value } })} /></label>
                         </>}
                       </div>
                       <label className="field"><span>Other flags</span><textarea rows={3} value={editor.form.remaining_flags} spellCheck={false} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, remaining_flags: event.target.value } })} /></label>
@@ -2122,6 +2347,7 @@ export function ModelsPage() {
 
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment
+        const occupied = occupiedNodeReasons(resource.data ?? [])
         const localPath = isLocalModelPath(recipe.model)
         const preflightTargets = new Map((transferPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
         const weighted = localPath
@@ -2131,11 +2357,12 @@ export function ModelsPage() {
             .map((target) => target.node_id))
         const missingNodes = (nodes.data ?? []).filter((node) => !weighted.has(node.id))
         const allowedIds = (nodes.data ?? []).filter((node) => {
+          if (occupied[node.id]) return false
           if (weighted.has(node.id)) return true
           const option = preflightTargets.get(node.id)
           return Boolean(option?.eligible || option?.download_eligible || option?.transfer_after_download_eligible)
         }).map((node) => node.id)
-        const unavailableReasons = Object.fromEntries(missingNodes.map((node) => [
+        const unavailableReasons = { ...Object.fromEntries(missingNodes.map((node) => [
           node.id,
           localPath
             ? 'Local paths are available only on the controller'
@@ -2145,7 +2372,7 @@ export function ModelsPage() {
                 ?? preflightTargets.get(node.id)?.download_reason
                 ?? preflightTargets.get(node.id)?.transfer_after_download_reason
                 ?? 'Model weights not cached',
-        ]))
+        ])), ...occupied }
         const exactCount = nodeIds.length === recipe.required_node_count
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
         const weightsReady = nodeIds.every((id) => weighted.has(id))
@@ -2232,8 +2459,36 @@ export function ModelsPage() {
         </div>
       })()}
 
+      {groupSelection && (() => {
+        const { deployment, action, instance } = groupSelection
+        const groups = selectableGroups(deployment, action)
+        const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id) : {}
+        const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => (action === 'start' ? groupNodeUnavailable(id) : undefined) || occupied[id]).find(Boolean)
+        const allBlocked = (deployment.instances ?? []).some((group) => groupReason(group))
+        const selectedBlocked = instance === 'all' ? allBlocked : groups.some((group) => group.instance_id === instance && groupReason(group))
+        const label = action === 'stop' ? 'Stop' : 'Start'
+        const groupBusy = busy === deployment.id
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !groupBusy && setGroupSelection(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="deployment-group-title">
+            <div className="modal-heading"><h2 id="deployment-group-title">{label} a group for {deployment.alias}</h2><button className="icon-button" disabled={groupBusy} onClick={() => setGroupSelection(undefined)} aria-label="Close dialog">&times;</button></div>
+            <p className="modal-description">Choose the group to {action}. Each group runs one model instance across its listed nodes.</p>
+            <fieldset className="node-selector deployment-group-picker" disabled={groupBusy}>
+              <legend>Deployment groups</legend>
+              {groups.map((group) => <label className="node-option" key={group.instance_id}>
+                <input type="radio" name="deployment-group" disabled={Boolean(groupReason(group))} checked={instance === group.instance_id} onChange={() => setGroupSelection({ ...groupSelection, instance: group.instance_id })} />
+                <span><strong>Group {group.instance_id + 1}: {group.node_names.join(' + ')}</strong><small>{groupReason(group) || (deployment.desired_state === 'stopped' || deployment.status === 'stopped' ? 'stopped' : group.status)}</small></span>
+              </label>)}
+              {(deployment.instances?.length ?? 0) > 1 && <label className="node-option"><input type="radio" name="deployment-group" disabled={allBlocked} checked={instance === 'all'} onChange={() => setGroupSelection({ ...groupSelection, instance: 'all' })} /><span>All groups{action === 'start' ? ' (includes running groups and applies saved settings)' : ''}</span></label>}
+            </fieldset>
+            {groupError && <p className="form-error" role="alert">{groupError}</p>}
+            <div className="modal-actions"><Button disabled={groupBusy} onClick={() => setGroupSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={groupBusy || !groups.length || selectedBlocked} onClick={() => void confirmGroupAction()}>{groupBusy ? `${label === 'Stop' ? 'Stopping' : 'Starting'}...` : `${label} ${instance === 'all' ? 'all groups' : 'selected group'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
       {startSelection && (() => {
         const { deployment, nodeIds } = startSelection
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
         const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
         const fixedTargets = deployment.selected_nodes?.length
           ? deployment.selected_nodes.map((node) => node.name)
@@ -2242,7 +2497,7 @@ export function ModelsPage() {
             : deployment.has_start_hook
               ? []
               : [nodes.data?.find((node) => node.id === 'local')?.name ?? localLabel]
-        const required = deploymentRequiredNodes(deployment)
+        const required = deployment.flexible_node_count ? nodeIds.length : deploymentRequiredNodes(deployment)
         const savedLaunch = deployment.status === 'saved'
         const adoptingDirect = Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
         const preparableLaunch = savedLaunch || adoptingDirect
@@ -2263,6 +2518,7 @@ export function ModelsPage() {
             || target.transfer_after_download_eligible)
           .map((target) => target.node_id))
         const allowedIds = (nodes.data ?? [])
+          .filter((node) => !occupied[node.id])
           .filter((node) => (
             (!deployment.managed && !preparableLaunch)
             || weighted.has(node.id)
@@ -2272,14 +2528,14 @@ export function ModelsPage() {
         const unavailableReasons = Object.fromEntries((nodes.data ?? [])
           .filter((node) => !allowedIds.includes(node.id)).map((node) => {
             const target = planTargets.get(node.id)
-            return [node.id, controllerArtifact
+            return [node.id, occupied[node.id] ?? (controllerArtifact
               ? 'Local model artifacts are available only on the controller'
               : target?.active_job_status
                 ? `Model preparation ${target.active_job_status}`
                 : target?.reason
                   ?? target?.download_reason
                   ?? target?.transfer_after_download_reason
-                  ?? 'Model weights not cached and the node cannot receive them']
+                  ?? 'Model weights not cached and the node cannot receive them')]
           }))
         const weightWarnings = preparableLaunch ? Object.fromEntries((nodes.data ?? [])
           .filter((node) => allowedIds.includes(node.id)
@@ -2337,7 +2593,7 @@ export function ModelsPage() {
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
-              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= required ? next : nodeIds })}
+              onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= (flexibleParallel ? deployment.parallel_rank_count ?? required : required) ? next : nodeIds })}
               loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}
@@ -2373,16 +2629,17 @@ export function ModelsPage() {
 
       {additionalLaunch && (() => {
         const { deployment, currentIds, additionalIds } = additionalLaunch
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
         const weighted = deploymentWeightedNodes(deployment)
         // Gate on the cache predicate only: cached nodes that are offline or
         // Docker-unready stay in allowedIds so the selector reports their
         // real status ("Offline", "Docker unavailable") instead of a
         // misleading "weights not cached".
-        const cachedIds = (nodes.data ?? []).filter((node) => !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
-        const allowedIds = [...currentIds, ...cachedIds]
-        const unavailableReasons = Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached']))
+        const cachedIds = (nodes.data ?? []).filter((node) => !occupied[node.id] && !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
+        const allowedIds = [...currentIds.filter((id) => !occupied[id]), ...cachedIds]
+        const unavailableReasons = { ...Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached'])), ...occupied }
         const additionalBusy = busy === deployment.id
-        const ready = additionalIds.length > 0 && !nodes.loading && !nodes.error
+        const ready = additionalIds.length > 0 && [...currentIds, ...additionalIds].every((id) => allowedIds.includes(id)) && !nodes.loading && !nodes.error
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !additionalBusy && setAdditionalLaunch(undefined)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="additional-nodes-title">
             <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
@@ -2407,6 +2664,50 @@ export function ModelsPage() {
               help={`Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
             />
             <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
+          </section>
+        </div>
+      })()}
+
+      {addInstanceLaunch && (() => {
+        const { deployment, nodeIds } = addInstanceLaunch
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+        const required = deployment.instance_node_count ?? 0
+        const occupiedIds = deployment.node_ids ?? []
+        // Occupied nodes stay visible but disabled so the picker shows where
+        // this deployment already runs; only free selectable nodes count.
+        const allowedIds = (nodes.data ?? [])
+          .filter((node) => isNodeSelectable(node) && !occupiedIds.includes(node.id) && !occupied[node.id])
+          .map((node) => node.id)
+        const unavailableReasons = { ...Object.fromEntries(
+          occupiedIds.map((id) => [id, 'Already running this deployment']),
+        ), ...occupied }
+        const addBusy = busy === deployment.id
+        const exact = nodeIds.length === required
+        const allFree = nodeIds.every((id) => allowedIds.includes(id))
+        const ready = exact && allFree && !nodes.loading && !nodes.error
+        return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !addBusy && setAddInstanceLaunch(undefined)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-instance-title">
+            <div className="modal-heading"><div><p className="eyebrow">Start another deployment</p><h2 id="add-instance-title">Add an engine group to {deployment.alias}</h2></div><button className="icon-button" disabled={addBusy} onClick={() => setAddInstanceLaunch(undefined)} aria-label="Close dialog">×</button></div>
+            <p className="modal-description">Currently on {selectedNodeLabel(nodes.data ?? [], occupiedIds, localLabel)}. Pick exactly {required} free node{required === 1 ? '' : 's'}: the new independent engine group keeps the same served name, and requests load-balance across every group. Nodes already running this deployment are not selectable.</p>
+            {addInstanceError && <p className="form-error" role="alert">{addInstanceError}</p>}
+            <NodeSelector
+              nodes={nodes.data ?? []}
+              selectedIds={nodeIds}
+              onChange={(next) => setAddInstanceLaunch({ deployment, nodeIds: next })}
+              loading={nodes.loading}
+              error={nodes.error}
+              onRetry={nodes.reload}
+              multiple={required > 1}
+              disabled={addBusy}
+              allowedIds={allowedIds}
+              unavailableReasons={unavailableReasons}
+              localLabel={localLabel}
+              primaryId={nodeIds[0]}
+              legend={`Another deployment · ${required} node${required === 1 ? '' : 's'}`}
+              help={`Exactly ${required} nodes form one more independent engine group of ${deployment.model_id}. The nodes running this deployment today cannot be reused.`}
+            />
+            {!exact && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
+            <div className="modal-actions"><Button type="button" disabled={addBusy} onClick={() => setAddInstanceLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || addBusy} onClick={() => void confirmAddInstance()}><Play size={15} /> {addBusy ? 'Starting…' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>
         </div>
       })()}
@@ -2540,6 +2841,7 @@ export function ModelsPage() {
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
                   {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
+                  {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
                 </div>}
@@ -2585,7 +2887,9 @@ export function ModelsPage() {
             >
               {!logData && logLoading
                 ? <span className="deployment-log-status">Loading logs…</span>
-                : <pre>{selectedLogMember?.logs || logData?.logs || 'No log output.'}</pre>}
+                : <pre>{selectedLogMember
+                  ? selectedLogMember.logs || selectedLogMember.error || 'No log output.'
+                  : logData?.logs || 'No log output.'}</pre>}
             </div>
             <div className="modal-actions">
               <Button type="button" variant={logTailing ? 'primary' : 'tertiary'} aria-pressed={logTailing} onClick={() => setLogTailing((current) => !current)}><ArrowDownToLine size={15} /> {logTailing ? 'Tailing' : 'Tail'}</Button>

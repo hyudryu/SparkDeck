@@ -160,6 +160,7 @@ export function SplitButton({
   items,
   disabled = false,
   mainAriaLabel,
+  mainDisabled = false,
   toggleAriaLabel,
 }: {
   label: ReactNode
@@ -167,6 +168,7 @@ export function SplitButton({
   items: SplitButtonItem[]
   disabled?: boolean
   mainAriaLabel?: string
+  mainDisabled?: boolean
   toggleAriaLabel: string
 }) {
   const toggleRef = useRef<HTMLButtonElement>(null)
@@ -210,7 +212,7 @@ export function SplitButton({
   }, [anchor])
   return (
     <span className="split-button">
-      <Button variant="tertiary" disabled={disabled} aria-label={mainAriaLabel} onClick={onMainAction}>{label}</Button>
+      <Button variant="tertiary" disabled={disabled || mainDisabled} aria-label={mainAriaLabel} onClick={onMainAction}>{label}</Button>
       <button
         ref={toggleRef}
         type="button"

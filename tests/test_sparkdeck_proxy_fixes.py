@@ -27,6 +27,66 @@ class FakeManager:
         self._unsloth_loaded_model = AsyncMock(return_value=None)
 
 
+class AwaitOrCancelCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_owner_cancellation_waits_for_upstream_cleanup(self):
+        for trigger in ("disconnect", "owner", "owner_without_watchers"):
+            with self.subTest(trigger=trigger):
+                started = asyncio.Event()
+                cleaning = asyncio.Event()
+                finish = asyncio.Event()
+                closed = asyncio.Event()
+                cancel = None if trigger == "owner_without_watchers" else asyncio.Event()
+
+                async def upstream():
+                    try:
+                        started.set()
+                        await asyncio.Event().wait()
+                    finally:
+                        cleaning.set()
+                        await finish.wait()
+                        closed.set()
+
+                owner = asyncio.create_task(Manager._await_or_cancel(upstream(), cancel))
+                await asyncio.wait_for(started.wait(), 1)
+                if trigger == "disconnect":
+                    cancel.set()
+                else:
+                    owner.cancel()
+                await asyncio.wait_for(cleaning.wait(), 1)
+                try:
+                    for _ in range(3):
+                        owner.cancel()
+                        for _ in range(3):
+                            await asyncio.sleep(0)
+                        self.assertFalse(owner.done())
+                        self.assertFalse(closed.is_set())
+                finally:
+                    finish.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(owner, 1)
+                self.assertTrue(closed.is_set())
+
+    async def test_disconnect_keeps_client_abort_after_cleanup(self):
+        cancel = asyncio.Event()
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def upstream():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                closed.set()
+
+        owner = asyncio.create_task(Manager._await_or_cancel(upstream(), cancel))
+        await asyncio.wait_for(started.wait(), 1)
+        cancel.set()
+        with self.assertRaises(ClientAbort):
+            await asyncio.wait_for(owner, 1)
+        self.assertTrue(closed.is_set())
+
+
 class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicitly_stopped_registered_deployment_cannot_auto_wake(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -271,6 +331,10 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            manager.list_containers.return_value = [
+                {"name": "live", "id": "live-id", "runtime": "vllm",
+                 "status": "running", "model": "org/live", "port": 8000},
+            ]
             service = SparkDeckService(manager, Path(directory))
             service.store.add_deployment(Deployment(
                 id="stopped-record", alias="shared-name",
@@ -308,6 +372,12 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            manager.list_containers.return_value = [
+                {"name": "one", "id": "one-id", "runtime": "vllm",
+                 "status": "running", "model": "org/one", "port": 8000},
+                {"name": "two", "id": "two-id", "runtime": "vllm",
+                 "status": "running", "model": "org/two", "port": 8000},
+            ]
             service = SparkDeckService(manager, Path(directory))
             service.deployments = AsyncMock(return_value=[
                 {
@@ -512,6 +582,30 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_distinguishes_inventory_outage_from_removed_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            container = {
+                "name": "user-container", "model": "org/model", "engine": "vllm",
+                "managed": False, "status": "running", "port": 8000,
+            }
+            container["phase"] = {"phase": "ready"}
+            manager.list_containers.side_effect = [
+                [container], RuntimeError("Docker unavailable"), [container], [], [container],
+            ]
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                with self.assertLogs("sparkdeck.lifecycle", level="INFO") as captured:
+                    for _ in range(5):
+                        await service.deployments(observe_events=True)
+                self.assertEqual(
+                    [record.deployment_event for record in captured.records],
+                    ["launched", "stopped", "launched"],
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
     async def test_unmanaged_discovered_container_has_lifecycle_logs_and_remove(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
@@ -631,7 +725,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
                     "id": node_id,
                     "models": [{
                         "model_id": "/cache/models/org--model/snapshots/rev",
-                        "revisions": ["main"],
+                        "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40},
                     }],
                 }
                 for node_id in ("local", "worker-1")
@@ -1107,9 +1201,11 @@ class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_nonstream_request_is_cancelled_on_disconnect(self):
         closed = asyncio.Event()
+        started = asyncio.Event()
         blocker = asyncio.Event()
 
         async def post(*_args, **_kwargs):
+            started.set()
             try:
                 await blocker.wait()
             finally:
@@ -1131,7 +1227,7 @@ class ExternalContainerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 {"model": "external", "messages": [], "stream": False},
                 "chat/completions", cancel,
             ))
-            await asyncio.sleep(0)
+            await asyncio.wait_for(started.wait(), timeout=2)
             cancel.set()
 
             with self.assertRaises(ClientAbort):

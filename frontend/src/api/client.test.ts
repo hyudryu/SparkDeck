@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api } from './client'
+import { api, deploymentFromWire } from './client'
 import type { ChatStreamUpdate } from './types'
 
 afterEach(() => {
@@ -8,6 +8,33 @@ afterEach(() => {
 })
 
 describe('API client adapters', () => {
+  it('preserves explicit served names and per-replica routing health', () => {
+    const replicas = [{
+      node_id: 'node-1', node_name: 'Node 1', rank: 0, status: 'running',
+      desired_state: 'running' as const, online: true, available: true,
+    }]
+
+    expect(deploymentFromWire({
+      id: 'replicas', alias: 'Replica pool', runtime: 'vllm', kind: 'managed',
+      model: { repository: 'org/model' }, served_models: ['public-model'],
+      status: 'running', deployment_mode: 'replicated', replicas,
+    })).toEqual(expect.objectContaining({
+      served_models: ['public-model'], replicas,
+    }))
+  })
+
+  it('uses the source IP and requested model as the routing-rule delete key', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.inferenceRouting.remove('2001:db8::1', 'org/model name')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/inference-routing-rules?source_ip=2001%3Adb8%3A%3A1&requested_model=org%2Fmodel+name',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
   it('streams split reasoning, output, usage, and per-response metrics', async () => {
     const encoder = new TextEncoder()
     const payload = [

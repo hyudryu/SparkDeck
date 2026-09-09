@@ -23,7 +23,10 @@ COMMUNITY_UPLOAD_FIELDS = frozenset({
     "inference_tokens_per_second", "telemetry_cluster_id",
     "concurrency", "tensor_parallel_size",
 })
-COMMUNITY_CONSENT_CONTRACT_VERSION = 4
+# Bumping the contract version on startup invalidates an existing opt-in so a
+# user who accepted only passive-capture telemetry must re-consent to wording
+# that covers automatic one-shot synthetic startup benchmarks.
+COMMUNITY_CONSENT_CONTRACT_VERSION = 5
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
     "exact_match_dimensions": [
@@ -626,6 +629,7 @@ class SparkDeckStore:
 
     def add_benchmark_if_consented(
         self, sample: BenchmarkSample, expected_generation: int,
+        extra_settings: dict[str, Any] | None = None,
     ) -> bool:
         """Atomically persist and queue telemetry under one consent snapshot.
 
@@ -633,6 +637,10 @@ class SparkDeckStore:
         begins. Turning sharing off (or changing cluster identity) increments
         the generation, so a request that finishes after that boundary cannot
         write telemetry even if sharing was subsequently enabled again.
+
+        ``extra_settings`` (e.g. a startup-boot seen marker) is written in the
+        same transaction as the sample so a crash cannot record evidence that
+        the caller later forgets it already processed.
         """
         with self._lock, self._connection:
             consent = self._community_consent_snapshot_locked()
@@ -649,6 +657,13 @@ class SparkDeckStore:
                 return False
             self._link_benchmark_series_point(sample)
             self._queue_benchmark_locked(sample)
+            if extra_settings:
+                for key, value in extra_settings.items():
+                    self._connection.execute(
+                        "INSERT INTO settings(key, value_json) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                        (key, json.dumps(value)),
+                    )
             return True
 
     def _insert_benchmark_locked(

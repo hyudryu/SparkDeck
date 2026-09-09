@@ -293,8 +293,10 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         members = state["deployments"][0]["members"]
         self.assertEqual(members[0]["status"], "missing")
         self.assertEqual(members[0]["phase"]["phase"], "missing")
-        self.assertEqual(members[1]["status"], "unreachable")
-        self.assertEqual(members[1]["phase"]["phase"], "unreachable")
+        self.assertEqual(members[1]["status"], "stopped")
+        self.assertEqual(members[1]["phase"]["phase"], "stopped")
+        self.assertEqual(members[1]["node_status"], "offline")
+        self.assertIn("assumed stopped", members[1]["phase"]["message"])
         self.assertNotIn("queued", str(members))
 
         manager.deployments[0]["status"] = "recovering"

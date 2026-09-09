@@ -48,6 +48,50 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         self.assignment.stop()
 
+    async def test_agent_container_launch_forwards_runtime_file_mounts(self):
+        mounts = [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}]
+        create = AsyncMock(return_value={"name": "rank-1"})
+        with patch.object(server, "_require_agent"), patch.object(server.manager, "create_container", create):
+            response = await self.client.post("/api/agent/containers", json={
+                "model": "org/model", "cluster_member": {"rank": 1},
+                "runtime_file_mounts": mounts,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(create.await_args.kwargs["runtime_file_mounts"], mounts)
+
+    async def test_settings_api_accepts_runtime_file_mounts(self):
+        mounts = [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}]
+        update = AsyncMock(return_value={"runtime_file_mounts": mounts})
+        with patch.object(server.sparkdeck, "update_deployment_settings", update):
+            response = await self.client.put("/api/v1/deployments/bookmark/settings", json={"runtime_file_mounts": mounts})
+        self.assertEqual(response.status_code, 200)
+        update.assert_awaited_once_with("bookmark", {"runtime_file_mounts": mounts})
+
+    async def test_bookmark_editor_accepts_instance_count_and_explicit_clear(self):
+        # The GUI always sends instances: null for a non-grouped bookmark.
+        # Exercise the route as well as service tests so its allowlist cannot
+        # reject otherwise valid creator-form saves.
+        for instances, mode in ((None, "sharded"), (2, "grouped_sharded")):
+            with self.subTest(instances=instances):
+                body = {
+                    "alias": "Recipe TP2", "image": "vllm/test",
+                    "model": "org/model",
+                    "context_length": 262144, "tensor_parallel_size": 2,
+                    "instances": instances, "parallel_slots": None,
+                    "gpu_layers": None, "quantization": None, "artifact": None,
+                    "extra_args": ["--max-num-seqs", "10"],
+                    "environment": {"NCCL_DEBUG": "INFO"},
+                    "runtime_file_mounts": [{"source": "/opt/patch.py", "target": "/opt/vllm/patch.py"}],
+                    "gpu_memory_utilization": 0.65,
+                    "node_ids": ["node-4", "node-3"] if instances is None else ["node-4", "node-3", "node-2", "local"],
+                    "deployment_mode": mode,
+                }
+                update = AsyncMock(return_value={"id": "bookmark", "settings": body})
+                with patch.object(server.sparkdeck, "update_deployment_settings", update):
+                    response = await self.client.put("/api/v1/deployments/bookmark/settings", json=body)
+                self.assertEqual(response.status_code, 200)
+                update.assert_awaited_once_with("bookmark", body)
+
     async def test_recipe_detail_returns_editable_args_and_launch_controls(self):
         with patch.object(server.manager, "get_recipe", AsyncMock(return_value=dict(RECIPE))):
             response = await self.client.get("/api/v1/recipes/r1")
@@ -200,8 +244,10 @@ class ModelsApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_deployment_settings_uses_exact_public_contract(self):
         changes = {
+            # The detail editor sends the unchanged model on a context edit.
+            "model": "org/model",
             "extra_args": ["--enable-prefix-caching"],
-            "launch_controls": {"context_window": 65536},
+            "launch_controls": {"context_window": 256000},
             "gpu_memory_utilization": 0.9,
             "gpu_memory_gb": None,
         }
@@ -1419,6 +1465,7 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.create_deployment = AsyncMock()
             self.start_container = AsyncMock(return_value={"ok": True})
             self.stop_container = AsyncMock(return_value={"ok": True})
+            self._explicitly_stopped_containers = set()
             self.recipe_model_preparation_preflight = AsyncMock(return_value={
                 "eligible": True, "action": "ready", "targets": [],
             })
@@ -2957,6 +3004,45 @@ class ExternalLifecycleHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(
                 "external-stack", service._external_lifecycle_tasks,
             )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_hook_actions_update_discovered_stop_intent(self):
+        container = {
+            "name": "external-stack", "model": "org/model", "engine": "vllm",
+            "managed": False, "status": "exited", "load_settings": {},
+            "start_command": "/opt/stack/start.sh",
+            "stop_command": "/opt/stack/stop.sh",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service, manager = self._service(directory, container)
+            manager._explicitly_stopped_containers.add("external-stack")
+            spawn = AsyncMock(side_effect=[self.FakeProcess(), self.FakeProcess()])
+            with patch("asyncio.create_subprocess_shell", spawn):
+                await service.deployment_action("container:external-stack", "start")
+                await service._external_lifecycle_tasks["external-stack"]["task"]
+                self.assertNotIn(
+                    "external-stack", manager._explicitly_stopped_containers,
+                )
+                self.assertEqual(
+                    service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )["desired_state"],
+                    "running",
+                )
+
+                await service.deployment_action("container:external-stack", "stop")
+                await service._external_lifecycle_tasks["external-stack"]["task"]
+                self.assertIn(
+                    "external-stack", manager._explicitly_stopped_containers,
+                )
+                self.assertEqual(
+                    service._discovered_deployment(
+                        container, "vllm", "org/model",
+                    )["desired_state"],
+                    "stopped",
+                )
+
             await manager.http.aclose()
             await service.close()
 

@@ -9,11 +9,14 @@ import type {
   DeploymentUpdateInput,
   EnvFileDeploymentUpdateInput,
   EnvFileEnvironmentOp,
+  RuntimeFileMount,
 } from '../api/types'
+import { RuntimeFileMountsEditor } from '../components/RuntimeFileMountsEditor'
 import { KvCacheDtypeSelect } from '../components/KvCacheDtypeSelect'
 import { isNodeSelectable, NodeSelector } from '../components/NodeSelector'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import { groupNodeIds, occupiedNodeReasons } from '../utils/deploymentOccupancy'
 import { formatEnvironment, parseEnvironment, unquoteEnvValue } from '../utils/environment'
 
 const quoteArg = (arg: string) => (arg === '' || /[^A-Za-z0-9_./:=+-]/.test(arg) ? `'${arg.replace(/'/g, `'\\''`)}'` : arg)
@@ -79,6 +82,11 @@ const canEditModel = (detail: DeploymentDetail) => (
   detail.runtime !== 'llama.cpp' && !detail.id.startsWith('container:')
 )
 
+const supportsRuntimeFileMounts = (detail: DeploymentDetail) => (
+  detail.runtime === 'vllm' && detail.managed && !detail.id.startsWith('container:')
+  && detail.edit_mode !== 'env-file' && !detail.has_start_hook && !detail.has_stop_hook
+)
+
 // A --revision pinned to the previous repository is almost certainly wrong
 // for the new one, so the matching pin is dropped when the model changes and
 // the new repository resolves its default revision. A pin the user typed for
@@ -115,6 +123,9 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   dspark_num_speculative_tokens: detail.launch_controls.dspark_num_speculative_tokens?.toString() ?? '',
   max_cudagraph_capture_size: detail.launch_controls.max_cudagraph_capture_size?.toString() ?? '',
   max_num_batched_tokens: detail.launch_controls.max_num_batched_tokens?.toString() ?? '',
+  sg_speculative_num_draft_tokens: detail.launch_controls.sg_speculative_num_draft_tokens?.toString() ?? '',
+  sg_cuda_graph_max_bs: detail.launch_controls.sg_cuda_graph_max_bs?.toString() ?? '',
+  sg_chunked_prefill_size: detail.launch_controls.sg_chunked_prefill_size?.toString() ?? '',
   gpu_memory_utilization: detail.gpu_memory_utilization?.toString() ?? '',
   gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
   sg_tp_size: detail.sg_tp_size?.toString() ?? '',
@@ -308,6 +319,9 @@ function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias 
       dspark_num_speculative_tokens: optionalNumber(editor.dspark_num_speculative_tokens),
       max_cudagraph_capture_size: optionalNumber(editor.max_cudagraph_capture_size),
       max_num_batched_tokens: optionalNumber(editor.max_num_batched_tokens),
+      sg_speculative_num_draft_tokens: optionalNumber(editor.sg_speculative_num_draft_tokens),
+      sg_cuda_graph_max_bs: optionalNumber(editor.sg_cuda_graph_max_bs),
+      sg_chunked_prefill_size: optionalNumber(editor.sg_chunked_prefill_size),
     },
     gpu_memory_utilization: optionalNumber(editor.gpu_memory_utilization),
     gpu_memory_gb: optionalNumber(editor.gpu_memory_gb),
@@ -321,18 +335,35 @@ export function DeploymentPage() {
   const navigate = useNavigate()
   const resource = useResource((signal) => api.deployments.get(deploymentId, signal), [deploymentId])
   const nodes = useResource((signal) => api.nodes.list(signal))
+  const deployments = useResource((signal) => api.deployments.list(signal))
   const [editor, setEditor] = useState<Editor>()
   const [savedEditor, setSavedEditor] = useState<Editor>()
   const [envText, setEnvText] = useState('')
   const [savedEnvText, setSavedEnvText] = useState('')
   const [servedName, setServedName] = useState('')
   const [savedServedName, setSavedServedName] = useState('')
+  const [runtimeFileMounts, setRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
+  const [savedRuntimeFileMounts, setSavedRuntimeFileMounts] = useState<RuntimeFileMount[]>([])
   const [busy, setBusy] = useState<'save' | 'run' | 'stop' | `instance-${number}`>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [runSelection, setRunSelection] = useState<string[]>()
   const [finalFlags, setFinalFlags] = useState('')
   const [previewError, setPreviewError] = useState<string>()
+
+  useEffect(() => {
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    setRunSelection((current) => {
+      const next = current?.filter((id) => !occupied[id])
+      return next?.length === current?.length ? current : next
+    })
+  }, [deployments.data, deploymentId])
+
+  useEffect(() => {
+    if (!runSelection) return
+    const timer = window.setInterval(deployments.reload, 5000)
+    return () => window.clearInterval(timer)
+  }, [runSelection, deployments.reload])
 
   useEffect(() => {
     if (resource.data) {
@@ -347,6 +378,9 @@ export function DeploymentPage() {
       const name = servedNameFrom(resource.data)
       setServedName(name)
       setSavedServedName(name)
+      const mounts = resource.data.runtime_file_mounts ?? resource.data.settings.runtime_file_mounts ?? []
+      setRuntimeFileMounts(mounts.map((mount) => ({ ...mount })))
+      setSavedRuntimeFileMounts(mounts)
     }
   }, [resource.data])
 
@@ -439,14 +473,20 @@ export function DeploymentPage() {
         throw reason
       }
     }
+    const mountsChanged = detail && supportsRuntimeFileMounts(detail)
+      && JSON.stringify(runtimeFileMounts) !== JSON.stringify(savedRuntimeFileMounts)
+    const mounts = runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
+    if (mountsChanged && mounts.some((mount) => !mount.source || !mount.target)) {
+      throw new Error('Each runtime file mount needs a host file path and a container file path.')
+    }
     const updated = await api.deployments.update(
       deploymentId,
-      updateInput(
+      { ...updateInput(
         editor,
         detail?.command_flags !== undefined,
         detail?.status === 'saved',
         detail ? canEditModel(detail) : false,
-      ),
+      ), ...(mountsChanged ? { runtime_file_mounts: mounts } : {}) },
     )
     // The backend can adjust the saved topology on save (e.g. trimming the
     // node list when the parallel layout shrinks); keep the page resource in
@@ -488,8 +528,7 @@ export function DeploymentPage() {
       ? editor.sg_tp_size
       : resource.data?.runtime === 'vllm' ? editor.tensor_parallel_size : '1')
     const tensor = Number.isInteger(tp) && tp > 0 ? tp : 1
-    if (resource.data?.runtime !== 'vllm') return tensor
-    const pp = Number(editor.pipeline_parallel_size)
+    const pp = resource.data?.runtime === 'vllm' ? Number(editor.pipeline_parallel_size) : 1
     const pipeline = Number.isInteger(pp) && pp > 0 ? pp : 1
     const world = tensor * pipeline
     const savedCount = resource.data?.node_ids?.length ?? 0
@@ -504,6 +543,26 @@ export function DeploymentPage() {
     && (resource.data.has_start_hook || resource.data.has_stop_hook || resource.data.direct_start)
   )
 
+  const runParallelRanks = () => {
+    if (!editor || resource.data?.deployment_mode !== 'sharded' || usesDirectLifecycle()) return 0
+    const runtime = resource.data?.runtime
+    if (runtime !== 'vllm' && runtime !== 'sglang') return 0
+    const tensor = Number(runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size)
+    const pipeline = runtime === 'vllm' ? Number(editor.pipeline_parallel_size || '1') : 1
+    const ranks = tensor * pipeline
+    return Number.isInteger(ranks) && ranks > 1 ? ranks : 0
+  }
+
+  const validParallelSelection = (ids: string[]) => {
+    const ranks = runParallelRanks()
+    if (ids.length < 2 || ranks % ids.length !== 0) return false
+    return ids.every((id) => {
+      const gpus = nodes.data?.find((node) => node.id === id)?.stats?.gpus
+      // Missing telemetry is checked by the backend's launch preflight.
+      return gpus === undefined || gpus.filter((gpu) => !gpu.error).length >= ranks / ids.length
+    })
+  }
+
   const openRun = (form: HTMLFormElement | null) => {
     if (resource.data?.editable && (!form || !form.reportValidity())) return
     if (usesDirectLifecycle()) {
@@ -511,10 +570,20 @@ export function DeploymentPage() {
       return
     }
     const required = requiredRunNodes()
-    const selectable = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
+    deployments.reload()
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    const selectable = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id]).map((node) => node.id)
     const preferred = (resource.data?.node_ids ?? []).filter((id) => selectable.includes(id))
     setError(undefined); setNotice(undefined)
     setRunSelection([...new Set([...preferred, ...selectable])].slice(0, required))
+  }
+
+  const checkOccupancy = async (ids: string[]) => {
+    const latest = await api.deployments.list()
+    deployments.apply(latest)
+    const occupied = occupiedNodeReasons(latest, deploymentId)
+    const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
+    if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
   }
 
   const run = async () => {
@@ -523,6 +592,7 @@ export function DeploymentPage() {
     setBusy('run'); setError(undefined); setNotice(undefined)
     try {
       if (resource.data?.editable) await persist()
+      await checkOccupancy(selection ?? resource.data?.node_ids ?? [])
       await api.deployments.action(deploymentId, 'start', selection)
       navigate('/models')
     } catch (reason) {
@@ -547,6 +617,10 @@ export function DeploymentPage() {
   const actOnInstance = async (instance: number, action: 'start' | 'stop') => {
     setBusy(`instance-${instance}`); setError(undefined); setNotice(undefined)
     try {
+      if (action === 'start' && resource.data) {
+        const group = resource.data.instances?.find((entry) => entry.instance_id === instance)
+        await checkOccupancy(group ? groupNodeIds(resource.data, group) : [])
+      }
       const updated = await api.deployments.action(
         deploymentId, action, undefined, undefined, false, instance,
       )
@@ -587,6 +661,7 @@ export function DeploymentPage() {
   const hasUnsavedChanges = (savedEditor !== undefined && editorFingerprint(editor) !== editorFingerprint(savedEditor))
     || envText !== savedEnvText
     || servedName !== savedServedName
+    || (supportsRuntimeFileMounts(detail) && JSON.stringify(runtimeFileMounts) !== JSON.stringify(savedRuntimeFileMounts))
   const active = ['launching', 'starting', 'stopping', 'running', 'ready'].includes(detail.status)
   const lifecycleDisabled = Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)
 
@@ -615,9 +690,14 @@ export function DeploymentPage() {
           <label className="field"><span>Speculative method</span><select disabled={disabled} value={editor.speculative_method} onChange={(event) => set('speculative_method', event.target.value)}><option value="">Auto / unset</option>{editor.speculative_method && !SPECULATIVE_METHODS.includes(editor.speculative_method) && <option value={editor.speculative_method}>{editor.speculative_method}</option>}{SPECULATIVE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
           <label className="field"><span>Draft sample method</span><select disabled={disabled} value={editor.draft_sample_method} onChange={(event) => set('draft_sample_method', event.target.value)}><option value="">Default</option>{editor.draft_sample_method && !DRAFT_SAMPLE_METHODS.includes(editor.draft_sample_method) && <option value={editor.draft_sample_method}>{editor.draft_sample_method}</option>}{DRAFT_SAMPLE_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
         </>}
-        {!envFileMode && <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>}
-        {!envFileMode && <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>}
-        <label className="field"><span>Max batched tokens</span><input disabled={envControlDisabled('max_num_batched_tokens')} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} />{envControlHint('max_num_batched_tokens')}</label>
+        {!envFileMode && detail.runtime !== 'sglang' && <label className="field"><span>Speculative tokens</span><input disabled={disabled} type="number" min="1" value={editor.dspark_num_speculative_tokens} onChange={(event) => set('dspark_num_speculative_tokens', event.target.value)} /></label>}
+        {!envFileMode && detail.runtime !== 'sglang' && <label className="field"><span>CUDA graph capture size</span><input disabled={disabled} type="number" min="1" value={editor.max_cudagraph_capture_size} onChange={(event) => set('max_cudagraph_capture_size', event.target.value)} /></label>}
+        {(detail.runtime !== 'sglang' || envFileMode) && <label className="field"><span>Max batched tokens</span><input disabled={envControlDisabled('max_num_batched_tokens')} type="number" min="1" value={editor.max_num_batched_tokens} onChange={(event) => set('max_num_batched_tokens', event.target.value)} />{envControlHint('max_num_batched_tokens')}</label>}
+        {detail.runtime === 'sglang' && !envFileMode && <>
+          <label className="field"><span>Speculative draft tokens</span><input disabled={disabled} type="number" min="1" value={editor.sg_speculative_num_draft_tokens} onChange={(event) => set('sg_speculative_num_draft_tokens', event.target.value)} /></label>
+          <label className="field"><span>CUDA graph max batch size</span><input disabled={disabled} type="number" min="1" value={editor.sg_cuda_graph_max_bs} onChange={(event) => set('sg_cuda_graph_max_bs', event.target.value)} /></label>
+          <label className="field"><span>Chunked prefill size</span><input disabled={disabled} type="number" min="1" value={editor.sg_chunked_prefill_size} onChange={(event) => set('sg_chunked_prefill_size', event.target.value)} /></label>
+        </>}
         {(detail.runtime === 'vllm' || envFileMode) && <label className="field"><span>GPU memory utilization</span><input disabled={envControlDisabled('gpu_memory_utilization')} type="number" min="0.01" max="1" step="0.01" value={editor.gpu_memory_utilization} onChange={(event) => set('gpu_memory_utilization', event.target.value)} />{envControlHint('gpu_memory_utilization')}</label>}
         {detail.runtime === 'vllm' && !envFileMode && <>
           <label className="field"><span>Tensor parallel size</span><input disabled={disabled} type="number" min="1" value={editor.tensor_parallel_size} onChange={(event) => set('tensor_parallel_size', event.target.value)} /></label>
@@ -625,6 +705,7 @@ export function DeploymentPage() {
           {!detail.id.startsWith('container:') && <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>}
           <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder="VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>
         </>}
+        {supportsRuntimeFileMounts(detail) && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} disabled={disabled} />}
         {detail.runtime === 'sglang' && !envFileMode && <>
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
@@ -645,13 +726,13 @@ export function DeploymentPage() {
             {detail.instances.map((instance) => (
               <div key={instance.instance_id} className="credential-state">
                 <div>
-                  <strong>Instance {instance.instance_id}</strong>
+                  <strong>Group {instance.instance_id + 1}</strong>
                   <span className="muted">
-                    {instance.node_names.join(', ')} · desired {instance.desired_state}
+                    {instance.node_names.join(' + ')} · desired {detail.desired_state === 'stopped' || detail.status === 'stopped' ? 'stopped' : instance.desired_state}
                   </span>
                 </div>
                 <div className="settings-save">
-                  {instance.desired_state === 'running'
+                  {detail.desired_state !== 'stopped' && detail.status !== 'stopped' && instance.desired_state === 'running'
                     ? <Button type="button" disabled={Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)} onClick={() => void actOnInstance(instance.instance_id, 'stop')}>{busy === `instance-${instance.instance_id}` ? 'Stopping…' : 'Stop group'}</Button>
                     : <Button type="button" variant="primary" disabled={Boolean(busy) || detail.status === 'stopping' || (!detail.editable && !detail.controllable)} onClick={() => void actOnInstance(instance.instance_id, 'start')}>{busy === `instance-${instance.instance_id}` ? 'Starting…' : 'Start group'}</Button>}
                 </div>
@@ -671,17 +752,26 @@ export function DeploymentPage() {
     {runSelection && (() => {
       const directLifecycle = usesDirectLifecycle()
       const required = requiredRunNodes()
+      const ranks = runParallelRanks()
+      const flexibleParallel = ranks > 1
+      const selectedCount = flexibleParallel ? runSelection.length : required
+      const countHelp = flexibleParallel
+        ? `Select at least two nodes whose count divides the ${ranks} GPU ranks evenly. Each node must have enough GPUs for its share.`
+        : `Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}.`
       const tensor = Number(detail.runtime === 'sglang' ? editor.sg_tp_size : editor.tensor_parallel_size) || 1
-      const layoutDescription = detail.deployment_mode === 'sharded'
+      const layoutDescription = flexibleParallel
+        ? `TP${tensor} uses ${ranks} GPU ranks distributed evenly across the selected nodes.`
+        : detail.deployment_mode === 'sharded'
         ? `TP${tensor} is distributed across exactly ${required} ${required === 1 ? 'node' : 'nodes'}.`
         : detail.deployment_mode === 'replicated'
           ? `This replicated layout runs on exactly ${required} nodes.`
           : detail.deployment_mode === 'grouped_sharded'
             ? `This grouped layout runs ${detail.instances?.length ?? 2} independent engine group(s) on exactly ${required} nodes.`
             : `This single-node layout runs TP${tensor} on one physical node.`
-      const exactCount = runSelection.length === required
-      const allSelectable = runSelection.every((id) => nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-      const ready = directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable)
+      const exactCount = flexibleParallel ? validParallelSelection(runSelection) : runSelection.length === required
+      const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+      const allSelectable = runSelection.every((id) => !occupied[id] && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
+      const ready = !deployments.loading && !deployments.error && (directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable))
       return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="run-deployment-title">
           <div className="modal-heading"><div><p className="eyebrow">Start deployment</p><h2 id="run-deployment-title">Start {detail.alias}</h2></div><button className="icon-button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)} aria-label="Close dialog">×</button></div>
@@ -689,10 +779,13 @@ export function DeploymentPage() {
             ? `This externally controlled deployment will start on its existing fixed targets (${required} ${required === 1 ? 'node' : 'nodes'}). Confirm to continue.`
             : `${layoutDescription} Select where SparkDeck should start the deployment.`}</p>
           {error && <p className="form-error" role="alert">{error}</p>}
+          {deployments.error && <ErrorState message={deployments.error} onRetry={deployments.reload} />}
           {!directLifecycle && <NodeSelector
             nodes={nodes.data ?? []}
             selectedIds={runSelection}
-            onChange={(next) => setRunSelection(next.length <= required ? next : runSelection)}
+            allowedIds={(nodes.data ?? []).filter((node) => !occupied[node.id]).map((node) => node.id)}
+            unavailableReasons={occupied}
+            onChange={(next) => setRunSelection(next.length <= (flexibleParallel ? ranks : required) ? next : runSelection)}
             loading={nodes.loading}
             error={nodes.error}
             onRetry={nodes.reload}
@@ -700,10 +793,10 @@ export function DeploymentPage() {
             disabled={Boolean(busy)}
             primaryId={runSelection[0]}
             legend="Target nodes"
-            help={`Choose exactly ${required} launch ${required === 1 ? 'node' : 'nodes'}. The first selected node coordinates the deployment.`}
+            help={`${countHelp} The first selected node coordinates the deployment.`}
           />}
-          {!directLifecycle && !exactCount && <p className="field-note" role="status">Select exactly {required} {required === 1 ? 'node' : 'nodes'} to continue.</p>}
-          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : directLifecycle ? 'Confirm start' : `Start on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
+          {!directLifecycle && !exactCount && <p className="field-note" role="status">{flexibleParallel ? countHelp : `Select exactly ${required} ${required === 1 ? 'node' : 'nodes'} to continue.`}</p>}
+          <div className="modal-actions"><Button type="button" disabled={Boolean(busy)} onClick={() => setRunSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || Boolean(busy)} onClick={() => void run()}><Play size={15} /> {busy === 'run' ? 'Starting…' : directLifecycle ? 'Confirm start' : `Start on ${selectedCount} ${selectedCount === 1 ? 'node' : 'nodes'}`}</Button></div>
         </section>
       </div>
     })()}

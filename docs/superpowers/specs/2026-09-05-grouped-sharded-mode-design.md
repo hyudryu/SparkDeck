@@ -177,9 +177,10 @@ the others.
 - `single`/`sharded`/`replicated` behavior is unchanged.
 - Served-name/alias uniqueness unchanged (single deployment, single served name).
 
-## Future work (not in this change)
+## Future work
 
-- Runtime scale up/down of instance count without restarting running groups.
+- Runtime scale down of a single instance group (per-instance stop exists;
+  removing one group's containers while keeping the rest is follow-up work).
 - Per-group hardware/weight placement controls beyond consecutive partition.
 
 ## Open questions

@@ -246,7 +246,10 @@ export function UsagePage() {
   const meter = useMemo(() => usageMeterDifference(meterCurrent, meterBaseline), [meterBaseline, meterCurrent])
   const meterModels = useMemo(() => [...meter.models].sort((left, right) => totalTokens(right.counters) - totalTokens(left.counters) || left.model.localeCompare(right.model, undefined, { numeric: true, sensitivity: 'base' })), [meter.models])
   const setSort = (next: SortKey) => { if (next === sortKey) setSortAscending((value) => !value); else { setSortKey(next); setSortAscending(next === 'model') } }
-  const reload = () => { summary.reload(); analysis.reload() }
+  const reload = () => {
+    summary.reload()
+    analysis.reload()
+  }
   useEffect(() => {
     if (!meterRunning) return
     let active = true

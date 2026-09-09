@@ -23,6 +23,7 @@ import {
 import { NavLink, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import { persistTheme, storedTheme } from '../theme'
+import { UpdateBanner } from './UpdateBanner'
 
 const navigation = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -294,13 +295,16 @@ export function AppShell({
       </aside>
       {drawerOpen && <button className="drawer-backdrop" onClick={() => setDrawerOpen(false)} aria-label="Close navigation" />}
       <div className="app-stage">
-        <header className="mobile-appbar">
-          <button ref={openerRef} className="icon-button" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen}>
-            <Menu size={20} />
-          </button>
-          <span className="mobile-title">{current?.label ?? 'SparkDeck'}</span>
-          <span className="mobile-brand-mark" aria-hidden="true" />
-        </header>
+        <div className="app-topbar">
+          <UpdateBanner controllerAvailable={controllerAvailable} />
+          <header className="mobile-appbar">
+            <button ref={openerRef} className="icon-button" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen}>
+              <Menu size={20} />
+            </button>
+            <span className="mobile-title">{current?.label ?? 'SparkDeck'}</span>
+            <span className="mobile-brand-mark" aria-hidden="true" />
+          </header>
+        </div>
         <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>
       </div>
     </div>

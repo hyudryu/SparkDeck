@@ -89,6 +89,95 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
+test('shows only deployment activity and errors in Logs', async ({ page }) => {
+  await page.route('**/api/v1/logs', async (route) => route.fulfill({ json: { entries: [
+    { timestamp: '2026-09-06 12:00:00', level: 'info', source: 'sparkdeck.lifecycle', event: 'launched', message: 'Deployment My model (engine group 1) launched' },
+    { timestamp: '2026-09-06 12:01:00', level: 'error', source: 'sparkdeck.lifecycle', event: 'crashed', message: 'Deployment My model (engine group 1) crashed: Out of memory' },
+    { level: 'info', message: 'GET /api/state 200 OK' },
+  ] } }))
+  await page.goto('/logs')
+  await expect(page.getByText('Deployment My model (engine group 1) launched', { exact: true })).toBeVisible()
+  await expect(page.getByText('GET /api/state 200 OK')).toHaveCount(0)
+  await page.getByRole('combobox', { name: 'Event type' }).selectOption('error')
+  await expect(page.getByText('Deployment My model (engine group 1) launched', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Deployment My model (engine group 1) crashed: Out of memory', { exact: true })).toBeVisible()
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+})
+
+test('keeps the update banner and mobile navigation visible while scrolling', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/system-update', (route) => route.fulfill({ json: {
+    up_to_date: false, can_update: true, target: { revision: 'abc12345' }, nodes: [],
+  } }))
+  await page.goto('/settings')
+  const banner = page.locator('.update-banner')
+  await expect(banner).toBeVisible()
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(100)
+  await expect.poll(() => banner.evaluate((element) => element.getBoundingClientRect().top)).toBe(0)
+  const mobileBar = page.locator('.mobile-appbar')
+  if (await mobileBar.isVisible()) {
+    const bannerBox = await banner.boundingBox()
+    const barBox = await mobileBar.boundingBox()
+    expect(barBox!.y).toBe(bannerBox!.height)
+    await page.getByRole('button', { name: 'Open navigation', exact: true }).click()
+    await expect(page.locator('.sidebar')).toHaveClass(/drawer-open/)
+    await page.locator('.sidebar').getByRole('button', { name: 'Close navigation' }).click()
+  }
+  await page.screenshot({ path: testInfo.outputPath('sticky-update-banner.png') })
+  await page.getByRole('button', { name: 'Dismiss update notification' }).click()
+  await expect(banner).toHaveCount(0)
+  if (await mobileBar.isVisible()) {
+    await expect.poll(() => mobileBar.evaluate((element) => element.getBoundingClientRect().top)).toBe(0)
+  }
+})
+
+test('keeps benchmark cards in place during background polling', async ({ page }, testInfo) => {
+  const run = {
+    id: 'run-live', model: 'org/test-model', model_id: 'org/test-model', status: 'running',
+    created_at: '2026-09-06T10:00:00Z', results: [], result_count: 0,
+    config: { prompt_sizes: [2048], response_sizes: [128], concurrency_levels: [1], context_depths: [0] },
+    progress: { requests_done: 3 },
+  }
+  let holdPoll = false
+  let pendingRequests = 0
+  let releasePoll!: () => void
+  const pending = new Promise<void>((resolve) => { releasePoll = resolve })
+  await page.clock.install()
+  await page.route('**/api/v1/benchmark-runner/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (holdPoll) {
+      pendingRequests += 1
+      await pending
+    }
+    const body = path.endsWith('/status')
+      ? { installed: true, version: '0.4.0', active_run_id: run.id }
+      : path.endsWith('/models') ? { items: [{ id: run.model, label: run.model }] }
+        : path.endsWith('/runs') ? { items: [run] } : run
+    await route.fulfill({ json: body })
+  })
+  await page.goto('/benchmarks')
+  await expect(page.getByText('3 requests completed')).toBeVisible()
+  const runner = page.locator('.benchmark-runner')
+  await runner.getByRole('table', { name: 'Benchmark run history' }).getByText(run.model).click()
+  await expect(page.getByRole('region', { name: `Results for run ${run.id}` })).toBeVisible()
+  const geometry = () => page.locator('.runner-tool-panel, .runner-config-panel, .runner-active-panel, .runner-history-table, .runner-detail, .benchmark-summary-grid').evaluateAll((cards) => cards.map((card) => {
+    const { top, height } = card.getBoundingClientRect()
+    return { top: top + window.scrollY, height }
+  }))
+  const before = await geometry()
+  holdPoll = true
+  await page.clock.fastForward(2_000)
+  await expect.poll(() => pendingRequests).toBe(4)
+  await expect(runner.getByText(/Checking for llama-benchy|Loading benchmark runs|Loading run results/)).toHaveCount(0)
+  expect(await geometry()).toEqual(before)
+  await page.screenshot({ path: testInfo.outputPath('benchmark-polling.png'), fullPage: true })
+  run.progress.requests_done = 4
+  releasePoll()
+  await expect(page.getByText('4 requests completed')).toBeVisible()
+  expect(await geometry()).toEqual(before)
+})
+
 test('keeps every primary route within the viewport', async ({ page }) => {
   for (const route of routes) {
     await page.goto(route)
@@ -321,4 +410,24 @@ test('keeps storage inventory and transfer controls touch friendly', async ({ pa
 
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
   expect(overflow).toBeLessThanOrEqual(1)
+})
+
+
+test('edits the Load Balancer limit and keeps IP rules in Settings', async ({ page }, testInfo) => {
+  await page.goto('/settings')
+  const limit = page.getByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
+  await expect(limit).toHaveValue('1')
+  await limit.fill('2')
+  await page.getByRole('button', { name: 'Save settings' }).click()
+  await expect(page.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+  await page.reload()
+  await expect(limit).toHaveValue('2')
+  await page.getByRole('region', { name: 'Load Balancer' }).screenshot({ path: testInfo.outputPath('load-balancer.png') })
+  const routing = page.getByRole('region', { name: 'IP routing rules' })
+  await routing.scrollIntoViewIfNeeded()
+  await expect(routing.getByLabel('Source IP')).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  await routing.screenshot({ path: testInfo.outputPath('ip-routing-rules.png') })
+  await page.goto('/usage')
+  await expect(page.getByRole('heading', { name: 'IP routing rules' })).toHaveCount(0)
 })

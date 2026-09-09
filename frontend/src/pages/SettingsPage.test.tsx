@@ -47,6 +47,122 @@ async function submitCommunitySignOut(user: ReturnType<typeof userEvent.setup>, 
 }
 
 describe('settings page', () => {
+  it('saves the prompt-processing limit and restores it on the next visit', async () => {
+    let limit = 1
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') limit = JSON.parse(String(init.body)).max_concurrent_prompt_processing
+        body = { theme: 'system', max_concurrent_prompt_processing: limit }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    const visit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
+    expect(field).toHaveValue(1)
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+    await user.clear(field)
+    await user.type(field, '3')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(limit).toBe(3))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())
+    visit.unmount()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })).toHaveValue(3))
+  })
+
+  it('rejects empty, zero, and fractional prompt-processing limits before saving', async () => {
+    const update = vi.spyOn(api.settings, 'update')
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ theme: 'system', items: [] }), { headers: { 'Content-Type': 'application/json' } })))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })
+    for (const value of ['', '0', '1.5']) {
+      await user.clear(field)
+      if (value) await user.type(field, value)
+      expect(field).toBeInvalid()
+      await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    }
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('refreshes request-routing health and rules with the Settings routing refresh action', async () => {
+    const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })
+    let state = 0
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) return json({ items: [{
+        id: 'deployment-a', alias: 'PRODUCTION DeepSeek', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'deepseek/repo' }, served_models: ['shared-model'],
+        status: state === 1 ? 'running' : 'degraded', desired_state: 'running',
+        settings: {}, deployment_mode: 'grouped_sharded',
+        instances: [{
+          instance_id: 0, status: state === 1 ? 'running' : 'starting', desired_state: 'running',
+          node_ids: ['node-1', 'node-2'], node_names: ['Node 1', 'Node 2'],
+        }],
+      }] })
+      if (path.includes('/api/v1/inference-routing-rules')) return json({ items: [{
+        source_ip: state === 0 ? '10.0.0.1' : '10.0.0.2', requested_model: 'shared-model', enabled: true,
+        deployment_id: 'deployment-a', instance_id: 0, node_ids: ['node-1', 'node-2'],
+      }] })
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json({ theme: 'system', max_concurrent_prompt_processing: 1 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('10.0.0.1')).toBeInTheDocument()
+    expect(screen.getByText('Unavailable')).toBeInTheDocument()
+
+    state = 1
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    expect(await screen.findByText('10.0.0.2')).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByText('10.0.0.1')).not.toBeInTheDocument())
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Source IP'), '192.0.2.50')
+    await user.selectOptions(screen.getByLabelText('Requested model'), 'shared-model')
+    const target = screen.getByRole('option', { name: /Group 1/ })
+    await user.selectOptions(screen.getByLabelText('Target deployment group'), target)
+    const deploymentCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/api/v1/deployments')).length
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/api/v1/deployments')).length).toBeGreaterThan(deploymentCalls))
+    expect(screen.getByLabelText('Source IP')).toHaveValue('192.0.2.50')
+    expect(screen.getByLabelText('Requested model')).toHaveValue('shared-model')
+    expect(screen.getByLabelText('Target deployment group')).toHaveValue(target.getAttribute('value'))
+
+    state = 2
+    await user.click(screen.getByRole('button', { name: 'Refresh IP routing rules' }))
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument()
+  })
+  it('checks the latest main commit on every settings mount', async () => {
+    let revision = 'b'.repeat(40)
+    const paths: string[] = []
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) {
+        paths.push(String(input))
+        return new Response(JSON.stringify({
+          current_revision: 'a'.repeat(40), target: { branch: 'main', revision },
+          can_update: false, blockers: [], nodes: [],
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ theme: 'system' }), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const firstVisit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    expect(await screen.findByText(/origin\/main bbbbbbbb/)).toBeInTheDocument()
+    firstVisit.unmount()
+    revision = 'c'.repeat(40)
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    expect(await screen.findByText(/origin\/main cccccccc/)).toBeInTheDocument()
+    expect(paths).toEqual(['/api/v1/system-update?refresh=true', '/api/v1/system-update?refresh=true'])
+  })
+
   it('opens accessible legal dialogs and links bug reports without saving settings', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -300,7 +416,7 @@ describe('settings page', () => {
         can_update: true, blockers: [],
         nodes: [
           { id: 'current', name: 'Already current', local: false, online: true, current_revision: current, blockers: [] },
-          { id: 'old', name: 'Needs update', local: true, online: true, current_revision: old, blockers: [] },
+          { id: 'old', name: 'Needs update', local: true, online: true, current_revision: old, commits_behind: 1, blockers: [] },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
@@ -316,8 +432,24 @@ describe('settings page', () => {
     expect(oldNode).not.toBeNull()
     expect(within(currentNode!).getByText('Latest')).toBeInTheDocument()
     expect(currentNode!.querySelector('.status-dot')).toHaveClass('status-running')
-    expect(within(oldNode!).getByText('Ready')).toBeInTheDocument()
+    expect(within(oldNode!).getByText('1 commit behind')).toBeInTheDocument()
     expect(oldNode!.querySelector('.status-dot')).toHaveClass('status-starting')
+  })
+
+  it.each([null, 0])('does not mark a different revision latest with a %s comparison', async (commitsBehind) => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const data = String(input).includes('system-update') ? {
+        repository: 'hyudryu/SparkDeck', target: { branch: 'main', revision: 'b'.repeat(40) },
+        can_update: true, blockers: [],
+        nodes: [{ id: 'unknown', name: 'Unknown version node', local: false, online: true,
+          current_revision: 'a'.repeat(40), commits_behind: commitsBehind, blockers: [] }],
+      } : { theme: 'system' }
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const node = (await screen.findByText('Unknown version node')).closest<HTMLElement>('.update-node')!
+    expect(within(node).getByText('Version unknown')).toBeInTheDocument()
+    expect(node.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
   it('labels preflight-ready nodes as queued during a rollout', async () => {
@@ -346,11 +478,45 @@ describe('settings page', () => {
     expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 
+  it('shows a pending update while source and destination transfers finish', async () => {
+    const revision = 'b'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).includes('system-update')) return new Response(JSON.stringify({
+        repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
+        target: { branch: 'main', revision },
+        can_update: false, blockers: [], nodes: [],
+        job: {
+          id: 'waiting-job', active: true, phase: 'pending_transfers', target_branch: 'main', target_revision: revision,
+          nodes: [
+            { id: 'source', name: 'Transfer source', local: false, online: true, current_revision: 'a'.repeat(40), blockers: [], phase: 'pending_transfers' },
+            { id: 'destination', name: 'Transfer destination', local: false, online: true, current_revision: 'a'.repeat(40), blockers: [], phase: 'pending_transfers' },
+          ],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ theme: 'system' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByRole('button', { name: 'Waiting for transfers' })).toBeDisabled()
+    expect(screen.getByText(/Waiting for model transfers to finish before updating/)).toHaveTextContent('Both source and destination nodes are protected.')
+    for (const name of ['Transfer source', 'Transfer destination']) {
+      const node = screen.getByText(name).closest<HTMLElement>('.update-node')!
+      expect(within(node).getByText('Waiting for transfers')).toBeInTheDocument()
+      expect(node.querySelector('.status-dot')).toHaveClass('status-starting')
+    }
+    expect(screen.queryByText('pending_transfers')).not.toBeInTheDocument()
+  })
+
   it('waits for an active update status request to settle before polling again', async () => {
     let updateRequests = 0
+    const updatePaths: string[] = []
     const pendingSignals: AbortSignal[] = []
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (String(input).includes('system-update')) {
+        updatePaths.push(String(input))
         updateRequests += 1
         if (updateRequests > 1) {
           if (init?.signal) pendingSignals.push(init.signal)
@@ -386,9 +552,10 @@ describe('settings page', () => {
 
     expect(updateRequests).toBe(2)
     expect(pendingSignals[0]?.aborted).toBe(false)
+    expect(updatePaths).toEqual(['/api/v1/system-update?refresh=true', '/api/v1/system-update'])
   }, 8_000)
 
-  it('does not trust an up-to-date phase saved for an older target', async () => {
+  it('shows live commit counts instead of a succeeded job saved for an older target', async () => {
     const current = 'b'.repeat(40)
     const old = 'a'.repeat(40)
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
@@ -397,10 +564,10 @@ describe('settings page', () => {
         target: { branch: 'main', revision: current, url: 'https://github.com/hyudryu/SparkDeck/tree/main' },
         up_to_date: false,
         can_update: true, blockers: [],
-        nodes: [],
+        nodes: [{ id: 'stale', name: 'Current node', local: false, online: true, current_revision: old, commits_behind: 7, blockers: [] }],
         job: {
           id: 'old-job', active: false, phase: 'partial', target_branch: 'main', target_revision: old,
-          nodes: [{ id: 'stale', name: 'Stale job node', local: false, online: true, current_revision: old, blockers: [], phase: 'up_to_date' }],
+          nodes: [{ id: 'stale', name: 'Stale job node', local: false, online: true, current_revision: old, blockers: [], phase: 'succeeded' }],
         },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       return new Response(JSON.stringify({
@@ -410,10 +577,10 @@ describe('settings page', () => {
 
     render(<MemoryRouter><SettingsPage /></MemoryRouter>)
 
-    const node = (await screen.findByText('Stale job node')).closest<HTMLElement>('.update-node')
+    const node = (await screen.findByText('Current node')).closest<HTMLElement>('.update-node')
     expect(node).not.toBeNull()
     expect(within(node!).queryByText('Latest')).not.toBeInTheDocument()
-    expect(within(node!).getByText('Ready')).toBeInTheDocument()
+    expect(within(node!).getByText('7 commits behind')).toBeInTheDocument()
     expect(node!.querySelector('.status-dot')).toHaveClass('status-starting')
   })
 })
@@ -652,9 +819,12 @@ describe('community features sign-in', () => {
 
   it('renews a long-open node session before its browser authorization expires', async () => {
     const callbacks: Array<() => void> = []
-    const interval = vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
-      if (typeof handler === 'function') callbacks.push(handler as () => void)
-      return 1
+    const setInterval = window.setInterval.bind(window)
+    const interval = vi.spyOn(window, 'setInterval').mockImplementation((handler, delay, ...args) => {
+      if (delay === COMMUNITY_SESSION_RENEW_MS && typeof handler === 'function') {
+        callbacks.push(handler as () => void)
+      }
+      return setInterval(handler, delay, ...args)
     })
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
       session: { status: 'signed-in', email: 'driver@example.com', token_invalid: false },
@@ -663,9 +833,9 @@ describe('community features sign-in', () => {
     render(<AuthProvider><AuthStatus /></AuthProvider>)
 
     expect(await screen.findByText('signed-in:driver@example.com')).toBeInTheDocument()
-    expect(interval).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RENEW_MS)
-    expect(callbacks.length).toBeGreaterThan(0)
-    await act(async () => callbacks.at(-1)?.())
+    await waitFor(() => expect(interval).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RENEW_MS))
+    expect(callbacks).toHaveLength(1)
+    await act(async () => callbacks[0]())
     await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
       String(input) === '/api/v1/community/session'
     ))).toHaveLength(2))
@@ -673,9 +843,12 @@ describe('community features sign-in', () => {
 
   it('ignores a delayed session renewal after sign-out completes', async () => {
     const callbacks: Array<() => void> = []
-    vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
-      if (typeof handler === 'function') callbacks.push(handler as () => void)
-      return 1
+    const setInterval = window.setInterval.bind(window)
+    vi.spyOn(window, 'setInterval').mockImplementation((handler, delay, ...args) => {
+      if (delay === COMMUNITY_SESSION_RENEW_MS && typeof handler === 'function') {
+        callbacks.push(handler as () => void)
+      }
+      return setInterval(handler, delay, ...args)
     })
     let sessionCalls = 0
     let resolveRenewal: ((response: Response) => void) | undefined
@@ -697,7 +870,8 @@ describe('community features sign-in', () => {
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
     expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
-    act(() => callbacks.at(-1)?.())
+    await waitFor(() => expect(callbacks).toHaveLength(1))
+    act(() => callbacks[0]())
     await waitFor(() => expect(resolveRenewal).toBeDefined())
     await submitCommunitySignOut(user)
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()

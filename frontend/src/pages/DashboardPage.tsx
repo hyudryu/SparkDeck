@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ActiveRequestStats, AdmissionStats, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
+import type { ActiveRequestGroupStats, ActiveRequestStats, AdmissionStats, Deployment, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
 import { Button, EmptyState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
@@ -33,7 +33,26 @@ function temperatureTone(value: number | null | undefined) {
   return ''
 }
 
-const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'starting', 'launching'])
+const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'ready', 'starting', 'launching', 'degraded'])
+
+function runningDeploymentGroups(deployment: Deployment) {
+  if (deployment.instances?.length) {
+    return deployment.instances.filter((group) => ACTIVE_DEPLOYMENT_STATUSES.has(group.status)
+      && (deployment.status !== 'error' || group.has_live_containers === true)).map((group) => ({
+      key: `${deployment.id}:${group.instance_id}`,
+      status: group.status,
+      stopPending: group.desired_state === 'stopped' || deployment.desired_state === 'stopped',
+      label: `Group ${group.instance_id + 1} · ${group.node_names.join(' + ')}`,
+    }))
+  }
+  if (!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)) return []
+  return [{
+    key: deployment.id,
+    status: deployment.status,
+    stopPending: deployment.desired_state === 'stopped',
+    label: (deployment.selected_nodes?.map((node) => node.name || node.id) ?? deployment.node_ids ?? []).join(' + '),
+  }]
+}
 
 function MetricBar({ value, label }: { value: number | null | undefined; label: string }) {
   return (
@@ -147,6 +166,47 @@ export function activeRequestSnapshot(
   return snapshot
 }
 
+export function inferenceSessionSnapshot(stats?: SystemStats, admission?: Record<string, AdmissionStats>) {
+  const groupedAdmission = Object.values(admission ?? {}).filter((item) => item.group_id)
+  if (stats?.active_request_groups === undefined && groupedAdmission.length === 0) {
+    return Object.entries(activeRequestSnapshot(stats, admission)).map(([key, request]) => ({ key, model: key, request, groupLabel: '' }))
+  }
+  const groups: Record<string, ActiveRequestGroupStats> = Object.fromEntries(
+    Object.entries(stats?.active_request_groups ?? {}).map(([key, request]) => [key, { ...request }]),
+  )
+  Object.values(admission ?? {}).forEach((item) => {
+    if (!item.group_id) return
+    const existing = groups[item.group_id]
+    if (!existing && item.running <= 0 && item.queued <= 0) return
+    groups[item.group_id] = {
+      ...existing,
+      group_id: item.group_id,
+      model: item.model || existing?.model || item.group_id,
+      deployment_id: item.deployment_id ?? existing?.deployment_id ?? null,
+      instance_id: item.instance_id ?? existing?.instance_id ?? null,
+      node_names: item.node_names ?? existing?.node_names ?? [],
+      connections: Math.max(existing?.connections ?? 0, item.running),
+      queued: item.queued,
+    }
+  })
+  const groupedModels = new Set(Object.values(groups).map((group) => group.model))
+  const legacyAdmission = Object.fromEntries(Object.entries(admission ?? {}).filter(([, item]) => !item.group_id))
+  const legacyStats = stats?.active_request_groups === undefined
+    ? { active_requests: Object.fromEntries(Object.entries(stats?.active_requests ?? {}).filter(([model]) => !groupedModels.has(model))) }
+    : undefined
+  const legacyRows = Object.entries(activeRequestSnapshot(legacyStats, legacyAdmission))
+    .filter(([, request]) => request.connections > 0 || (request.queued ?? 0) > 0)
+    .map(([model, request]) => ({ key: `legacy:${model}`, model, request, groupLabel: '' }))
+  return [...Object.entries(groups)
+    .filter(([, request]) => request.connections > 0 || (request.queued ?? 0) > 0)
+    .map(([key, request]) => ({
+      key,
+      model: request.model,
+      request,
+      groupLabel: [request.instance_id === null ? '' : `Group ${request.instance_id + 1}`, request.node_names.join(' + ')].filter(Boolean).join(' · '),
+    })), ...legacyRows]
+}
+
 export function DashboardPage() {
   const resourcesRef = useRef<DashboardStreamResources | null>(null)
   const stream = useDashboardStream(resourcesRef)
@@ -189,15 +249,16 @@ export function DashboardPage() {
     : admission
   const deployments = deploymentsResource.data ?? []
   const sync = syncResource.data
-  const activeRequests = Object.entries(activeRequestSnapshot(stats, admissionForSessions))
-  const runningSessions = activeRequests.reduce((sum, [, item]) => sum + (item.connections ?? 0), 0)
+  const activeRequests = inferenceSessionSnapshot(stats, admissionForSessions)
+  const runningSessions = activeRequests.reduce((sum, { request }) => sum + (request.connections ?? 0), 0)
   const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
   const freshQueuedRequests = Object.values(admissionForSessions ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
   // Admission only covers concurrency-limited vLLM targets. A non-empty feed
   // can prove work exists, but an empty feed cannot prove the cluster is idle.
   const inferenceAvailable = stats !== undefined || activeRequests.length > 0
   const inferenceComplete = stats !== undefined && admissionForSessions !== undefined
-  const activeDeployments = deployments.filter((item) => ACTIVE_DEPLOYMENT_STATUSES.has(item.status))
+  const activeDeploymentGroups = deployments.flatMap((deployment) => runningDeploymentGroups(deployment).map((group) => ({ deployment, group })))
+  const activeDeploymentCount = new Set(activeDeploymentGroups.map(({ deployment }) => deployment.id)).size
   const updatedAt = stats?.ts ? new Date(stats.ts * 1000) : undefined
   const allClusterNodes = nodesResource.data ?? []
   const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
@@ -300,7 +361,7 @@ export function DashboardPage() {
           <div className="dashboard-grid">
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${activeDeployments.length} of ${deployments.length} deployments active`}</p></div></div>
+                <div><span className="panel-icon"><Server size={17} /></span><div><h2>Running models</h2><p>{deploymentsResource.loading && !deploymentsResource.data ? 'Loading deployments' : `${activeDeploymentCount} of ${deployments.length} deployments active`}</p></div></div>
                 <Link className="text-link" to="/models">Manage</Link>
               </div>
               {deploymentsResource.error && deploymentsResource.data && <p className="dashboard-stale" role="status">Deployment refresh paused: {deploymentsResource.error}</p>}
@@ -308,15 +369,15 @@ export function DashboardPage() {
                 <LoadingState label="Loading deployments" />
               ) : deploymentsResource.error && !deploymentsResource.data ? (
                 <EmptyState title="Deployment status unavailable" description="Refresh to retry loading model status." />
-              ) : activeDeployments.length === 0 ? (
+              ) : activeDeploymentGroups.length === 0 ? (
                 <EmptyState title="No models running" description="Start a deployment to make it available for chat and comparison." action={<Link className="button button-primary" to="/models">Open models</Link>} />
               ) : (
                 <div className="dashboard-list">
-                  {activeDeployments.map((deployment) => (
-                    <div className="dashboard-list-row" key={deployment.id}>
-                      <span className={`status-dot status-${deployment.status}`} aria-hidden="true" />
-                      <span className="sr-only">Status: {deployment.status}</span>
-                      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small></div>
+                  {activeDeploymentGroups.map(({ deployment, group }) => (
+                    <div className="dashboard-list-row" key={group.key}>
+                      <span className={`status-dot status-${group.status}`} aria-hidden="true" />
+                      <span className="sr-only">Status: {group.status}</span>
+                      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}{group.stopPending && <small>Stop pending</small>}{!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}</div>
                       <RuntimeMark runtime={deployment.runtime} />
                     </div>
                   ))}
@@ -332,7 +393,7 @@ export function DashboardPage() {
               {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
               {activeRequests.length > 0 ? (
                 <div className="dashboard-list">
-                  {activeRequests.map(([model, request]) => <SessionRow key={model} model={model} request={request} />)}
+                  {activeRequests.map(({ key, model, request, groupLabel }) => <SessionRow key={key} model={model} request={request} groupLabel={groupLabel} />)}
                 </div>
               ) : !inferenceAvailable && (statsResource.error || admissionResource.error) ? (
                 <EmptyState title="Active session status unavailable" description="Refresh to retry loading current inference sessions." />
@@ -377,7 +438,7 @@ function stageRate(value: number | null | undefined, waiting: boolean) {
   return `${value.toFixed(1)} tok/s`
 }
 
-function SessionRow({ model, request }: { model: string; request: ActiveRequestStats }) {
+function SessionRow({ model, request, groupLabel }: { model: string; request: ActiveRequestStats; groupLabel: string }) {
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
@@ -387,6 +448,7 @@ function SessionRow({ model, request }: { model: string; request: ActiveRequestS
       <span className={`status-dot status-${waiting ? 'waiting' : 'running'}`} aria-hidden="true" />
       <div>
         <strong>{model}</strong>
+        {groupLabel && <small className="deployment-group-nodes">{groupLabel}</small>}
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>

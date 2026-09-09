@@ -1,8 +1,8 @@
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NodeInventoryItem } from '../api/types'
-import { clusterResourceSnapshot, DashboardPage } from './DashboardPage'
+import { clusterResourceSnapshot, DashboardPage, inferenceSessionSnapshot } from './DashboardPage'
 
 function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -56,6 +56,158 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
+  it('shows each group per-stage prompt/output/thinking rates without merging separate thinking into output', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1', 'Node 2'], connections: 2, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10 },
+      second: { group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 3', 'Node 4'], connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0 },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const first = within((await screen.findByText('Group 1 · Node 1 + Node 2')).closest('.session-row') as HTMLElement)
+    expect(first.getByText('Prompt processing')).toBeInTheDocument()
+    expect(first.getByText('1200.0 tok/s')).toBeInTheDocument()
+    expect(first.getByText('40.0 tok/s')).toBeInTheDocument()
+    expect(first.getByText('Thinking')).toBeInTheDocument()
+    expect(first.getByText('10.0 tok/s')).toBeInTheDocument()
+    expect(first.queryByText('50.0 tok/s')).not.toBeInTheDocument()
+    const second = within(screen.getByText('Group 2 · Node 3 + Node 4').closest('.session-row') as HTMLElement)
+    expect(second.getAllByText('Measuring…')).toHaveLength(2)
+    expect(second.getByText('70.0 tok/s')).toBeInTheDocument()
+    expect(second.getByText('Thinking')).toBeInTheDocument()
+  })
+
+  it('keeps a booting group yellow independently of the ready peer group', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split model', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed', status: 'running', settings: {},
+        instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'running' },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'starting' },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const ready = await screen.findByText('Status: running')
+    const starting = screen.getByText('Status: starting')
+    expect(ready.previousElementSibling).toHaveClass('status-running')
+    expect(starting.previousElementSibling).toHaveClass('status-starting')
+    expect(screen.getByText('Group 2 · Node 1 + Node 2')).toBeInTheDocument()
+  })
+
+  it('shows a still-running group with stopped intent despite a deployment error', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Failed stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'error', desired_state: 'stopped', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'running', desired_state: 'stopped', has_live_containers: true },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'stopped', desired_state: 'stopped' },
+        ],
+      }, {
+        id: 'stopped', alias: 'Stopped model', model: { repository: 'org/other' }, runtime: 'vllm', kind: 'managed',
+        status: 'stopped', settings: {},
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Failed stop')).toBeInTheDocument()
+    expect(screen.getByText('Group 1 · Node 3 + Node 4')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.getByText('Deployment status: error')).toBeInTheDocument()
+    expect(screen.getByText('1 of 2 deployments active')).toBeInTheDocument()
+    expect(screen.queryByText('Group 2 · Node 1 + Node 2')).not.toBeInTheDocument()
+    expect(screen.queryByText('Stopped model')).not.toBeInTheDocument()
+  })
+
+  it.each([false, undefined])('hides rolled-back groups without live inventory confirmation (%s)', async (hasLiveContainers) => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Failed launch', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'error', desired_state: 'running', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 3', 'Node 4'], status: 'starting', desired_state: 'running', has_live_containers: hasLiveContainers },
+          { instance_id: 1, node_names: ['Node 1', 'Node 2'], status: 'running', desired_state: 'running', has_live_containers: hasLiveContainers },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('0 of 1 deployments active')).toBeInTheDocument()
+    expect(screen.queryByText('Failed launch')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Group 1/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Group 2/)).not.toBeInTheDocument()
+  })
+
+  it('shows running models and inference separately for each engine group', async () => {
+    const groups = [
+      { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'running', desired_state: 'running' },
+      { instance_id: 1, node_names: ['Node 3', 'Node 4'], status: 'running', desired_state: 'running' },
+      { instance_id: 2, node_names: ['Node 5', 'Node 6'], status: 'stopped', desired_state: 'stopped' },
+    ]
+    const stats = {
+      active_requests: { 'shared-model': { connections: 2 } },
+      active_request_groups: Object.fromEntries(groups.slice(0, 2).map((group) => [String(group.instance_id), {
+        ...group, group_id: String(group.instance_id), deployment_id: 'dep', model: 'shared-model', connections: 1,
+      }])),
+    }
+    const fallback = stubDashboardFetch(stats)
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split model', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', deployment_mode: 'grouped_sharded', settings: {}, instances: groups,
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findAllByText('Group 1 · Node 1 + Node 2')).toHaveLength(2)
+    expect(screen.getAllByText('Group 2 · Node 3 + Node 4')).toHaveLength(2)
+    expect(screen.getAllByText('1 active · 0 queued')).toHaveLength(2)
+    expect(screen.queryByText(/Node 5 \+ Node 6/)).not.toBeInTheDocument()
+    expect(screen.getByText('2 active · 0 queued')).toBeInTheDocument()
+  })
+
+  it('merges admission by group without combining shared model sessions', () => {
+    const group = { group_id: 'dep:instance:0', deployment_id: 'dep', instance_id: 0, node_names: ['Node 1', 'Node 2'], model: 'shared' }
+    const snapshot = inferenceSessionSnapshot({ active_request_groups: {
+      [group.group_id]: { ...group, connections: 1, queued: 2 },
+    } }, {
+      first: { ...group, running: 1, queued: 0 },
+      second: { ...group, group_id: 'dep:instance:1', instance_id: 1, node_names: ['Node 3', 'Node 4'], running: 1, queued: 1 },
+    })
+    expect(snapshot.map(({ request }) => [request.connections, request.queued])).toEqual([[1, 0], [1, 1]])
+    expect(snapshot[1].groupLabel).toBe('Group 2 · Node 3 + Node 4')
+    expect(inferenceSessionSnapshot({ active_requests: { legacy: { connections: 2 } } })[0].model).toBe('legacy')
+  })
+
+  it('keeps admission-only groups separate when stats are unavailable and preserves legacy targets', () => {
+    const group = { deployment_id: 'dep', instance_id: 0, node_names: ['Node 1', 'Node 2'], model: 'shared', running: 1, queued: 0 }
+    const snapshot = inferenceSessionSnapshot(undefined, {
+      first: { ...group, group_id: 'dep:instance:0' },
+      second: { ...group, deployment_id: 'other', group_id: 'other:instance:0', node_names: ['Node 3', 'Node 4'] },
+      legacy: { model: 'legacy', running: 1, queued: 2 },
+    })
+    expect(snapshot.map(({ key }) => key)).toEqual(['dep:instance:0', 'other:instance:0', 'legacy:legacy'])
+    expect(snapshot.map(({ request }) => request.connections)).toEqual([1, 1, 1])
+    expect(snapshot[2].request.queued).toBe(2)
+  })
+
+  it('shows the empty state when a degraded deployment has no active groups', async () => {
+    const fallback = stubDashboardFetch({ active_requests: {}, active_request_groups: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split model', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'error', desired_state: 'running' },
+          { instance_id: 1, node_names: ['Node 3', 'Node 4'], status: 'stopped', desired_state: 'stopped' },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('No models running')).toBeInTheDocument()
+  })
+
   it('renders pooled CPU, GPU, and RAM while excluding hidden nodes', async () => {
     const localStats = {
       cpu_pct: 20, cpu_logical_count: 4, cpu_temp_c: 54, mem: { used: 64 * 1024 ** 3, total: 128 * 1024 ** 3, pct: 50 },

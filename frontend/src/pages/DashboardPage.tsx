@@ -432,11 +432,14 @@ function useDashboardResource<T>(loader: (signal: AbortSignal) => Promise<T>, po
   return resource
 }
 
+function stageRate(value: number | null | undefined, waiting: boolean) {
+  if (waiting) return 'Waiting'
+  if (value == null || value <= 0) return 'Measuring…'
+  return `${value.toFixed(1)} tok/s`
+}
+
 function SessionRow({ model, request, groupLabel }: { model: string; request: ActiveRequestStats; groupLabel: string }) {
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
-  const rateLabel = (rate: number | null | undefined) => waiting ? '—'
-    : typeof rate === 'number' && Number.isFinite(rate) && rate >= 0 ? `${rate.toFixed(1)} tok/s` : 'Measuring…'
-  const separateThinking = Number.isFinite(request.thinking_tok_s) && (request.thinking_tok_s ?? 0) > 0
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
     .map(([ip, connections]) => `${connections} from ${ip}`)
@@ -449,13 +452,10 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
-      <div className="session-metrics">
-        {waiting && <span className="session-rate">Waiting</span>}
-        <dl aria-label={`Aggregate inference rates for ${groupLabel || model}`}>
-          <div><dt>Prompt processing</dt><dd>{rateLabel(request.pp_tok_s)}</dd></div>
-          <div><dt>Output</dt><dd>{rateLabel(request.output_tok_s)}</dd></div>
-          {separateThinking && <div><dt>Thinking</dt><dd>{rateLabel(request.thinking_tok_s)}</dd></div>}
-        </dl>
+      <div className="session-stages" role="group" aria-label="Token rate by stage">
+        <span className="session-stage"><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{stageRate(request.pp_tok_s, waiting)}</span></span>
+        <span className="session-stage"><span className="session-stage-label">Output</span><span className="session-stage-value">{stageRate(request.output_tok_s, waiting)}</span></span>
+        <span className="session-stage"><span className="session-stage-label">Thinking</span><span className="session-stage-value">{stageRate(request.thinking_tok_s, waiting)}</span></span>
       </div>
     </div>
   )

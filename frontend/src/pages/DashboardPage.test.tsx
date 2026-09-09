@@ -56,23 +56,23 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
-  it('shows each group aggregate prompt/output rates without merging separate thinking into output', async () => {
+  it('shows each group per-stage prompt/output/thinking rates without merging separate thinking into output', async () => {
     vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
       first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1', 'Node 2'], connections: 2, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10 },
       second: { group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 3', 'Node 4'], connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0 },
     } }))
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
-    const first = within(await screen.findByLabelText('Aggregate inference rates for Group 1 · Node 1 + Node 2'))
+    const first = within((await screen.findByText('Group 1 · Node 1 + Node 2')).closest('.session-row') as HTMLElement)
     expect(first.getByText('Prompt processing')).toBeInTheDocument()
     expect(first.getByText('1200.0 tok/s')).toBeInTheDocument()
     expect(first.getByText('40.0 tok/s')).toBeInTheDocument()
     expect(first.getByText('Thinking')).toBeInTheDocument()
     expect(first.getByText('10.0 tok/s')).toBeInTheDocument()
     expect(first.queryByText('50.0 tok/s')).not.toBeInTheDocument()
-    const second = within(screen.getByLabelText('Aggregate inference rates for Group 2 · Node 3 + Node 4'))
-    expect(second.getByText('Measuring…')).toBeInTheDocument()
+    const second = within(screen.getByText('Group 2 · Node 3 + Node 4').closest('.session-row') as HTMLElement)
+    expect(second.getAllByText('Measuring…')).toHaveLength(2)
     expect(second.getByText('70.0 tok/s')).toBeInTheDocument()
-    expect(second.queryByText('Thinking')).not.toBeInTheDocument()
+    expect(second.getByText('Thinking')).toBeInTheDocument()
   })
 
   it('keeps a booting group yellow independently of the ready peer group', async () => {
@@ -682,6 +682,44 @@ describe('DashboardPage', () => {
 
     expect(await screen.findByText('live-model')).toBeInTheDocument()
     expect(screen.getByText('2 from 192.0.2.10 · 1 from 192.0.2.20')).toBeInTheDocument()
+  })
+
+  it('shows live prompt processing, output, and thinking token rates per stage', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': {
+          connections: 1,
+          pp_tok_s: 2400,
+          output_tok_s: 12.5,
+          thinking_tok_s: 4,
+        },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('Prompt processing')).toBeInTheDocument()
+    expect(screen.getByText('2400.0 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Output')).toBeInTheDocument()
+    expect(screen.getByText('12.5 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Thinking')).toBeInTheDocument()
+    expect(screen.getByText('4.0 tok/s')).toBeInTheDocument()
+  })
+
+  it('shows measuring placeholders when prompt processing speed is not yet available', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': { connections: 1, pp_tok_s: null, output_tok_s: 0, thinking_tok_s: 0 },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getAllByText('Measuring…')).toHaveLength(3)
   })
 
   it('prefers fresh local stats over retained local node telemetry', () => {

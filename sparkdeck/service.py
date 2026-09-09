@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 
 from .catalog import (
@@ -42,6 +43,9 @@ from .envfile_settings import (
     resolve_control_updates,
 )
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from .runtime_file_mounts import normalize_runtime_file_mounts
+from .stream_cleanup import close_async_stream
+from .prompt_gate import PromptGates
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -104,14 +108,12 @@ _LOCAL_ROUTING_KEYS = {
     "launch_controls",
     # Non-secret vLLM environment variables are local launch inputs and must
     # never be included in community benchmark configuration.
-    "environment",
+    "environment", "runtime_file_mounts",
 }
 _COMMUNITY_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _COMMUNITY_MAX_REDIRECTS = 5
 _COMMUNITY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-_COMMUNITY_SAMPLE_INTERVAL_SECONDS = 4 * 60 * 60
 _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS = 10_000
-_COMMUNITY_SAMPLE_MIN_DECODE_SECONDS = 3.0
 _STREAM_OBSERVATION_QUEUE_SIZE = 256
 _PUBLIC_GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})(?P<separator>-of-)"
@@ -403,6 +405,11 @@ class SparkDeckService:
         self.manager = manager
         self._data_dir = Path(data_dir)
         self.store = SparkDeckStore(self._data_dir / "sparkdeck.sqlite3")
+        self.prompt_gate = PromptGates(
+            lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
+        )
+        self.manager.prompt_gate = self.prompt_gate
+        self.manager._prompt_observation_dispatch = self._activate_group_observation
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
             manager.http,
@@ -416,7 +423,10 @@ class SparkDeckService:
         # two different records from claiming the same selector concurrently.
         self._deployment_alias_lock = asyncio.Lock()
         self._deployment_launches: dict[str, asyncio.Event] = {}
+        self._deployment_launch_node_ids: dict[str, list[str]] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
+        self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
         # {"action": str, "task": asyncio.Task, "process": subprocess | None}.
         self._external_lifecycle_tasks: dict[str, dict[str, Any]] = {}
@@ -430,8 +440,31 @@ class SparkDeckService:
             contextvars.ContextVar("sparkdeck_community_observation", default=None)
         )
         self._community_active_observations: dict[str, dict[str, Any]] = {}
+        # Callbacks invoked when community sharing is disabled so in-flight
+        # background work (e.g. startup synthetic probes) can be canceled
+        # promptly rather than waiting for the next polling tick.
+        self._consent_cancellers: list[Any] = []
+        self._source_routing_cache = {}
+        self._source_routing_refresh_tasks = {}
+
+    def register_consent_canceller(self, canceller: Any) -> None:
+        """Register a callable invoked immediately when sharing is disabled."""
+        if canceller not in self._consent_cancellers:
+            self._consent_cancellers.append(canceller)
+
+    def _cancel_consent_work(self) -> None:
+        """Cancel background work that depends on active community consent."""
+        for canceller in list(self._consent_cancellers):
+            try:
+                canceller()
+            except Exception:
+                log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
+        refreshes = list(getattr(self, "_source_routing_refresh_tasks", {}).values())
+        for refresh in refreshes:
+            refresh.cancel()
+        await asyncio.gather(*refreshes, return_exceptions=True)
         tasks = list(self._deployment_launch_tasks.values())
         for task in tasks:
             task.cancel()
@@ -545,16 +578,23 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Serialize consent changes with benchmark queue mutations."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.set_community_consent, enabled, telemetry_cluster_id
             )
+            if not enabled:
+                # Cancel active synthetic startup probes immediately instead of
+                # waiting for the next polling tick.
+                self._cancel_consent_work()
+            return result
 
     async def revoke_community_membership(self) -> dict[str, Any]:
         """Disable sharing and forget a former controller's cluster identity."""
         async with self._community_upload_lock:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.store.revoke_community_membership
             )
+            self._cancel_consent_work()
+            return result
 
     async def delete_benchmark(self, sample_id: str) -> bool:
         """Serialize deletion with queue mutations; the uploader re-reads the
@@ -970,7 +1010,7 @@ class SparkDeckService:
             model["local_deployment_ids"] = [item["id"] for item in local]
         return {"model": model, "aggregates": []}
 
-    async def deployments(self) -> list[dict[str, Any]]:
+    async def deployments(self, *, observe_events: bool = False) -> list[dict[str, Any]]:
         raw_manager_deployments = getattr(self.manager, "deployments", [])
         registered = await self._adopt_unlinked_manager_deployments(
             raw_manager_deployments, skip_if_creating=True,
@@ -1027,13 +1067,20 @@ class SparkDeckService:
             # request can otherwise block the polling endpoint.
             containers = cluster_state.get("containers") or []
             docker_unavailable = not bool(cluster_state.get("docker_ready"))
+            # Absence is authoritative when the container snapshot itself
+            # succeeded, even if the separate image inventory failed.
+            container_inventory_ready = bool(cluster_state.get("containers_ready"))
         else:
             docker_unavailable = False
+            container_inventory_ready = False
             try:
                 containers = await self.manager.list_containers()
             except Exception:
                 containers = []
                 docker_unavailable = True
+            # A successful snapshot is authoritative for absence even when a
+            # later inventory facet is unavailable.
+            container_inventory_ready = not docker_unavailable
         seen: set[str] = set()
         local_cluster_members: dict[str, dict[str, Any]] = {}
         for stored in registered:
@@ -1086,6 +1133,10 @@ class SparkDeckService:
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
             stored["status"] = _deployment_status(cluster.get("status"))
+            if cluster in (cluster_state.get("deployments") or []):
+                occupied = _observed_occupied_node_ids(cluster)
+                if occupied is not None:
+                    stored["occupied_node_ids"] = occupied
             stored.update(_deployment_launch_progress(cluster))
             stored["last_used_at"] = cluster.get("last_used_at")
             launch_controls = cluster.get("launch_controls")
@@ -1108,6 +1159,8 @@ class SparkDeckService:
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             if cluster.get("mode") == "grouped_sharded":
                 stored["instances"] = _grouped_instance_summary(cluster)
+            elif cluster.get("mode") == "replicated":
+                stored["replicas"] = _replica_summary(cluster)
             served_models = cluster.get("served_models")
             if isinstance(served_models, list):
                 stored["served_models"] = list(served_models)
@@ -1199,6 +1252,10 @@ class SparkDeckService:
                 # deployment's state and layout contract, not just this node's
                 # rank container.
                 discovered["status"] = _deployment_status(owner.get("status"))
+                if owner in (cluster_state.get("deployments") or []):
+                    occupied = _observed_occupied_node_ids(owner)
+                    if occupied is not None:
+                        discovered["occupied_node_ids"] = occupied
                 discovered.update(self._layout_contract(owner.get("launch_settings")))
                 owner_node_ids = [
                     str(item) for item in owner.get("node_ids") or [] if str(item).strip()
@@ -1225,6 +1282,10 @@ class SparkDeckService:
                         "status": "starting",
                         "launch_phase": "queued",
                         "launch_message": "Preparing deployment launch",
+                        "node_ids": list(self._deployment_launch_node_ids.get(
+                            deployment["id"],
+                            (deployment.get("settings") or {}).get("node_ids") or [],
+                        )),
                     })
                     continue
                 settings = deployment.get("settings") or {}
@@ -1253,7 +1314,147 @@ class SparkDeckService:
         for deployment in registered:
             deployment.pop("_base_url", None)
             deployment.pop("_credential_ref", None)
+        if observe_events:
+            runtime_deployments = {
+                str(item["id"]): (
+                    cluster_by_id.get((item.get("settings") or {}).get("manager_deployment_id"))
+                    or cluster_by_record.get(item["id"])
+                    or cluster_by_container.get(item.get("container_name"))
+                    or {}
+                ) for item in registered
+            }
+            self._observe_deployment_events(
+                registered, inventory_complete=container_inventory_ready,
+                runtime_deployments=runtime_deployments,
+            )
         return registered
+
+    def _observe_deployment_events(
+        self, deployments: list[dict[str, Any]], *, inventory_complete: bool = False,
+        runtime_deployments: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Log actual lifecycle changes once, including independent engine groups.
+
+        Missing inventory is not proof of a shutdown. Keep the last known state
+        through discovery outages so recovery does not manufacture another launch.
+        """
+        states = self._deployment_log_states
+        errors = self._deployment_log_errors
+        event_logger = logging.getLogger("sparkdeck.lifecycle")
+        if inventory_complete:
+            present_ids = {str(item.get("id") or "") for item in deployments}
+            for key in (states.keys() | errors.keys()):
+                if key[0] in present_ids:
+                    continue
+                previous = states.pop(key, None)
+                errors.pop(key, None)
+                if previous and previous[0] in {"running", "starting", "stopping", "degraded"}:
+                    name = key[0]
+                    if key[1] is not None:
+                        name += f" (engine group {key[1]})"
+                    event_logger.info(
+                        "Deployment %s stopped (removed from inventory)", name,
+                        extra={"deployment_event": "stopped"},
+                    )
+        for deployment in deployments:
+            deployment_id = str(deployment.get("id") or "")
+            if not deployment_id:
+                continue
+            label = str(deployment.get("alias") or deployment.get("name") or deployment_id)
+            groups = deployment.get("instances") or [deployment]
+            if deployment.get("instances"):
+                # Recovery/action failures belong to the deployment, including
+                # degraded layouts whose healthy groups keep serving.
+                parent_error = str(deployment.get("last_error") or deployment.get("error") or "")
+                parent_key = (deployment_id, None)
+                if deployment.get("status") == "running":
+                    parent_error = ""
+                if parent_error and errors.get(parent_key) != parent_error:
+                    event_logger.error("Deployment %s error: %s", label, parent_error)
+                if parent_error:
+                    errors[parent_key] = parent_error
+                else:
+                    errors.pop(parent_key, None)
+            for group in groups:
+                instance = group.get("instance_id")
+                key = (deployment_id, instance)
+                name = f"{label} (engine group {instance})" if instance is not None else label
+                status = str(group.get("status") or "unknown")
+                error = str(group.get("last_error") or group.get("error") or "")
+                if not error and status == "error":
+                    error = str(deployment.get("last_error") or deployment.get("error") or "")
+                external_endpoint = (
+                    deployment.get("kind") == DeploymentKind.EXTERNAL.value
+                    and not deployment_id.startswith("container:")
+                )
+                if external_endpoint or status in {"unknown", "missing", "unreachable"}:
+                    # Endpoint health and failed inventory cannot prove that a
+                    # process launched or exited. Report their errors without
+                    # replacing the last known process state.
+                    if external_endpoint and status != "error":
+                        error = ""
+                    if error and errors.get(key) != error:
+                        event_logger.error("Deployment %s error: %s", name, error)
+                    if error:
+                        errors[key] = error
+                    else:
+                        errors.pop(key, None)
+                    continue
+                # Error details on degraded/recovering states are actionable;
+                # only healthy rows can carry irrelevant persisted errors.
+                if status == "running":
+                    error = ""
+                previous = states.get(key)
+                runtime = (runtime_deployments or {}).get(deployment_id) or {}
+                process_lost = _deployment_process_lost(runtime, instance)
+                if status != "running" and process_lost and previous and previous[0] == "running":
+                    message = f"Deployment {name} crashed"
+                    if error:
+                        message += f": {error}"
+                    event_logger.error(message, extra={"deployment_event": "crashed"})
+                    states[key] = ("crashed", error)
+                    if error:
+                        errors[key] = error
+                    continue
+                if error and status != "error" and errors.get(key) != error:
+                    event_logger.error("Deployment %s error: %s", name, error)
+                if error:
+                    errors[key] = error
+                else:
+                    errors.pop(key, None)
+                # Readiness probes and partial group availability can wobble
+                # without the process exiting. Only a terminal state ends a
+                # launch; recovery from these probes is not another launch.
+                # A deliberate recreation (recreate_pending) ends the prior
+                # generation: let the transition record so the replacement that
+                # returns to running announces a new launch.
+                if previous and previous[0] == "running" and status in {
+                    "starting", "degraded", "stopping",
+                } and not _deployment_recreating(runtime, instance):
+                    continue
+                current = (status, error)
+                if previous == current:
+                    continue
+                states[key] = current
+                event = None
+                level = logging.INFO
+                if status == "running" and (previous is None or previous[0] != "running"):
+                    event = "launched"
+                elif status == "error":
+                    event = "crashed" if previous and previous[0] == "running" else "error"
+                    level = logging.ERROR
+                elif status == "stopped" and previous and previous[0] in {
+                    "running", "starting", "stopping", "degraded",
+                }:
+                    desired = group.get("desired_state", deployment.get("desired_state"))
+                    event = "crashed" if desired == "running" else "stopped"
+                    if event == "crashed":
+                        level = logging.ERROR
+                if event:
+                    message = f"Deployment {name} {event}"
+                    if error:
+                        message += f": {error}"
+                    event_logger.log(level, message, extra={"deployment_event": event})
 
     async def register_manager_deployment(
         self, cluster: dict[str, Any],
@@ -1832,6 +2033,9 @@ class SparkDeckService:
             "sg_mem_fraction": sg_mem_fraction,
             "image": image,
             "environment": environment or {},
+            "runtime_file_mounts": (
+                saved_settings if saved_only else (launch_settings or {})
+            ).get("runtime_file_mounts") or [],
         }
         if discovered_editable and isinstance(
             discovered_settings.get("command_flags"), str
@@ -1925,7 +2129,7 @@ class SparkDeckService:
 
         allowed = {
             "extra_args", "launch_controls",
-            "environment",
+            "environment", "runtime_file_mounts",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction",
             "model",
@@ -2274,7 +2478,7 @@ class SparkDeckService:
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "alias",
-            "environment", "instances",
+            "environment", "runtime_file_mounts", "instances",
             "model",
         }
         unknown = sorted(set(changes) - allowed)
@@ -2291,6 +2495,10 @@ class SparkDeckService:
         if "environment" in changes:
             settings["environment"] = normalize_runtime_environment(
                 changes.get("environment"), str(stored.get("runtime") or "vllm"),
+            )
+        if "runtime_file_mounts" in changes:
+            settings["runtime_file_mounts"] = normalize_runtime_file_mounts(
+                changes["runtime_file_mounts"], str(stored.get("runtime") or "vllm"),
             )
         if "image" in changes:
             image = _optional_string(changes.get("image"))
@@ -2871,7 +3079,12 @@ class SparkDeckService:
         else:
             mode = "single"
             count = 1
-        return {"deployment_mode": mode, "required_node_count": count}
+        result = {"deployment_mode": mode, "required_node_count": count}
+        if mode == "sharded" and runtime in {
+            RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+        }:
+            result["parallel_rank_count"] = world
+        return result
 
     def _reject_sensitive_launch_args(self, extra_args: Any) -> None:
         """Apply Manager's credential-argv policy before anything is saved."""
@@ -2990,6 +3203,9 @@ class SparkDeckService:
             settings["environment"] = environment
         else:
             settings.pop("environment", None)
+        settings["runtime_file_mounts"] = normalize_runtime_file_mounts(
+            settings.get("runtime_file_mounts"), runtime.value,
+        )
         artifact = _optional_string(body.get("artifact") or settings.get("artifact"))
         quantization = canonical_quantization(
             body.get("quantization") or settings.get("quantization")
@@ -3512,7 +3728,17 @@ class SparkDeckService:
             # is verified by each node when its container is created; the
             # whole-repository inventory check would reject selective GGUF
             # snapshots that are perfectly launchable.
-            await self._validate_start_selection(deployment_dict, selected_ids, None)
+            cached_revision = await self._validate_start_selection(
+                deployment_dict, selected_ids, settings,
+            )
+            if cached_revision:
+                settings = {
+                    **settings,
+                    "extra_args": [
+                        *(settings.get("extra_args") or []),
+                        "--revision", cached_revision,
+                    ],
+                }
         llama_artifact = None
         if record.runtime is RuntimeKind.LLAMA_CPP:
             if not artifact:
@@ -3601,7 +3827,7 @@ class SparkDeckService:
                 self._link_cluster_record(
                     deployment, settings, mode, node_ids, cluster,
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Manager persists node-specific launch failures. Once linked,
                 # retaining the SQLite row makes that diagnostic durable and
                 # visible in Deployments. A preflight failure is handled by
@@ -3613,6 +3839,8 @@ class SparkDeckService:
                 )
                 if not linked:
                     self.store.delete_deployment(deployment.id)
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Deployment %s launch failed: %s", deployment.alias, exc)
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment.id, None)
@@ -3754,6 +3982,22 @@ class SparkDeckService:
         count = contract.get("required_node_count")
         if isinstance(count, int) and not isinstance(count, bool):
             result["required_node_count"] = count
+        # Nodes one additional engine group occupies: the per-group TP for a
+        # grouped-sharded deployment, the whole saved group for sharded. The
+        # start-another-deployment picker requires exactly this many free
+        # nodes.
+        if contract.get("deployment_mode") == "grouped_sharded":
+            tensor = contract.get("tensor_parallel_size")
+            if isinstance(tensor, int) and not isinstance(tensor, bool) and tensor > 0:
+                result["instance_node_count"] = tensor
+        elif contract.get("deployment_mode") == "sharded":
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                result["instance_node_count"] = count
+            if (launch_settings or {}).get("engine", "vllm") in {"vllm", "sglang"}:
+                result["parallel_rank_count"] = (
+                    contract.get("tensor_parallel_size", 1)
+                    * contract.get("pipeline_parallel_size", 1)
+                )
         revision = contract.get("model_revision")
         if isinstance(revision, str) and revision.strip():
             result["model_revision"] = revision.strip()
@@ -3768,6 +4012,20 @@ class SparkDeckService:
             raise ValueError("node_ids must not contain duplicates")
         contract = self._layout_contract(launch_settings)
         required = contract.get("required_node_count")
+        ranks = contract.get("parallel_rank_count")
+        if (
+            contract.get("deployment_mode") == "sharded"
+            and isinstance(ranks, int) and ranks > 1
+        ):
+            # Saved hosts are a preference, not a cap on TP/PP placement.
+            # Manager preflight checks the actual GPUs per selected host
+            # before replacing any existing ranks.
+            if len(selected) < 2 or ranks % len(selected):
+                raise ValueError(
+                    f"{ranks} parallel GPU ranks must divide evenly across "
+                    "at least two selected nodes"
+                )
+            return selected
         if required is not None and len(selected) != required:
             raise ValueError(
                 f"this deployment requires exactly {required} node(s)"
@@ -3777,8 +4035,8 @@ class SparkDeckService:
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
         launch_settings: dict[str, Any] | None,
-    ) -> None:
-        """Mirror the recipe deploy gate for an explicit start selection."""
+    ) -> str | None:
+        """Validate weights and select an immutable cached default when unpinned."""
         repository = str((deployment.get("model") or {}).get("repository") or "")
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         is_local_path = bool(repository and resolve_local and resolve_local(repository))
@@ -3809,24 +4067,56 @@ class SparkDeckService:
         revision = (
             (deployment.get("model") or {}).get("revision")
             or self._persisted_revision(launch_settings)
-            or "main"
         )
+        if deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value:
+            # GGUF selection owns its cache-relative artifact revision and
+            # llama-server has no --revision flag. Preserve that contract.
+            revision = revision or "main"
         inventory = await self.manager.model_cache_inventory()
-        nodes_with_weights = {
-            node.get("id")
+        cached = {
+            node.get("id"): next((
+                model for model in node.get("models") or []
+                if isinstance(model, dict) and not model.get("partial")
+                and model.get("model_id") == repository
+            ), None)
             for node in inventory if isinstance(node, dict)
-            for model in node.get("models") or []
-            if isinstance(model, dict)
-            and not model.get("partial")
-            and model.get("model_id") == repository
-            and revision in (model.get("revisions") or [])
         }
-        missing = [node_id for node_id in node_ids if node_id not in nodes_with_weights]
+        missing = [
+            node_id for node_id in node_ids if not cached.get(node_id)
+            or (revision and revision not in (cached[node_id].get("revisions") or []))
+        ]
         if missing:
             raise ValueError(
                 "model weights are not available on selected node(s): "
                 + ", ".join(missing)
             )
+        if revision:
+            # Explicit pins remain authoritative; do not substitute another
+            # cached snapshot merely because it is complete.
+            return None
+        snapshots = [
+            {
+                value for value in cached[node_id].get("revisions") or []
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+            }
+            for node_id in node_ids
+        ]
+        common = set.intersection(*snapshots) if snapshots else set()
+        main_refs = [
+            (cached[node_id].get("revision_refs") or {}).get("main")
+            for node_id in node_ids
+        ]
+        if (
+            main_refs and main_refs[0] in common
+            and all(value == main_refs[0] for value in main_refs)
+        ):
+            return main_refs[0]
+        if len(common) == 1:
+            return next(iter(common))
+        raise ValueError(
+            "selected nodes do not have one unambiguous complete cached model revision; "
+            "set --revision to a snapshot available on every selected node"
+        )
 
     def _adopt_manager_replacement(
         self, deployment: dict[str, Any], replacement: dict[str, Any],
@@ -3976,6 +4266,10 @@ class SparkDeckService:
                 self._deployment_launches.setdefault(
                     deployment_id, asyncio.Event(),
                 )
+                if node_ids:
+                    # Publish the requested topology before slow launch work,
+                    # without changing the saved bookmark on a failed start.
+                    self._deployment_launch_node_ids[deployment_id] = list(node_ids)
             try:
                 return await self._deployment_action_locked(
                     deployment_id, action, node_ids, additional_node_ids,
@@ -3983,6 +4277,7 @@ class SparkDeckService:
                 )
             finally:
                 self._deployment_launches.pop(deployment_id, None)
+                self._deployment_launch_node_ids.pop(deployment_id, None)
 
     @asynccontextmanager
     async def _deployment_lifecycle_lock(
@@ -4524,6 +4819,49 @@ class SparkDeckService:
             container, required,
         )
 
+    async def _grouped_action_response(
+        self, current: dict[str, Any], manager_id: str,
+    ) -> dict[str, Any]:
+        """Attach current group readiness rather than saved creation phases."""
+        cluster = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict) and item.get("id") == manager_id
+        ), None)
+        if not cluster or cluster.get("mode") != "grouped_sharded":
+            return current
+        try:
+            state = await self.manager.get_state()
+            observed = next((
+                item for item in state.get("deployments", [])
+                if isinstance(item, dict) and item.get("id") == manager_id
+            ), None)
+            if observed is not None:
+                cluster = observed
+                occupied = _observed_occupied_node_ids(cluster)
+                if occupied is not None:
+                    current["occupied_node_ids"] = occupied
+        except Exception:
+            # The action already succeeded. Preserve its durable state when
+            # inventory is temporarily unavailable instead of failing it.
+            pass
+        current.update(self._layout_contract(cluster.get("launch_settings")))
+        current.update(_deployment_launch_progress(cluster))
+        current.update({
+            "status": _deployment_status(cluster.get("status")),
+            "desired_state": cluster.get("desired_state") or current.get("desired_state"),
+            "instances": _grouped_instance_summary(cluster),
+            "node_ids": list(cluster.get("node_ids") or []),
+            "last_error": str(cluster["error"]) if cluster.get("error") else None,
+        })
+        last_deployed_at = cluster.get("last_deployed_at")
+        if isinstance(last_deployed_at, (int, float)) and last_deployed_at:
+            current["last_deployed_at"] = datetime.fromtimestamp(
+                last_deployed_at, timezone.utc,
+            ).isoformat()
+        elif isinstance(last_deployed_at, str) and last_deployed_at:
+            current["last_deployed_at"] = last_deployed_at
+        return current
+
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
@@ -4555,6 +4893,30 @@ class SparkDeckService:
             None,
         ) if manager_id else None
         launch_settings = (owner or linked or {}).get("launch_settings")
+        if action == "add_instance":
+            # Start another engine group of the same deployment on nodes the
+            # deployment does not already occupy. The deployment object, its
+            # alias, and its served name all stay the same.
+            target = manager_id or (owner or {}).get("id")
+            if not target:
+                raise ValueError(
+                    "start-another-deployment is only available for cluster "
+                    "deployments"
+                )
+            if not node_ids:
+                raise ValueError(
+                    "select the nodes for the additional deployment"
+                )
+            result = await self.manager.add_deployment_instance(target, node_ids)
+            if not result.get("ok"):
+                raise RuntimeError(
+                    "; ".join(result.get("errors") or ["cluster action failed"])
+                )
+            current = self.store.deployment(deployment_id) or deployment
+            current["status"] = str(result.get("status") or "starting")
+            if result.get("node_ids"):
+                current["node_ids"] = list(result["node_ids"])
+            return await self._grouped_action_response(current, target)
         if (
             discovered is not None and not deployment.get("managed")
             and action == "start" and node_ids
@@ -4597,6 +4959,7 @@ class SparkDeckService:
             # runtime, model, settings, and node preferences.
             return await self._launch_saved_deployment(deployment, node_ids)
         relaunch_mode: str | None = None
+        cached_start_revision: str | None = None
         if additional_node_ids and action == "start":
             # "Launch on additional nodes" grows the running node set instead
             # of relocating it: the current cluster nodes stay first in the
@@ -4630,7 +4993,9 @@ class SparkDeckService:
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
-            await self._validate_start_selection(deployment, merged, launch_settings)
+            cached_start_revision = await self._validate_start_selection(
+                deployment, merged, launch_settings,
+            )
             if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
                 relaunch_mode = "replicated"
             node_ids = merged
@@ -4646,7 +5011,9 @@ class SparkDeckService:
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
             # revalidate before relaunching.
-            await self._validate_start_selection(deployment, node_ids, launch_settings)
+            cached_start_revision = await self._validate_start_selection(
+                deployment, node_ids, launch_settings,
+            )
         if instance is not None and (node_ids is not None or additional_node_ids):
             # A per-instance grouped-sharded action addresses one engine
             # group; a node selection relocates the whole deployment. The
@@ -4662,6 +5029,7 @@ class SparkDeckService:
             # grouped-sharded stop does not own the deployment's intent.
             self.store.update_desired_state(deployment_id, "stopped")
         if manager_id:
+            revision_kwargs = {"model_revision": cached_start_revision} if cached_start_revision else {}
             if node_ids is None:
                 if instance is not None:
                     result = await self.manager.deployment_action(
@@ -4672,10 +5040,12 @@ class SparkDeckService:
             elif relaunch_mode:
                 result = await self.manager.deployment_action(
                     manager_id, action, node_ids, relaunch_mode,
+                    **revision_kwargs,
                 )
             else:
                 result = await self.manager.deployment_action(
                     manager_id, action, node_ids,
+                    **revision_kwargs,
                 )
             if not result.get("ok"):
                 raise RuntimeError("; ".join(result.get("errors") or ["cluster action failed"]))
@@ -4706,8 +5076,11 @@ class SparkDeckService:
             else:
                 current["status"] = "running" if action == "start" else "stopped"
             current["node_ids"] = list(current.get("settings", {}).get("node_ids") or [])
-            return current
+            return await self._grouped_action_response(
+                current, replacement["id"] if isinstance(replacement, dict) and replacement.get("id") else manager_id,
+            )
         if owner:
+            revision_kwargs = {"model_revision": cached_start_revision} if cached_start_revision else {}
             # A discovered card can be one rank of a manager-only cluster.
             # Acting on the single rank leaves the remaining ranks running,
             # and the cluster health monitor restarts the whole deployment —
@@ -4716,9 +5089,12 @@ class SparkDeckService:
                 if relaunch_mode:
                     result = await self.manager.deployment_action(
                         owner["id"], action, node_ids, relaunch_mode,
+                        **revision_kwargs,
                     )
                 else:
-                    result = await self.manager.deployment_action(owner["id"], action, node_ids)
+                    result = await self.manager.deployment_action(
+                        owner["id"], action, node_ids, **revision_kwargs,
+                    )
             else:
                 if instance is not None:
                     result = await self.manager.deployment_action(
@@ -4733,7 +5109,10 @@ class SparkDeckService:
                 return self._adopt_manager_replacement(
                     deployment, replacement, launch_settings,
                 )
-            return {**deployment, "status": "running" if action == "start" else "stopped"}
+            return await self._grouped_action_response(
+                {**deployment, "status": "running" if action == "start" else "stopped"},
+                owner["id"],
+            )
         if not container:
             raise LookupError("managed container not found")
         if discovered is None:
@@ -4763,6 +5142,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "start", str(start_command),
                     )
+                    self._record_external_lifecycle_intent(container, "start")
                 else:
                     await self.manager.start_container(
                         container, explicit=True, managed=False,
@@ -4778,6 +5158,7 @@ class SparkDeckService:
                     self._start_external_lifecycle_task(
                         container, "stop", str(stop_command),
                     )
+                    self._record_external_lifecycle_intent(container, "stop")
                 else:
                     await self.manager.stop_container(
                         container, explicit=True, managed=False,
@@ -4789,6 +5170,18 @@ class SparkDeckService:
         current = self.store.deployment(deployment_id) or deployment
         current["status"] = "running" if action == "start" else "stopped"
         return current
+
+    def _record_external_lifecycle_intent(
+        self, container_name: str, action: str,
+    ) -> None:
+        """Mirror hook-backed Start/Stop intent in Manager's container ledger."""
+        stopped = getattr(self.manager, "_explicitly_stopped_containers", None)
+        if stopped is None:
+            stopped = self.manager._explicitly_stopped_containers = set()
+        if action == "stop":
+            stopped.add(container_name)
+        else:
+            stopped.discard(container_name)
 
     def _reject_external_lifecycle_in_flight(self, container_name: str) -> None:
         """Reject any action while a lifecycle hook runs for this container."""
@@ -4955,7 +5348,7 @@ class SparkDeckService:
             )
             arguments = (action, container_name, process.returncode, duration)
             if process.returncode:
-                logger.warning(message, *arguments)
+                logger.error(message, *arguments)
             else:
                 logger.info(message, *arguments)
         except asyncio.CancelledError:
@@ -6033,10 +6426,30 @@ class SparkDeckService:
             item_id = str(item.get("id") or "")
             if item_id == str(deployment.get("id")):
                 continue
+            instances = item.get("instances")
+            # Independent Stop leaves the parent running intent intact. Once
+            # every group has explicitly finished stopping, that stale intent
+            # must not reserve selectors. Pending recreation still owns them.
+            all_groups_stopped = (
+                item.get("deployment_mode") == "grouped_sharded"
+                and item.get("status") == "stopped"
+                and item.get("launch_phase") == "stopped"
+                and isinstance(instances, list)
+                and bool(instances)
+                and all(
+                    isinstance(instance, dict)
+                    and instance.get("status") == "stopped"
+                    and instance.get("desired_state") == "stopped"
+                    for instance in instances
+                )
+            )
             if (
                 item_id not in self._deployment_launches
                 and str(item.get("status") or "") not in {"running", "starting"}
-                and str(item.get("desired_state") or "") != "running"
+                and (
+                    str(item.get("desired_state") or "") != "running"
+                    or all_groups_stopped
+                )
             ):
                 continue
             item_alias = str(item.get("alias") or "")
@@ -6179,6 +6592,17 @@ class SparkDeckService:
             "base_url_set": bool(container.get("port")),
             "port": container.get("port"),
             "managed": bool(container.get("managed")),
+            # An unmanaged container has no persisted desired state. Distinguish
+            # a SparkDeck explicit Stop (kept in the manager's stop ledger) from
+            # an unexpected Docker exit so the Logs view does not report a crash
+            # as an intentional shutdown.
+            "desired_state": (
+                "stopped"
+                if str(container.get("name") or "") in getattr(
+                    self.manager, "_explicitly_stopped_containers", (),
+                )
+                else "running"
+            ),
             "promotable": (
                 (container.get("load_settings") or {}).get("editable") is not False
                 and not str(container.get("start_command") or "").strip()
@@ -6236,7 +6660,7 @@ class SparkDeckService:
         all_deployments = await self.deployments()
         deployments = [
             deployment for deployment in all_deployments
-            if deployment.get("status") in ("running", "registered")
+            if self._deployment_can_serve_inference(deployment)
         ]
         public_ids = {
             deployment["id"]: self._deployment_public_model_ids(deployment)
@@ -6368,13 +6792,33 @@ class SparkDeckService:
             return exact["id"] == deployment["id"]
         return owners == {deployment["id"]}
 
+    @staticmethod
+    def _deployment_can_serve_inference(deployment: dict[str, Any]) -> bool:
+        """Keep surviving engine groups available through the public router."""
+        if deployment.get("status") in ("running", "registered"):
+            return True
+        # Overall health includes intentionally stopped groups. Inference
+        # availability only requires one running group; Manager still owns
+        # selection, admission, load balancing, and per-group stop checks.
+        return (
+            deployment.get("status") == "degraded"
+            and deployment.get("deployment_mode") == "grouped_sharded"
+            and deployment.get("desired_state") != "stopped"
+            and any(
+                instance.get("status") == "running"
+                and instance.get("desired_state") != "stopped"
+                for instance in deployment.get("instances") or []
+                if isinstance(instance, dict)
+            )
+        )
+
     async def _live_deployment_for_model_id(
         self, model_id: str,
     ) -> dict[str, Any] | None:
         """Resolve a request id to the live deployment that owns it."""
         deployments = [
             deployment for deployment in await self.deployments()
-            if deployment.get("status") in ("running", "registered")
+            if self._deployment_can_serve_inference(deployment)
         ]
         live_by_id = {deployment["id"]: deployment for deployment in deployments}
         stored_deployments = self.store.deployments(include_private=True)
@@ -6413,27 +6857,411 @@ class SparkDeckService:
         stored, live = matches[0]
         return {**stored, **live}
 
+    def source_ip_routing_rules(self) -> list[dict[str, Any]]:
+        return self.manager.list_source_ip_routing_rules()
+
+    async def upsert_source_ip_routing_rule(
+        self, value: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Structural validation happens in Manager so disk reload and API
+        # writes share one contract. Enabled routes additionally require a
+        # live deployment which currently owns the exact request model.
+        normalized = self.manager._normalize_source_ip_routing_rule(value)
+        observed_replicas = None
+        observed_instances = None
+        observed_members = None
+        if normalized["enabled"]:
+            target = await self._source_routed_deployment(
+                normalized, normalized["requested_model"], validating=True,
+            )
+            observed_replicas = target.get("replicas")
+            observed_instances = target.get("instances")
+            observed_members = target.get("_source_routing_members")
+        return self.manager.upsert_source_ip_routing_rule(
+            normalized,
+            observed_replicas=observed_replicas,
+            observed_instances=observed_instances,
+            observed_members=observed_members,
+        )
+
+    def delete_source_ip_routing_rule(
+        self, source_ip: str, requested_model: str,
+    ) -> bool:
+        return self.manager.delete_source_ip_routing_rule(
+            source_ip, requested_model,
+        )
+
+    def _source_routing_config_signature(self, stored: dict) -> str:
+        """Cheap local config identity; health observations are cached separately."""
+        linked = next((item for item in getattr(self.manager, "deployments", [])
+                       if item.get("sparkdeck_record_id") == stored.get("id")), {})
+        return json.dumps({
+            "stored": {key: stored.get(key) for key in (
+                "id", "alias", "runtime", "kind", "model", "settings", "desired_state",
+            )},
+            "manager_id": linked.get("id"),
+            "manager_model": linked.get("model"),
+            "record_id": linked.get("sparkdeck_record_id"),
+            "mode": linked.get("mode"),
+            "engine": linked.get("engine"),
+            "served_model": linked.get("served_model"),
+            "served_models": linked.get("served_models"),
+            "launch_settings": linked.get("launch_settings"),
+            "settings_dirty": linked.get("settings_dirty"),
+            "desired_state": linked.get("desired_state"),
+            "members": [(m.get("node_id"), m.get("rank"), m.get("instance_id"),
+                         m.get("container_name"), m.get("container_id"),
+                         m.get("launch_settings_fingerprint"), m.get("desired_state"))
+                        for m in linked.get("members") or []],
+        }, sort_keys=True, default=str)
+
+    async def _source_routing_member_state(self, deployment: dict, member: dict, coordinator: bool) -> dict:
+        from cluster import NodeAgentResponseError
+
+        name = member["container_name"]
+        node_id = member["node_id"]
+        if node_id == "local":
+            container = await self.manager._container_by_name(name)
+            ready = bool(container and container.get("status") == "running")
+            if ready and coordinator:
+                ready = await self.manager._check_ready(container, strict_health=True)
+            return {"status": (container or {}).get("status", "missing"), "ready": ready,
+                    "served_models": (container or {}).get("served_models")
+                    or ([(container or {})["served_model"]] if (container or {}).get("served_model") else [])}
+        try:
+            state = await self.manager.node_registry.request(
+                node_id, "GET", f"/api/agent/containers/{name}/state?check_ready={'true' if coordinator else 'false'}",
+                timeout=8,
+            )
+            if state.get("served_model") and not state.get("served_models"):
+                state = {**state, "served_models": [state["served_model"]]}
+            if not (deployment.get("settings_dirty") and coordinator) or state.get("served_models"):
+                return state
+        except NodeAgentResponseError as exc:
+            if exc.status_code != 404:
+                raise
+        # Older agents lack the endpoint or its served-name metadata. Inspect
+        # only this selected node, never global inventory or sibling groups.
+        status = await self.manager.node_registry.request(node_id, "GET", "/api/agent/status", timeout=8)
+        if status.get("docker_ready") is not True or status.get("inventory_available") is False:
+            raise RuntimeError("selected node container inventory is unavailable")
+        container = next((row for row in status.get("containers") or [] if row.get("name") == name), {})
+        ready = container.get("status") == "running"
+        if ready and coordinator:
+            health = await self.manager.node_registry.request(
+                node_id, "POST", "/api/agent/inference/health", timeout=8,
+                json_body={"model": deployment.get("model"), "_sparkdeck_container_name": name,
+                           "_sparkdeck_deployment_id": deployment["id"], "strict_health": True},
+            )
+            ready = health.get("ready") is True and health.get("health_status") == 200
+        return {"status": container.get("status", "missing"), "ready": ready,
+                "served_models": container.get("served_models")
+                or ([container["served_model"]] if container.get("served_model") else [])}
+
+    async def _observe_source_routing_target(self, stored: dict, rule: dict) -> list[dict]:
+        deployment, nodes = self.manager.source_ip_routing_target(
+            stored["id"], rule.get("instance_id"), rule["node_ids"],
+        )
+        mode = deployment.get("mode")
+        members = [m for m in self.manager._cluster_members_sorted(deployment)
+                   if m.get("node_id") in nodes
+                   and (mode != "grouped_sharded" or m.get("instance_id") == rule.get("instance_id"))]
+        if stored.get("desired_state") == "stopped" or deployment.get("desired_state") == "stopped" or any(m.get("desired_state") == "stopped" for m in members):
+            raise RuntimeError("selected serving unit is stopped")
+        probes = [asyncio.create_task(
+            self._source_routing_member_state(deployment, member, mode == "replicated" or int(member.get("rank") or 0) == 0))
+            for member in members
+        ]
+        try:
+            observations = await asyncio.gather(*probes)
+        finally:
+            for probe in probes:
+                if not probe.done():
+                    probe.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
+        observed_members = []
+        for member, state in zip(members, observations):
+            coordinator = mode == "replicated" or int(member.get("rank") or 0) == 0
+            healthy = state.get("status") == "running" and (not coordinator or state.get("ready") is True)
+            observed_members.append({**member, "status": "running" if healthy else "unknown",
+                                     "node_status": "online", "node_docker_ready": True,
+                                     "phase": {"phase": "ready" if healthy else "unknown"}})
+        healthy = bool(observed_members) and all(m["status"] == "running" for m in observed_members)
+        observed = {**deployment, "members": observed_members, "status": "running" if healthy else "unknown"}
+        live = {**stored, "status": "running" if healthy else "unknown", "deployment_mode": mode,
+                "desired_state": deployment.get("desired_state"), "managed": True,
+                "served_models": self.manager._deployment_served_models(deployment)}
+        observed_names = list(dict.fromkeys(
+            str(name) for member, state in zip(members, observations)
+            if mode == "replicated" or int(member.get("rank") or 0) == 0
+            for name in state.get("served_models") or [] if name
+        ))
+        if observed_names:
+            live["served_models"] = observed_names
+        elif deployment.get("settings_dirty"):
+            raise RuntimeError("selected serving unit's active model names are unavailable")
+        if mode == "replicated":
+            live["replicas"] = _replica_summary(observed)
+        elif mode == "grouped_sharded":
+            live["instances"] = _grouped_instance_summary(observed)
+        if mode in {"single", "sharded"}:
+            live["_source_routing_members"] = [
+                {key: member.get(key) for key in (
+                    "node_id", "rank", "container_name", "status", "desired_state",
+                    "node_status", "node_docker_ready",
+                )} for member in observed_members
+            ]
+        return [live]
+
+    async def _refresh_source_routing_snapshot(self, key: str, stored: dict, rule: dict, signature: str) -> None:
+        try:
+            rows = await asyncio.wait_for(self._observe_source_routing_target(stored, rule), timeout=10.0)
+            current = self.store.deployment(stored["id"], include_private=True)
+            if current is None or self._source_routing_config_signature(current) != signature:
+                raise RuntimeError("source-IP routing configuration changed during health refresh")
+            entry = (time.monotonic() + 4.0, copy.deepcopy(rows), signature)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            entry = (time.monotonic() + 1.0, None, signature)
+        finally:
+            self._source_routing_refresh_tasks.pop(key, None)
+        if key not in self._source_routing_cache and len(self._source_routing_cache) >= 128:
+            self._source_routing_cache.pop(next(iter(self._source_routing_cache)))
+        self._source_routing_cache[key] = entry
+
+    async def _source_routing_snapshot(self, stored: dict, rule: dict) -> list[dict]:
+        from manager import SourceRoutingUnavailable
+
+        if not isinstance(getattr(self, "_source_routing_cache", None), dict):
+            self._source_routing_cache = {}
+        if not hasattr(self, "_source_routing_refresh_tasks"):
+            self._source_routing_refresh_tasks = {}
+        key = json.dumps([stored["id"], rule.get("instance_id"), rule.get("node_ids")])
+        signature = self._source_routing_config_signature(stored)
+        cached = self._source_routing_cache.get(key)
+        if not cached or cached[0] <= time.monotonic() or cached[2] != signature:
+            task = self._source_routing_refresh_tasks.get(key)
+            if task is None:
+                if len(self._source_routing_refresh_tasks) >= 128:
+                    raise SourceRoutingUnavailable("source-IP routing health refresh capacity is unavailable")
+                if len(self._source_routing_cache) >= 128:
+                    self._source_routing_cache.pop(next(iter(self._source_routing_cache)))
+                task = asyncio.create_task(
+                    self._refresh_source_routing_snapshot(key, stored, rule, signature),
+                )
+                self._source_routing_refresh_tasks[key] = task
+            await asyncio.shield(task)
+        cached = self._source_routing_cache.get(key)
+        if not cached or cached[1] is None or cached[0] <= time.monotonic() or cached[2] != self._source_routing_config_signature(stored):
+            raise SourceRoutingUnavailable("source-IP routing health snapshot is unavailable")
+        return copy.deepcopy(cached[1])
+
+    async def _source_routed_deployment(
+        self,
+        rule: dict[str, Any],
+        requested_model: str,
+        *,
+        validating: bool = False,
+    ) -> dict[str, Any]:
+        from manager import SourceRoutingUnavailable
+
+        stable_id = str(rule.get("deployment_id") or "")
+        stored = self.store.deployment(stable_id, include_private=True)
+        error_type = LookupError if validating else SourceRoutingUnavailable
+        if stored is None:
+            raise error_type("source-IP routing target deployment is unavailable")
+        live = next((
+            deployment for deployment in await self._source_routing_snapshot(stored, rule)
+            if deployment.get("id") == stable_id
+        ), None)
+        if stored is None or live is None:
+            raise error_type("source-IP routing target deployment is unavailable")
+        deployment = {**stored, **live}
+        replicas = deployment.get("replicas") or []
+        replicated = deployment.get("deployment_mode") == "replicated" or "replicas" in deployment
+        healthy_replica = (
+            replicated
+            and deployment.get("status") == "degraded"
+            and deployment.get("desired_state") != "stopped"
+            and any(replica.get("available") is True for replica in replicas)
+        )
+        if not self._deployment_can_serve_inference(deployment) and not healthy_replica:
+            raise error_type("source-IP routing target deployment is unavailable")
+        if replicated:
+            selected = next((
+                replica for replica in replicas
+                if [replica.get("node_id")] == rule.get("node_ids")
+            ), None)
+            if selected is None or selected.get("available") is not True:
+                raise error_type("source-IP routing target replica is unavailable")
+        if deployment.get("deployment_mode") == "grouped_sharded":
+            selected_instance = next((
+                instance for instance in deployment.get("instances") or []
+                if instance.get("instance_id") == rule.get("instance_id")
+            ), None)
+            if (
+                selected_instance is None
+                or list(selected_instance.get("node_ids") or [])
+                != list(rule.get("node_ids") or [])
+                or selected_instance.get("status") != "running"
+                or selected_instance.get("desired_state") == "stopped"
+            ):
+                raise error_type(
+                    "source-IP routing target engine group is unavailable"
+                )
+        if (
+            deployment.get("kind") != DeploymentKind.MANAGED.value
+            or deployment.get("runtime") not in {
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+            }
+        ):
+            raise error_type(
+                "source-IP routing target is not a supported managed runtime"
+            )
+        owned_models = set(self._deployment_public_model_ids(deployment))
+        owned_models.add(stable_id)
+        alias = str(deployment.get("alias") or "").strip()
+        if alias:
+            owned_models.add(alias)
+        if requested_model not in owned_models:
+            raise error_type(
+                "source-IP routing target does not own the requested model"
+            )
+        settings = deployment.get("settings") or {}
+        manager_deployment = next((
+            item for item in getattr(self.manager, "deployments", [])
+            if isinstance(item, dict)
+            and item.get("sparkdeck_record_id") == stable_id
+        ), None)
+        if manager_deployment is None:
+            raise error_type("source-IP routing target deployment is unavailable")
+        manager_id = str(manager_deployment.get("id") or "")
+        configured_manager_id = str(settings.get("manager_deployment_id") or "")
+        if configured_manager_id and configured_manager_id != manager_id:
+            raise error_type(
+                "source-IP routing target deployment generation changed"
+            )
+        deployment["settings"] = {
+            **settings, "manager_deployment_id": manager_id,
+        }
+        return deployment
+
+    async def _pin_source_route(
+        self, source_route: dict[str, Any], requested_model: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve and decorate a validated source-IP routing rule."""
+        deployment = await self._source_routed_deployment(
+            source_route, requested_model,
+        )
+        pinned = {
+            **source_route,
+            "_observed_replicas": deployment.get("replicas"),
+            "_observed_instances": deployment.get("instances"),
+            "_observed_members": deployment.get("_source_routing_members"),
+        }
+        return pinned, deployment
+
+    async def _source_rule_for_request(
+        self, caller_ip: str | None, requested_model: str,
+    ) -> dict[str, Any] | None:
+        """Resolve pins from persisted ownership before live model selection."""
+        if not caller_ip:
+            return None
+        source_rules = getattr(self.manager, "source_ip_routing_rules_for_source", None)
+        if not callable(source_rules):
+            return None
+        rules = source_rules(caller_ip)
+        exact = next((rule for rule in rules if rule.get("requested_model") == requested_model), None)
+        if exact is not None:
+            # An explicitly disabled exact rule restores ordinary routing;
+            # another naming form must not silently re-enable its pin.
+            return exact if exact.get("enabled") is True else None
+        matches = []
+        owners = {}
+        observed_targets = {}
+        for rule in rules:
+            if rule.get("enabled") is not True:
+                continue
+            stable_id = str(rule.get("deployment_id") or "")
+            if stable_id not in owners:
+                owners[stable_id] = self.store.deployment(stable_id, include_private=True)
+            stored = owners[stable_id]
+            if stored is None:
+                continue
+            # Ownership survives an absent Manager runtime just as it does
+            # for a saved launch bookmark. Resolve its persisted launch names
+            # without requiring the deployment to appear in live inventory.
+            owned_models = set(self._deployment_public_model_ids({**stored, "status": "saved"}))
+            owned_models.add(stable_id)
+            alias = str(stored.get("alias") or "").strip()
+            if alias:
+                owned_models.add(alias)
+            linked = next((item for item in getattr(self.manager, "deployments", [])
+                           if item.get("sparkdeck_record_id") == stable_id), {})
+            if requested_model not in owned_models and linked.get("settings_dirty"):
+                # Saved settings describe the next launch. Inspect only this
+                # caller's pinned serving unit for names its current runtime
+                # still owns; unavailable observations must never fail open.
+                target = (stable_id, rule.get("instance_id"), tuple(rule.get("node_ids") or []))
+                if target not in observed_targets:
+                    observed_targets[target] = await self._source_routing_snapshot(stored, rule)
+                for live in observed_targets[target]:
+                    if live.get("id") == stable_id:
+                        owned_models.update(self._deployment_public_model_ids(live))
+            if requested_model in owned_models:
+                matches.append(rule)
+        if not matches:
+            return None
+        targets = {
+            (rule["deployment_id"], rule.get("instance_id"), tuple(rule.get("node_ids") or []))
+            for rule in matches
+        }
+        if len(targets) != 1:
+            from manager import SourceRoutingUnavailable
+
+            raise SourceRoutingUnavailable(
+                "source-IP routing has conflicting alternate-name pins; configure an exact rule"
+            )
+        return min(matches, key=lambda rule: rule["requested_model"])
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
+        route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
+        source_route = (
+            route_lookup(caller_ip, requested_model)
+            if callable(route_lookup) else None
+        )
+        if source_route is None:
+            source_route = await self._source_rule_for_request(caller_ip, requested_model)
         stored_deployment = self.store.deployment(
             requested_model, include_private=True,
         )
-        deployment = await self._live_deployment_for_model_id(
-            requested_model
-        )
-        if deployment is None:
-            deployment = stored_deployment
+        if source_route is not None:
+            source_route, deployment = await self._pin_source_route(
+                source_route, requested_model,
+            )
+        else:
+            deployment = await self._live_deployment_for_model_id(
+                requested_model
+            )
+            if deployment is None:
+                deployment = stored_deployment
         observation = self._community_observation_start(
-            self._community_observation_scopes(deployment, requested_model)
+            self._community_observation_scopes(deployment, requested_model), deferred=True,
         )
         context_token = self._community_observation.set(observation)
         streaming = False
         try:
             if deployment:
+                route_kwargs = (
+                    {"source_route": source_route} if source_route else {}
+                )
                 result = await self._proxy_registered(
                     deployment, body, endpoint, cancel, caller_ip=caller_ip,
+                    **route_kwargs,
                 )
             else:
                 # Compatibility for existing vLLM/SGLang containers. Resolve the
@@ -6441,14 +7269,14 @@ class SparkDeckService:
                 # arbitrary served alias as the model identity.
                 started = time.monotonic()
                 caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
-                result = (
-                    await self.manager.proxy_chat_completions(
+                result = await self._run_service_prompt_gate(
+                    ("legacy", requested_model),
+                    lambda _deployment: self.manager.proxy_chat_completions(
                         body, cancel, **caller_kwargs,
                     )
                     if endpoint == "chat/completions"
-                    else await self.manager.proxy_completions(
-                        body, cancel, **caller_kwargs,
-                    )
+                    else self.manager.proxy_completions(body, cancel, **caller_kwargs),
+                    cancel=cancel, model=requested_model,
                 )
                 model, runtime, settings = await self._legacy_model_identity(
                     requested_model
@@ -6472,6 +7300,7 @@ class SparkDeckService:
 
     def _community_observation_scopes(
         self, deployment: dict[str, Any] | None, requested_model: str,
+        *, member: dict[str, Any] | None = None,
     ) -> frozenset[str]:
         """Return private in-memory identities for potentially shared hardware."""
         if deployment:
@@ -6481,6 +7310,8 @@ class SparkDeckService:
                 item for item in getattr(self.manager, "deployments", [])
                 if isinstance(item, dict) and item.get("id") == manager_id
             ), None)
+            if member is not None and linked is not None:
+                return self._engine_observation_scopes(linked, member)
             node_ids = {
                 str(node_id)
                 for source in (
@@ -6508,6 +7339,7 @@ class SparkDeckService:
 
     def _community_observation_start(
         self, scopes: frozenset[str] | None = None,
+        *, deferred: bool = False,
     ) -> dict[str, Any] | None:
         snapshot = self.store.community_consent_snapshot()
         scopes = scopes or frozenset({"unspecified"})
@@ -6521,12 +7353,56 @@ class SparkDeckService:
             "scopes": scopes,
             "contaminated": False,
         }
+        if not deferred:
+            self._community_observation_activate(observation)
+        return observation
+
+    @staticmethod
+    def _engine_observation_scopes(deployment: dict, member: dict) -> frozenset[str]:
+        if deployment.get("mode") == "grouped_sharded":
+            members = [item for item in deployment.get("members") or []
+                       if item.get("instance_id") == member.get("instance_id")]
+        elif deployment.get("mode") == "replicated":
+            members = [member]
+        else:
+            members = deployment.get("members") or [member]
+        return frozenset(f"node:{item['node_id']}" for item in members if item.get("node_id"))
+
+    def _activate_group_observation(self, deployment: dict, member: dict) -> None:
+        self._community_observation_activate(
+            self._community_observation.get(), self._engine_observation_scopes(deployment, member),
+        )
+
+    def _community_manager_requests_overlap(self, scopes: frozenset[str]) -> bool:
+        for rec in getattr(self.manager, "_active_reqs", {}).values():
+            if rec.get("paused"):
+                continue
+            nodes = (rec.get("group") or {}).get("node_ids")
+            if not nodes or scopes.intersection(f"node:{node}" for node in nodes):
+                return True
+        return False
+
+    def _community_observation_activate(
+        self, observation: dict | None, scopes: frozenset[str] | None = None,
+    ) -> None:
+        if observation is None:
+            return
+        if scopes is not None:
+            observation["scopes"] = scopes
+        scopes = observation["scopes"]
+        if observation.get("startup_benchmark") and "manager_scope_sequences" not in observation:
+            sequences = getattr(self.manager, "_inference_scope_sequences", {})
+            observation["manager_scope_sequences"] = {scope: sequences.get(scope, 0) for scope in scopes}
+            observation.setdefault("manager_requests_expected", 1)
+            if self._community_manager_requests_overlap(scopes):
+                observation["contaminated"] = True
         for active in self._community_active_observations.values():
+            if active is observation:
+                continue
             if scopes.intersection(active.get("scopes") or ()):
                 observation["contaminated"] = True
                 active["contaminated"] = True
         self._community_active_observations[observation["id"]] = observation
-        return observation
 
     def _community_observation_end(self, observation: dict[str, Any] | None) -> None:
         if observation is not None and observation.get("id"):
@@ -6535,18 +7411,127 @@ class SparkDeckService:
     async def _community_observed_stream(
         self, stream: AsyncIterator[str], observation: dict[str, Any] | None,
     ) -> AsyncIterator[str]:
-        token = self._community_observation.set(observation)
         try:
-            async for chunk in stream:
+            while True:
+                token = self._community_observation.set(observation)
+                try:
+                    chunk = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                finally:
+                    self._community_observation.reset(token)
                 yield chunk
         finally:
-            self._community_observation.reset(token)
-            self._community_observation_end(observation)
+            token = self._community_observation.set(observation)
+            try:
+                await close_async_stream(stream)
+            finally:
+                try:
+                    self._community_observation.reset(token)
+                finally:
+                    self._community_observation_end(observation)
+
+    @staticmethod
+    def _startup_probe_kwargs(startup_benchmark: bool) -> dict[str, bool]:
+        """Only forward the probe marker when a startup benchmark is active.
+
+        Ordinary requests must keep an unchanged proxy signature (no extra
+        keyword) so downstream call sites and call assertions are unaffected.
+        """
+        return {"startup_benchmark": True} if startup_benchmark else {}
+
+    async def _run_service_prompt_gate(
+        self, key: Any, factory: Any, *, cancel: Any, model: str,
+        deployment: dict[str, Any] | None = None,
+    ) -> Any:
+        """Publish service waiters and revalidate their target before dispatch."""
+        deployment_id = str((deployment or {}).get("id") or "")
+        discovered = deployment_id.startswith("container:")
+        original = None
+        container = None
+        credential = None
+        if deployment is not None:
+            if discovered:
+                container = copy.deepcopy(await self._resolve_discovered_container(deployment_id))
+            else:
+                original = copy.deepcopy(self.store.deployment(deployment_id, include_private=True))
+                if original is None or original.get("id") != deployment_id:
+                    raise LookupError("deployment is unavailable")
+                credential = self._get_credential(deployment_id, original.get("_credential_ref"))
+        group_resolver = getattr(self.manager, "_request_group", None)
+        group = (
+            group_resolver(model, deployment_id or None, (deployment or {}).get("container_name"))
+            if callable(group_resolver) else {
+                "model": model, "deployment_id": deployment_id or None,
+                "group_id": deployment_id or model, "instance_id": None, "node_names": [],
+            }
+        )
+        pending = getattr(self.manager, "_prompt_waiting_requests", None)
+        if pending is None:
+            pending = self.manager._prompt_waiting_requests = {}
+        ticket = object()
+        pending[ticket] = {"model": model, "created_at": time.monotonic(), "group": group}
+
+        async def dispatch():
+            pending.pop(ticket, None)
+            current = deployment
+            if discovered:
+                live = await self._resolve_discovered_container(deployment_id)
+                if any(live.get(field) != container.get(field) for field in (
+                    "id", "container_id", "name", "runtime", "port", "model",
+                    "served_model", "load_settings", "started_at",
+                )) or live.get("status") != "running":
+                    raise LookupError("container changed while waiting for prompt processing")
+                current = self._discovered_deployment(
+                    live, deployment["runtime"], deployment["model"]["repository"],
+                )
+            elif original is not None:
+                stored = self.store.deployment(deployment_id, include_private=True)
+                fields = ("id", "created_at", "alias", "kind", "runtime", "model",
+                          "settings", "container_name", "_base_url", "_credential_ref", "desired_state")
+                if stored is None or any(stored.get(field) != original.get(field) for field in fields):
+                    raise LookupError("deployment changed while waiting for prompt processing")
+                if self._get_credential(deployment_id, stored.get("_credential_ref")) != credential:
+                    raise LookupError("deployment credentials changed while waiting for prompt processing")
+                current = {**deployment, **stored}
+            self._community_observation_activate(
+                self._community_observation.get(),
+                self._community_observation_scopes(current, model),
+            )
+            return await factory(current)
+
+        try:
+            return await self.prompt_gate.run(key, dispatch, cancel=cancel)
+        finally:
+            pending.pop(ticket, None)
 
     async def _proxy_registered(self, deployment: dict[str, Any], body: dict[str, Any],
                                 endpoint: str, cancel: Any, *,
                                 caller_ip: str | None = None,
+                                startup_benchmark: bool = False,
+                                source_route: dict | None = None,
                                 ) -> dict[str, Any] | AsyncIterator[str]:
+        factory = lambda current: self._proxy_registered_unlimited(
+            current, body, endpoint, cancel, caller_ip=caller_ip,
+            startup_benchmark=startup_benchmark, source_route=source_route,
+        )
+        if (deployment.get("settings") or {}).get("manager_deployment_id") and (
+            deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            and deployment.get("kind") == DeploymentKind.MANAGED.value
+        ):
+            # Manager acquires the selected group's slot, including failover.
+            return await factory(deployment)
+        return await self._run_service_prompt_gate(
+            ("deployment", deployment["id"]), factory, cancel=cancel,
+            model=str(body.get("model") or deployment.get("alias") or ""), deployment=deployment,
+        )
+
+    async def _proxy_registered_unlimited(self, deployment: dict[str, Any], body: dict[str, Any],
+                                         endpoint: str, cancel: Any, *,
+                                         caller_ip: str | None = None,
+                                         startup_benchmark: bool = False,
+                                         source_route: dict | None = None,
+                                         ) -> dict[str, Any] | AsyncIterator[str]:
         manager_desired = None
         manager_id = (deployment.get("settings") or {}).get(
             "manager_deployment_id"
@@ -6567,6 +7552,11 @@ class SparkDeckService:
                 or manager_desired == "stopped"
             )
         ):
+            if source_route is not None:
+                from manager import SourceRoutingUnavailable
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target deployment is unavailable"
+                )
             raise RuntimeError(
                 "deployment is stopped; start it before sending inference requests"
             )
@@ -6580,8 +7570,13 @@ class SparkDeckService:
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
             )
         ):
+            route_kwargs = (
+                {"source_route": source_route} if source_route else {}
+            )
             return await self._proxy_managed(
                 deployment, body, endpoint, cancel, caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
+                **route_kwargs,
             )
         base_url = normalize_openai_base_url(deployment.get("_base_url") or "")
         if not base_url:
@@ -6628,6 +7623,8 @@ class SparkDeckService:
     async def _proxy_managed(self, deployment: dict[str, Any], body: dict[str, Any],
                              endpoint: str, cancel: Any, *,
                              caller_ip: str | None = None,
+                             startup_benchmark: bool = False,
+                             source_route: dict | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
         """Keep managed vLLM/SGLang requests on Manager's admission path."""
         requested_model = str(body.get("model") or deployment["alias"])
@@ -6639,10 +7636,14 @@ class SparkDeckService:
         manager_id = settings.get("manager_deployment_id")
         route_observation: dict[str, Any] = {}
         caller_kwargs = {"caller_ip": caller_ip} if caller_ip else {}
+        route_kwargs = (
+            {"source_route": source_route} if source_route else {}
+        )
         result = (
             await self.manager.proxy_cluster_inference(
                 manager_id, model, upstream_body, endpoint, cancel,
                 route_observation=route_observation,
+                **route_kwargs,
                 **caller_kwargs,
             )
             if manager_id
@@ -6651,14 +7652,14 @@ class SparkDeckService:
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
                 if endpoint == "chat/completions"
                 else await self.manager._vllm_completions(
                     model, upstream_body, stream, cancel,
                     container_name=deployment.get("container_name"),
                     deployment_id=deployment["id"],
-                    **caller_kwargs,
+                    **caller_kwargs, **self._startup_probe_kwargs(startup_benchmark),
                 )
             )
         )
@@ -6756,16 +7757,19 @@ class SparkDeckService:
                         parsed["model"] = deployment["alias"]
                         line = "data: " + json.dumps(parsed, separators=(",", ":"))
                 yield f"{line}\n\n"
+                if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                    break
         except BaseException as exc:
             stream_error = exc
             raise
         finally:
-            if stream_error is None:
-                await response_context.__aexit__(None, None, None)
-            else:
-                await response_context.__aexit__(
-                    type(stream_error), stream_error, stream_error.__traceback__,
-                )
+            with anyio.CancelScope(shield=True):
+                if stream_error is None:
+                    await response_context.__aexit__(None, None, None)
+                else:
+                    await response_context.__aexit__(
+                        type(stream_error), stream_error, stream_error.__traceback__,
+                    )
         if usage:
             self._record_usage(
                 deployment["id"], deployment["model"]["repository"],
@@ -6858,12 +7862,11 @@ class SparkDeckService:
             finally:
                 if not observation_ended:
                     self._community_observation_end(observation)
-                if cancelled:
-                    close_stream = getattr(stream, "aclose", None)
-                    if close_stream is not None:
-                        await close_stream()
-                if not cancelled:
-                    await relay.put(finished)
+                try:
+                    await close_async_stream(stream)
+                finally:
+                    if not cancelled:
+                        await relay.put(finished)
 
         producer = asyncio.create_task(produce())
         try:
@@ -6876,7 +7879,8 @@ class SparkDeckService:
         finally:
             if not producer.done():
                 producer.cancel()
-            await asyncio.gather(producer, return_exceptions=True)
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(producer, return_exceptions=True)
 
     def _record_response(self, deployment_id: str | None, model: str, runtime: str,
                          settings: dict[str, Any], started: float, data: dict[str, Any],
@@ -6906,13 +7910,25 @@ class SparkDeckService:
                       completed_at: float | None = None) -> None:
         observation = self._community_observation.get()
         passive_observation = observation is not None
-        # Community sharing is the authority for passive inference telemetry.
-        # When it is off, do not even create a local sample row.
+        # Only the synthetic startup probe contributes automatic telemetry.
+        # Ordinary requests still track overlap, but never create sample rows.
         if passive_observation and (
-            not observation.get("enabled") or observation.get("contaminated")
+            not observation.get("startup_benchmark")
+            or not observation.get("enabled") or observation.get("contaminated")
             or not stream_timing_trusted
+            or getattr(self, "_startup_benchmark_busy", lambda: False)()
         ):
             return
+        if passive_observation and "manager_request_sequence" in observation:
+            expected = int(observation.get("manager_requests_expected", 1))
+            if getattr(self.manager, "_req_seq", 0) > observation["manager_request_sequence"] + expected:
+                return
+        if passive_observation and "manager_scope_sequences" in observation:
+            sequences = getattr(self.manager, "_inference_scope_sequences", {})
+            expected = observation.get("manager_requests_expected", 1)
+            if any(sequences.get(scope, 0) > count + expected
+                   for scope, count in observation["manager_scope_sequences"].items()):
+                return
         completed = time.monotonic() if completed_at is None else completed_at
         input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         output_tokens = max(0, int(usage.get("completion_tokens") or 0))
@@ -6940,26 +7956,16 @@ class SparkDeckService:
         generation_tps = native_generation_tps or observed_generation_tps
         prompt_tps = native_prompt_tps or observed_prompt_tps
         public_model = _public_model_id(model)
-        measured_decode_seconds = (
-            generation_seconds
-            if first_token_at is not None
-            else (
-                output_tokens / native_generation_tps
-                if native_generation_tps and output_tokens else 0.0
-            )
-        )
-        passive_eligible = bool(
+        startup_eligible = bool(
             public_model != "local-model"
             and 0 < input_tokens < _COMMUNITY_SAMPLE_MAX_INPUT_TOKENS
-            and output_tokens >= 32
-            and measured_decode_seconds >= _COMMUNITY_SAMPLE_MIN_DECODE_SECONDS
+            and output_tokens == 200
+            and first_token_at is not None
+            and completed > first_token_at
             and generation_tps is not None
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
             and tensor_parallel_size is not None
-            and self._community_sample_due(
-                public_model, quantization, tensor_parallel_size,
-            )
         )
         legacy_eligible = bool(
             public_model != "local-model" and input_tokens > 0
@@ -6969,13 +7975,16 @@ class SparkDeckService:
             and runtime_kind.value in self.registry.kinds
             and hardware_verified
         )
-        eligible = passive_eligible if passive_observation else legacy_eligible
+        eligible = startup_eligible if passive_observation else legacy_eligible
         if passive_observation and not eligible:
             return
         # For community evidence this compatibility field represents observed
         # prompt occupancy, not the deployment's configured maximum context.
         if passive_observation:
             safe_settings["context_length"] = input_tokens
+            safe_settings["benchmark_concurrency"] = 1
+            safe_settings["benchmark_depth"] = 0
+            safe_settings["benchmark_source"] = "container_startup"
         sample = BenchmarkSample(
             id=str(uuid.uuid4()), created_at=datetime.now(timezone.utc).isoformat(),
             deployment_id=deployment_id,
@@ -7002,49 +8011,14 @@ class SparkDeckService:
             consent = bool(self.store.get_setting("community_consent", False))
             self.store.add_benchmark(sample, queue=eligible and consent)
             return
-        inserted = self.store.add_benchmark_if_consented(
-            sample, int(observation.get("generation") or 0)
-        )
-        if inserted:
-            self.store.set_setting(
-                self._community_sample_setting(
-                    public_model, quantization, tensor_parallel_size,
-                ),
-                datetime.now(timezone.utc).isoformat(),
-            )
-
-    @staticmethod
-    def _community_sample_setting(
-        model: str, quantization: str, tensor_parallel_size: int = 1,
-    ) -> str:
-        quantization = canonical_quantization(quantization) or "UNKNOWN"
-        digest = hashlib.sha256(
-            (
-                f"{model.casefold()}\0{quantization.casefold()}"
-                f"\0tp:{tensor_parallel_size}"
-            ).encode("utf-8")
-        ).hexdigest()
-        return f"community_sampled_at:{digest}"
-
-    def _community_sample_due(
-        self, model: str, quantization: str, tensor_parallel_size: int = 1,
-    ) -> bool:
-        value = self.store.get_setting(
-            self._community_sample_setting(
-                model, quantization, tensor_parallel_size,
-            ), None
-        )
-        if not isinstance(value, str):
-            return True
-        try:
-            sampled_at = datetime.fromisoformat(value)
-            if sampled_at.tzinfo is None:
-                sampled_at = sampled_at.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return True
-        return (
-            datetime.now(timezone.utc) - sampled_at
-        ).total_seconds() >= _COMMUNITY_SAMPLE_INTERVAL_SECONDS
+        seen_key = observation.get("seen_key")
+        if self.store.add_benchmark_if_consented(
+            sample, int(observation.get("generation") or 0),
+            extra_settings={seen_key: True} if seen_key else None,
+        ):
+            # Only an actually-persisted sample confirms a successful startup
+            # probe; the seen marker is committed in the same transaction.
+            observation["startup_recorded"] = True
 
     async def _runtime_for_legacy_model(self, model: str) -> str:
         _, runtime, _ = await self._legacy_model_identity(model)
@@ -7306,6 +8280,119 @@ def _deployment_status(value: Any) -> str:
     return "unknown"
 
 
+def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Distinguish confirmed rank loss/health recovery from readiness or outages."""
+    if cluster.get("desired_state") == "stopped" or cluster.get("status") in {"stopped", "stopping"}:
+        return False
+    members = [
+        member for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    ]
+    expected = [member for member in members if member.get("desired_state") != "stopped"]
+    for member in expected:
+        member_status = member.get("status")
+        if member_status in {"exited", "dead", "removed", "error"}:
+            return True
+        if member_status == "missing" and member.get("node_docker_ready") is True:
+            # An absent container is only a confirmed loss when the node's
+            # container inventory was reliable. A reachable node reporting
+            # docker_ready=false advertises nothing and must not be treated
+            # as a crash, or recovery later manufactures a false launch.
+            return True
+    # Startup reconnects and environment migrations also use recovering. Only
+    # the health recovery path proves a broken generation. For grouped layouts
+    # require evidence in that group so healthy siblings never emit crashes.
+    if cluster.get("status") == "recovering" and cluster.get("health_issue"):
+        return instance is None or any(
+            member.get("status") in {"starting", "restarting", "stopped"}
+            for member in expected
+        )
+    return False
+
+
+def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> bool:
+    """Whether a deliberate recreation is in flight for this engine group.
+
+    Recreation publishes ``recreate_pending`` while it tears down and queues
+    replacement ranks. Such a transition ends the previous generation rather
+    than being a readiness wobble, so the eventual running state must announce
+    a new launch instead of matching the stale running tuple.
+    """
+    return any(
+        member.get("recreate_pending")
+        for member in cluster.get("members") or []
+        if isinstance(member, dict)
+        and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    )
+
+
+def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
+    """Reserve online live ranks without claiming stopped or offline peers.
+
+    Only call with a refreshed Manager inventory, never persisted members.
+    Offline nodes are treated as stopped and cannot be selected for starts.
+    Online stopped intent alone cannot prove a container stopped. In-flight
+    operations retain their online reservations.
+    """
+    members = cluster.get("members")
+    if not isinstance(members, list) or not members:
+        return None
+    occupied = set(cluster.get("node_ids") or [])
+    offline = {
+        member["node_id"] for member in members if member.get("node_id") and (
+            member.get("node_status") in {"offline", "unreachable", "disconnected"}
+            or member.get("status") == "unreachable"
+        )
+    }
+    if cluster.get("status") in {"launching", "starting", "stopping", "recovering"}:
+        return sorted((occupied | {
+            member["node_id"] for member in members if member.get("node_id")
+        }) - offline)
+    by_node: dict[str, list[dict[str, Any]]] = {}
+    for member in members:
+        if member.get("node_id"):
+            by_node.setdefault(member["node_id"], []).append(member)
+    for node_id, ranks in by_node.items():
+        idle = all(
+            member.get("status") in {"exited", "stopped", "dead", "missing"}
+            and not member.get("recreate_pending")
+            and not member.get("failed_stop_error")
+            and (
+                (member.get("desired_state") or cluster.get("desired_state")) == "stopped"
+                or cluster.get("status") == "stopped"
+            )
+            for member in ranks
+        )
+        if idle:
+            occupied.discard(node_id)
+        else:
+            occupied.add(node_id)
+    return sorted(occupied - offline)
+
+
+def _replica_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose observed replica health without leaking private member metadata."""
+    from manager import Manager
+
+    return [
+        {
+            "node_id": member.get("node_id"),
+            "node_name": member.get("node_name") or member.get("node_id"),
+            "rank": member.get("rank"),
+            "status": member.get("status") or "unknown",
+            "desired_state": member.get("desired_state") or cluster.get("desired_state"),
+            "online": str(member.get("node_status") or "").casefold()
+            in {"online", "degraded"},
+            "available": cluster.get("desired_state") != "stopped"
+            and str(member.get("node_status") or "").casefold() in {"online", "degraded"}
+            and Manager._source_routing_member_available(member),
+        }
+        for member in cluster.get("members") or []
+        if isinstance(member, dict) and member.get("node_id")
+    ]
+
+
 def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
     """Per-engine-group state for a grouped-sharded deployment card.
 
@@ -7325,21 +8412,45 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             "statuses": [],
             "desired_state": "running",
             "node_names": [],
+            "node_ids": [],
+            "primary_ready": False,
+            "has_live_containers": False,
         })
+        entry["has_live_containers"] |= member.get("has_live_container") is True
+        if member.get("node_id"):
+            entry["node_ids"].append(str(member["node_id"]))
         entry["node_names"].append(
             str(member.get("node_name") or member.get("node_id") or ""),
         )
-        entry["statuses"].append(str(member.get("status") or "queued"))
+        entry["statuses"].append(_deployment_status(member.get("status")))
+        if member.get("rank") == 0:
+            phase = member.get("phase")
+            entry["primary_ready"] = (
+                (phase.get("phase") if isinstance(phase, dict) else phase) == "ready"
+            )
         if str(member.get("desired_state") or "running") == "stopped":
             entry["desired_state"] = "stopped"
     for entry in groups.values():
         states = entry.pop("statuses")
-        if "error" in states:
+        primary_ready = entry.pop("primary_ready")
+        if cluster.get("desired_state") == "stopped":
+            entry["desired_state"] = "stopped"
+        if cluster.get("status") == "stopped":
+            entry["status"] = "stopped"
+        elif cluster.get("status") == "stopping":
+            entry["status"] = "stopping"
+        elif "error" in states:
             entry["status"] = "error"
+        elif "stopping" in states:
+            entry["status"] = "stopping"
         elif states and all(state == "stopped" for state in states):
             entry["status"] = "stopped"
         elif states and all(state in {"running", "ready"} for state in states):
-            entry["status"] = "running"
+            # Docker running only confirms processes exist. Each independent
+            # engine must reach its own API-ready phase before its group turns
+            # green. Headless TP workers do not expose an API, so require their
+            # containers to run, but use rank zero for engine readiness.
+            entry["status"] = "running" if primary_ready else "starting"
         else:
             entry["status"] = "starting"
         entry["node_names"].sort()
@@ -7348,6 +8459,8 @@ def _grouped_instance_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
     """Flatten honest per-member launch state for deployment list cards."""
+    if deployment.get("status") == "unknown" and deployment.get("status_message") == "Docker is unavailable":
+        return {"launch_phase": "unknown", "launch_message": "Docker is unavailable"}
     if deployment.get("status") == "error" or deployment.get("error"):
         return {
             "launch_phase": "error",
@@ -7376,6 +8489,74 @@ def _deployment_launch_progress(deployment: dict[str, Any]) -> dict[str, str]:
         member for member in (deployment.get("members") or [])
         if isinstance(member, dict)
     ]
+    if status == "stopped":
+        # Completed Stop is authoritative over stale heartbeat launch phases.
+        # Independent recreation temporarily keeps stopped intent while its
+        # new ranks are queued; only those actual creates retain progress.
+        members = [
+            member for member in members
+            if member.get("recreate_pending")
+            and member.get("status") in {"queued", "creating"}
+        ]
+        if not members:
+            return {
+                "launch_phase": "stopped",
+                "launch_message": "Deployment stopped",
+            }
+    if (
+        deployment.get("mode") == "grouped_sharded"
+        and deployment.get("desired_state") != "stopped"
+        and status != "stopped"
+    ):
+        # An intentionally stopped peer group is not part of this launch.
+        # Recreated ranks keep stopped intent until every create settles, so
+        # retain their pending progress while excluding ordinary stopped peers.
+        members = [
+            member for member in members
+            if member.get("desired_state") != "stopped"
+            or member.get("recreate_pending")
+        ]
+        groups: dict[int, list[dict[str, Any]]] = {}
+        for member in members:
+            member = dict(member)
+            if member.get("node_status") in {"offline", "unreachable", "disconnected"}:
+                member["phase"] = {"phase": "unreachable", "message": "Group node is unreachable"}
+            elif member.get("error"):
+                member["phase"] = {"phase": "error", "message": str(member["error"])}
+            elif member.get("status") in {"dead", "error", "unreachable", "missing", "unknown", "exited", "stopped"}:
+                member["phase"] = {"phase": "error", "message": "An expected group rank is not running"}
+            groups.setdefault(int(member.get("instance_id") or 0), []).append(member)
+        members = []
+        def healthy_member(member: dict[str, Any]) -> bool:
+            phase = member.get("phase") or {}
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            return (
+                str(member.get("status") or "").casefold() in {"running", "ready"}
+                and not member.get("error")
+                and not member.get("recreate_pending")
+                and member.get("node_status") not in {"offline", "unreachable", "disconnected"}
+                and str(phase_name or "").casefold()
+                not in {"error", "dead", "unreachable", "missing", "unknown", "failed"}
+            )
+
+        for group in groups.values():
+            try:
+                expected_ranks = (
+                    0 if deployment.get("settings_dirty") else
+                    int((deployment.get("launch_settings") or {}).get("tensor_parallel_size") or 0)
+                )
+            except (TypeError, ValueError):
+                expected_ranks = 0
+            if expected_ranks and (
+                len(group) != expected_ranks
+                or {int(member.get("rank") or 0) for member in group} != set(range(expected_ranks))
+            ):
+                group.append({"phase": {"phase": "missing", "message": "A tensor-parallel rank is missing"}})
+            primary = next((member for member in group if int(member.get("rank") or 0) == 0), None)
+            healthy = all(healthy_member(member) for member in group)
+            # Headless ranks never report HTTP ready. Their coordinator owns
+            # progress once every rank is running without a reported failure.
+            members.extend([primary] if primary is not None and healthy else group)
     # Report the least-advanced active rank. Rank order is only a tie-breaker:
     # a queued worker must win over a rank-0 image pull, and an image pull must
     # win over another rank that has already started loading model weights.

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -529,65 +530,94 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "model_id": "unsloth/Qwen3-4B-GGUF",
         })
 
-    def test_progress_stream_builds_a_bounded_sanitized_live_log(self):
+    async def test_spawn_streams_native_stdout_before_process_exit(self):
         service = self._service()
-        progress_path = Path(self.temp.name) / "progress.jsonl"
-        events = [
-            {"type": "header", "llama_benchy_version": "0.4.0"},
-            {"type": "latency_measured", "latency_s": 0.0125, "mode": "generation"},
-            {
-                "type": "request_start", "request_id": 7,
-                "model": "secret-model", "base_url": "http://secret.internal/v1",
-                "prompt_size": 2048, "response_size": 128,
-                "context_size": 4096, "concurrency": 2, "run_index": 0,
-            },
-            {"type": "request_first_token", "request_id": 7, "ttft_s": 0.25},
-            {"type": "tokens", "request_id": 7, "count": 1, "snippet": "private output"},
-            {"type": "request_end", "request_id": 7, "total_tokens": 128, "error": ""},
-            {"type": "bench_complete", "status": "ok"},
+        run = {"id": "live-output", "_run_dir": self.temp.name,
+               "_argv": [sys.executable, "-c",
+                         "import time; print('Warming up...'); time.sleep(30)"],
+               "progress": {}}
+        process = await service._spawn(run)
+        try:
+            for _ in range(100):
+                service._consume_output(run, Path(self.temp.name) / "output.log", 0)
+                if run["progress"].get("log_lines"):
+                    break
+                await asyncio.sleep(0.02)
+            self.assertIsNone(process.returncode)
+            self.assertEqual(run["progress"]["log_lines"], ["Warming up..."])
+        finally:
+            process.kill()
+            await process.wait()
+
+    def test_native_log_preserves_benchy_stages_and_sanitizes_content(self):
+        service = self._service()
+        output = Path(self.temp.name) / "output.log"
+        native = [
+            "Date: 2026-09-06 17:02:43",
+            "Concurrency levels: [1]",
+            "Loading text from cache: C:/private/cache/book.txt",
+            "Total tokens available in text corpus: 144590",
+            "Warming up...",
+            "Warmup (User only) complete. Delta: 4 tokens (Server: 26, Local: 22)",
+            "Warmup (System+Probe) complete. Delta: 4 tokens (Server: 27, Local context: 22, Probe: 1)",
+            "Running coherence test...",
+            "Coherence test PASSED.",
+            "Measuring latency using mode: generation...",
+            "Average latency (generation): 274.47 ms",
+            "Running test: pp=2048, tg=128, depth=16384, concurrency=1",
         ]
-        events.extend(
-            {"type": "request_end", "request_id": index, "total_tokens": 1, "error": ""}
-            for index in range(8, 213)
-        )
-        progress_path.write_text(
-            "\n".join(json.dumps(event) for event in events) + "\n",
-            encoding="utf-8",
-        )
-        run = {"progress": {"requests_done": 0, "requests_failed": 0}}
-
-        offset = service._consume_progress(run, progress_path, 0)
-
-        self.assertEqual(offset, progress_path.stat().st_size)
-        self.assertEqual(run["progress"]["requests_done"], 206)
+        stages = [f"  {label} ({phase}, batch size 1)..."
+                  for label in ["Warmup", "Run 1/3", "Run 2/3", "Run 3/3"]
+                  for phase in ["Context Load", "Inference"]]
+        output.write_text("\n".join(native + stages) + "\n", encoding="utf-8")
+        run = {"progress": {}}
+        offset = service._consume_output(run, output, 0)
+        self.assertEqual(run["progress"]["log_lines"],
+                         native[:2] + ["Loading text from cache"] + native[3:] + stages)
+        self.assertEqual(service._consume_output(run, output, offset), offset)
+        self.assertEqual(len(run["progress"]["log_lines"]), len(native + stages))
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write("Coherence test FAILED: Expected Paris. Got: private output\n")
+            handle.write("Warmup failed: secret server response\n")
+            handle.write('{"results": "private output"}\n')
+            handle.write("  Run 1/3 (Infer")
+        offset = service._consume_output(run, output, offset)
+        self.assertEqual(run["progress"]["log_lines"][-2:],
+                         ["Coherence test FAILED.", "Warmup failed."])
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write("ence, batch size 1)...\n" + "Warming up...\n" * 205)
+        service._consume_output(run, output, offset)
         self.assertEqual(len(run["progress"]["log_lines"]), 200)
-        rendered = "\n".join(run["progress"]["log_lines"])
-        self.assertNotIn("private output", rendered)
-        self.assertNotIn("secret.internal", rendered)
-        self.assertIn("Request #212 completed: 1 tokens", rendered)
+        self.assertNotIn("private", "\n".join(run["progress"]["log_lines"]))
 
-    def test_progress_stream_treats_invalid_token_count_as_unknown(self):
+    def test_progress_keeps_counters_and_partial_records_without_inventing_stages(self):
         service = self._service()
-        progress_path = Path(self.temp.name) / "invalid-token-progress.jsonl"
-        progress_path.write_text(json.dumps({
-            "type": "request_end", "request_id": 7,
-            "total_tokens": "not-a-number", "error": "",
-        }) + "\n", encoding="utf-8")
-        run = {"progress": {"requests_done": 0, "requests_failed": 0}}
-
-        offset = service._consume_progress(run, progress_path, 0)
-
-        self.assertEqual(offset, progress_path.stat().st_size)
+        path = Path(self.temp.name) / "progress.jsonl"
+        events = [
+            {"type": "request_start", "prompt_size": 2048, "response_size": 128,
+             "context_size": 16384, "concurrency": 1, "run_index": 3},
+            {"type": "tokens", "snippet": "private output"},
+            {"type": "request_end", "total_tokens": "not-a-number", "error": ""},
+        ]
+        path.write_text("\n".join(map(json.dumps, events)) + '\n{"type":"request_end",',
+                        encoding="utf-8")
+        run = {"progress": {"log_lines": ["Warming up..."]}}
+        offset = service._consume_progress(run, path, 0)
         self.assertEqual(run["progress"]["requests_done"], 1)
-        self.assertEqual(
-            run["progress"]["log_lines"],
-            ["Request #7 completed: token count unavailable"],
-        )
+        self.assertEqual(run["progress"]["current"]["context_depth"], 16384)
+        self.assertEqual(run["progress"]["log_lines"], ["Warming up..."])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('"error":"failed"}\n')
+        self.assertEqual(service._consume_progress(run, path, offset), path.stat().st_size)
+        self.assertEqual(run["progress"]["requests_failed"], 1)
 
     async def test_completed_run_parses_report_and_writes_csv(self):
         service = self._service()
+        observation = {"startup_benchmark": True, "contaminated": False}
+        service.sparkdeck._community_active_observations = {"probe": observation}
 
         async def fake_spawn(run):
+            self.assertTrue(observation["contaminated"])
             run.pop("_argv")
             run_dir = Path(run["_run_dir"])
             (run_dir / "report.json").write_text(

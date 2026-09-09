@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Download, RefreshCw, Search } from 'lucide-react'
 import { api } from '../api/client'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel } from '../components/ui'
@@ -6,35 +6,48 @@ import { useResource } from '../hooks/useResource'
 
 export function LogsPage() {
   const resource = useResource((signal) => api.logs.list(signal))
+  const { reload, loading } = resource
+  useEffect(() => {
+    if (loading) return
+    const timer = window.setTimeout(reload, 5000)
+    return () => window.clearTimeout(timer)
+  }, [reload, loading])
   const [query, setQuery] = useState('')
   const [level, setLevel] = useState('')
-  const entries = useMemo(() => (resource.data ?? []).filter((entry) => {
-    const matchesQuery = !query || `${entry.source ?? ''} ${entry.message}`.toLowerCase().includes(query.toLowerCase())
-    const matchesLevel = !level || entry.level?.toLowerCase() === level
+  const activity = useMemo(() => (resource.data ?? []).filter((entry) => {
+    const isError = ['error', 'critical', 'fatal'].includes(entry.level?.toLowerCase() ?? '')
+    const isLifecycle = ['launched', 'stopped', 'crashed'].includes(entry.event ?? '')
+    return isError || isLifecycle
+  }), [resource.data])
+  const entries = useMemo(() => activity.filter((entry) => {
+    const matchesQuery = !query || `${entry.source ?? ''} ${entry.message} ${JSON.stringify(entry.details ?? {})}`.toLowerCase().includes(query.toLowerCase())
+    const isError = ['error', 'critical', 'fatal'].includes(entry.level?.toLowerCase() ?? '')
+    const isLifecycle = ['launched', 'stopped', 'crashed'].includes(entry.event ?? '')
+    const matchesLevel = !level || (level === 'error' ? isError : isLifecycle)
     return matchesQuery && matchesLevel
-  }), [resource.data, query, level])
+  }), [activity, query, level])
 
   const download = () => {
-    const blob = new Blob([entries.map((entry) => `${entry.timestamp ?? ''} ${entry.level ?? ''} ${entry.source ?? ''} ${entry.message}`.trim()).join('\n')], { type: 'text/plain' })
+    const blob = new Blob([JSON.stringify(entries, null, 2)], { type: 'application/json' })
     const href = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = href
-    anchor.download = `sparkdeck-logs-${new Date().toISOString().slice(0, 10)}.txt`
+    anchor.download = `sparkdeck-logs-${new Date().toISOString().slice(0, 10)}.json`
     anchor.click()
     URL.revokeObjectURL(href)
   }
 
   return (
     <div className="page logs-page">
-      <PageHeader eyebrow="Diagnostics" title="Logs" description="Inspect local SparkDeck and runtime activity. Secrets are redacted before entries reach this view." actions={<><Button onClick={resource.reload}><RefreshCw size={15} /> Refresh</Button><Button onClick={download} disabled={!entries.length}><Download size={15} /> Export</Button></>} />
+      <PageHeader eyebrow="Diagnostics" title="Logs" description="Deployment launches, shutdowns, crashes, and errors. Secrets are redacted before entries reach this view." actions={<><Button onClick={resource.reload}><RefreshCw size={15} /> Refresh</Button><Button onClick={download} disabled={!entries.length}><Download size={15} /> Export</Button></>} />
       <div className="log-filters">
         <label className="search-field"><span className="sr-only">Filter logs</span><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter log messages" /></label>
-        <label className="select-field"><span className="sr-only">Log level</span><select value={level} onChange={(event) => setLevel(event.target.value)}><option value="">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select></label>
+        <label className="select-field"><span className="sr-only">Event type</span><select value={level} onChange={(event) => setLevel(event.target.value)}><option value="">All events</option><option value="lifecycle">Deployment activity</option><option value="error">Errors</option></select></label>
       </div>
       {resource.loading && <LoadingState label="Loading logs" />}
       {resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
-      {!resource.loading && !resource.error && entries.length === 0 && <EmptyState title={resource.data?.length ? 'No matching entries' : 'No log entries'} description={resource.data?.length ? 'Change the filters to see more activity.' : 'Runtime and application events will appear here.'} />}
-      {entries.length > 0 && <Panel className="log-view" aria-label="Application logs" tabIndex={0}>{entries.map((entry, index) => <div className="log-line" key={`${entry.timestamp}-${index}`}><time>{entry.timestamp ?? '—'}</time><span className={`log-level log-${entry.level?.toLowerCase() ?? 'info'}`}>{entry.level ?? 'info'}</span><span className="log-source">{entry.source ?? 'sparkdeck'}</span><span>{entry.message}</span></div>)}</Panel>}
+      {!resource.loading && !resource.error && entries.length === 0 && <EmptyState title={activity.length ? 'No matching entries' : 'No log entries'} description={activity.length ? 'Change the filters to see more activity.' : 'Deployment launches, shutdowns, crashes, and errors will appear here.'} />}
+      {entries.length > 0 && <Panel className="log-view" aria-label="Application logs" tabIndex={0}>{entries.map((entry, index) => <div className="log-line" key={`${entry.timestamp}-${index}`}><time>{entry.timestamp ?? '—'}</time><span className={`log-level log-${entry.level?.toLowerCase() ?? 'info'}`}>{entry.level ?? 'info'}</span><span className="log-source">{entry.source ?? 'sparkdeck'}</span><div><span>{entry.message}</span>{entry.details && <details><summary>Error details (JSON)</summary><pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{JSON.stringify(entry.details, null, 2)}</pre></details>}</div></div>)}</Panel>}
     </div>
   )
 }

@@ -13,6 +13,8 @@ import type {
   ChatStreamUpdate,
   ChatUsage,
   ContainerImage,
+  PatchBuild,
+  CreatePatchBuildInput,
   CreateDeploymentInput,
   Deployment,
   DeploymentDetail,
@@ -46,8 +48,10 @@ import type {
   SavedConfigurationDetail,
   RecipeUpdateInput,
   RuntimeFlagsPreview,
+  RuntimeFileMount,
   UsageAnalysis,
   UsageSummary,
+  InferenceRoutingRule,
   SystemUpdateOverview,
   SystemUpdateJob,
   RouterOSConnectionInput,
@@ -347,6 +351,8 @@ export interface WireDeployment {
   runtime: RuntimeKind
   kind: 'managed' | 'external'
   model: { repository: string; revision?: string; artifact?: string; quantization?: string }
+  served_model?: string
+  served_models?: string[]
   status: Deployment['status']
   container_name?: string
   settings?: Deployment['settings']
@@ -356,7 +362,10 @@ export interface WireDeployment {
   selected_nodes?: Deployment['selected_nodes']
   deployment_mode?: string
   instances?: Deployment['instances']
+  replicas?: Deployment['replicas']
   required_node_count?: number
+  instance_node_count?: number
+  occupied_node_ids?: string[]
   parallel_rank_count?: number
   flexible_node_count?: boolean
   single_host_topology_replayable?: boolean
@@ -379,6 +388,7 @@ export interface WireDeployment {
 }
 
 interface WireDeploymentDetail extends WireDeployment {
+  runtime_file_mounts?: RuntimeFileMount[]
   editable: boolean
   edit_reason?: string | null
   edit_mode?: string | null
@@ -419,6 +429,8 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     id: item.id,
     alias: item.alias,
     model_id: item.model.repository,
+    served_model: item.served_model,
+    served_models: item.served_models,
     model_revision: item.model_revision ?? item.model.revision,
     runtime: item.runtime,
     status: item.status,
@@ -435,7 +447,10 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     },
     deployment_mode: item.deployment_mode,
     instances: item.instances,
+    replicas: item.replicas,
     required_node_count: item.required_node_count,
+    instance_node_count: item.instance_node_count,
+    occupied_node_ids: item.occupied_node_ids,
     parallel_rank_count: item.parallel_rank_count,
     flexible_node_count: item.flexible_node_count,
     single_host_topology_replayable: item.single_host_topology_replayable,
@@ -458,6 +473,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
 function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail {
   return {
     ...deploymentFromWire(item),
+    runtime_file_mounts: item.runtime_file_mounts ?? item.settings?.runtime_file_mounts,
     editable: item.editable,
     edit_reason: item.edit_reason,
     edit_mode: item.edit_mode,
@@ -616,7 +632,7 @@ export const api = {
       },
       NO_REQUEST_TIMEOUT,
     ),
-    action: async (id: string, action: 'start' | 'stop' | 'remove', nodeIds?: string[], additionalNodeIds?: string[], promote = false, instance?: number) => {
+    action: async (id: string, action: 'start' | 'stop' | 'remove' | 'add_instance', nodeIds?: string[], additionalNodeIds?: string[], promote = false, instance?: number) => {
       if (action === 'remove') {
         return request<void>(
           `/api/v1/deployments/${encodeURIComponent(id)}`,
@@ -624,7 +640,9 @@ export const api = {
           NO_REQUEST_TIMEOUT,
         )
       }
-      const payload = action === 'start' && additionalNodeIds?.length
+      const payload = action === 'add_instance' && nodeIds?.length
+        ? { node_ids: nodeIds }
+        : action === 'start' && additionalNodeIds?.length
         ? { additional_node_ids: additionalNodeIds }
         : action === 'start' && nodeIds?.length ? { node_ids: nodeIds, promote: promote || undefined } : instance !== undefined
           ? { instance }
@@ -866,6 +884,8 @@ export const api = {
     }),
   },
   images: {
+    patchBuilds: (signal?: AbortSignal) => request<{ items: PatchBuild[] }>('/api/v1/images/patch-builds', { signal }),
+    createPatchBuild: (input: CreatePatchBuildInput) => request<PatchBuild>('/api/v1/images/patch-builds', { method: 'POST', body: JSON.stringify(input) }),
     list: async (signal?: AbortSignal): Promise<ContainerImage[]> => {
       const data = await requestWithFallback<ContainerImage[] | { items?: ContainerImage[]; images?: ContainerImage[] }>('/api/v1/images', '/api/images', {
         signal,
@@ -1001,6 +1021,28 @@ export const api = {
       { method: 'DELETE' },
     ),
   },
+  inferenceRouting: {
+    list: async (signal?: AbortSignal) => {
+      const data = await request<{ items: InferenceRoutingRule[] }>(
+        '/api/v1/inference-routing-rules', { signal },
+      )
+      return data.items
+    },
+    save: (rule: InferenceRoutingRule) =>
+      request<InferenceRoutingRule>('/api/v1/inference-routing-rules', {
+        method: 'PUT',
+        body: JSON.stringify(rule),
+      }),
+    remove: (sourceIp: string, requestedModel: string) => {
+      const query = new URLSearchParams({
+        source_ip: sourceIp,
+        requested_model: requestedModel,
+      })
+      return request<void>(`/api/v1/inference-routing-rules?${query}`, {
+        method: 'DELETE',
+      })
+    },
+  },
   settings: {
     get: (signal?: AbortSignal) => requestWithFallback<AppSettings>('/api/v1/settings', '/api/settings', { signal }),
     update: async (settings: AppSettings) => {
@@ -1014,8 +1056,8 @@ export const api = {
     clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
   },
   updates: {
-    overview: (signal?: AbortSignal) => request<SystemUpdateOverview>(
-      '/api/v1/system-update', { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
+    overview: (signal?: AbortSignal, refresh = false) => request<SystemUpdateOverview>(
+      `/api/v1/system-update${refresh ? '?refresh=true' : ''}`, { signal }, SYSTEM_UPDATE_OVERVIEW_TIMEOUT_MS,
     ),
     start: (revision: string) => request<SystemUpdateJob>('/api/v1/system-update', {
       method: 'POST',

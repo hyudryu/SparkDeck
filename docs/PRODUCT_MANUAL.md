@@ -42,6 +42,23 @@ For a first installation, start with the [two-node QuickStart](../QUICKSTART.md)
 - **Node-targeted work:** downloads, image pulls, deployments, and model-weight transfers are assigned to explicit nodes.
 - **Local-first data:** operational state, settings, credentials, prompts, responses, and detailed benchmark history stay on the systems you control. Community sharing is optional and separately disclosed.
 
+### Automatic conversation routing
+
+For replicated and grouped-sharded deployments, SparkDeck automatically prefers
+the engine group that successfully handled an earlier matching conversation
+prefix. OpenAI-compatible chat harnesses do not need to send a session ID.
+New conversations use load balancing; shared system instructions, AGENTS.md,
+and tool definitions alone do not establish affinity. Later turns must extend
+a complete previously served prompt and contain assistant history. Tool and
+leading-message changes invalidate the match rather than imply a cache hit.
+
+Affinity yields when the preferred group has more than two additional active
+requests compared with the least-loaded group, and normal failover remains in
+effect. Hints contain hashes, expire after 30 minutes of inactivity, and reset
+on controller restart or tracked deployment changes. They predict cache
+locality, not guaranteed engine cache residency. Plain text completions and
+requests without usable conversation history retain ordinary load balancing.
+
 ## Dashboard
 
 The Dashboard is the cluster command center. It summarizes the current entry node and every paired node without combining per-machine telemetry into misleading cluster totals.
@@ -201,6 +218,33 @@ Use it to:
 
 An image pull is not the same as a Hugging Face model download. Runtime images contain serving software; model weights are managed through Explore, Models, and Storage.
 
+### Create a patched image
+
+Choose **Create patched image**, select a base image or enter its registry reference,
+and give the result a new explicit tag such as `sparkdeck/qwen-dflash:patch-v1`.
+Select every node that will run the image. Upload a UTF-8 Python file or paste its
+contents, and enter the absolute file destination inside the container. Add more
+files if needed, then choose **Build patched image**. Limits are 16 files, 1 MiB
+per file, and 4 MiB total.
+
+SparkDeck adds or replaces these files without running the uploaded code during
+the build. Only use code you trust: it executes when the runtime imports it.
+The builder verifies each file's contents before publishing the new tag. All
+selected nodes must resolve the same base image; differing cached versions fail
+with an error instead of silently producing different runtime code. Existing
+output tags are never overwritten. Use a new tag for each patch revision.
+
+Build history shows per-node results, logs, and file hashes and survives page
+refreshes. Uploaded source is not included in history; keep your original patch
+files. If a build partly succeeds, inspect the node results before retrying with
+a new tag. A SparkDeck restart interrupts build tracking and reports that state.
+
+Once every selected node succeeds, enter the resulting tag in the deployment's
+image field under Models and select those nodes. A baked-in patch does not need
+a host runtime-file mount. Container mounts can still hide image files at their
+mount destinations. Agents can use the same workflow through
+`create_patched_image` and `list_image_patch_builds`.
+
 ## Storage
 
 Storage is SparkDeck's opt-in Virtual NAS for complete Hugging Face cache entries.
@@ -258,11 +302,13 @@ Update the whole cluster to the immutable commit currently at `origin/main`. Spa
 
 ## Logs
 
-Logs shows redacted application and runtime activity from the controller's SparkDeck service. Opening the UI through a joined worker still forwards this request to the controller; it does not show that worker's local service logs.
+Logs shows deployment launches, shutdowns, crashes, and errors from the controller's SparkDeck service. Routine requests, debug messages, and warnings are omitted. Opening the UI through a joined worker still forwards this request to the controller; it does not show that worker's local service logs.
 
 ![Logs with illustrative application and runtime events](screenshots/manual/logs-dark.png)
 
-Use the free-text search and severity selector to narrow the list. Refresh to fetch new entries and **Export** to download the visible diagnostic set. Review an export before sharing it even though SparkDeck redacts recognized secrets.
+Use the free-text search and event selector to narrow the list to deployment activity or errors. The list refreshes every five seconds; **Refresh** fetches the current entries immediately and **Export** downloads only the visible entries. Review an export before sharing it even though SparkDeck redacts recognized secrets.
+
+Lifecycle monitoring continues while this page is closed. Events reflect observed deployment state changes, so very short transitions between checks can be missed. Recent events are held in memory and reset when the controller restarts. For full container output, open a deployment's own logs from Models.
 
 ## Mobile navigation
 

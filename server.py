@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from http import HTTPStatus
 
 from fastapi import (
     FastAPI, HTTPException, Query, Request, Response, WebSocket,
@@ -23,7 +24,9 @@ import httpx
 import jwt
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
-from manager import Manager, ClientAbort, FanSettingsConflict
+from manager import (
+    Manager, ClientAbort, FanSettingsConflict, SourceRoutingUnavailable,
+)
 from cluster import (
     AGENT_PROTOCOL_VERSION,
     COORDINATOR_ID_HEADER,
@@ -37,6 +40,8 @@ from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
 )
+from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
@@ -54,17 +59,21 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.updater import CONFIRMATION, UpdateService
+from sparkdeck.image_patch_jobs import ImagePatchJobs
+from sparkdeck.image_patches import valid_base_image_identity
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
 
 ROOT = Path(__file__).parent
 manager = Manager(data_dir=ROOT / "data")
 sparkdeck = SparkDeckService(manager, data_dir=ROOT / "data")
 benchmark_runner = BenchmarkRunnerService(manager, sparkdeck, data_dir=ROOT / "data")
+sparkdeck._startup_benchmark_busy = lambda: benchmark_runner.active_run() is not None
 onboarding = OnboardingService(
     manager, data_dir=ROOT / "data", port=7878,
     revoke_community_consent=sparkdeck.revoke_community_membership,
 )
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
+image_patch_jobs = ImagePatchJobs(manager, ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
     ControllerClient("http://127.0.0.1:7878"),
@@ -127,19 +136,73 @@ async def _guard_stream(stream, watcher: asyncio.Task):
         async for chunk in stream:
             yield chunk
     finally:
-        watcher.cancel()
+        try:
+            await close_async_stream(stream)
+        finally:
+            watcher.cancel()
 
 # ---------- in-memory server log buffer ----------
 MAX_LOG_LINES = 5000
 _log_buffer: deque[str] = deque(maxlen=MAX_LOG_LINES)
+# Activity entries can carry up to 16 KiB of response body each, so a count
+# bound alone would let an unauthenticated caller inflate controller memory.
+# Retain by a total-byte budget in addition to an entry-count cap.
+MAX_ACTIVITY_BYTES = 4 * 1024 * 1024
+_activity_buffer: deque[dict] = deque()
+_activity_sizes: deque[int] = deque()
+_activity_bytes = 0
+
+
+def _push_activity(entry: dict) -> None:
+    """Append to the activity buffer honoring both count and byte budgets."""
+    global _activity_bytes
+    size = len(json.dumps(entry, default=str))
+    _activity_buffer.append(entry)
+    _activity_sizes.append(size)
+    _activity_bytes += size
+    while _activity_buffer and (
+        _activity_bytes > MAX_ACTIVITY_BYTES or len(_activity_buffer) > MAX_LOG_LINES
+    ):
+        _activity_buffer.popleft()
+        _activity_bytes -= _activity_sizes.popleft()
 
 
 class _DequeHandler(logging.Handler):
     """Appends formatted log records to the in-memory deque."""
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Uvicorn records may reach this handler directly and through root.
+            if getattr(record, "_sparkdeck_captured", False):
+                return
+            record._sparkdeck_captured = True
             msg = _redact_log(self.format(record))
             _log_buffer.append(msg)
+            event = getattr(record, "deployment_event", None)
+            if record.levelno >= logging.ERROR or event in {
+                "launched", "stopped", "crashed",
+            }:
+                # Keep a separate buffer so routine traffic cannot evict events.
+                formatter = self.formatter or logging.Formatter()
+                entry = {
+                    "timestamp": formatter.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+                    "level": record.levelname.lower(),
+                    "source": record.name,
+                    "message": _redact_log(record.getMessage()),
+                }
+                if record.levelno >= logging.ERROR:
+                    details = dict(getattr(record, "error_details", None) or {
+                        "kind": "error", "message": record.getMessage(),
+                    })
+                    if record.exc_info:
+                        details["exception"] = {
+                            "type": record.exc_info[0].__name__,
+                            "message": str(record.exc_info[1]),
+                            "traceback": formatter.formatException(record.exc_info),
+                        }
+                    entry["details"] = _redact_log_value(details)
+                if event in {"launched", "stopped", "crashed"}:
+                    entry["event"] = event
+                _push_activity(entry)
         except Exception:
             pass
 
@@ -167,16 +230,115 @@ def _redact_log(message: str) -> str:
     return redacted
 
 
+_LOG_PRIVATE_KEYS = {
+    "authorization", "proxyauthorization", "cookie", "setcookie", "token",
+    "apikey", "accesstoken", "refreshtoken", "idtoken", "hftoken", "agenttoken",
+    "huggingfacehubtoken", "password", "secret", "clientsecret", "input",
+}
+
+
+def _redact_log_value(value, depth=0):
+    """Preserve JSON structure without credentials or echoed validation input."""
+    if depth >= 12:
+        return "[Nested details omitted]"
+    if isinstance(value, dict):
+        return {
+            _redact_log(str(key)): (
+                "[REDACTED]" if re.sub(r"[^a-z0-9]", "", str(key).lower()) in _LOG_PRIVATE_KEYS
+                else _redact_log_value(item, depth + 1)
+            ) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_log_value(item, depth + 1) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_log(str(value))
+
+
+class _ErrorResponseLogMiddleware:
+    """Observe failed ASGI responses without consuming or buffering their streams."""
+    MAX_BODY_BYTES = 16 * 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        status = None
+        body = bytearray()
+        total = 0
+        complete = False
+        content_type = ""
+        exception = None
+
+        async def capture(message):
+            nonlocal status, total, complete, content_type
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                content_type = dict(message.get("headers", [])).get(b"content-type", b"").decode("latin-1")
+            elif message["type"] == "http.response.body" and status is not None and status >= 400:
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                body.extend(chunk[:max(0, self.MAX_BODY_BYTES - len(body))])
+                complete = not message.get("more_body", False)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        except Exception:
+            exception = sys.exc_info()
+            if status is None:
+                status = 500
+            raise
+        finally:
+            if status is not None and (status >= 400 or exception):
+                response = None
+                if body:
+                    if total > self.MAX_BODY_BYTES or not complete:
+                        # Partial JSON can split credentials before redaction can
+                        # recognize them. Report the omission rather than a prefix.
+                        response = "[Response body omitted: truncated or incomplete]"
+                    elif "json" in content_type or content_type.startswith("text/"):
+                        response = body.decode("utf-8", errors="replace")
+                        try:
+                            response = json.loads(response)
+                        except (ValueError, RecursionError):
+                            pass
+                    else:
+                        response = "[Non-text response body omitted]"
+                elif exception and status == 500:
+                    response = "Internal Server Error"
+                try:
+                    reason = HTTPStatus(status).phrase
+                except ValueError:
+                    reason = "HTTP error"
+                details = {
+                    "kind": "http_error", "method": scope.get("method", ""),
+                    "path": scope.get("path", ""), "status": status,
+                    "reason": reason, "response": response,
+                    "response_truncated": total > self.MAX_BODY_BYTES,
+                }
+                if isinstance(response, dict):
+                    details["detail"] = response.get("detail", response.get("error"))
+                logging.getLogger("sparkdeck.http").error(
+                    "%s %s returned %s %s", details["method"], details["path"], status, reason,
+                    extra={"error_details": details}, exc_info=exception,
+                )
+
+
 def _install_log_capture():
     """Route Python logging + uvicorn access logs into the in-memory buffer."""
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
         datefmt="%H:%M:%S",
     )
-    handler = _DequeHandler()
+    root_logger = logging.getLogger()
+    handler = next((item for item in root_logger.handlers if isinstance(item, _DequeHandler)), None)
+    if handler is None:
+        handler = _DequeHandler()
     handler.setFormatter(fmt)
     # Capture all loggers
-    root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
     # Also capture uvicorn access logs
@@ -188,15 +350,45 @@ def _install_log_capture():
 _install_log_capture()
 
 
+async def _deployment_log_loop():
+    """Observe lifecycle changes even when no dashboard or Logs tab is open."""
+    last_error = None
+    while True:
+        try:
+            await sparkdeck.deployments(observe_events=True)
+            last_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A repeated discovery outage should produce one actionable error.
+            message = str(exc)
+            if message != last_error:
+                logging.getLogger("sparkdeck.lifecycle").error(
+                    "Could not refresh deployment activity: %s", message,
+                )
+                last_error = message
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
         uploader = asyncio.create_task(community_upload_loop())
+        deployment_logs = asyncio.create_task(_deployment_log_loop())
+        startup_benchmark_monitor = StartupBenchmarkMonitor(sparkdeck)
+        sparkdeck.register_consent_canceller(startup_benchmark_monitor.cancel_active)
+        startup_benchmarks = asyncio.create_task(startup_benchmark_monitor.run())
         try:
             yield
         finally:
             uploader.cancel()
+            deployment_logs.cancel()
+            startup_benchmarks.cancel()
+            await asyncio.gather(startup_benchmarks, return_exceptions=True)
+            await manager.virtual_nas.stop_dispatcher()
+            await updater.close()
+            await asyncio.gather(deployment_logs, return_exceptions=True)
             await sparkdeck.close()
             await manager.stop()
 
@@ -273,6 +465,9 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     return response
 
+
+# Wrap forwarding and security middleware so their errors are captured too.
+app.add_middleware(_ErrorResponseLogMiddleware)
 
 def _require_agent(request: Request) -> None:
     authorization = request.headers.get("authorization", "")
@@ -465,6 +660,12 @@ async def get_stats():
 async def get_inference_queue():
     """Controller-side vLLM admission state, keyed by deployment/container."""
     return manager.inference_admission()
+
+
+@app.post("/api/inference-queue/reset")
+async def reset_inference_queue():
+    """Clear all admission slots to recover a queue stuck on ghost slots."""
+    return manager.reset_inference_admission()
 
 
 DASHBOARD_STREAM_INTERVAL_SECONDS = 2.0
@@ -823,6 +1024,37 @@ async def agent_update_routeros_fan(req: Request):
         raise HTTPException(502, str(exc)) from exc
 
 
+async def _image_patch_body(req: Request):
+    try:
+        # JSON can escape each UTF-8 text byte into six bytes.
+        body = await read_limited_json(req, 25 * 1024 * 1024)
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return body
+    except RequestBodyTooLarge as exc:
+        raise HTTPException(413, "Patch upload is too large") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agent/images/patch-builds", status_code=202)
+async def agent_start_image_patch(req: Request):
+    _require_agent(req)
+    try:
+        return await image_patch_jobs.start(await _image_patch_body(req), agent=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/agent/images/patch-builds/{job_id}")
+async def agent_image_patch_status(job_id: str, req: Request):
+    _require_agent(req)
+    try:
+        return image_patch_jobs.get(job_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.post("/api/agent/images/pull")
 async def agent_pull_image(req: Request):
     _require_agent(req)
@@ -1151,11 +1383,16 @@ async def agent_inference_health(req: Request):
         raise HTTPException(400, "model is required")
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
+    strict_health = body.get("strict_health") is True
     try:
         ready = await manager.inference_target_health(
             model, container_name=container_name, deployment_id=deployment_id,
+            **({"strict_health": True} if strict_health else {}),
         )
-        return {"ready": ready, "model": model}
+        return {
+            "ready": ready, "model": model,
+            **({"health_status": 200 if ready else None} if strict_health else {}),
+        }
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -1174,6 +1411,7 @@ async def agent_inference(endpoint: str, req: Request):
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
     caller_ip = _normalized_caller_ip(body.pop("_sparkdeck_caller_ip", None))
+    startup_benchmark = bool(body.pop("_sparkdeck_startup_benchmark", False))
     cancel = asyncio.Event()
     watcher = _watch_disconnect(req, cancel)
     stream = False
@@ -1182,13 +1420,13 @@ async def agent_inference(endpoint: str, req: Request):
             await manager._vllm_chat(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             if endpoint == "chat/completions"
             else await manager._vllm_completions(
                 model, body, bool(body.get("stream")), cancel,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
         )
         stream = hasattr(result, "__aiter__")
@@ -1351,6 +1589,7 @@ async def agent_create_container(req: Request):
             gpu_memory_utilization=body.get("gpu_memory_utilization"),
             gpu_memory_gb=body.get("gpu_memory_gb"),
             environment=body.get("environment"),
+            runtime_file_mounts=body.get("runtime_file_mounts"),
             extra_args=body.get("extra_args") or [],
             name=body.get("name"),
             image=body.get("image"),
@@ -1408,6 +1647,27 @@ async def agent_remove_container(name: str, req: Request):
         return await manager.remove_cluster_member(name)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/agent/containers/{name}/state")
+async def agent_container_state(name: str, req: Request, check_ready: bool = False):
+    await _require_managed_agent_container(name, req)
+    container = await manager._container_by_name(name)
+    if container is None:
+        raise HTTPException(404, "managed container not found")
+    ready = None
+    if check_ready:
+        ready = container.get("status") == "running" and await manager._check_ready(
+            container, strict_health=True,
+        )
+    state = {"name": name, "status": container.get("status"), "ready": ready}
+    # Report the names observed on this container, not pending launch settings.
+    # Targeted routing needs these to address the currently running engine.
+    if isinstance(container.get("served_models"), list):
+        state["served_models"] = list(container["served_models"])
+    if container.get("served_model"):
+        state["served_model"] = container["served_model"]
+    return state
 
 
 @app.get("/api/agent/containers/{name}/logs")
@@ -1910,7 +2170,7 @@ def _v1_image_item(raw: dict, containers: list[dict]) -> dict:
         "tag": tag,
         "created_at": raw.get("created"),
         "runtimes": runtimes,
-        "in_use": raw.get("id") in used_images or any(
+        "in_use": raw.get("id") in used_images or raw.get("full_id") in used_images or any(
             image in used_images for image in tags
         ),
     }
@@ -1918,11 +2178,43 @@ def _v1_image_item(raw: dict, containers: list[dict]) -> dict:
 
 async def _v1_image_inventory() -> dict:
     inventory = await manager.cluster_image_inventory()
+    # Independent builds can have different Docker creation metadata and IDs.
+    # Only group actual immutable IDs verified by the same completed build;
+    # a tag alone never establishes identity after retagging/rebuilding.
+    verified = {}
+    for job in image_patch_jobs.verified_images():
+        if job.get("status") != "succeeded" or not job.get("files"):
+            continue
+        nodes = job.get("nodes") or []
+        base_ids = {node.get("base_id") for node in nodes}
+        identities = [node.get("base_identity") for node in nodes]
+        same_base = (
+            all(valid_base_image_identity(identity) for identity in identities) and len(set(identities)) == 1
+            if any(identity is not None for identity in identities) else len(base_ids) == 1
+        )
+        if not same_base or not all(
+            node.get("status") == "succeeded"
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("image_id") or ""))
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(node.get("base_id") or ""))
+            for node in nodes
+        ):
+            continue
+        for node in nodes:
+            verified.setdefault((node["node_id"], node["image_id"], job["image"]), job)
     merged: dict[str, dict] = {}
     for result in inventory["results"]:
         node = result["node"]
         for raw in result["images"]:
             item = _v1_image_item(raw, result["containers"])
+            patch_job = next((verified[(node["id"], raw.get("full_id"), tag)]
+                              for tag in raw.get("tags") or []
+                              if (node["id"], raw.get("full_id"), tag) in verified), None)
+            if patch_job:
+                item = _v1_image_item({**raw, "id": "patch-build:" + patch_job["id"],
+                                       "tags": [patch_job["image"]]}, result["containers"]) | {
+                    "in_use": item["in_use"], "full_id": None,
+                    "patch_build_id": patch_job["id"], "node_image_ids": {},
+                }
             key = str(item.get("id") or (item.get("tags") or [""])[0])
             if not key:
                 continue
@@ -1932,6 +2224,8 @@ async def _v1_image_inventory() -> dict:
             current["in_use"] = bool(current.get("in_use") or item.get("in_use"))
             current["node_ids"].append(node["id"])
             current["selected_nodes"].append(node)
+            if patch_job:
+                current["node_image_ids"][node["id"]] = raw["full_id"]
     return {
         "items": list(merged.values()),
         "partial": inventory["partial"],
@@ -1941,6 +2235,19 @@ async def _v1_image_inventory() -> dict:
 
 async def _v1_image_items() -> list[dict]:
     return (await _v1_image_inventory())["items"]
+
+
+@app.get("/api/v1/images/patch-builds")
+async def v1_image_patch_builds():
+    return image_patch_jobs.list()
+
+
+@app.post("/api/v1/images/patch-builds", status_code=202)
+async def v1_start_image_patch_build(req: Request):
+    try:
+        return await image_patch_jobs.start(await _image_patch_body(req))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/v1/images")
@@ -2012,6 +2319,11 @@ async def v1_remove_image(image_id: str):
     if selected.get("in_use"):
         raise HTTPException(409, "image is used by a deployment")
     try:
+        if selected.get("node_image_ids"):
+            return await manager.remove_image_on_nodes(
+                image_id, selected.get("node_ids") or [],
+                node_image_ids=selected["node_image_ids"],
+            )
         return await manager.remove_image_on_nodes(image_id, selected.get("node_ids") or [])
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
@@ -2211,6 +2523,56 @@ async def v1_deployments():
     return {"items": await sparkdeck.deployments()}
 
 
+@app.get("/api/v1/inference-routing-rules")
+async def v1_inference_routing_rules():
+    try:
+        return {"items": sparkdeck.source_ip_routing_rules()}
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.put("/api/v1/inference-routing-rules")
+async def v1_upsert_inference_routing_rule(req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be an object")
+    allowed = {
+        "source_ip", "requested_model", "enabled", "deployment_id",
+        "instance_id", "node_ids",
+    }
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise HTTPException(400, f"unsupported field(s): {', '.join(unknown)}")
+    try:
+        return await sparkdeck.upsert_source_ip_routing_rule(body)
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/v1/inference-routing-rules")
+async def v1_delete_inference_routing_rule(
+    source_ip: str = Query(...), requested_model: str = Query(...),
+):
+    try:
+        deleted = sparkdeck.delete_source_ip_routing_rule(
+            source_ip, requested_model,
+        )
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not deleted:
+        raise HTTPException(404, "source-IP routing rule was not found")
+    return {"ok": True}
+
+
 @app.post("/api/v1/runtime-flags/preview")
 async def v1_runtime_flags_preview(req: Request):
     """Preview the exact editable argv after backend normalization."""
@@ -2266,7 +2628,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         raise HTTPException(400, "request body must be an object")
     allowed = {
         "extra_args", "command_flags", "launch_controls",
-        "environment",
+        "environment", "runtime_file_mounts",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_mem_fraction",
         # Hook-backed env-file cards accept their file-backed contract; which
@@ -2274,8 +2636,9 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         "served_model_name", "env_file_mtime",
         # Saved-deployment bookmarks (never launched) accept the creator-form
         # contract; which keys apply is decided per record in the service.
-        "alias", "context_length", "tensor_parallel_size", "parallel_slots",
+        "alias", "context_length", "tensor_parallel_size", "instances", "parallel_slots",
         "gpu_layers", "quantization", "artifact", "image", "node_ids", "deployment_mode",
+        "model",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -2512,6 +2875,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
 
 
 _APP_SETTING_DEFAULTS = {
+    "max_concurrent_prompt_processing": 1,
     "theme": "system",
     "default_runtime": "vllm",
     "default_context_length": 8192,
@@ -2553,7 +2917,14 @@ async def v1_update_settings(req: Request):
         raise HTTPException(400, "default_context_length must be an integer") from e
     if not 256 <= default_context_length <= 10_000_000:
         raise HTTPException(400, "default_context_length must be between 256 and 10000000")
+    prompt_limit = body.get(
+        "max_concurrent_prompt_processing",
+        sparkdeck.store.get_setting("max_concurrent_prompt_processing", 1),
+    )
+    if type(prompt_limit) is not int or prompt_limit < 1:
+        raise HTTPException(400, "max_concurrent_prompt_processing must be a positive integer")
     values = {
+        "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
         "default_runtime": default_runtime,
         "default_context_length": default_context_length,
@@ -2568,6 +2939,7 @@ async def v1_update_settings(req: Request):
                 raise HTTPException(400, "hf_token is not valid")
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
+    sparkdeck.prompt_gate.refresh()
     if credential:
         await manager.update_settings({"hf_token": credential})
     values["vllm_image"] = manager.settings.get("vllm_image")
@@ -2697,8 +3069,8 @@ async def update_routeros_fan(node_id: str, req: Request):
 
 
 @app.get("/api/v1/system-update")
-async def system_update_overview():
-    return await updater.overview()
+async def system_update_overview(refresh: bool = False):
+    return await updater.overview(refresh=refresh)
 
 
 @app.post("/api/v1/system-update", status_code=202)
@@ -3979,6 +4351,8 @@ async def v1_chat_completions(req: Request):
     except ClientAbort:
         # Client left; upstream request was aborted too. Nothing to send.
         return Response(status_code=499)
+    except SourceRoutingUnavailable as e:
+        raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except TimeoutError as e:
@@ -4016,6 +4390,8 @@ async def v1_completions(req: Request):
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         return Response(status_code=499)
+    except SourceRoutingUnavailable as e:
+        raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except TimeoutError as e:
@@ -4037,6 +4413,12 @@ async def v1_completions(req: Request):
 
 
 # ---------- server logs ----------
+@app.get("/api/v1/logs")
+async def get_activity_logs(tail: int = 500):
+    """Deployment lifecycle events and errors, without routine server traffic."""
+    return {"entries": list(_activity_buffer)[-max(1, min(tail, MAX_LOG_LINES)):]}
+
+
 @app.get("/api/server-logs")
 async def get_server_logs(tail: int = 500):
     """Return the most recent server log lines from the in-memory buffer."""
@@ -4137,6 +4519,9 @@ async def _serve_application() -> None:
         log_level="info",
         timeout_graceful_shutdown=10,
     ))
+
+    # Config applies Uvicorn logging and replaces its logger handlers.
+    _install_log_capture()
 
     async def watch_launcher_shutdown() -> None:
         while not instance.should_exit:

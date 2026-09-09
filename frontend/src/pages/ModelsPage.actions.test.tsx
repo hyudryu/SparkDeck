@@ -105,6 +105,78 @@ function renderPage() {
 }
 
 describe('models page vLLM deployment targets', () => {
+  it('saves runtime file mounts on a new deployment', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
+    await user.type(screen.getByLabelText('Display name'), 'Patched model')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.click(screen.getByRole('button', { name: 'Add runtime file' }))
+    await user.type(screen.getByLabelText('Host file path 1'), '/home/user/patch.py')
+    await user.type(screen.getByLabelText('Container file path 1'), '/opt/runtime/model.py')
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === '/api/v1/deployments' && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body)).settings.runtime_file_mounts).toEqual([
+        { source: '/home/user/patch.py', target: '/opt/runtime/model.py' },
+      ])
+    })
+  })
+
+  it('loads saved file mounts, clears them from a fresh creator, and saves removal', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments' && !init?.method) {
+        return new Response(JSON.stringify({ items: [{ ...runningDeployment, status: 'saved', settings: {
+          ...runningDeployment.settings,
+          runtime_file_mounts: [{ source: '/home/user/patch.py', target: '/opt/runtime/model.py' }],
+        } }] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Edit Chat model' }))
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    expect(screen.getByLabelText('Host file path 1')).toHaveValue('/home/user/patch.py')
+    expect(screen.getByLabelText('Container file path 1')).toHaveValue('/opt/runtime/model.py')
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByRole('button', { name: 'Create deployment' }))
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByRole('button', { name: 'Edit Chat model' }))
+    await user.click(screen.getByRole('button', { name: 'Remove runtime file mount 1' }))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(JSON.parse(String(request?.[1]?.body)).runtime_file_mounts).toEqual([])
+    })
+  })
+
+  it.each(['sglang', 'external'])('omits file mounts when switching to %s', async (runtime) => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
+    await user.type(screen.getByLabelText('Display name'), 'Other runtime')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/model')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.click(screen.getByRole('button', { name: 'Add runtime file' }))
+    if (runtime === 'external') {
+      await user.click(screen.getByRole('checkbox', { name: /Connect an existing endpoint/ }))
+      await user.type(screen.getByLabelText('Endpoint URL'), 'http://node:8000')
+    } else {
+      await user.selectOptions(screen.getByLabelText('Runtime'), runtime)
+    }
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === '/api/v1/deployments' && init?.method === 'POST')
+      expect(request).toBeDefined()
+      expect(JSON.parse(String(request?.[1]?.body)).settings).not.toHaveProperty('runtime_file_mounts')
+    })
+  })
+
   it('allows remote-only tensor parallelism and submits the selected vLLM image', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -267,6 +339,75 @@ describe('models page llama.cpp pull targets', () => {
 })
 
 describe('models page running actions', () => {
+  it.each([
+    { tensor: 4, ranks: undefined, layout: 'TP4' },
+    { tensor: 2, ranks: 4, layout: 'TP2 PP2 from the backend rank count' },
+  ])('launches a $layout clone on four nodes despite its saved two-node preference', async ({ tensor, ranks }) => {
+    const user = userEvent.setup()
+    const cloned = {
+      ...runningDeployment, status: 'saved', desired_state: 'stopped',
+      managed: true, deployment_mode: 'sharded', required_node_count: 2,
+      node_ids: ['local', 'worker-1'], settings: { tensor_parallel_size: tensor },
+      parallel_rank_count: ranks,
+    }
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [cloned] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/prepare/preflight')) return preparationResponse('org/model')
+      return fallback(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+    const dialog = await screen.findByRole('dialog')
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    expect(within(dialog).getByRole('button', { name: 'Launch on 3 nodes' })).toBeDisabled()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 4 nodes' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['local', 'worker-1', 'worker-2', 'worker-3'])
+    })
+  })
+
+  it('disables nodes occupied by another group while keeping its inactive group nodes free', async () => {
+    const original = fetchMock.getMockImplementation()!
+    const target = { ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped' }
+    const occupied = { ...runningDeployment, deployment_mode: 'grouped_sharded', node_ids: ['worker-1', 'worker-2'], instances: [
+      { instance_id: 0, status: 'starting', desired_state: 'running', node_ids: ['worker-1'], node_names: ['Node 4'] },
+      { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-2'], node_names: ['Node 3'] },
+    ] }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [occupied, target] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Backup' })
+    const busyNode = within(dialog).getByRole('radio', { name: /Node 4/ })
+    expect(busyNode).toBeDisabled()
+    expect(busyNode).not.toBeChecked()
+    expect(within(dialog).getByText(/Already used by deployment Chat model/)).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeEnabled()
+  })
+
+  it('rechecks occupancy before launching when another deployment claimed a selected node', async () => {
+    const original = fetchMock.getMockImplementation()!
+    let claimed = false
+    const target = { ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped' }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [target, ...(claimed ? [runningDeployment] : [])] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Backup' })
+    claimed = true
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Already used by deployment Chat model')
+    expect(fetchMock.mock.calls.some(([path, init]) => String(path).endsWith('/target/start') && init?.method === 'POST')).toBe(false)
+  })
   it('clones a persisted deployment and shows the generated copy name', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {
@@ -385,6 +526,50 @@ describe('models page running actions', () => {
     expect(tooltip).toHaveTextContent('Node 4')
   })
 
+  it('starts another deployment of a grouped layout on free nodes only', async () => {
+    const user = userEvent.setup()
+    const groupedRunning = {
+      ...runningDeployment,
+      alias: 'TP2 production',
+      status: 'running',
+      deployment_mode: 'grouped_sharded',
+      instance_node_count: 2,
+      required_node_count: 4,
+      node_ids: ['worker-1', 'worker-2'],
+    }
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') return new Response(JSON.stringify({ items: [groupedRunning] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/model-cache') return new Response(JSON.stringify(modelCache), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/recipes') return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/onboarding') return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path === '/api/v1/settings') return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(groupedRunning), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('TP2 production')
+    await user.click(screen.getByRole('button', { name: 'More actions for TP2 production' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Start another deployment…' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add an engine group to TP2 production' })
+    // Nodes already running this deployment are visible but not selectable.
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 3/ })).toBeDisabled()
+    expect(within(dialog).getAllByText(/Already running this deployment/).length).toBe(2)
+
+    await user.click(screen.getByRole('button', { name: 'Start on 2 nodes' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/deployments/dep-1/add_instance') && init?.method === 'POST'
+      ))
+      expect(call).toBeDefined()
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ node_ids: ['local', 'worker-3'] })
+    })
+  })
+
   it('keeps the running replica while launching on an additional node', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -427,6 +612,25 @@ describe('models page running actions', () => {
       ))
       expect(stop).toBeDefined()
     })
+  })
+
+  it.each(['stopped', 'exited'])('hides completed %s launch details while keeping Start available', async (phase) => {
+    const defaultFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [{
+          ...runningDeployment, status: 'stopped', desired_state: 'stopped',
+          launch_phase: phase, launch_message: 'Deployment stopped',
+        }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return defaultFetch(input, init)
+    })
+    renderPage()
+
+    expect(await screen.findByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(screen.getByText('stopped')).toBeInTheDocument()
+    expect(screen.queryByText('Deployment stopped')).not.toBeInTheDocument()
+    expect(screen.queryByText('Exited')).not.toBeInTheDocument()
   })
 
   it('shows a disabled Stopping button while a stop is in flight', async () => {
@@ -1535,5 +1739,253 @@ describe('deployment creator model and quantization pickers', () => {
     const quantSelect = await screen.findByRole('combobox', { name: /Quantization/ })
     expect(within(quantSelect).getByRole('option', { name: 'Q4_K_M · 807 B' })).toBeInTheDocument()
     expect(within(quantSelect).queryByRole('option', { name: /✓ Downloaded/ })).not.toBeInTheDocument()
+  })
+})
+
+
+describe('deployment group controls', () => {
+  it.each([false, true])('keeps an online group available with offline peers while respecting active reservations (%s)', async (active) => {
+    const original = fetchMock.getMockImplementation()!
+    const target = {
+      ...runningDeployment, id: 'target', alias: 'Backup', status: 'stopped', desired_state: 'stopped',
+      deployment_mode: 'grouped_sharded', node_ids: ['local', 'worker-3', 'worker-2', 'worker-1'],
+      instances: [
+        { instance_id: 0, status: 'stopped', desired_state: 'stopped', node_ids: ['local', 'worker-3'], node_names: ['Controller', 'Node 2'] },
+        { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-2', 'worker-1'], node_names: ['Node 3', 'Node 4'] },
+      ],
+    }
+    const peer = {
+      ...runningDeployment, status: 'degraded', desired_state: 'running',
+      node_ids: target.node_ids, occupied_node_ids: active ? ['local', 'worker-2', 'worker-1'] : ['worker-2', 'worker-1'],
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [peer, target] }), { headers: { 'Content-Type': 'application/json' } })
+      if (String(input) === '/api/v1/nodes') return new Response(JSON.stringify({ items: nodes.map((node) => ['worker-1', 'worker-2'].includes(node.id) ? { ...node, online: false, selectable: false } : node) }), { headers: { 'Content-Type': 'application/json' } })
+      return original(input, init)
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Backup' })
+    const healthy = within(dialog).getByRole('radio', { name: /Group 1:/ })
+    if (active) expect(healthy).toBeDisabled()
+    else {
+      expect(healthy).toBeEnabled()
+      expect(healthy).toBeChecked()
+      expect(within(dialog).getByRole('button', { name: 'Start selected group' })).toBeEnabled()
+    }
+    expect(within(dialog).getByRole('radio', { name: /Group 2:/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /All groups/ })).toBeDisabled()
+  })
+
+  it('blocks only the offline group even when there are no competing reservations', async () => {
+    const original = fetchMock.getMockImplementation()!
+    const target = { ...runningDeployment, status: 'stopped', desired_state: 'stopped', deployment_mode: 'grouped_sharded', instances: [
+      { instance_id: 0, status: 'stopped', desired_state: 'stopped', node_ids: ['local', 'worker-3'], node_names: ['Controller', 'Node 2'] },
+      { instance_id: 1, status: 'stopped', desired_state: 'stopped', node_ids: ['worker-4'], node_names: ['Node 1'] },
+    ] }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [target] }), { headers: { 'Content-Type': 'application/json' } }) : original(input, init))
+    renderPage()
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByRole('radio', { name: /Group 1:/ })).toBeEnabled()
+    expect(within(dialog).getByRole('radio', { name: /Group 2:/ })).toBeDisabled()
+    expect(within(dialog).getByText('Node 1 is unavailable')).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /All groups/ })).toBeDisabled()
+  })
+
+  const grouped = {
+    ...runningDeployment,
+    deployment_mode: 'grouped_sharded', required_node_count: 4,
+    settings: { tensor_parallel_size: 2, instances: 2 },
+    node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
+    instances: [
+      { instance_id: 0, status: 'running', desired_state: 'running', node_names: ['Controller', 'Node 4'] },
+      { instance_id: 1, status: 'running', desired_state: 'running', node_names: ['Node 3', 'Node 2'] },
+    ],
+  }
+
+  function mockGrouped(deployment: typeof grouped) {
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [deployment] }), { headers: { 'Content-Type': 'application/json' } })
+      return original(input, init)
+    })
+  }
+
+  it('shows a healthy partial deployment with its running group count and controls', async () => {
+    mockGrouped({ ...grouped, instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    expect(await screen.findByText('1 of 2 groups running')).toBeInTheDocument()
+    expect(screen.getByText('running', { exact: true })).toBeInTheDocument()
+    expect(screen.queryByText('degraded', { exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByText('Starting', { exact: true })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.getByRole('menuitem', { name: 'Start group' })).toBeEnabled()
+  })
+
+  it('keeps unexpected group degradation visible beside the running count', async () => {
+    mockGrouped({ ...grouped, status: 'degraded', instances: [grouped.instances[0], { ...grouped.instances[1], status: 'error' }] })
+    renderPage()
+    expect(await screen.findByText('1 of 2 groups running')).toBeInTheDocument()
+    expect(screen.getByText('degraded', { exact: true })).toBeInTheDocument()
+  })
+
+  it('stops only the selected group and shows its nodes', async () => {
+    const user = userEvent.setup()
+    mockGrouped(grouped)
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Stop' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Stop a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2: Node 3 \+ Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Stop selected group' }))
+    await waitFor(() => {
+      const requests = fetchMock.mock.calls.filter(([path, request]) => String(path).endsWith('/dep-1/stop') && request?.method === 'POST')
+      expect(requests).toHaveLength(1)
+      expect(JSON.parse(String(requests[0][1]?.body))).toEqual({ instance: 1 })
+    })
+  })
+
+  it('starts one saved group without requiring all four nodes', async () => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status: 'stopped', desired_state: 'stopped' })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2: Node 3 \+ Node 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ instance: 1 })
+    })
+  })
+
+  it('starts all groups explicitly so saved settings can be applied', async () => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status: 'degraded', instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('menuitem', { name: 'Start group' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /All groups/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start all groups' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/start') && init?.method === 'POST')
+      expect(request).toBeDefined()
+      expect(request?.[1]?.body).toBeUndefined()
+    })
+  })
+
+  it.each(['degraded', 'starting', 'running'])('offers Start group only in Stop dropdown while deployment is %s', async (status) => {
+    const user = userEvent.setup()
+    mockGrouped({ ...grouped, status, instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }] })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('menuitem', { name: 'Start group' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).getAllByRole('radio')).toHaveLength(2)
+    expect(within(dialog).getByRole('radio', { name: /Group 2/ })).toBeChecked()
+  })
+
+  it('allows Start group but disables adding another deployment during container preparation', async () => {
+    const user = userEvent.setup()
+    const preparing = { ...grouped, status: 'starting', launch_phase: 'pulling_image', instance_node_count: 2,
+      instances: [grouped.instances[0], { ...grouped.instances[1], status: 'stopped', desired_state: 'stopped' }],
+    }
+    mockGrouped(preparing)
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.getByRole('button', { name: 'Stop', hidden: true })).toBeDisabled()
+    expect(screen.getByRole('menuitem', { name: 'Start another deployment…' })).toBeDisabled()
+    expect(screen.getByRole('menuitem', { name: 'Start group' })).toBeEnabled()
+    await user.click(screen.getByRole('menuitem', { name: 'Start group' }))
+    expect(await screen.findByRole('dialog', { name: 'Start a group for Chat model' })).toBeInTheDocument()
+  })
+
+  it('starts both groups sequentially using the returned group states without a page reload', async () => {
+    const user = userEvent.setup()
+    const stopped = {
+      ...grouped, status: 'stopped', desired_state: 'stopped',
+      instances: grouped.instances.map((instance) => ({ ...instance, status: 'stopped', desired_state: 'stopped' })),
+    }
+    let updated = stopped
+    const started: number[] = []
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        // The catalog can still contain the pre-action probe snapshot.
+        return new Response(JSON.stringify({ items: [stopped] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/dep-1/start') && init?.method === 'POST') {
+        const { instance } = JSON.parse(String(init.body)) as { instance: number }
+        started.push(instance)
+        updated = {
+          ...updated, status: started.length === 2 ? 'running' : 'degraded', desired_state: 'running',
+          instances: updated.instances.map((group) => group.instance_id === instance
+            ? { ...group, status: 'running', desired_state: 'running' } : group),
+        }
+        return new Response(JSON.stringify({
+          ...updated, deployment_mode: undefined, required_node_count: undefined,
+          node_ids: undefined, selected_nodes: undefined,
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    let dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /Group 2/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.queryByRole('button', { name: 'Start group' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('menuitem', { name: 'Start group' }))
+    dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    expect(within(dialog).queryByRole('radio', { name: /Group 2:/ })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Group 1:/ })).toBeChecked()
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Start a group for Chat model' })).not.toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: 'More actions for Chat model' }))
+    expect(screen.queryByRole('menuitem', { name: 'Start group' })).not.toBeInTheDocument()
+    expect(started).toEqual([1, 0])
+    expect(await screen.findByText('running')).toBeInTheDocument()
+  })
+
+  it('probes again after accepting a group action with a degraded status and no launch phase', async () => {
+    const user = userEvent.setup()
+    const stopped = {
+      ...grouped, status: 'stopped', desired_state: 'stopped',
+      instances: grouped.instances.map((instance) => ({ ...instance, status: 'stopped', desired_state: 'stopped' })),
+    }
+    const accepted = {
+      ...grouped, status: 'degraded',
+      instances: [grouped.instances[0], stopped.instances[1]],
+    }
+    let actionAccepted = false
+    let followupProbes = 0
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        if (actionAccepted) followupProbes += 1
+        return new Response(JSON.stringify({ items: [actionAccepted ? accepted : stopped] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/dep-1/start') && init?.method === 'POST') {
+        actionAccepted = true
+        return new Response(JSON.stringify(accepted), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+    await user.click(await screen.findByRole('button', { name: 'More actions for Chat model' }))
+    await screen.findByRole('menuitem', { name: 'Start group' })
+    await waitFor(() => expect(followupProbes).toBeGreaterThan(0), { timeout: 3500 })
   })
 })

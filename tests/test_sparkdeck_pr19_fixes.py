@@ -54,6 +54,68 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["status"], "missing")
         self.assertEqual(result[0]["last_error"], "Docker is unavailable")
 
+    async def test_queued_saved_launch_exposes_requested_nodes_without_persisting_them(self):
+        self.service.store.add_deployment(Deployment(
+            id="saved-remote", alias="remote", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            desired_state="stopped", settings={"node_ids": ["old-worker"]},
+        ))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def select_nodes(_node_ids):
+            entered.set()
+            await release.wait()
+            raise ValueError("worker unavailable")
+
+        self.manager.selected_cluster_nodes = AsyncMock(side_effect=select_nodes)
+        launch = asyncio.create_task(self.service.deployment_action(
+            "saved-remote", "start", node_ids=["new-worker"],
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            queued = (await self.service.deployments())[0]
+            self.assertEqual(queued["status"], "starting")
+            self.assertEqual(queued["launch_phase"], "queued")
+            self.assertEqual(queued["node_ids"], ["new-worker"])
+            self.assertEqual(queued["settings"]["node_ids"], ["old-worker"])
+        finally:
+            release.set()
+            with self.assertRaisesRegex(ValueError, "worker unavailable"):
+                await launch
+
+        saved = (await self.service.deployments())[0]
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(saved["node_ids"], ["old-worker"])
+        self.assertEqual(self.service._deployment_launch_node_ids, {})
+
+    async def test_queued_saved_launch_without_override_exposes_saved_nodes(self):
+        self.service.store.add_deployment(Deployment(
+            id="saved-remote", alias="remote", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            desired_state="stopped", settings={"node_ids": ["worker"]},
+        ))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def select_nodes(node_ids):
+            self.assertEqual(node_ids, ["worker"])
+            entered.set()
+            await release.wait()
+            raise ValueError("worker unavailable")
+
+        self.manager.selected_cluster_nodes = AsyncMock(side_effect=select_nodes)
+        launch = asyncio.create_task(self.service.deployment_action("saved-remote", "start"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            queued = (await self.service.deployments())[0]
+            self.assertEqual(queued["status"], "starting")
+            self.assertEqual(queued["node_ids"], ["worker"])
+        finally:
+            release.set()
+            with self.assertRaisesRegex(ValueError, "worker unavailable"):
+                await launch
+
     def test_cluster_progress_uses_least_advanced_active_member(self):
         deployment = {
             "status": "starting",
@@ -344,13 +406,13 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.model_cache_inventory = AsyncMock(return_value=[
-            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False}]},
             {"id": "b", "models": []},
         ])
 
         await self.service.deployment_action("dep-1", "start", node_ids=["a"])
 
-        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a"])
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a"], model_revision="a" * 40)
 
     async def test_start_rejects_nodes_without_cached_weights(self):
         self.service.store.add_deployment(Deployment(
@@ -361,7 +423,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.model_cache_inventory = AsyncMock(return_value=[
-            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "a", "models": [{"model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False}]},
             {"id": "b", "models": []},
         ])
 
@@ -390,7 +452,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.model_cache_inventory = AsyncMock(return_value=[
             {"id": node_id, "models": [{
-                "model_id": "org/model", "revisions": ["main"], "partial": False,
+                "model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False,
             }]}
             for node_id in ("local", "worker-1", "worker-2")
         ])
@@ -408,6 +470,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.deployment_action.assert_awaited_once_with(
             "cluster-1", "start", ["worker-1", "local"],
+            model_revision="a" * 40,
         )
 
     async def test_start_rejects_node_selection_for_standalone_container(self):
@@ -432,8 +495,8 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.model_cache_inventory = AsyncMock(return_value=[
-            {"id": "local", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
-            {"id": "node-2", "models": [{"model_id": "org/model", "revisions": ["main"], "partial": False}]},
+            {"id": "local", "models": [{"model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False}]},
+            {"id": "node-2", "models": [{"model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False}]},
         ])
         self.manager.list_containers.return_value = [{
             "name": "cluster-1-r0-model", "model": "org/model", "engine": "vllm",
@@ -448,7 +511,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         # single local container — otherwise the health monitor would
         # resurrect the deployment.
         self.assertEqual(started["status"], "running")
-        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["local", "node-2"])
+        self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["local", "node-2"], model_revision="a" * 40)
         self.manager.start_container.assert_not_awaited()
 
     async def test_remote_relocation_adopts_manager_only_card_durably(self):
@@ -480,7 +543,7 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "worker-1", "models": [{
-                "model_id": "org/model", "revisions": ["main"], "partial": False,
+                "model_id": "org/model", "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40}, "partial": False,
             }],
         }])
         self.manager.list_containers.return_value = [{
@@ -488,7 +551,8 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             "managed": True, "status": "exited", "port": 8000,
         }]
 
-        async def relocate(*_args):
+        async def relocate(*_args, **kwargs):
+            self.assertEqual(kwargs, {"model_revision": "a" * 40})
             self.manager.deployments = [replacement]
             self.manager.list_containers.return_value = []
             return {"ok": True, "errors": [], "deployment": replacement}

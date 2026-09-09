@@ -416,6 +416,39 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_offline_stopped_ranks_do_not_reserve_confirmed_idle_online_nodes(self):
+        deployment = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": "degraded", "desired_state": "stopped",
+            "mode": "sharded", "node_ids": ["local", "worker-1", "worker-2", "worker-3"],
+            "members": [
+                {"node_id": "local", "status": "exited"},
+                {"node_id": "worker-1", "status": "exited"},
+                {"node_id": "worker-2", "status": "stopped", "node_status": "offline"},
+                {"node_id": "worker-3", "status": "stopped", "node_status": "offline"},
+            ],
+        }
+        self.manager.deployments = [deployment]
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+        listed = await self.service.deployments()
+        self.assertEqual(listed[0]["occupied_node_ids"], [])
+
+        # Active containers are never freed merely because Stop was requested.
+        deployment["members"][0]["status"] = "running"
+        listed = await self.service.deployments()
+        self.assertEqual(listed[0]["occupied_node_ids"], ["local"])
+
+        # A launch/recovery owns online idle ranks, but not disconnected nodes.
+        for status in ("launching", "starting", "stopping", "recovering"):
+            deployment["status"] = status
+            listed = await self.service.deployments()
+            self.assertEqual(listed[0]["occupied_node_ids"], ["local", "worker-1"])
+
+        # Failed inventory must fall back conservatively, not reuse stale idle data.
+        self.manager.get_state.side_effect = RuntimeError("inventory unavailable")
+        listed = await self.service.deployments()
+        self.assertNotIn("occupied_node_ids", listed[0])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.manager = FakeManager()

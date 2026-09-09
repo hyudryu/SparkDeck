@@ -32,6 +32,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
   fetchMock.mockClear()
   fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
     const path = String(input)
     if (path === '/api/v1/nodes') {
       return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -70,7 +71,7 @@ function renderPage() {
 
 const groupedDetail = {
   ...detail,
-  status: 'degraded', editable: false, controllable: true,
+  status: 'degraded', desired_state: 'running', editable: false, controllable: true,
   deployment_mode: 'grouped_sharded',
   required_node_count: 4,
   node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'],
@@ -81,9 +82,125 @@ const groupedDetail = {
 }
 
 describe('deployment object page', () => {
+  it('shows occupied nodes disabled in Run while allowing the inactive peer group nodes', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [{ ...detail, id: 'other', alias: 'Chat model', status: 'running',
+        node_ids: ['local', 'worker-1', 'worker-2', 'worker-3'], instances: [
+          { instance_id: 0, status: 'starting', node_ids: ['local', 'worker-1'], node_names: ['Controller', 'Node 2'] },
+          { instance_id: 1, status: 'stopped', node_ids: ['worker-2', 'worker-3'], node_names: ['Node 3', 'Node 4'] },
+        ],
+      }] }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).toBeDisabled())
+    expect(within(dialog).getByRole('checkbox', { name: /Controller/ })).not.toBeChecked()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 2/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 3/ })).toBeEnabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeEnabled()
+    expect(within(dialog).getAllByText(/Already used by deployment Chat model/)).toHaveLength(2)
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+    await screen.findByRole('heading', { name: 'Models destination' })
+    const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+    expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['worker-2', 'worker-3'])
+  })
+
+  it('rechecks occupancy before starting from Run and preserves the dialog on conflict', async () => {
+    const user = userEvent.setup()
+    let occupied = false
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: occupied ? [{ ...detail, id: 'other', alias: 'Chat model', status: 'running' }] : [] }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Start on 2 nodes' })).toBeEnabled())
+    occupied = true
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 2 nodes' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Already used by deployment Chat model')
+    expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')).toBe(false)
+  })
+
+  it('edits and removes runtime file mounts after a managed deployment has launched', async () => {
+    const user = userEvent.setup()
+    let mounts = [{ source: '/home/user/old.py', target: '/opt/runtime/model.py' }]
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
+      const path = String(input)
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        mounts = JSON.parse(String(init.body)).runtime_file_mounts
+      }
+      if (path === '/api/v1/deployments/dep-1' || path === '/api/v1/deployments/dep-1/settings') {
+        return new Response(JSON.stringify({ ...detail, runtime_file_mounts: mounts }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    const source = await screen.findByLabelText('Host file path 1')
+    expect(source).toHaveValue('/home/user/old.py')
+    expect(screen.getByLabelText('Container file path 1')).toHaveValue('/opt/runtime/model.py')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    await user.clear(source)
+    await user.type(source, '/home/user/fixed.py')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(mounts).toEqual([{ source: '/home/user/fixed.py', target: '/opt/runtime/model.py' }]))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
+    expect(screen.getByLabelText('Host file path 1')).toHaveValue('/home/user/fixed.py')
+    await user.click(screen.getByRole('button', { name: 'Remove runtime file mount 1' }))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(mounts).toEqual([]))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled())
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+    cleanup()
+    renderPage()
+    await screen.findByRole('button', { name: 'Add runtime file' })
+    expect(screen.queryByLabelText('Host file path 1')).not.toBeInTheDocument()
+  })
+
+  it('preserves unchanged runtime file mounts when saving runtime flags', async () => {
+    const user = userEvent.setup()
+    const mounts = [{ source: '/home/user/patch.py', target: '/opt/runtime/model.py' }]
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify({ ...detail, settings: { ...detail.settings, runtime_file_mounts: mounts } }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await screen.findByLabelText('Host file path 1')
+    await user.type(screen.getByRole('textbox', { name: /^Runtime flags/ }), ' --enable-chunked-prefill')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(request).toBeDefined()
+      const body = JSON.parse(String(request?.[1]?.body))
+      expect(body.extra_args).toContain('--enable-chunked-prefill')
+      expect(body).not.toHaveProperty('runtime_file_mounts')
+    })
+  })
+
+  it.each([
+    { kind: 'external' },
+    { has_start_hook: true },
+    { edit_mode: 'env-file' },
+    { runtime: 'sglang' },
+  ])('hides runtime file mounts for unsupported deployments: %j', async (override) => {
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify({ ...detail, ...override }), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+    await screen.findByText('Reasoning server')
+    expect(screen.queryByRole('button', { name: 'Add runtime file' })).not.toBeInTheDocument()
+  })
+
   it('starts one grouped-sharded engine group without touching the others', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -95,8 +212,8 @@ describe('deployment object page', () => {
     })
     renderPage()
 
-    expect(await screen.findByText('Instance 0')).toBeInTheDocument()
-    expect(screen.getByText('Instance 1')).toBeInTheDocument()
+    expect(await screen.findByText('Group 1')).toBeInTheDocument()
+    expect(screen.getByText('Group 2')).toBeInTheDocument()
     // The running group offers Stop; the stopped group offers Start.
     expect(screen.getByRole('button', { name: 'Stop group' })).toBeInTheDocument()
 
@@ -118,6 +235,7 @@ describe('deployment object page', () => {
       status: 'stopped', editable: false, controllable: true,
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -126,7 +244,7 @@ describe('deployment object page', () => {
     })
     renderPage()
 
-    await screen.findByText('Instance 0')
+    await screen.findByText('Group 1')
     await user.click(screen.getByRole('button', { name: 'Run' }))
 
     // TP2 x 2 instances needs all four nodes, not the TP value.
@@ -137,6 +255,7 @@ describe('deployment object page', () => {
   it('polls the detail while a stop is in flight and updates once stopped', async () => {
     let detailRequests = 0
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -189,6 +308,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
     }
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -251,6 +371,7 @@ describe('deployment object page', () => {
 
   it('preserves a custom KV cache dtype as a selectable current value', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const body = String(input) === '/api/v1/nodes'
         ? { items: nodes }
         : { ...detail, launch_controls: { ...detail.launch_controls, kv_cache_dtype: 'future_dtype' } }
@@ -265,6 +386,7 @@ describe('deployment object page', () => {
 
   it('uses SGLang KV choices and hides the unsupported llama.cpp control', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       const body = path === '/api/v1/nodes'
         ? { items: nodes }
@@ -280,6 +402,7 @@ describe('deployment object page', () => {
 
     rendered.unmount()
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       const body = path === '/api/v1/nodes'
         ? { items: nodes }
@@ -356,6 +479,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 4 },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -383,6 +507,7 @@ describe('deployment object page', () => {
       launch_controls: { ...detail.launch_controls, tensor_parallel_size: 1 },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -415,6 +540,7 @@ describe('deployment object page', () => {
       },
     }
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       if (String(input) === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -425,7 +551,35 @@ describe('deployment object page', () => {
     expect(await screen.findByLabelText('Tensor parallel size')).toHaveValue(4)
     await user.click(screen.getByRole('button', { name: 'Run' }))
     expect(await screen.findByRole('button', { name: 'Start on 2 nodes' })).toBeInTheDocument()
-    expect(screen.getByText(/TP4 is distributed across exactly 2 nodes/)).toBeInTheDocument()
+    expect(screen.getByText(/TP4 uses 4 GPU ranks distributed evenly across the selected nodes/)).toBeInTheDocument()
+  })
+
+  it.each(['vllm', 'sglang'])('allows a cloned two-node %s deployment to run TP4 on four nodes', async (runtime) => {
+    const user = userEvent.setup()
+    const cloned = {
+      ...detail, runtime, node_ids: ['local', 'worker-1'], required_node_count: 2,
+      settings: { tensor_parallel_size: 2 },
+      extra_args: runtime === 'sglang' ? ['--tp-size', '2'] : [],
+    }
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments/dep-1' && (!init?.method || init.method === 'GET')) {
+        return new Response(JSON.stringify(cloned), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    const tensor = await screen.findByLabelText(runtime === 'vllm' ? 'Tensor parallel size' : 'TP size')
+    fireEvent.change(tensor, { target: { value: '4' } })
+    await user.click(screen.getByRole('button', { name: 'Run' }))
+    const dialog = await screen.findByRole('dialog')
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 3/ }))
+    expect(within(dialog).getByRole('button', { name: 'Start on 3 nodes' })).toBeDisabled()
+    await user.click(within(dialog).getByRole('checkbox', { name: /Node 4/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start on 4 nodes' }))
+    await screen.findByRole('heading', { name: 'Models destination' })
+    const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/start') && init?.method === 'POST')
+    expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(nodes.map((node) => node.id))
   })
 
   it('recomputes the run topology from the server-persisted node set after a trimming save', async () => {
@@ -447,6 +601,7 @@ describe('deployment object page', () => {
       launch_controls: { ...fourNode.launch_controls, tensor_parallel_size: 2 },
     }
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -595,6 +750,7 @@ describe('deployment object page', () => {
 
   it('hides the model weights field for llama.cpp deployments', async () => {
     fetchMock.mockImplementation(async (input) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -646,6 +802,7 @@ describe('env-file backed deployment page', () => {
     requestedDetail: Record<string, unknown> = envFileDetail,
   ) {
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -793,6 +950,7 @@ describe('env-file backed deployment page', () => {
 
     let detailRequests = 0
     fetchMock.mockImplementation(async (input, init) => {
+    if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
       const path = String(input)
       if (path === '/api/v1/nodes') {
         return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })

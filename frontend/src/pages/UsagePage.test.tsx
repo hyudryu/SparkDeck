@@ -653,4 +653,16 @@ describe('UsagePage', () => {
     await user.click(screen.getByRole('button', { name: 'Retry' }))
     await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBeforeRetry))
   })
+
+  it('keeps IP request routing out of Usage', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/token-stats/hourly') || path.includes('/api/token-stats/daily')) return json([])
+      return json(summary)
+    }))
+    render(<UsagePage />)
+    await screen.findByLabelText('Usage overview')
+    expect(screen.queryByLabelText('Source IP')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'IP routing rules' })).not.toBeInTheDocument()
+  })
 })

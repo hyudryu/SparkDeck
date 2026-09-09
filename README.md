@@ -1,5 +1,7 @@
 # SparkDeck
 
+> **Note:** SparkDeck is still in development and may contain bugs. Contributions and bug reports are greatly appreciated!
+
 **Built by a DGX Spark GB10 cluster owner, for other DGX Spark GB10 owners.**
 
 Running one DGX Spark is straightforward. The moment I added more, the practical questions multiplied: Which models actually fit? What inference speed should I expect? Which Spark has the weights? Is every node healthy? Which runtime and configuration really wins?
@@ -7,6 +9,100 @@ Running one DGX Spark is straightforward. The moment I added more, the practical
 I built SparkDeck for my own GB10 cluster to answer those questions in one local-first interface. It brings vLLM, llama.cpp `llama-server`, and SGLang together, coordinates paired machines, stages model weights where the work will run, and records comparable performance evidence. I am sharing it so other Spark owners can spend less time coordinating machines and more time running models.
 
 The cluster stays yours. Management remains local, community sharing is opt-in, and SparkDeck never uploads prompts or generated responses.
+
+## Features
+
+Click a feature to see a cropped view of the live UI. Every screenshot is illustrative demo data, not a measured hardware claim.
+
+<details>
+<summary><strong>Deploy &amp; stop inference servers across the cluster</strong></summary>
+
+> Manage vLLM, SGLang, and llama.cpp `llama-server` deployments and easily deploy or stop them across every node.
+
+![Deployment table with running and stop actions across the cluster](docs/screenshots/readme/feature-deployments.png)
+
+_Deployments of vLLM and SGLang, each with running/stop state, across the cluster. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Monitor nodes, temperatures, memory &amp; active inference</strong></summary>
+
+> Monitor temperatures, memory, and resource usage of each node, and see active inference requests plus output/thinking speeds.
+
+![Cluster node telemetry and current inference](docs/screenshots/readme/feature-cluster-monitoring.png)
+
+_Node CPU/GPU temperature, unified memory, and session telemetry per node, plus aggregate inference rate per active engine group. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Opt-in community performance sharing</strong></summary>
+
+> Optionally opt in to shared community results for inference speeds, to compare against evidence from comparable model configurations.
+
+![Community Run Models throughput and cluster-fit evidence](docs/screenshots/readme/feature-community-speeds.png)
+
+_Community throughput and per-node/replicated cluster-fit evidence, matched by model ID, quantization, prompt-length bucket, and tensor-parallel size. Illustrative demo data; estimates are evidence, not guarantees._
+</details>
+
+<details>
+<summary><strong>Multi-group routing with load balancing</strong></summary>
+
+> Route across multiple model groups with automatic load balancing, and guide cache-friendly session placement to improve the likelihood that repeated context is reused and throughput stays high.
+
+![Deployment table with target nodes and launch recipes for grouped engines](docs/screenshots/readme/feature-routing.png)
+
+_A single TP2 model served across Group 1 and Group 2, with per-group aggregate output and thinking inference rates. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Virtual NAS for fast weight transfers</strong></summary>
+
+> Quickly transfer model weights between nodes, using a configured fabric when one is set up (e.g. a 4 TB Spark + 1 TB GX10, or when you have a NAS), without re-downloading.
+
+![Virtual NAS node storage and queue a transfer](docs/screenshots/readme/feature-virtual-nas.png)
+
+_Node storage inventory plus a queue-a-transfer form to copy model weights to selected nodes. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Usage statistics</strong></summary>
+
+> See token activity, daily trends, and per-model usage across the cluster.
+
+![Usage stats with token activity, trends, and model usage](docs/screenshots/readme/feature-usage-stats.png)
+
+_Token activity, time-range heatmap, daily trend, and per-model usage breakdown. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Docker image manager</strong></summary>
+
+> Pull and manage runtime container images, and see cluster image availability per node.
+
+![Runtime images manager and pull form](docs/screenshots/readme/feature-docker-images.png)
+
+_Pull an image to chosen nodes and see cluster image availability per node. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Test chat to measure output speed</strong></summary>
+
+> Use a built-in test chat to measure real output tok/s and verify model behavior.
+
+![Chat workspace showing output tok/s measurement](docs/screenshots/readme/feature-chat-speed.png)
+
+_Chat workspace reporting live output tok/s for the selected model. Illustrative demo data._
+</details>
+
+<details>
+<summary><strong>Hugging Face integration</strong></summary>
+
+> Use Hugging Face API keys to easily pull weights from Hugging Face onto nodes, including gated and private models.
+
+![Hugging Face API key configuration](docs/screenshots/readme/feature-huggingface.png)
+
+_Set one Hugging Face credential for gated and private models across the cluster. Illustrative demo data._
+</details>
 
 ## Documentation
 
@@ -178,7 +274,7 @@ Community inference upload JSON contains exactly `model_id`, `quantization`, `pr
 
 Community results should be treated as evidence, not a guarantee. Hardware, runtime versions, quantization, context length, concurrency, and parallelism all materially affect performance.
 
-Community inference estimates include only measurements captured while exactly one inference stream is active. C2 and higher runs remain in local benchmark history but are not contributed. SparkDeck removes output-speed outliers and uploads one current average for the signed-in user and exact model, quantization, prompt-length bucket, and tensor-parallel setting (TP1, TP2, TP4, and so on). The hosted service keeps at most one current average per signed-in user in each exact TP cohort, then averages those per-user values with equal weight, so one busy user cannot dominate the result. A fully local fallback has no account identity and uses the installation's telemetry cluster ID as the contributor proxy. Local calculations are bounded to the latest 100,000 eligible rows and the latest 256 observations per contributor and evidence dimension.
+When sharing is enabled, SparkDeck automatically benchmarks each started container after its health endpoint returns HTTP 200. The synthetic request asks for 200 output tokens at context depth 0 and concurrency 1 (C1), and records output speed in tok/s. Successful measurements join the user's local pool and update their average for the exact model, quantization, and TP size before community upload. Ordinary proxied requests retain local token accounting and no longer supply automatic community samples. Community inference estimates include only measurements captured while exactly one inference stream is active. C2 and higher runs remain in local benchmark history but are not contributed. SparkDeck removes output-speed outliers and uploads one current average for the signed-in user and exact model, quantization, prompt-length bucket, and tensor-parallel setting (TP1, TP2, TP4, and so on). The hosted service keeps at most one current average per signed-in user in each exact TP cohort, then averages those per-user values with equal weight, so one busy user cannot dominate the result. A fully local fallback has no account identity and uses the installation's telemetry cluster ID as the contributor proxy. Local calculations are bounded to the latest 100,000 eligible rows and the latest 256 observations per contributor and evidence dimension.
 
 Coordinated runs made through `benchmark_cluster_deployment` are grouped by model, context window, measured concurrency, and TP size. Open a model on **Benchmarks** to compare prompt and generation throughput at C1, C2, C5, and C10. Prompt throughput uses prompt tokens divided by measured time to first token; generation throughput uses completed tokens over the concurrent batch wall time. Runs without first-token timing and prompt-token usage remain local results and are not plotted. Only combinations that were actually measured are shown.
 
@@ -192,7 +288,7 @@ After a successful sign-in the frontend sends the Cognito ID and refresh tokens 
 
 **Sessions follow the paired node, not one browser origin.** The direct Cognito flow briefly stages tokens in that browser origin, then removes the browser copy after the backend accepts the pairing. Every SparkDeck UI restores sanitized signed-in state from its node (`GET /api/v1/community/session`). The node validates its private refresh credential and returns only status, email, and the reauthentication flag—never the Cognito subject or any token. The pool currently issues refresh tokens valid for 3650 days (the Cognito maximum).
 
-**Telemetry upload runs on every paired node.** The community API is built in — every installation talks to `https://oqft567ar3.execute-api.us-east-2.amazonaws.com`; there is no user-facing URL setting (developers and forks can point elsewhere with the `SPARKDECK_COMMUNITY_API_URL` environment variable, or set it empty to stay fully local). It accepts consented samples at `POST /v3/samples` and serves aggregates at `GET /v3/aggregates`, both authenticated with a Cognito ID token. To operate without a browser open, each paired node uses its private refresh credential solely to mint short-lived ID tokens. A background uploader ticks every 60 seconds while sharing is opted in: it posts each pending outbox sample using only the seven-field JSON contract documented above, and marks results `synced`, leaves transient failures pending, and marks definitive rejections `failed` (retryable from the Benchmarks page). Community estimates are proxied through `GET /api/v1/community/aggregates`, which authenticates server-side so hosted bearers never need to leave the node backend.
+**Telemetry upload runs on every paired node.** The community API is built in — every installation talks to `https://oqft567ar3.execute-api.us-east-2.amazonaws.com`; there is no user-facing URL setting (developers and forks can point elsewhere with the `SPARKDECK_COMMUNITY_API_URL` environment variable, or set it empty to stay fully local). It accepts consented samples at `POST /v3/samples` and serves aggregates at `GET /v3/aggregates`, both authenticated with a Cognito ID token. To operate without a browser open, each paired node uses its private refresh credential solely to mint short-lived ID tokens. A background uploader ticks every 60 seconds while sharing is opted in: it posts each pending outbox sample using only the seven-field JSON contract documented above, and marks results `synced`, leaves transient failures pending, and marks definitive rejections `failed`. Community estimates are proxied through `GET /api/v1/community/aggregates`, which authenticates server-side so hosted bearers never need to leave the node backend.
 
 **Sign-in propagates across the cluster.** After pairing locally, the controller pushes the sign-in (and later the sign-out) to every joined peer node over the cluster-private agent channel (`PUT`/`DELETE /api/agent/community-pairing`), including nodes disabled for model workloads. Propagation is best-effort and never blocks sign-in: a node that is already paired with a *different* account is never overridden — this applies to the controller itself too, which refuses the sign-in and tells you which account it holds. Conflicts and unreachable nodes are reported in **Settings → Community Features** and pick up the state on the next sign-in or sign-out. Pairing also promotes any locally queued "waiting for account" benchmark uploads so they start syncing.
 
@@ -284,7 +380,7 @@ Adjust the template if your checkout lives elsewhere. Never place tokens directl
 
 ### Cluster-wide main updates
 
-After installing the bundled user service, open **Settings → Software update** to update the cluster to the immutable commit currently at `origin/main`. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced.
+After installing the bundled user service, open **Settings → Software update** to update the cluster to the immutable commit currently at `origin/main`. An update started from any joined node is forwarded to the controller. The controller preflights the entire cluster, updates and verifies workers one at a time, and restarts itself last. Model data, local settings, credentials, untracked files, and running Docker workloads are not replaced. If a model transfer is in progress, the update stays pending until it finishes, protecting both the source and destination nodes from restarting during the transfer.
 
 Self-update never deploys an arbitrary branch or URL. Every node must use the official Git origin, have a clean tracked checkout, run the bundled service launcher (`sparkdeck.service` on Linux or the Windows launcher), and already support the update protocol. A dirty, offline, or unsupported node blocks the rollout before any node changes. A clean divergent or non-main checkout is detached at the verified main commit so its branch pointer is preserved and later updates continue tracking verified `origin/main` commits.
 

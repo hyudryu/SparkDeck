@@ -64,7 +64,13 @@ export interface CatalogResponse {
   next_cursor?: string | null
 }
 
+export interface RuntimeFileMount {
+  source: string
+  target: string
+}
+
 export interface DeploymentSettings {
+  node_ids?: string[]
   image?: string
   context_length?: number
   tensor_parallel_size?: number
@@ -81,22 +87,38 @@ export interface DeploymentSettings {
   dtype?: string
   gpu_memory_utilization?: number
   environment?: Record<string, string>
+  runtime_file_mounts?: RuntimeFileMount[]
   port?: number
   extra_args?: string[]
 }
 
 // One independent engine group of a grouped-sharded deployment.
 export interface DeploymentInstance {
+  node_ids?: string[]
+  // Current node inventory confirms a live container in this group.
+  has_live_containers?: boolean
   instance_id: number
   status: string
   desired_state: 'running' | 'stopped'
   node_names: string[]
 }
 
+export interface DeploymentReplica {
+  node_id: string
+  node_name: string
+  rank: number
+  status: string
+  desired_state: 'running' | 'stopped'
+  online: boolean
+  available: boolean
+}
+
 export interface Deployment {
   id: string
   alias: string
   model_id: string
+  served_model?: string
+  served_models?: string[]
   model_revision?: string
   runtime: RuntimeKind
   status: DeploymentStatus
@@ -112,7 +134,10 @@ export interface Deployment {
   settings: DeploymentSettings
   deployment_mode?: string
   instances?: DeploymentInstance[]
+  replicas?: DeploymentReplica[]
   required_node_count?: number
+  // Nodes one more engine group of a tensor-parallel deployment occupies.
+  instance_node_count?: number
   parallel_rank_count?: number
   flexible_node_count?: boolean
   single_host_topology_replayable?: boolean
@@ -123,6 +148,8 @@ export interface Deployment {
   last_deployed_at?: string | number
   node_ids?: string[]
   selected_nodes?: NodeSummary[]
+  // Authoritative runtime reservations; an empty array means no nodes are held.
+  occupied_node_ids?: string[]
   desired_state?: 'running' | 'stopped'
   launch_phase?: string
   launch_message?: string
@@ -181,6 +208,7 @@ export interface DeploymentSettingsEnv {
 }
 
 export interface DeploymentDetail extends Deployment {
+  runtime_file_mounts?: RuntimeFileMount[]
   editable: boolean
   edit_reason?: string | null
   edit_mode?: string | null
@@ -217,6 +245,7 @@ export interface EnvFileDeploymentUpdateInput {
 }
 
 export interface DeploymentUpdateInput {
+  runtime_file_mounts?: RuntimeFileMount[]
   model?: string
   extra_args?: string[]
   command_flags?: string
@@ -247,6 +276,7 @@ export interface SavedDeploymentUpdateInput {
   artifact?: string | null
   extra_args?: string[]
   environment?: Record<string, string>
+  runtime_file_mounts?: RuntimeFileMount[]
   gpu_memory_utilization?: number | null
   node_ids?: string[]
   deployment_mode?: 'single' | 'replicated' | 'sharded' | 'grouped_sharded' | null
@@ -590,6 +620,25 @@ export interface ContainerImage {
   selected_nodes?: NodeSummary[]
 }
 
+export interface PatchBuild {
+  persistence_warning?: string
+  id: string
+  base_image: string
+  image: string
+  created_at: string
+  status: 'queued' | 'building' | 'succeeded' | 'failed'
+  files: Array<{ target: string; sha256: string }>
+  nodes: Array<{ node_id: string; node_name: string; status: 'queued' | 'building' | 'succeeded' | 'failed'; logs: string[]; error?: string; image_id?: string; base_id?: string; base_identity?: string }>
+  error?: string
+}
+
+export interface CreatePatchBuildInput {
+  base_image: string
+  image: string
+  files: Array<{ target: string; content: string }>
+  node_ids: string[]
+}
+
 export interface ImagePullResult {
   ok: boolean
   image: string
@@ -599,6 +648,7 @@ export interface ImagePullResult {
 }
 
 export interface AppSettings {
+  max_concurrent_prompt_processing?: number
   theme?: 'system' | 'light' | 'dark'
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.
@@ -626,6 +676,7 @@ export interface SystemUpdateNode {
   local: boolean
   online: boolean
   current_revision?: string
+  commits_behind?: number | null
   phase?: string
   error?: string
   blockers: string[]
@@ -658,6 +709,8 @@ export interface SystemUpdateOverview {
 }
 
 export interface LogEntry {
+  details?: Record<string, unknown>
+  event?: 'launched' | 'stopped' | 'crashed'
   timestamp?: string
   level?: string
   source?: string
@@ -750,6 +803,14 @@ export interface ActiveRequestStats {
   admission_limit?: number
 }
 
+export interface ActiveRequestGroupStats extends ActiveRequestStats {
+  group_id: string
+  model: string
+  deployment_id: string | null
+  instance_id: number | null
+  node_names: string[]
+}
+
 export interface SystemStats {
   cpu_pct?: number | null
   cpu_logical_count?: number | null
@@ -757,11 +818,16 @@ export interface SystemStats {
   mem?: { total?: number; used?: number; available?: number; pct?: number }
   gpus?: GpuStats[]
   active_requests?: Record<string, ActiveRequestStats>
+  active_request_groups?: Record<string, ActiveRequestGroupStats>
   ts?: number
 }
 
 export interface AdmissionStats {
   model?: string
+  group_id?: string
+  deployment_id?: string | null
+  instance_id?: number | null
+  node_names?: string[]
   limit?: number | null
   effective_limit?: number
   running: number
@@ -1023,6 +1089,15 @@ export interface UsageSummary {
   total: UsageCounters
   routing_rules?: Record<string, string>
   merge_groups?: Record<string, string>
+}
+
+export interface InferenceRoutingRule {
+  source_ip: string
+  requested_model: string
+  enabled: boolean
+  deployment_id: string
+  instance_id: number | null
+  node_ids: string[]
 }
 
 export interface HourlyUsagePoint {

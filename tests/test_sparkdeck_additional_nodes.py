@@ -26,7 +26,7 @@ def weights_inventory(*node_ids: str) -> list[dict]:
             "id": node_id,
             "models": [{
                 "model_id": "org/model", "partial": False,
-                "revisions": ["main"],
+                "revisions": ["main", "a" * 40], "revision_refs": {"main": "a" * 40},
             }],
         }
         for node_id in node_ids
@@ -117,6 +117,7 @@ class AdditionalNodeLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["status"], "running")
             manager.deployment_action.assert_awaited_once_with(
                 "manager-1", "start", ["worker-1", "worker-2"], "replicated",
+                model_revision="a" * 40,
             )
             stored = service.store.deployment("record-1", include_private=True)
             self.assertEqual(stored["settings"]["node_ids"], ["worker-1", "worker-2"])
@@ -136,6 +137,7 @@ class AdditionalNodeLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             manager.deployment_action.assert_awaited_once_with(
                 "manager-1", "start", ["worker-1", "worker-2", "worker-3"],
+                model_revision="a" * 40,
             )
         finally:
             await manager.http.aclose()

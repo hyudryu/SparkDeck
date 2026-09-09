@@ -12,6 +12,8 @@ from manager import Manager
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.service import SparkDeckService, _container_last_deployed_at
 
+CACHED_REVISION = "a" * 40
+
 
 def node(node_id: str, name: str, *, local: bool = False) -> dict:
     return {
@@ -52,7 +54,9 @@ class FakeBookmarkManager:
         self.cluster_nodes = AsyncMock(return_value=self.nodes)
         self.model_cache_inventory = AsyncMock(return_value=[
             {"id": "remote-1", "models": [
-                {"model_id": "org/model", "partial": False, "revisions": ["main"]},
+                {"model_id": "org/model", "partial": False,
+                 "revisions": [CACHED_REVISION, "main"],
+                 "revision_refs": {"main": CACHED_REVISION}},
             ]},
             {"id": "local", "models": []},
         ])
@@ -65,6 +69,9 @@ class FakeBookmarkManager:
         self.queue_recipe_model_preparation = AsyncMock(return_value={
             "workflow_id": None, "job_ids": [], "jobs": [],
         })
+        self.recipe_deployment_contract = Mock(side_effect=lambda settings: {
+            "model_revision": Manager._cli_option(settings.get("extra_args") or [], {"--revision"}),
+        })
 
     async def _selected(self, node_ids):
         by_id = {item["id"]: item for item in self.nodes}
@@ -75,6 +82,7 @@ class FakeBookmarkManager:
         return [str(item) for item in args or []]
 
     # Reuse Manager's real parser so llama.cpp controls surface correctly.
+    _cli_option = staticmethod(Manager._cli_option)
     _deployment_launch_controls = Manager._deployment_launch_controls
     _deployment_served_models = Manager._deployment_served_models
     _normalize_runtime_environment = staticmethod(
@@ -545,11 +553,152 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launch["engine"], "vllm")
         self.assertEqual(launch["node_ids"], ["remote-1"])
         self.assertEqual(launch["deployment_mode"], "single")
-        self.assertEqual(launch["extra_args"], ["--max-model-len", "8192"])
+        self.assertEqual(launch["extra_args"], ["--revision", CACHED_REVISION, "--max-model-len", "8192"])
         self.assertEqual(started["node_ids"], ["remote-1"])
         stored = self.service.store.deployment("bookmark", include_private=True)
         self.assertEqual(stored["desired_state"], "running")
         self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
+
+    async def test_edited_sharded_bookmark_starts_on_all_four_nodes(self):
+        selected = ["local", "remote-1", "remote-2", "remote-3"]
+        self.manager.nodes.extend([
+            node("remote-2", "Worker 2"), node("remote-3", "Worker 3"),
+        ])
+        self.manager.model_cache_inventory.return_value = [{
+            "id": node_id, "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION],
+            }],
+        } for node_id in selected]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "resized", "runtime": "vllm",
+            "node_ids": selected[:2], "deployment_mode": "sharded",
+            "settings": {"tensor_parallel_size": 2},
+        })
+        await self.service.update_deployment_settings("resized", {
+            "launch_controls": {"tensor_parallel_size": 4},
+        })
+
+        await self.service.deployment_action("resized", "start", selected)
+
+        launch = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(launch["node_ids"], selected)
+        self.assertEqual(launch["deployment_mode"], "sharded")
+        self.assertEqual(
+            Manager._cli_option(launch["extra_args"], {"--tensor-parallel-size"}), "4",
+        )
+
+    async def test_manager_sharded_start_uses_edited_parallelism_not_saved_hosts(self):
+        selected = ["local", "remote-1", "remote-2", "remote-3"]
+        self.service.store.add_deployment(Deployment(
+            id="resized", alias="resized", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-1"},
+        ))
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "launch_settings": {
+                "engine": "vllm", "deployment_mode": "sharded",
+                "node_ids": selected[:2], "tensor_parallel_size": 2,
+                "extra_args": ["--tensor-parallel-size", "4"],
+            },
+        }]
+        self.manager.recipe_deployment_contract = lambda recipe: (
+            Manager.recipe_deployment_contract(self.manager, recipe)
+        )
+        self.manager.model_cache_inventory.return_value = [{
+            "id": node_id, "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION],
+            }],
+        } for node_id in selected]
+
+        for invalid in (selected[:3], ["local", "remote-1"] * 2):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                await self.service.deployment_action("resized", "start", invalid)
+            self.manager.deployment_action.assert_not_awaited()
+
+        for allowed in (selected, selected[:2]):
+            with self.subTest(allowed=allowed):
+                await self.service.deployment_action("resized", "start", allowed)
+                self.manager.deployment_action.assert_awaited_with(
+                    "cluster-1", "start", allowed, model_revision=CACHED_REVISION,
+                )
+
+    async def test_sharded_selection_uses_tensor_times_pipeline_parallelism(self):
+        for engine, args in (
+            ("vllm", ["--tensor-parallel-size", "2", "--pipeline-parallel-size", "2"]),
+            ("sglang", ["--tp-size", "4"]),
+        ):
+            with self.subTest(engine=engine):
+                self.manager.recipe_deployment_contract = lambda recipe: (
+                    Manager.recipe_deployment_contract(self.manager, recipe)
+                )
+                settings = {
+                    "engine": engine, "deployment_mode": "sharded",
+                    "node_ids": ["a", "b"], "extra_args": args,
+                }
+                for allowed in (["d", "c", "b", "a"], ["b", "a"]):
+                    self.assertEqual(
+                        self.service._normalized_start_selection(settings, allowed), allowed,
+                    )
+                for invalid in ([], ["a"], ["a", "b", "c"]):
+                    with self.assertRaises(ValueError):
+                        self.service._normalized_start_selection(settings, invalid)
+
+    async def test_start_selection_preserves_fixed_grouped_and_replicated_layouts(self):
+        for mode in ("grouped_sharded", "replicated"):
+            with self.subTest(mode=mode):
+                self.manager.recipe_deployment_contract = Mock(return_value={
+                    "deployment_mode": mode, "required_node_count": 4,
+                    "tensor_parallel_size": 4,
+                })
+                settings = {
+                    "engine": "vllm", "deployment_mode": mode,
+                    "node_ids": ["a", "b", "c", "d"],
+                    "extra_args": ["--tensor-parallel-size", "4"],
+                }
+                with self.assertRaises(ValueError):
+                    self.service._normalized_start_selection(settings, ["a", "b"])
+                self.assertEqual(
+                    self.service._normalized_start_selection(settings, ["d", "c", "b", "a"]),
+                    ["d", "c", "b", "a"],
+                )
+
+    async def test_gui_bookmark_start_pins_complete_snapshot_without_default_alias(self):
+        self.manager.model_cache_inventory.return_value = [{
+            "id": "remote-1", "models": [{
+                "model_id": "org/model", "partial": False,
+                "revisions": [CACHED_REVISION], "revision_refs": {},
+            }],
+        }]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "cached-bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"context_length": 256000},
+        })
+        await self.service.deployment_action("cached-bookmark", "start", ["remote-1"])
+        body = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(Manager._cli_option(body["extra_args"], {"--revision"}), CACHED_REVISION)
+        self.assertEqual(Manager._cli_option(body["extra_args"], {"--max-model-len"}), "256000")
+        stored = self.service.store.deployment("cached-bookmark", include_private=True)
+        self.assertEqual(
+            Manager._cli_option(stored["settings"]["extra_args"], {"--revision"}),
+            CACHED_REVISION,
+        )
+
+    async def test_saved_cli_pin_missing_from_cache_rejects_before_launch(self):
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "pinned-bookmark", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"extra_args": ["--revision", "b" * 40]},
+        })
+        before = self.service.store.deployment("pinned-bookmark", include_private=True)
+        with self.assertRaisesRegex(ValueError, "model weights are not available"):
+            await self.service.deployment_action("pinned-bookmark", "start", ["remote-1"])
+        self.manager.create_deployment.assert_not_called()
+        after = self.service.store.deployment("pinned-bookmark", include_private=True)
+        self.assertEqual(after["settings"], before["settings"])
 
     async def test_start_without_nodes_falls_back_to_saved_preferences(self):
         await self.service.create_deployment({
@@ -706,6 +855,25 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         await self.service.deployment_action(created["id"], "start", ["remote-1"])
         launch = self.manager.create_deployment.await_args.args[0]
         self.assertEqual(launch["environment"], updated)
+
+    async def test_runtime_file_mounts_round_trip_edit_and_launch(self):
+        mounts = [{"source": "/opt/patches/qwen3_dflash.py", "target": "/opt/vllm/qwen3_dflash.py"}]
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "mount-bookmark", "runtime": "vllm",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"runtime_file_mounts": mounts},
+        })
+        self.assertEqual(created["settings"]["runtime_file_mounts"], mounts)
+        detail = await self.service.deployment_detail(created["id"])
+        self.assertEqual(detail["runtime_file_mounts"], mounts)
+        updated = [{**mounts[0], "source": "/opt/patches/new.py"}]
+        detail = await self.service.update_deployment_settings(created["id"], {
+            "runtime_file_mounts": updated,
+        })
+        self.assertEqual(detail["runtime_file_mounts"], updated)
+        self.assertNotIn("runtime_file_mounts", self.service._safe_configuration(detail["settings"]))
+        await self.service.deployment_action(created["id"], "start", ["remote-1"])
+        self.assertEqual(self.manager.create_deployment.await_args.args[0]["runtime_file_mounts"], updated)
 
     async def test_runtime_environment_rejects_credentials_and_non_vllm_runtimes(self):
         with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
@@ -1169,6 +1337,18 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         listed = (await self.service.deployments())[0]
         self.assertEqual(listed["required_node_count"], 2)
 
+        # The Models list needs total ranks even though PP is stored inside
+        # launch_controls and the preferred saved host count remains two.
+        await self.service.update_deployment_settings("sharded-bookmark", {
+            "launch_controls": {
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 2,
+            },
+        })
+        listed = (await self.service.deployments())[0]
+        self.assertEqual(listed["required_node_count"], 2)
+        self.assertEqual(listed["parallel_rank_count"], 4)
+
         # A layout the saved nodes cannot divide requires one node per rank.
         await self.service.update_deployment_settings("sharded-bookmark", {
             "launch_controls": {
@@ -1274,6 +1454,74 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             started = await self.service.deployment_action("TP4", "start")
         self.assertEqual(started["status"], "starting")
         self.manager.create_deployment.assert_awaited()
+
+    async def test_start_releases_selector_after_all_groups_explicitly_stop(self):
+        for alias in ("TP2", "TP4"):
+            await self.service.create_deployment({
+                "model": "org/model", "alias": alias, "runtime": "vllm",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+            })
+        stopped = {
+            "id": "old-tp2", "alias": "TP2", "kind": "managed",
+            "status": "stopped", "desired_state": "running",
+            "deployment_mode": "grouped_sharded", "launch_phase": "stopped",
+            "model": {"repository": "org/model"},
+            "served_models": ["org/model"], "settings": {},
+            "instances": [
+                {"instance_id": index, "status": "stopped", "desired_state": "stopped"}
+                for index in (0, 1)
+            ],
+        }
+        with patch.object(
+            self.service, "deployments", AsyncMock(return_value=[stopped]),
+        ):
+            started = await self.service.deployment_action("TP4", "start")
+        self.assertEqual(started["status"], "starting")
+        self.manager.create_deployment.assert_awaited()
+
+    async def test_stopped_group_selector_remains_reserved_when_state_is_uncertain(self):
+        requested = {
+            "id": "new-tp4", "kind": "managed", "alias": "TP4",
+            "model": {"repository": "org/model"}, "settings": {},
+        }
+        stopped_group = {"status": "stopped", "desired_state": "stopped"}
+        stopped = {
+            "id": "old-tp2", "alias": "TP2", "kind": "managed",
+            "status": "stopped", "desired_state": "running",
+            "deployment_mode": "grouped_sharded", "launch_phase": "stopped",
+            "model": {"repository": "org/model"}, "settings": {},
+            "instances": [stopped_group, stopped_group],
+        }
+        cases = [
+            {"status": status}
+            for status in ("running", "starting", "stopping", "error", "unknown", "degraded")
+        ] + [
+            {"launch_phase": phase}
+            for phase in (None, "queued", "creating", "starting", "recovering", "checking_image")
+        ] + [
+            {"instances": instances}
+            for instances in (
+                None, [], [None], [{}],
+                [stopped_group, {"status": "stopped", "desired_state": "running"}],
+                [stopped_group, {"status": "running", "desired_state": "stopped"}],
+            )
+        ] + [{"deployment_mode": "sharded"}]
+        for changes in cases:
+            with self.subTest(changes=changes), patch.object(
+                self.service, "deployments",
+                AsyncMock(return_value=[{**stopped, **changes}]),
+            ):
+                with self.assertRaisesRegex(ValueError, "already served"):
+                    await self.service._assert_deployment_start_selectors(requested)
+        self.service._deployment_launches["old-tp2"] = object()
+        try:
+            with patch.object(
+                self.service, "deployments", AsyncMock(return_value=[stopped]),
+            ):
+                with self.assertRaisesRegex(ValueError, "already served"):
+                    await self.service._assert_deployment_start_selectors(requested)
+        finally:
+            self.service._deployment_launches.pop("old-tp2")
 
     async def test_saved_selector_updates_serialize_and_allow_same_repo_profiles(self):
         for alias in ("TP2", "TP4"):

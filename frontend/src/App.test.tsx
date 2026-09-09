@@ -794,7 +794,7 @@ describe('model deployments', () => {
         pipeline_parallel_size: 1, node_ids: ['local', 'node-2'], extra_args_count: 2,
       }] } : path.includes('/api/v1/deployments') ? { items: [{
         id: 'dep-1', alias: 'Running model', runtime: 'vllm', kind: 'managed',
-        model: { repository: 'org/model' }, status: 'running', settings: {}, node_ids: ['local', 'node-2'],
+        model: { repository: 'org/model' }, status: 'stopped', settings: {}, node_ids: ['local', 'node-2'],
       }] } : path.includes('/api/v1/nodes') ? { items: [
         { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
         { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
@@ -1198,8 +1198,8 @@ describe('model deployments', () => {
       }
       if (path.includes('/api/v1/deployments')) {
         deploymentListCalls += 1
-        if (deploymentListCalls === 2) return liveRefresh
-        const deployments = deploymentListCalls === 1 ? [] : [{
+        if (deploymentListCalls === 3) return liveRefresh
+        const deployments = deploymentListCalls <= 2 ? [] : [{
           id: 'dep-live', alias: 'Live recipe', runtime: 'sglang', kind: 'managed',
           model: { repository: 'org/model' }, status: 'running', settings: {},
           node_ids: ['local'], launch_phase: 'ready', launch_message: 'SGLang API ready',
@@ -1232,7 +1232,7 @@ describe('model deployments', () => {
     expect(within(deploymentRow).getByRole('button', { name: 'Stop' })).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent('Started deployment Live recipe on This device.')
 
-    await waitFor(() => expect(deploymentListCalls).toBe(2), { timeout: 3500 })
+    await waitFor(() => expect(deploymentListCalls).toBe(3), { timeout: 3500 })
     expect(screen.queryByText('Loading deployments')).not.toBeInTheDocument()
     expect(screen.queryByText('Refreshing deployments…')).not.toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Live recipe' })).toBeInTheDocument()
@@ -1247,7 +1247,7 @@ describe('model deployments', () => {
     expect(within(deploymentRow).getByText('Pulling Image')).toBeInTheDocument()
     expect(await within(deploymentRow).findByText(/Last inference \d+m ago/, {}, { timeout: 3500 })).toBeInTheDocument()
     expect(within(deploymentRow).queryByText('SGLang API ready')).not.toBeInTheDocument()
-    expect(deploymentListCalls).toBeGreaterThanOrEqual(3)
+    expect(deploymentListCalls).toBeGreaterThanOrEqual(4)
   })
 
   it('keeps a live deployment row stable when a background refresh fails', async () => {
@@ -1405,6 +1405,7 @@ describe('model deployments', () => {
 
   it('keeps an accepted recipe row when removal fails before the first deployment load finishes', async () => {
     const user = userEvent.setup()
+    let deploymentListCalls = 0
     let resolveInitialList: (response: Response) => void = () => undefined
     const initialList = new Promise<Response>((resolve) => { resolveInitialList = resolve })
     fetchMock.mockImplementation(async (input, init) => {
@@ -1426,7 +1427,11 @@ describe('model deployments', () => {
           status: 500, headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (path.includes('/api/v1/deployments')) return initialList
+      if (path.includes('/api/v1/deployments')) {
+        deploymentListCalls += 1
+        if (deploymentListCalls === 2) return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
+        return initialList
+      }
       const body = path.includes('/api/v1/model-cache') ? { nodes: [
         { id: 'local', name: 'Spark One', online: true, models: [{ model_id: 'org/model', size_bytes: 20, revisions: ['main'] }] },
       ] } : path.includes('/api/v1/recipes') ? { items: [{
@@ -1858,18 +1863,24 @@ describe('model deployments', () => {
     }
   })
 
-  it('switches multi-node deployment logs locally and preserves the selected node on refresh', async () => {
+  it('keeps available node logs accessible with an offline peer and preserves selection after refresh failures', async () => {
     const user = userEvent.setup()
     let logRequests = 0
     fetchMock.mockImplementation(async (input) => {
       const path = String(input)
       if (path.includes('/api/v1/deployments/dep-logs/logs')) {
         logRequests += 1
+        if (logRequests === 3) {
+          return new Response(JSON.stringify({ detail: 'Temporary log refresh failure' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          })
+        }
         return new Response(JSON.stringify({
           logs: 'combined output',
           members: [
             { node_id: 'node-2', node_name: 'Render Spark', rank: 1, logs: logRequests === 1 ? 'worker first output' : 'worker refreshed output' },
             { node_id: 'local', rank: 0, logs: 'primary output' },
+            { node_id: 'node-3', node_name: 'Offline Spark', rank: 2, logs: '', error: 'Node is offline; logs unavailable' },
           ],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -1891,7 +1902,7 @@ describe('model deployments', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Parallel model' })
     const tablist = await within(dialog).findByRole('tablist', { name: 'Deployment log nodes' })
     const tabs = within(tablist).getAllByRole('tab')
-    expect(tabs).toHaveLength(2)
+    expect(tabs).toHaveLength(3)
     expect(tabs[0]).toHaveTextContent('Control Spark')
     expect(tabs[0]).toHaveTextContent('Primary')
     expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
@@ -1899,6 +1910,10 @@ describe('model deployments', () => {
     expect(tabs[1]).toHaveTextContent('Rank 1')
     expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('primary output')
     expect(within(dialog).queryByText('worker first output')).not.toBeInTheDocument()
+
+    await user.click(tabs[2])
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('Node is offline; logs unavailable')
+    expect(within(dialog).getByRole('tabpanel')).not.toHaveTextContent('combined output')
 
     await user.click(tabs[1])
     expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
@@ -1909,7 +1924,7 @@ describe('model deployments', () => {
     await user.keyboard('{ArrowLeft}')
     expect(tabs[0]).toHaveFocus()
     expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
-    await user.keyboard('{End}')
+    await user.keyboard('{ArrowRight}')
     expect(tabs[1]).toHaveFocus()
     expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
 
@@ -1917,6 +1932,14 @@ describe('model deployments', () => {
     expect(await within(dialog).findByText('worker refreshed output')).toBeInTheDocument()
     expect(within(tablist).getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true')
     expect(logRequests).toBe(2)
+
+    await user.click(within(dialog).getByRole('button', { name: 'Refresh' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Temporary log refresh failure')
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('worker refreshed output')
+    expect(within(tablist).getAllByRole('tab')[1]).toHaveAttribute('aria-selected', 'true')
+    await user.click(within(tablist).getAllByRole('tab')[0])
+    expect(within(dialog).getByRole('tabpanel')).toHaveTextContent('primary output')
+    expect(logRequests).toBe(3)
   })
 
   it('formats recent deployment times compactly and uses a date after seven days', () => {
@@ -1961,7 +1984,7 @@ describe('model deployments', () => {
     await user.click(await screen.findByRole('button', { name: 'Start' }))
 
     const dialog = await screen.findByRole('dialog', { name: 'Start Sharded model' })
-    expect(dialog).toHaveTextContent('TP2 requires exactly 2 nodes')
+    expect(dialog).toHaveTextContent('TP2 uses 2 GPU ranks and can run on exactly 2 nodes')
     // Exactly two nodes hold complete weights, so both start selected; a
     // partial cache entry does not count as usable weights.
     expect(within(dialog).getByRole('checkbox', { name: /Spark One/ })).toBeChecked()

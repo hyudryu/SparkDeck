@@ -2,6 +2,7 @@
 import asyncio
 import codecs
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -24,6 +25,7 @@ from typing import Any
 from urllib.parse import quote
 
 import docker
+import anyio
 import httpx
 import requests
 import shutil
@@ -36,7 +38,14 @@ from cluster import (
     NodeRegistry,
 )
 from sparkdeck.onboarding import resolve_agent_connection
+from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.prefix_affinity import PrefixAffinity
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
+from sparkdeck.runtime_file_mounts import (
+    RUNTIME_FILE_MOUNTS_CAPABILITY,
+    normalize_runtime_file_mounts,
+    runtime_file_volumes,
+)
 from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
@@ -139,6 +148,7 @@ PERSISTED_DEPLOYMENT_ARGS_ERROR = (
 # ``grouped_sharded`` runs N independent sharded engine groups (each a
 # tensor-parallel-sized node group) behind one served name.
 _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
+MEMBER_LOG_TIMEOUT_SECONDS = 5.0
 # Member-label modes that run one rank of a distributed engine: host
 # networking, fabric environment, and per-rank VRAM fitting all apply.
 _SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
@@ -353,6 +363,14 @@ INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 # deployments that have not produced a usable capacity report yet; once found,
 # the result is persisted with the deployment.
 VLLM_CAPACITY_SCAN_INTERVAL_SECONDS = 5.0
+
+# A container that exits (crash, OOM kill, engine wedge) cannot run the
+# release path for its already-granted concurrency slots, so its admission
+# counter stays saturated and every later request queues forever. The
+# reaper clears a target's slots once it has had no live container for a
+# full grace window, so ordinary stop/start restarts never trip it.
+ADMISSION_REAP_SWEEP_SECONDS = 15.0
+ADMISSION_REAP_GRACE_SECONDS = 60.0
 VLLM_GPU_KV_CACHE_RE = re.compile(
     r"GPU KV cache size:\s*([\d,]+)\s+tokens",
     re.IGNORECASE,
@@ -453,6 +471,10 @@ class ClusterReplicaUnavailable(RuntimeError):
     """A replica-local availability failure that may be failed over."""
 
 
+class SourceRoutingUnavailable(RuntimeError):
+    """An enabled source-IP route cannot safely serve its pinned target."""
+
+
 class _InterruptedLaunchDeferred(RuntimeError):
     """Startup relaunch is waiting for one or more selected nodes."""
 
@@ -506,6 +528,21 @@ class PreparedAsyncStream:
 
     async def aclose(self):
         await self._stream.aclose()
+
+
+_CURRENT_INFERENCE_OWNER = object()
+
+
+class _AdmissionLease(str):
+    """A target-compatible grant tied to one admission-state generation."""
+
+    def __new__(cls, target, state, owner):
+        lease = super().__new__(cls, target)
+        lease.state = state
+        lease.owner = owner
+        lease.cancel = None
+        lease.released = False
+        return lease
 
 
 class FanSettingsConflict(Exception):
@@ -722,6 +759,7 @@ class Manager:
         self.lock = asyncio.Lock()
         self.worker_task: asyncio.Task | None = None
         self.idle_task: asyncio.Task | None = None
+        self.admission_reaper_task: asyncio.Task | None = None
         self.cluster_health_task: asyncio.Task | None = None
         self.deployment_capacity_task: asyncio.Task | None = None
         self.fan_cluster_task: asyncio.Task | None = None
@@ -776,6 +814,13 @@ class Manager:
         self._rebuild_synced_token_usage()
         self.deployments_path = self.data_dir / "deployments.json"
         self.deployments: list[dict] = self._load_deployments()
+        self.source_ip_routing_rules_path = (
+            self.data_dir / "source_ip_routing_rules.json"
+        )
+        self.source_ip_routing_rules_error: str | None = None
+        self.source_ip_routing_rules: dict[str, dict] = (
+            self._load_source_ip_routing_rules()
+        )
         deployments_changed = self._migrate_deployment_hf_credentials()
         deployments_changed = (
             self._migrate_vllm_prompt_token_details() or deployments_changed
@@ -907,6 +952,7 @@ class Manager:
             ("deployment_stop_resume_task", self._resume_interrupted_stops),
             ("worker_task", self._worker_loop),
             ("idle_task", self._idle_monitor_loop),
+            ("admission_reaper_task", self._admission_reaper_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
             ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
             ("fan_cluster_task", self._fan_cluster_monitor_loop),
@@ -921,7 +967,8 @@ class Manager:
         """Stop controller-only schedulers after a successful live join."""
         await self.virtual_nas.stop()
         for field in (
-            "worker_task", "idle_task", "cluster_health_task",
+            "worker_task", "idle_task", "admission_reaper_task",
+            "cluster_health_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
             "deployment_stop_resume_task",
@@ -963,6 +1010,7 @@ class Manager:
         for t in (
             self.worker_task,
             self.idle_task,
+            self.admission_reaper_task,
             self.cluster_health_task,
             self.deployment_capacity_task,
             self.fan_cluster_task,
@@ -1162,6 +1210,8 @@ class Manager:
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
+                RUNTIME_FILE_MOUNTS_CAPABILITY,
+                "patched-images-v1",
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -1174,6 +1224,7 @@ class Manager:
             stats = await self.get_stats()
         disk = await self.get_disk()
         docker_ready, docker_status_message = await self._docker_runtime_status()
+        inventory_available = True
         try:
             if containers is None:
                 containers = await self.list_containers()
@@ -1193,6 +1244,7 @@ class Manager:
             ]
         except Exception:
             containers = []
+            inventory_available = False
         existing_names = {c.get("name") for c in containers}
         # Launch updates can arrive from a Docker worker thread while the
         # status endpoint is being serialized.
@@ -1235,6 +1287,7 @@ class Manager:
             "stats": stats,
             "disk": disk,
             "containers": containers,
+            "inventory_available": inventory_available,
             "llama_rpc": self.llama_rpc_status(),
         }
 
@@ -2497,17 +2550,20 @@ class Manager:
         # value) so the agent downloads as the same HF account the
         # controller used to resolve the revision, instead of falling back
         # to whatever worker-local token exists.
-        return await self.node_registry.request(
-            node_id, "POST",
-            f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
-            json_body={
-                "revision": revision,
-                "requested_revision": requested_revision or revision,
-                "hf_token": self._resolved_hf_token() or "",
-                "files": list(filenames),
-            },
-            timeout=24 * 60 * 60,
-        )
+        # Track controller-dispatched downloads even when the destination
+        # still runs an older agent without its own update admission guard.
+        with self.virtual_nas.transfer_operation(model_id):
+            return await self.virtual_nas._await_uncancelable(self.node_registry.request(
+                node_id, "POST",
+                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
+                json_body={
+                    "revision": revision,
+                    "requested_revision": requested_revision or revision,
+                    "hf_token": self._resolved_hf_token() or "",
+                    "files": list(filenames),
+                },
+                timeout=24 * 60 * 60,
+            ))
 
     async def node_transfer_model_files(
         self, source_node_id: str, target_node_id: str,
@@ -3473,6 +3529,296 @@ class Manager:
     def _save_deployments(self) -> None:
         _atomic_private_json_write(self.deployments_path, self.deployments)
 
+    # Source-IP inference routing is intentionally separate from usage aliases
+    # and accounting rules.  These records affect request placement and are
+    # private controller configuration.
+    @staticmethod
+    def _canonical_source_routing_ip(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw or raw.casefold() == "unknown" or "/" in raw or "%" in raw:
+            raise ValueError("source_ip must be an exact IPv4 or IPv6 address")
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError as exc:
+            raise ValueError(
+                "source_ip must be an exact IPv4 or IPv6 address"
+            ) from exc
+
+    @staticmethod
+    def _source_routing_key(source_ip: str, model: str) -> str:
+        return f"{source_ip}\0{model}"
+
+    @staticmethod
+    def _source_routing_model(value: Any) -> str:
+        model = str(value or "").strip()
+        if not model or len(model) > 512:
+            raise ValueError(
+                "requested_model must be a non-empty exact request model id"
+            )
+        return model
+
+    @classmethod
+    def _normalize_source_ip_routing_rule(cls, value: Any) -> dict:
+        if not isinstance(value, dict):
+            raise ValueError("routing rule must be an object")
+        source_ip = cls._canonical_source_routing_ip(value.get("source_ip"))
+        requested_model = cls._source_routing_model(value.get("requested_model"))
+        enabled = value.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        deployment_id = str(value.get("deployment_id") or "").strip()
+        if not deployment_id:
+            raise ValueError("deployment_id is required")
+        instance_id = value.get("instance_id")
+        if instance_id is not None and (
+            isinstance(instance_id, bool)
+            or not isinstance(instance_id, int)
+            or instance_id < 0
+        ):
+            raise ValueError("instance_id must be a non-negative integer or null")
+        node_ids = value.get("node_ids")
+        if not isinstance(node_ids, list) or not node_ids:
+            raise ValueError("node_ids must be a non-empty rank-ordered list")
+        normalized_nodes = [str(node_id or "").strip() for node_id in node_ids]
+        if any(not node_id for node_id in normalized_nodes):
+            raise ValueError("node_ids must not contain empty values")
+        if len(set(normalized_nodes)) != len(normalized_nodes):
+            raise ValueError("node_ids must not contain duplicates")
+        return {
+            "source_ip": source_ip,
+            "requested_model": requested_model,
+            "enabled": enabled,
+            "deployment_id": deployment_id,
+            "instance_id": instance_id,
+            "node_ids": normalized_nodes,
+        }
+
+    def _load_source_ip_routing_rules(self) -> dict[str, dict]:
+        path = self.source_ip_routing_rules_path
+        self._index_source_ip_routing_rules({})
+        self.source_ip_routing_rules_error = None
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration cannot be inspected: {exc}"
+            )
+            return {}
+        if not exists:
+            return {}
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration cannot be read: {exc}"
+            )
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration is not valid JSON: {exc}"
+            )
+            return {}
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("root must be an object")
+            if payload.get("version") != 1:
+                raise ValueError(
+                    f"unsupported version {payload.get('version')!r}"
+                )
+            rows = payload.get("rules")
+            if not isinstance(rows, list):
+                raise ValueError("rules must be an array")
+            result: dict[str, dict] = {}
+            for index, row in enumerate(rows):
+                try:
+                    rule = self._normalize_source_ip_routing_rule(row)
+                except ValueError as exc:
+                    raise ValueError(f"rule {index} is invalid: {exc}") from exc
+                key = self._source_routing_key(
+                    rule["source_ip"], rule["requested_model"]
+                )
+                if key in result:
+                    raise ValueError(f"rule {index} duplicates an earlier rule")
+                result[key] = rule
+            self._index_source_ip_routing_rules(result)
+            return result
+        except (ValueError, TypeError) as exc:
+            self.source_ip_routing_rules_error = (
+                f"source-IP routing configuration is invalid: {exc}"
+            )
+            return {}
+
+    def _assert_source_ip_routing_config_valid(self) -> None:
+        error = getattr(self, "source_ip_routing_rules_error", None)
+        if error:
+            raise SourceRoutingUnavailable(error)
+
+    def _save_source_ip_routing_rules(
+        self, rules_by_key: dict[str, dict] | None = None,
+    ) -> None:
+        rules_by_key = (
+            self.source_ip_routing_rules
+            if rules_by_key is None else rules_by_key
+        )
+        rules = sorted(
+            rules_by_key.values(),
+            key=lambda rule: (rule["source_ip"], rule["requested_model"]),
+        )
+        _atomic_private_json_write(
+            self.source_ip_routing_rules_path,
+            {"version": 1, "rules": rules},
+        )
+        self.source_ip_routing_rules_error = None
+
+    def list_source_ip_routing_rules(self) -> list[dict]:
+        self._assert_source_ip_routing_config_valid()
+        return [
+            dict(rule) for rule in sorted(
+                getattr(self, "source_ip_routing_rules", {}).values(),
+                key=lambda row: (row["source_ip"], row["requested_model"]),
+            )
+        ]
+
+    def _index_source_ip_routing_rules(self, rules: dict[str, dict]) -> None:
+        by_source: dict[str, list[dict]] = {}
+        for rule in rules.values():
+            by_source.setdefault(rule["source_ip"], []).append(rule)
+        self._source_ip_routing_rules_by_source = by_source
+        self._source_ip_routing_index_rules = rules
+
+    def source_ip_routing_rules_for_source(self, source_ip: Any) -> list[dict]:
+        """Return configured rows, including disabled rows, without a global scan."""
+        self._assert_source_ip_routing_config_valid()
+        try:
+            canonical_ip = self._canonical_source_routing_ip(source_ip)
+        except ValueError:
+            return []
+        rules = getattr(self, "source_ip_routing_rules", {})
+        # Also support replacing the rule snapshot outside the persistence API.
+        if getattr(self, "_source_ip_routing_index_rules", None) is not rules:
+            self._index_source_ip_routing_rules(rules)
+        return [
+            dict(rule) for rule in
+            self._source_ip_routing_rules_by_source.get(canonical_ip, ())
+        ]
+
+    def source_ip_routing_rule(
+        self, source_ip: Any, requested_model: Any,
+    ) -> dict | None:
+        self._assert_source_ip_routing_config_valid()
+        try:
+            canonical_ip = self._canonical_source_routing_ip(source_ip)
+            exact_model = self._source_routing_model(requested_model)
+        except ValueError:
+            return None
+        rule = getattr(self, "source_ip_routing_rules", {}).get(
+            self._source_routing_key(canonical_ip, exact_model)
+        )
+        return dict(rule) if rule and rule.get("enabled") is True else None
+
+    def upsert_source_ip_routing_rule(
+        self,
+        value: Any,
+        *,
+        observed_replicas: list[dict] | None = None,
+        observed_instances: list[dict] | None = None,
+        observed_members: list[dict] | None = None,
+    ) -> dict:
+        self._assert_source_ip_routing_config_valid()
+        rule = self._normalize_source_ip_routing_rule(value)
+        # Re-derive the serving unit from the current Manager topology.  The
+        # request's node list is only a fingerprint and is never authoritative.
+        if rule["enabled"]:
+            deployment, derived_nodes = self.source_ip_routing_target(
+                rule["deployment_id"], rule["instance_id"], rule["node_ids"]
+            )
+            try:
+                self._source_route_candidates(deployment, {
+                    **rule,
+                    "_observed_replicas": observed_replicas,
+                    "_observed_instances": observed_instances,
+                    "_observed_members": observed_members,
+                })
+            except SourceRoutingUnavailable as exc:
+                raise ValueError(str(exc)) from exc
+            rule["deployment_id"] = str(
+                deployment.get("sparkdeck_record_id") or ""
+            )
+            rule["node_ids"] = derived_nodes
+        rules = dict(getattr(self, "source_ip_routing_rules", {}))
+        rules[self._source_routing_key(
+            rule["source_ip"], rule["requested_model"]
+        )] = rule
+        self._save_source_ip_routing_rules(rules)
+        self.source_ip_routing_rules = rules
+        self._index_source_ip_routing_rules(rules)
+        return dict(rule)
+
+    def delete_source_ip_routing_rule(
+        self, source_ip: Any, requested_model: Any,
+    ) -> bool:
+        self._assert_source_ip_routing_config_valid()
+        canonical_ip = self._canonical_source_routing_ip(source_ip)
+        exact_model = self._source_routing_model(requested_model)
+        key = self._source_routing_key(canonical_ip, exact_model)
+        rules = dict(getattr(self, "source_ip_routing_rules", {}))
+        if key not in rules:
+            return False
+        rules.pop(key)
+        self._save_source_ip_routing_rules(rules)
+        self.source_ip_routing_rules = rules
+        self._index_source_ip_routing_rules(rules)
+        return True
+
+    def source_ip_routing_target(
+        self,
+        stable_deployment_id: str,
+        instance_id: int | None,
+        node_ids: list[str],
+    ) -> tuple[dict, list[str]]:
+        deployment = next((
+            item for item in getattr(self, "deployments", [])
+            if isinstance(item, dict)
+            and item.get("sparkdeck_record_id") == stable_deployment_id
+        ), None)
+        if deployment is None:
+            raise LookupError("source routing target deployment was not found")
+        members = self._cluster_members_sorted(deployment)
+        mode = str(deployment.get("mode") or "")
+        if mode == "grouped_sharded":
+            if instance_id is None:
+                raise ValueError("instance_id is required for a grouped deployment")
+            unit = [
+                member for member in members
+                if member.get("instance_id") == instance_id
+            ]
+            if not unit:
+                raise LookupError("source routing target engine group was not found")
+        elif mode == "replicated":
+            if instance_id is not None:
+                raise ValueError("instance_id must be null for a replicated deployment")
+            if len(node_ids) != 1:
+                raise ValueError("a replicated target must identify exactly one node")
+            unit = [member for member in members if member.get("node_id") == node_ids[0]]
+            if not unit:
+                raise LookupError("source routing target replica was not found")
+        elif mode in {"single", "sharded"}:
+            if instance_id is not None:
+                raise ValueError("instance_id is only valid for grouped deployments")
+            unit = members
+        else:
+            raise LookupError("source routing target deployment mode is unsupported")
+        derived_nodes = [str(member.get("node_id") or "") for member in unit]
+        if not derived_nodes or any(not node_id for node_id in derived_nodes):
+            raise LookupError("source routing target has no complete serving unit")
+        if derived_nodes != node_ids:
+            raise ValueError(
+                "node_ids fingerprint does not match the target serving unit"
+            )
+        return deployment, derived_nodes
+
     @staticmethod
     def _with_vllm_prompt_token_details(args: list[Any]) -> list[Any]:
         """Enable cached-token details unless the user explicitly chose."""
@@ -3882,6 +4228,9 @@ class Manager:
             "image": body.get("image") or None,
             "environment": cls._normalize_runtime_environment(
                 body.get("environment"), engine,
+            ),
+            "runtime_file_mounts": normalize_runtime_file_mounts(
+                body.get("runtime_file_mounts"), engine,
             ),
             "extra_args": extra_args,
             "gpu_memory_utilization": body.get("gpu_memory_utilization"),
@@ -5641,13 +5990,20 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
-        return await self.node_registry.request(
-            node_id,
-            "POST",
-            "/api/agent/containers",
-            json_body=payload,
-            timeout=1800,
-        )
+        try:
+            return await self.node_registry.request(
+                node_id,
+                "POST",
+                "/api/agent/containers",
+                json_body=payload,
+                timeout=1800,
+            )
+        finally:
+            # Preflight may have cached this node before the member existed.
+            # Creation can also succeed despite an ambiguous agent failure.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
 
     @staticmethod
     def _cluster_members_sorted(deployment: dict) -> list[dict]:
@@ -5781,16 +6137,204 @@ class Manager:
         rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
         return [chosen, *rest]
 
+    @staticmethod
+    def _source_routing_member_available(member: dict) -> bool:
+        return (
+            member.get("desired_state") != "stopped"
+            and str(member.get("status") or "").casefold() in {"running", "ready"}
+            and str(member.get("node_status") or "").casefold()
+            not in {"offline", "unreachable", "unknown", "disconnected"}
+            and member.get("node_docker_ready") is not False
+        )
+
+    def _source_route_candidates(
+        self, deployment: dict, source_route: dict,
+    ) -> list[dict]:
+        """Return the one coordinator selected by a validated, pinned rule."""
+        if deployment.get("sparkdeck_record_id") != source_route.get("deployment_id"):
+            raise SourceRoutingUnavailable(
+                "source-IP routing target deployment identity changed"
+            )
+        try:
+            current, derived_nodes = self.source_ip_routing_target(
+                str(source_route.get("deployment_id") or ""),
+                source_route.get("instance_id"),
+                list(source_route.get("node_ids") or []),
+            )
+        except (LookupError, ValueError) as exc:
+            raise SourceRoutingUnavailable(
+                f"source-IP routing target topology is unavailable: {exc}"
+            ) from exc
+        if current.get("id") != deployment.get("id"):
+            raise SourceRoutingUnavailable(
+                "source-IP routing target deployment generation changed"
+            )
+        members = self._cluster_members_sorted(current)
+        mode = str(current.get("mode") or "")
+        instance_id = source_route.get("instance_id")
+        if mode == "grouped_sharded":
+            unit = [m for m in members if m.get("instance_id") == instance_id]
+        elif mode == "replicated":
+            unit = [m for m in members if m.get("node_id") == derived_nodes[0]]
+        else:
+            unit = members
+        # get_state decorates copies: persisted container status can remain
+        # exited after an external restart. Service supplies trusted live
+        # replica observations separately; these never enter persisted rules.
+        observed_replicas = source_route.get("_observed_replicas")
+        observed_instances = source_route.get("_observed_instances")
+        observed_members = source_route.get("_observed_members")
+        if mode == "replicated" and observed_replicas is not None:
+            replica = next((
+                row for row in observed_replicas
+                if row.get("node_id") == derived_nodes[0]
+            ), None)
+            if replica is None or replica.get("available") is not True:
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target replica is unavailable"
+                )
+            health_members = []
+        elif mode == "grouped_sharded" and observed_instances is not None:
+            observed_instance = next((
+                row for row in observed_instances
+                if row.get("instance_id") == instance_id
+            ), None)
+            if (
+                observed_instance is None
+                or list(observed_instance.get("node_ids") or []) != derived_nodes
+                or observed_instance.get("status") != "running"
+                or observed_instance.get("desired_state") == "stopped"
+            ):
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target engine group is unavailable"
+                )
+            health_members = []
+        elif mode in {"single", "sharded"}:
+            identities = [(m.get("node_id"), m.get("rank"), m.get("container_name")) for m in unit]
+            if (
+                not isinstance(observed_members, list)
+                or [m.get("rank") for m in unit] != list(range(len(unit)))
+                or [(m.get("node_id"), m.get("rank"), m.get("container_name"))
+                    for m in observed_members if isinstance(m, dict)] != identities
+                or len(observed_members) != len(unit)
+                or not all(
+                    self._source_routing_member_available(m)
+                    and m.get("node_status") in {"online", "degraded"}
+                    and m.get("node_docker_ready") is True
+                    for m in observed_members
+                )
+            ):
+                raise SourceRoutingUnavailable("source-IP routing target member health is unavailable")
+            health_members = []
+        else:
+            health_members = unit
+        if current.get("desired_state") == "stopped" or any(
+            member.get("desired_state") == "stopped"
+            for member in unit
+        ) or any(
+            str(member.get("status") or "").casefold() in {
+                "stopped", "error", "exited", "dead", "removed", "missing", "unreachable",
+            }
+            or str(member.get("node_status") or "").casefold() in {
+                "offline", "unreachable", "unknown", "disconnected",
+            }
+            or member.get("node_docker_ready") is False
+            for member in health_members
+        ):
+            raise SourceRoutingUnavailable(
+                "source-IP routing target serving unit is unavailable"
+            )
+        coordinator = (
+            unit[0] if mode == "replicated"
+            else next(
+                (member for member in unit if int(member.get("rank") or 0) == 0),
+                None,
+            )
+        )
+        if coordinator is None:
+            raise SourceRoutingUnavailable(
+                "source-IP routing target serving unit has no coordinator"
+            )
+        return [coordinator]
+
+    def _cluster_affinity_context(self, deployment, model, body, endpoint, caller_ip):
+        """Keep cache hints within a caller, model and deployment generation."""
+        if deployment.get("mode") not in {"replicated", "grouped_sharded"}:
+            return None
+        affinity = getattr(self, "_prefix_affinity", None)
+        if affinity is None:
+            affinity = self._prefix_affinity = PrefixAffinity()
+        keys = affinity.keys(body, endpoint)
+        if not keys:
+            return None
+        scope = json.dumps([
+            deployment.get("id"), model, endpoint, caller_ip,
+            getattr(self, "_prefix_affinity_generation", 0),
+            deployment.get("health_restarted_at"),
+            deployment.get("health_restart_counts"),
+            [(m.get("node_id"), m.get("container_name"), m.get("container_id"),
+              m.get("instance_id"), m.get("desired_state"))
+             for m in self._cluster_members_sorted(deployment)],
+        ], sort_keys=True)
+        return affinity, scope, keys
+
+    def _prefer_cluster_affinity(self, deployment, candidates, context):
+        if context is None or len(candidates) < 2:
+            return candidates
+        affinity, scope, keys = context
+        deployment_id = str(deployment.get("id") or "")
+        targets = {self._cluster_member_key(deployment_id, m): m for m in candidates}
+        preferred = targets.get(affinity.lookup(scope, keys, list(targets)))
+        if preferred is None:
+            return candidates
+        minimum = min(self._cluster_member_active(deployment_id, m) for m in candidates)
+        if self._cluster_member_active(deployment_id, preferred) > minimum + 2:
+            return candidates
+        return [preferred, *(m for m in candidates if m is not preferred)]
+
+    def _remember_cluster_affinity(self, context, deployment_id, member):
+        if context is not None:
+            affinity, scope, keys = context
+            affinity.remember(scope, keys, self._cluster_member_key(deployment_id, member))
+
+    @staticmethod
+    def _affinity_stream_error(chunk):
+        # Errors can use engine-specific types; all SSE error objects prevent
+        # a failed response from teaching the router a cache location.
+        for line in chunk.splitlines():
+            if line.startswith("data:"):
+                try:
+                    payload = json.loads(line[5:].strip())
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(payload, dict) and "error" in payload:
+                    return True
+        return False
+
     def _tracked_cluster_stream(
         self, stream, deployment_id: str, member: dict,
     ):
+        released = False
+
+        def release_once():
+            nonlocal released
+            if not released:
+                released = True
+                self._release_cluster_member(deployment_id, member)
+
+        lifecycle = getattr(stream, "inference_lifecycle", None)
+        if isinstance(lifecycle, dict):
+            lifecycle["release_member"] = release_once
+
         async def relay():
             try:
                 async for chunk in stream:
                     yield chunk
             finally:
-                await stream.aclose()
-                self._release_cluster_member(deployment_id, member)
+                try:
+                    await close_async_stream(stream)
+                finally:
+                    release_once()
 
         return relay()
 
@@ -5903,6 +6447,7 @@ class Manager:
         initial_member: dict,
         route_observation: dict | None,
         caller_ip: str | None = None,
+        affinity_context=None,
     ):
         """Relay a stream, failing over until its first real SSE event.
 
@@ -5992,9 +6537,17 @@ class Manager:
                     self._observe_cluster_serving_member(
                         route_observation, current_member,
                     )
+                    failed = self._affinity_stream_error(first_chunk)
+                    completed = "data: [DONE]" in first_chunk
                     yield first_chunk
                     async for chunk in current:
+                        failed = failed or self._affinity_stream_error(chunk)
+                        completed = completed or "data: [DONE]" in chunk
                         yield chunk
+                    if completed and not failed and not (cancel and cancel.is_set()):
+                        self._remember_cluster_affinity(
+                            affinity_context, deployment_id, current_member,
+                        )
                     return
             finally:
                 if current is not None:
@@ -6011,14 +6564,32 @@ class Manager:
         cancel: asyncio.Event | None = None,
         route_observation: dict | None = None,
         caller_ip: str | None = None,
+        source_route: dict | None = None,
     ):
         """Proxy to a cluster member, balancing replicas and failing over."""
         deployment = self._deployment(deployment_id)
         if not deployment:
+            if source_route is not None:
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target deployment is unavailable"
+                )
             raise LookupError("cluster deployment not found")
         if deployment.get("desired_state") == "stopped":
+            if source_route is not None:
+                raise SourceRoutingUnavailable(
+                    "source-IP routing target deployment is unavailable"
+                )
             raise RuntimeError("deployment is stopped; start it before sending inference requests")
-        candidates = self._cluster_route_order(deployment)
+        if source_route is not None:
+            affinity_context = None
+            candidates = self._source_route_candidates(deployment, source_route)
+        else:
+            affinity_context = self._cluster_affinity_context(
+                deployment, model, body, endpoint, caller_ip,
+            )
+            candidates = self._prefer_cluster_affinity(
+                deployment, self._cluster_route_order(deployment), affinity_context,
+            )
         if not candidates:
             raise LookupError("cluster deployment has no inference member")
         for index, member in enumerate(candidates):
@@ -6031,8 +6602,12 @@ class Manager:
                     return self._cluster_stream_with_failover(
                         result, candidates[index + 1:], deployment, model,
                         body, endpoint, cancel, member, route_observation,
-                        caller_ip,
+                        caller_ip, affinity_context,
                     )
+                if not (cancel and cancel.is_set()) and not (
+                    isinstance(result, dict) and "error" in result
+                ):
+                    self._remember_cluster_affinity(affinity_context, deployment_id, member)
                 self._observe_cluster_serving_member(
                     route_observation, member,
                 )
@@ -6040,6 +6615,10 @@ class Manager:
             except ClientAbort:
                 raise
             except Exception as exc:
+                if source_route is not None and self._cluster_failover_retryable(exc):
+                    raise SourceRoutingUnavailable(
+                        f"source-IP routing target is unavailable: {exc}"
+                    ) from exc
                 if (
                     index == len(candidates) - 1
                     or not self._cluster_failover_retryable(exc)
@@ -6053,6 +6632,69 @@ class Manager:
         raise LookupError("cluster deployment has no inference member")
 
     async def _proxy_cluster_member(
+        self, deployment: dict, member: dict, model: str, body: dict,
+        endpoint: str, cancel: asyncio.Event | None, *,
+        caller_ip: str | None = None, startup_benchmark: bool = False,
+    ):
+        from sparkdeck.prompt_gate import PromptGates
+
+        gates = getattr(self, "prompt_gate", None)
+        if not isinstance(gates, PromptGates):
+            return await self._proxy_cluster_member_unlimited(
+                deployment, member, model, body, endpoint, cancel,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+            )
+        member = dict(member)
+        deployment_id = str(deployment.get("id") or "")
+        if deployment.get("mode") == "grouped_sharded":
+            key = ("cluster", deployment_id, "group", int(member.get("instance_id") or 0))
+        elif deployment.get("mode") == "replicated":
+            key = ("cluster", deployment_id, "replica", member.get("node_id"))
+        else:
+            key = ("cluster", deployment_id)
+        # Include queued PP requests in normal balancing. Transfer this
+        # reservation to the transport's existing accounting when dispatched.
+        self._acquire_cluster_member(deployment_id, member)
+        waiting = True
+        pending = getattr(self, "_prompt_waiting_requests", None)
+        if pending is None:
+            pending = self._prompt_waiting_requests = {}
+        ticket = object()
+        pending[ticket] = {
+            "model": model, "created_at": time.monotonic(),
+            "group": self._request_group(model, deployment_id, member.get("container_name")),
+        }
+
+        async def dispatch():
+            nonlocal waiting
+            self._release_cluster_member(deployment_id, member)
+            waiting = False
+            pending.pop(ticket, None)
+            current = self._deployment(deployment_id)
+            selected = next((candidate for candidate in (current or {}).get("members") or []
+                             if all(candidate.get(field) == member.get(field)
+                                    for field in ("node_id", "instance_id", "rank", "container_name"))), None)
+            if current is None or selected is None or any(
+                selected.get(field) != member.get(field)
+                for field in ("container_id", "launch_settings_fingerprint")
+            ):
+                raise ClusterReplicaUnavailable("engine group changed while waiting for prompt processing")
+            observation_dispatch = getattr(self, "_prompt_observation_dispatch", None)
+            if callable(observation_dispatch):
+                observation_dispatch(current, selected)
+            return await self._proxy_cluster_member_unlimited(
+                current, selected, model, body, endpoint, cancel,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+            )
+
+        try:
+            return await gates.run(key, dispatch, cancel=cancel)
+        finally:
+            pending.pop(ticket, None)
+            if waiting:
+                self._release_cluster_member(deployment_id, member)
+
+    async def _proxy_cluster_member_unlimited(
         self,
         deployment: dict,
         member: dict,
@@ -6062,6 +6704,7 @@ class Manager:
         cancel: asyncio.Event | None,
         *,
         caller_ip: str | None = None,
+        startup_benchmark: bool = False,
     ):
         """Send one request to a specific member without failover.
 
@@ -6084,6 +6727,7 @@ class Manager:
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)
         stream_owns_member = False
+        release_member_once = None
         try:
             if node_id == LOCAL_NODE_ID:
                 proxy = (
@@ -6096,6 +6740,7 @@ class Manager:
                     container_name=member.get("container_name"),
                     deployment_id=deployment_id,
                     caller_ip=caller_ip,
+                    **(self._startup_probe_kwargs(startup_benchmark) if startup_benchmark else {}),
                 )
                 if not body.get("stream"):
                     return result
@@ -6120,15 +6765,32 @@ class Manager:
                 "_sparkdeck_container_name": member.get("container_name"),
                 "_sparkdeck_deployment_id": deployment_id,
             }
+            if startup_benchmark:
+                # Signal the remote agent that this is a synthetic startup probe
+                # so it suppresses ordinary usage persistence on its side too.
+                remote_body["_sparkdeck_startup_benchmark"] = True
             if caller_ip:
                 remote_body["_sparkdeck_caller_ip"] = caller_ip
-            request_id = (
-                self._track_start(
-                    model, deployment_id=deployment_id, caller_ip=caller_ip,
-                )
-                if caller_ip else None
+            request_id = self._track_start(
+                model, deployment_id=deployment_id, caller_ip=caller_ip,
+                container_name=member.get("container_name"),
+                streaming=bool(body.get("stream")),
+                startup_benchmark=startup_benchmark,
+            )
+            member_released = False
+
+            def release_member_once():
+                nonlocal member_released
+                if not member_released:
+                    member_released = True
+                    self._release_cluster_member(deployment_id, member)
+
+            self._transfer_inference_ownership(
+                admission, request_id, cancel=cancel,
+                release_callback=release_member_once,
             )
             if body.get("stream"):
+                remote_started_at = time.monotonic()
                 try:
                     response = await self._await_or_cancel(
                         self.node_registry.open_stream(
@@ -6165,18 +6827,42 @@ class Manager:
                     self._release_inference_slot(admission)
                     raise
                 stream_owns_member = True
+                self._transfer_inference_ownership(
+                    admission, request_id, owner=None, cancel=cancel,
+                    cleanup_stream=response,
+                )
 
                 async def stream_remote():
+                    self._transfer_inference_ownership(admission, request_id)
+                    first_output_at = None
+                    latest_usage = None
                     try:
                         async for line in self._aiter_lines_cancellable(response, cancel):
                             if line:
+                                thinking, output = self._sse_chunk_token_counts(line)
+                                now = time.monotonic()
+                                if (thinking or output) and first_output_at is None:
+                                    first_output_at = now
+                                latest_usage = self._usage_from_sse_line(line) or latest_usage
+                                if first_output_at is not None and latest_usage and self._usage_has_cached_prompt_tokens(latest_usage):
+                                    prompt_tokens, cached_tokens = self._usage_prompt_counts(latest_usage)
+                                    self._track_prompt_processing(
+                                        request_id, prompt_tokens - cached_tokens,
+                                        first_output_at - remote_started_at,
+                                    )
+                                self._track_output(request_id, now, "thinking", thinking)
+                                self._track_output(request_id, now, "output", output)
                                 yield f"{line}\n\n"
+                                if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                                    break
                     finally:
-                        await response.aclose()
-                        if request_id is not None:
-                            self._track_end(request_id)
-                        self._release_inference_slot(admission)
-                        self._release_cluster_member(deployment_id, member)
+                        try:
+                            await self._close_inference_transport(request_id)
+                        finally:
+                            if request_id is not None:
+                                self._track_end(request_id)
+                            self._release_inference_slot(admission)
+                            release_member_once()
 
                 return stream_remote()
 
@@ -6193,7 +6879,10 @@ class Manager:
                 self._release_inference_slot(admission)
         finally:
             if not stream_owns_member:
-                self._release_cluster_member(deployment_id, member)
+                if release_member_once is not None:
+                    release_member_once()
+                else:
+                    self._release_cluster_member(deployment_id, member)
 
     async def cluster_deployment_health(self, deployment_id: str, model: str) -> bool:
         """Check member readiness through authenticated agents.
@@ -6245,6 +6934,24 @@ class Manager:
         )
         return bool((result or {}).get("ready"))
 
+    @staticmethod
+    def _validate_runtime_file_mount_nodes(
+        mounts: list[dict[str, str]] | None, node_ids: list[str], available: dict,
+    ) -> None:
+        if not mounts:
+            return
+        incompatible = [
+            available.get(nid, {}).get("name") or nid for nid in node_ids
+            if nid != LOCAL_NODE_ID and RUNTIME_FILE_MOUNTS_CAPABILITY
+            not in (available.get(nid, {}).get("capabilities") or [])
+        ]
+        if incompatible:
+            raise ValueError(
+                "Runtime file mounts require updated SparkDeck agents on: "
+                + ", ".join(incompatible)
+                + ". Update these nodes in Settings before starting this deployment."
+            )
+
     async def _preflight_deployment_launch(
         self, body: dict, *, exclude_deployment_id: str | None = None,
     ) -> dict:
@@ -6254,6 +6961,9 @@ class Manager:
         engine = str(body.get("engine") or "vllm")
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        body["runtime_file_mounts"] = normalize_runtime_file_mounts(
+            body.get("runtime_file_mounts"), engine,
+        )
         body["environment"] = normalize_runtime_environment(
             body.get("environment"), engine,
         )
@@ -6320,6 +7030,9 @@ class Manager:
         if docker_unready:
             names = [available[n].get("name", n) for n in docker_unready]
             raise ValueError(f"Docker is unavailable on: {', '.join(names)}")
+        self._validate_runtime_file_mount_nodes(
+            body["runtime_file_mounts"], node_ids, available,
+        )
 
         model = body.get("model") or ""
         if not model:
@@ -6533,30 +7246,40 @@ class Manager:
         node_ids: list[str], available: dict,
         fabrics: dict[str, tuple[str | None, str | None]],
         local_port: int | None, tensor_parallel_size: int, instances: int,
+        first_instance: int = 0,
+        existing_members: list[dict] | None = None,
     ) -> tuple[list, list[dict]]:
         """Build one independent sharded engine group per instance.
 
-        Group ``g`` owns ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own
-        coordinator (the group's first node) and master port, so every group
-        is a complete tensor-parallel engine behind the shared served name.
+        Group ``g`` (counted from ``first_instance``) owns
+        ``node_ids[g*T:(g+1)*T]`` and rendezvouses on its own coordinator
+        (the group's first node) and master port, so every group is a
+        complete tensor-parallel engine behind the shared served name.
         """
         tasks: list = []
         member_specs: list[dict] = []
+        existing_by_node = {
+            member["node_id"]: member for member in existing_members or []
+        }
         safe_model = re.sub(
             r"[^a-zA-Z0-9_.-]+", "-", str(base.get("model") or ""),
         ).strip("-").lower()
         for group in range(instances):
+            instance = first_instance + group
             group_nodes = node_ids[
                 group * tensor_parallel_size:(group + 1) * tensor_parallel_size
             ]
             group_master_ip = fabrics[group_nodes[0]][0]
-            group_master_port = 29501 + group
+            group_master_port = 29501 + instance
             for local_rank, node_id in enumerate(group_nodes):
                 node = available[node_id]
                 member_port = local_port if node_id == LOCAL_NODE_ID else None
                 fabric_ip, fabric_interface = fabrics[node_id]
-                global_rank = group * tensor_parallel_size + local_rank
+                global_rank = instance * tensor_parallel_size + local_rank
                 name = f"cluster-{deployment_id}-r{global_rank}-{safe_model[:36]}"
+                existing = existing_by_node.get(node_id, {})
+                name = existing.get("container_name") or name
+                member_port = existing.get("port") or member_port
                 payload = dict(base)
                 payload.update({
                     "port": member_port,
@@ -6565,7 +7288,7 @@ class Manager:
                         "deployment_id": deployment_id,
                         "node_id": node_id,
                         "rank": local_rank,
-                        "instance_id": group,
+                        "instance_id": instance,
                         "nnodes": tensor_parallel_size,
                         "mode": "grouped_sharded",
                         "serve_port": member_port,
@@ -6611,7 +7334,7 @@ class Manager:
                     "node_id": node_id,
                     "node_name": node.get("name", node_id),
                     "rank": local_rank,
-                    "instance_id": group,
+                    "instance_id": instance,
                     "container_name": name,
                     "fabric_ip": fabric_ip,
                     "port": member_port,
@@ -6681,6 +7404,7 @@ class Manager:
             "shm_size": body.get("shm_size"),
             "infiniband_device": body.get("infiniband_device"),
             "environment": body.get("environment"),
+            "runtime_file_mounts": body.get("runtime_file_mounts"),
             "extra_args": (
                 self._with_vllm_prompt_token_details(
                     list(body.get("extra_args") or [])
@@ -6868,6 +7592,21 @@ class Manager:
     async def _member_action(
         self, member: dict, action: str, *, log_tail: int = 300,
     ) -> Any:
+        if action == "logs":
+            # One offline worker must not hold the entire logs dialog behind
+            # lifecycle timeouts. Bound all connection attempts together.
+            try:
+                return await asyncio.wait_for(
+                    self._read_member_logs(member, log_tail),
+                    timeout=MEMBER_LOG_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Logs unavailable from {member.get('node_name') or member['node_id']}: "
+                    f"node did not respond within {MEMBER_LOG_TIMEOUT_SECONDS:g} seconds"
+                ) from exc
+        if action in {"start", "stop", "restart", "remove"}:
+            self._prefix_affinity_generation = getattr(self, "_prefix_affinity_generation", 0) + 1
         node_id = member["node_id"]
         name = member["container_name"]
         owner = next(
@@ -6895,18 +7634,36 @@ class Manager:
                 return await self.stop_container(name, explicit=explicit_stop)
             if action == "remove":
                 return await self.remove_cluster_member(name)
-            if action == "logs":
-                return {"logs": await self.get_cluster_member_logs(name, log_tail)}
-        method = "GET" if action == "logs" else ("DELETE" if action == "remove" else "POST")
-        suffix = (
-            f"/logs?tail={max(1, min(int(log_tail), 100_000))}"
-            if action == "logs"
-            else ("" if action == "remove" else f"/{action}")
-        )
+        method = "DELETE" if action == "remove" else "POST"
+        suffix = "" if action == "remove" else f"/{action}"
         if explicit_stop:
             suffix += "?explicit=true"
+        try:
+            return await self.node_registry.request(
+                node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
+            )
+        finally:
+            # A cached pre-action phase may still say ready after a restart.
+            # Refresh after lifecycle actions, including ambiguous errors.
+            invalidate = getattr(self.node_registry, "invalidate_status", None)
+            if callable(invalidate):
+                invalidate(node_id)
+
+    async def _read_member_logs(self, member: dict, tail: int) -> dict:
+        node_id = member["node_id"]
+        name = member["container_name"]
+        if node_id == LOCAL_NODE_ID:
+            return {"logs": await self.get_cluster_member_logs(name, tail)}
+        cached_status = getattr(self.node_registry, "cached_status", None)
+        cached = cached_status(node_id) if callable(cached_status) else None
+        if isinstance(cached, dict) and cached.get("online") is False:
+            raise RuntimeError(
+                f"Logs unavailable from {member.get('node_name') or node_id}: node is offline"
+            )
         return await self.node_registry.request(
-            node_id, method, f"/api/agent/containers/{name}{suffix}", timeout=120
+            node_id, "GET",
+            f"/api/agent/containers/{name}/logs?tail={max(1, min(int(tail), 100_000))}",
+            timeout=MEMBER_LOG_TIMEOUT_SECONDS,
         )
 
     def _cluster_action_lock(self) -> asyncio.Lock:
@@ -7014,12 +7771,14 @@ class Manager:
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
         instance: int | None = None,
+        *, model_revision: str | None = None,
     ) -> dict:
         # A health recovery and a user action must never interleave their
         # per-rank stop/start requests.
         async with self._cluster_action_lock():
             return await self._deployment_action_locked(
                 deployment_id, action, node_ids, relaunch_mode, instance,
+                model_revision=model_revision,
             )
 
     @staticmethod
@@ -7061,33 +7820,260 @@ class Manager:
 
     @staticmethod
     def _grouped_deployment_status(deployment: dict) -> str:
-        """Derive grouped-sharded status from the per-group member states."""
-        all_groups: set[int] = set()
-        running_groups: set[int] = set()
+        """Compare actual ranks with the groups explicitly expected to run."""
+        groups: dict[int, list[dict]] = {}
         for member in deployment.get("members") or []:
+            if member.get("failed_stop_error"):
+                return "degraded"
             group = int(member.get("instance_id") or 0)
-            all_groups.add(group)
-            if int(member.get("rank") or 0) == 0 and str(
-                member.get("status") or ""
-            ) not in {"stopped", "error"}:
-                running_groups.add(group)
-        if not running_groups:
+            groups.setdefault(group, []).append(member)
+        expected = [
+            members for members in groups.values()
+            if any(
+                member.get("desired_state") != "stopped"
+                or member.get("recreate_pending")
+                for member in members
+            )
+        ]
+        if not expected:
             return "stopped"
-        if running_groups == all_groups:
-            return "running"
-        return "degraded"
+        try:
+            expected_ranks = (
+                0 if deployment.get("settings_dirty") else
+                int((deployment.get("launch_settings") or {}).get("tensor_parallel_size") or 0)
+            )
+        except (TypeError, ValueError):
+            expected_ranks = 0
+        starting = False
+        for members in expected:
+            if expected_ranks and (
+                len(members) != expected_ranks
+                or {int(member.get("rank") or 0) for member in members} != set(range(expected_ranks))
+            ):
+                return "degraded"
+            primary = next((member for member in members if int(member.get("rank") or 0) == 0), None)
+            if primary is None:
+                return "degraded"
+            for member in members:
+                status = str(member.get("status") or "unknown").casefold()
+                if member.get("recreate_pending") and status not in {"queued", "creating", "created", "starting"}:
+                    return "degraded"
+                phase = member.get("phase") or {}
+                phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+                if status not in {"running", "ready", "queued", "creating", "created", "starting", "restarting"} or str(phase_name).casefold() in {
+                    "error", "dead", "unreachable", "missing", "unknown", "failed",
+                } or member.get("error") or member.get("node_status") in {"offline", "unreachable", "disconnected"}:
+                    return "degraded"
+                if status not in {"running", "ready"}:
+                    starting = True
+            # A headless TP worker has no HTTP readiness endpoint. Once all
+            # ranks run, only this group's coordinator establishes readiness.
+            phase = primary.get("phase") or {}
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            if phase_name and phase_name != "ready":
+                starting = True
+        return "starting" if starting else "running"
+
+    @staticmethod
+    def _group_launch_settings_fingerprint(deployment: dict) -> str:
+        encoded = json.dumps(
+            deployment.get("launch_settings") or {}, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _recreate_grouped_instance(
+        self, deployment: dict, instance: int,
+    ) -> dict:
+        """Apply saved settings to one existing group without moving its peers."""
+        members = list(deployment.get("members") or [])
+        selected = sorted(
+            [member for member in members
+             if int(member.get("instance_id") or 0) == instance],
+            key=lambda member: int(member.get("rank") or 0),
+        )
+        launch = copy.deepcopy(deployment.get("launch_settings") or {})
+        saved_nodes = list(launch.get("node_ids") or [])
+        tp, _ = _grouped_sharded_topology(launch, len(saved_nodes))
+        if (
+            len(selected) != tp
+            or [int(member.get("rank") or 0) for member in selected] != list(range(tp))
+            or saved_nodes != [
+                member.get("node_id") for member in sorted(
+                    members, key=lambda member: (
+                        int(member.get("instance_id") or 0),
+                        int(member.get("rank") or 0),
+                    ),
+                )
+            ]
+        ):
+            raise ValueError(
+                "changing the node layout requires starting the whole deployment"
+            )
+        fingerprint = self._group_launch_settings_fingerprint(deployment)
+        launch.update({
+            "node_ids": [member["node_id"] for member in selected],
+            "deployment_mode": "grouped_sharded",
+            "instances": 1,
+            "tensor_parallel_size": tp,
+        })
+        local = next((m for m in selected if m["node_id"] == LOCAL_NODE_ID), None)
+        if local and local.get("port"):
+            # The deployment port belongs to its first primary, which may be
+            # remote. Other groups keep their own allocated member ports.
+            if (launch.get("port") is not None
+                    and launch["port"] != deployment.get("api_port")):
+                raise ValueError(
+                    "changing the saved port requires starting the whole deployment"
+                )
+            launch["port"] = local["port"]
+        plan = await self._preflight_deployment_launch(
+            launch, exclude_deployment_id=deployment["id"],
+        )
+        # A legacy deployment-wide Stop may predate per-member intent. Record
+        # that intent before waking this group so peers remain stopped.
+        if deployment.get("desired_state") == "stopped" or deployment.get("status") == "stopped":
+            for member in members:
+                member["desired_state"] = "stopped"
+                member["status"] = "stopped"
+        for member in selected:
+            member["desired_state"] = "stopped"
+            member["recreate_pending"] = True
+        self._save_deployments()
+        removed = await asyncio.gather(
+            *(self._member_action(member, "remove") for member in selected),
+            return_exceptions=True,
+        )
+        errors = self._member_action_errors(removed, "remove")
+        if errors:
+            for member, result in zip(selected, removed):
+                if not self._member_action_errors([result], "remove"):
+                    member["status"] = "stopped"
+                    member.pop("container_id", None)
+                member.pop("launch_settings_fingerprint", None)
+            deployment["settings_dirty"] = True
+            deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["error"] = "; ".join(errors)
+            self._save_deployments()
+            return {"ok": False, "errors": errors, "status": deployment["status"], "instance": instance}
+
+        body = plan["body"]
+        base = {key: body.get(key) for key in (
+            "model", "engine", "gpu_memory_utilization", "gpu_memory_gb",
+            "shm_size", "infiniband_device", "environment", "runtime_file_mounts", "image", "sg_tp_size",
+            "sg_context_length", "sg_max_running_requests", "sg_mem_fraction", "sg_image",
+        )}
+        base["hf_token"] = self._resolved_hf_token()
+        base["extra_args"] = (
+            self._with_vllm_prompt_token_details(list(body.get("extra_args") or []))
+            if plan["engine"] == "vllm" else list(body.get("extra_args") or [])
+        )
+        tasks, specs = self._build_grouped_sharded_members(
+            deployment_id=deployment["id"], engine=plan["engine"], base=base,
+            node_ids=plan["node_ids"], available=plan["available"],
+            fabrics=plan["fabrics"], local_port=plan["local_port"],
+            tensor_parallel_size=tp, instances=1, first_instance=instance,
+            existing_members=selected,
+        )
+        replacements = {spec["node_id"]: spec for spec in specs}
+        for spec in specs:
+            # Keep inference and recovery away until every rank is created.
+            spec["desired_state"] = "stopped"
+            spec["recreate_pending"] = True
+        deployment["members"] = [
+            replacements[member["node_id"]]
+            if int(member.get("instance_id") or 0) == instance else member
+            for member in members
+        ]
+        deployment["status"] = self._grouped_deployment_status(deployment)
+        self._save_deployments()
+        interrupted = False
+        creating = asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            try:
+                created = await asyncio.shield(creating)
+                break
+            except asyncio.CancelledError:
+                # Docker creation can continue in a thread or on a remote
+                # agent after its caller is cancelled. Retain the lifecycle
+                # lock and wait for creation before removing these identities.
+                interrupted = True
+        if interrupted:
+            errors.append("Group launch was interrupted")
+        for spec, result in zip(specs, created):
+            if isinstance(result, BaseException):
+                spec["status"] = "error"
+                spec["error"] = str(result)
+                errors.append(f"{spec['node_name']}: {result}")
+            else:
+                spec["status"] = result.get("status", "starting")
+                spec["phase"] = result.get("phase") or {
+                    "phase": "starting", "message": "Container created; starting the model server",
+                }
+                spec["container_id"] = result.get("id")
+                spec["port"] = result.get("port") or spec.get("port")
+        if errors:
+            # Even a request that failed can have created a remote container.
+            # Clean every selected identity, never a sibling group's ranks.
+            cleaning = asyncio.gather(
+                *(self._member_action(spec, "remove") for spec in specs),
+                return_exceptions=True,
+            )
+            while True:
+                try:
+                    cleaned = await asyncio.shield(cleaning)
+                    break
+                except asyncio.CancelledError:
+                    interrupted = True
+            errors.extend(self._member_action_errors(cleaned, "remove"))
+            for spec, result in zip(specs, cleaned):
+                if not self._member_action_errors([result], "remove"):
+                    spec["status"] = "stopped"
+                    spec.pop("container_id", None)
+            deployment["settings_dirty"] = True
+        else:
+            for spec in specs:
+                spec["desired_state"] = "running"
+                spec.pop("failed_stop_error", None)
+                spec.pop("recreate_pending", None)
+                spec["launch_settings_fingerprint"] = fingerprint
+            deployment["desired_state"] = "running"
+            deployment["last_deployed_at"] = time.time()
+            if deployment.get("settings_dirty"):
+                deployment["settings_dirty"] = any(
+                    member.get("launch_settings_fingerprint") != fingerprint
+                    for member in deployment["members"]
+                )
+        deployment["status"] = self._grouped_deployment_status(deployment)
+        deployment["status_message"] = None
+        deployment["error"] = "; ".join(errors) if errors else None
+        self._save_deployments()
+        if interrupted:
+            raise asyncio.CancelledError
+        return {"ok": not errors, "errors": errors, "status": deployment["status"], "instance": instance}
 
     async def _deployment_action_locked(
         self, deployment_id: str, action: str,
         node_ids: list[str] | None = None,
         relaunch_mode: str | None = None,
         instance: int | None = None,
+        *, model_revision: str | None = None,
     ) -> dict:
         deployment = self._deployment(deployment_id)
         if not deployment:
             raise ValueError("deployment not found")
         if action not in {"start", "stop", "remove"}:
             raise ValueError("invalid deployment action")
+        if model_revision is not None and (
+            action != "start" or not node_ids or instance is not None
+            or deployment.get("engine", "vllm") not in {"vllm", "sglang"}
+            or not isinstance(model_revision, str)
+            or not IMMUTABLE_HF_REVISION.fullmatch(model_revision)
+        ):
+            raise ValueError(
+                "a cached model revision requires an explicit full-deployment "
+                "start selection for vLLM or SGLang"
+            )
         targeted_instance = self._grouped_target_instance(
             deployment, action, instance,
         )
@@ -7106,11 +8092,32 @@ class Manager:
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
         if targeted_instance is not None and action == "start" and (
-            deployment.get("settings_dirty") or node_ids
+            node_ids or relaunch_mode
         ):
             raise ValueError(
-                "saved launch settings changed; start the whole deployment "
-                "to apply them"
+                "changing the node layout requires starting the whole deployment"
+            )
+
+        selected_members = [
+            member for member in deployment.get("members") or []
+            if targeted_instance is None
+            or int(member.get("instance_id") or 0) == targeted_instance
+        ]
+        if action == "start" and (deployment.get("launch_settings") or {}).get("runtime_file_mounts"):
+            # Also guard ordinary starts of existing containers. A mixed-version
+            # cluster may have created them while silently ignoring the mounts.
+            available = {node["id"]: node for node in await self.cluster_nodes()}
+            self._validate_runtime_file_mount_nodes(
+                deployment["launch_settings"]["runtime_file_mounts"],
+                node_ids or [member["node_id"] for member in selected_members],
+                available,
+            )
+        settings_dirty = bool(deployment.get("settings_dirty"))
+        if targeted_instance is not None and settings_dirty:
+            fingerprint = self._group_launch_settings_fingerprint(deployment)
+            settings_dirty = not selected_members or any(
+                member.get("launch_settings_fingerprint") != fingerprint
+                for member in selected_members
             )
 
         # Persist user intent before touching any member. Inference and health
@@ -7118,6 +8125,9 @@ class Manager:
         # request racing an explicit Stop cannot resurrect the deployment.
         if action == "stop" and targeted_instance is None:
             deployment["desired_state"] = "stopped"
+            if deployment.get("mode") == "grouped_sharded":
+                for member in deployment.get("members") or []:
+                    member["desired_state"] = "stopped"
             # The stop can take seconds per rank; report the honest transition
             # instead of leaving the pre-stop status on the card.
             deployment["status"] = "stopping"
@@ -7126,7 +8136,10 @@ class Manager:
         # Containers cannot move between nodes: an explicit node selection (or
         # any argv-affecting setting change) means removing the old ranks and
         # relaunching the deployment through the fully validated path.
-        relaunch = action == "start" and (deployment.get("settings_dirty") or node_ids)
+        relaunch = action == "start" and (
+            settings_dirty or node_ids
+            or any(member.get("recreate_pending") for member in selected_members)
+        )
         environment_drift: dict[str, list[str]] | None = None
         if action == "start" and not relaunch and deployment.get("members"):
             # A container bakes its environment at create time. When the saved
@@ -7135,7 +8148,7 @@ class Manager:
             # the ranks through the same validated relaunch path instead.
             try:
                 environment_drift = await self._deployment_environment_drift(
-                    deployment,
+                    {**deployment, "members": selected_members},
                 )
             except Exception:
                 # An unexpected inspection failure must never block a start.
@@ -7143,14 +8156,26 @@ class Manager:
             if environment_drift:
                 relaunch = True
                 drifted = ", ".join(sorted(environment_drift))
-                deployment["status"] = "starting"
-                deployment["status_message"] = (
-                    "Recreating containers: their environment no longer "
-                    f"matches the saved launch settings ({drifted})"
-                )
-                self._save_deployments()
+                if targeted_instance is None:
+                    deployment["status"] = "starting"
+                    deployment["status_message"] = (
+                        "Recreating containers: their environment no longer "
+                        f"matches the saved launch settings ({drifted})"
+                    )
+                    self._save_deployments()
         if relaunch:
+            if targeted_instance is not None:
+                return await self._recreate_grouped_instance(
+                    deployment, targeted_instance,
+                )
             launch_body = dict(deployment.get("launch_settings") or {})
+            if model_revision is not None:
+                args = list(launch_body.get("extra_args") or [])
+                previous_revision = self._cli_option(args, {"--revision"})
+                if previous_revision and previous_revision != model_revision:
+                    raise ValueError("cached model revision cannot replace an explicit revision")
+                if not previous_revision:
+                    launch_body["extra_args"] = [*args, "--revision", model_revision]
             launch_body["recipe_id"] = deployment.get("recipe_id")
             if node_ids:
                 launch_body["node_ids"] = [str(item) for item in node_ids]
@@ -7228,9 +8253,13 @@ class Manager:
                 if int(member.get("instance_id") or 0) == targeted_instance:
                     member["desired_state"] = desired
                 else:
+                    if deployment.get("status") == "stopped":
+                        member["status"] = "stopped"
                     member["desired_state"] = (
                         "stopped"
-                        if str(member.get("status") or "") in {"stopped", "error"}
+                        if deployment.get("desired_state") == "stopped"
+                        or member.get("desired_state") == "stopped"
+                        or str(member.get("status") or "") in {"stopped", "error"}
                         else "running"
                     )
             if action == "start":
@@ -7256,12 +8285,17 @@ class Manager:
             *[self._member_action(m, action) for m in targeted_members],
             return_exceptions=True,
         )
-        if targeted_instance is not None:
+        if targeted_instance is not None or (
+            action in {"start", "stop"} and deployment.get("mode") == "grouped_sharded"
+        ):
             # Record the local transition on the acted members so the derived
             # status reflects this action without waiting for a reconcile.
             for member, result in zip(targeted_members, results):
                 if isinstance(result, Exception):
+                    if action == "stop":
+                        member["failed_stop_error"] = str(result)
                     continue
+                member.pop("failed_stop_error", None)
                 member["status"] = "starting" if action == "start" else "stopped"
         errors = self._member_action_errors(results, action)
         if action == "remove" and not errors:
@@ -7286,13 +8320,371 @@ class Manager:
                 deployment["status"] = "starting" if action == "start" else "stopped"
                 if action == "start":
                     deployment["last_deployed_at"] = time.time()
-            deployment["error"] = "; ".join(errors) if errors else None
+            pending_stop_errors = [str(member["failed_stop_error"]) for member in deployment.get("members", []) if member.get("failed_stop_error")]
+            deployment["error"] = "; ".join(dict.fromkeys([*errors, *pending_stop_errors])) or None
         self._save_deployments()
         return {
             "ok": not errors,
             "errors": errors,
             "status": deployment.get("status"),
         }
+
+    def _instance_group_node_count(self, deployment: dict) -> int:
+        """Hosts per engine group for a sharded/grouped deployment."""
+        launch = deployment.get("launch_settings") or {}
+        try:
+            tensor = int(launch.get("tensor_parallel_size") or 0)
+        except (TypeError, ValueError):
+            tensor = 0
+        if tensor >= 2:
+            return tensor
+        members = deployment.get("members") or []
+        if not members:
+            return 0
+        # A sharded deployment never persisted a per-group scalar: its member
+        # count is the host count of the one group it owns.
+        return len(members)
+
+    def _convert_sharded_deployment_to_grouped(
+        self, deployment: dict, tensor_parallel_size: int,
+    ) -> None:
+        """Backfill instance identity so a sharded deployment can grow.
+
+        The running group becomes instance 0 without touching its containers:
+        only the persisted record changes (mode, per-group scalars, member
+        marks), so the next launch reproduces the same topology through the
+        grouped path.
+        """
+        for member in deployment.get("members") or []:
+            member["instance_id"] = 0
+        deployment["mode"] = "grouped_sharded"
+        deployment["instances"] = 2
+        launch = deployment.get("launch_settings") or {}
+        launch["deployment_mode"] = "grouped_sharded"
+        launch["tensor_parallel_size"] = tensor_parallel_size
+        launch["instances"] = 2
+
+    async def add_deployment_instance(
+        self, deployment_id: str, node_ids: list[str],
+    ) -> dict:
+        """Launch one more independent engine group on free nodes.
+
+        The deployment keeps its served name and identity: requests balance
+        across every started group's coordinator, and the new group must use
+        nodes the deployment does not already occupy. A plain sharded
+        deployment is converted to grouped in place (instance 0 backfilled)
+        before the new group launches.
+        """
+        async with self._cluster_action_lock():
+            deployment = self._deployment(deployment_id)
+            if not deployment:
+                raise ValueError("deployment not found")
+            mode = deployment.get("mode")
+            if mode not in {"sharded", "grouped_sharded"}:
+                raise ValueError(
+                    "start-another-deployment is only available for tensor "
+                    "parallel deployments; replicated layouts already run one "
+                    "copy per selected node"
+                )
+            engine = str(deployment.get("engine") or "vllm")
+            if engine not in {"vllm", "sglang"}:
+                raise ValueError(
+                    "start-another-deployment requires a vLLM or SGLang runtime"
+                )
+            requested = list(dict.fromkeys(str(item).strip() for item in node_ids))
+            if not requested or any(not item for item in requested):
+                raise ValueError("node_ids must contain non-empty node IDs")
+            members = deployment.get("members") or []
+            if not members:
+                raise ValueError(
+                    "start the deployment before launching another instance"
+                )
+            tensor_parallel_size = self._instance_group_node_count(deployment)
+            if tensor_parallel_size < 2:
+                raise ValueError(
+                    "cannot determine the tensor parallel node count for "
+                    "another deployment"
+                )
+            # A group with several ranks per host would need to mirror a
+            # world size the grouped builder does not reproduce; keep the
+            # one-rank-per-host layouts this action is for.
+            launch = deployment.get("launch_settings") or {}
+            args = list(launch.get("extra_args") or [])
+            world_tp = self._cli_option(
+                args, {"--tensor-parallel-size", "-tp"}, int,
+            )
+            if engine == "sglang":
+                try:
+                    world_tp = int(launch.get("sg_tp_size") or world_tp or 0)
+                except (TypeError, ValueError):
+                    world_tp = 0
+            if world_tp and world_tp != tensor_parallel_size:
+                raise ValueError(
+                    "this deployment places several tensor parallel ranks on "
+                    "one node; start-another-deployment requires one rank per "
+                    "node"
+                )
+            if mode == "sharded" and not world_tp:
+                # A vLLM sharded deployment without an explicit TP flag
+                # pipelines across the nodes (default 1 TP x N PP layout): an
+                # added TP-only group would not reproduce that engine.
+                raise ValueError(
+                    "this deployment pipelines across the selected nodes; "
+                    "start-another-deployment requires an explicit tensor "
+                    "parallel layout"
+                )
+            if deployment.get("settings_dirty"):
+                raise ValueError(
+                    "saved launch settings changed; start the deployment to "
+                    "apply them before launching another deployment"
+                )
+            if deployment.get("desired_state") == "stopped":
+                raise ValueError(
+                    "start the deployment before launching another deployment"
+                )
+            # Everything below mutates the record: every rejecting check must
+            # have run by this point.
+            if len(requested) != tensor_parallel_size:
+                raise ValueError(
+                    f"another TP{tensor_parallel_size} deployment requires "
+                    f"exactly {tensor_parallel_size} node(s), got {len(requested)}"
+                )
+            occupied = {
+                str(member.get("node_id")) for member in members
+                if member.get("node_id")
+            }
+            clash = sorted(occupied.intersection(requested))
+            if clash:
+                raise ValueError(
+                    "this deployment already runs on: " + ", ".join(clash)
+                )
+
+            available = {n["id"]: n for n in await self.cluster_nodes()}
+            missing = [nid for nid in requested if nid not in available]
+            if missing:
+                raise ValueError(f"unknown cluster node(s): {', '.join(missing)}")
+            offline = [
+                available[nid].get("name", nid) for nid in requested
+                if not available[nid].get("online")
+            ]
+            if offline:
+                raise ValueError(
+                    "cluster node(s) are offline: " + ", ".join(offline)
+                )
+            unready = [
+                available[nid].get("name", nid) for nid in requested
+                if not available[nid].get("docker_ready")
+            ]
+            if unready:
+                raise ValueError("Docker is unavailable on: " + ", ".join(unready))
+            self._validate_runtime_file_mount_nodes(
+                launch.get("runtime_file_mounts"), requested, available,
+            )
+            gpu_short = []
+            fabrics: dict[str, tuple[str | None, str | None]] = {}
+            for nid in requested:
+                node = available[nid]
+                requested_ip = (
+                    self.settings.get("cluster_fabric_ip")
+                    if nid == LOCAL_NODE_ID else node.get("fabric_ip")
+                )
+                requested_interface = (
+                    self.settings.get("cluster_fabric_interface")
+                    if nid == LOCAL_NODE_ID else node.get("fabric_interface")
+                )
+                fabrics[nid] = self._inferred_fabric(
+                    node, requested_ip, requested_interface,
+                )
+                if not fabrics[nid][0]:
+                    raise ValueError(
+                        "could not determine fabric IP for "
+                        f"{node.get('name', nid)}"
+                    )
+                gpus = (node.get("stats") or {}).get("gpus")
+                if gpus is not None and not [
+                    gpu for gpu in gpus
+                    if not (isinstance(gpu, dict) and gpu.get("error"))
+                ]:
+                    gpu_short.append(node.get("name", nid))
+            if gpu_short:
+                raise ValueError(
+                    "no usable GPUs on: " + ", ".join(gpu_short)
+                )
+
+            # All rejecting checks have passed. Snapshot the pre-conversion
+            # state so a failed launch can restore a plain sharded record
+            # exactly, then convert in memory.
+            converted = mode == "sharded"
+            pre_conversion = {
+                "mode": deployment.get("mode"),
+                "instances": deployment.get("instances"),
+                "launch_mode": launch.get("deployment_mode"),
+                "launch_tensor": launch.get("tensor_parallel_size"),
+                "launch_instances": launch.get("instances"),
+            } if converted else None
+            if converted:
+                self._convert_sharded_deployment_to_grouped(
+                    deployment, tensor_parallel_size,
+                )
+
+            instance_ids = [
+                int(member.get("instance_id") or 0) for member in members
+            ]
+            next_instance = (max(instance_ids) + 1) if instance_ids else 0
+            local_port = None
+            if LOCAL_NODE_ID in requested:
+                local_port = await self._allocate_port(
+                    exclude_deployment_id=deployment_id,
+                )
+            model = str(deployment.get("model") or "")
+            base = {
+                "model": model,
+                "engine": engine,
+                "hf_token": self._resolved_hf_token(),
+                "gpu_memory_utilization": launch.get("gpu_memory_utilization"),
+                "gpu_memory_gb": launch.get("gpu_memory_gb"),
+                "shm_size": launch.get("shm_size"),
+                "infiniband_device": launch.get("infiniband_device"),
+                "environment": launch.get("environment"),
+                "runtime_file_mounts": launch.get("runtime_file_mounts"),
+                "extra_args": (
+                    self._with_vllm_prompt_token_details(
+                        list(launch.get("extra_args") or [])
+                    )
+                    if engine == "vllm"
+                    else list(launch.get("extra_args") or [])
+                ),
+                "image": launch.get("image"),
+                "sg_tp_size": launch.get("sg_tp_size"),
+                "sg_context_length": launch.get("sg_context_length"),
+                "sg_max_running_requests": launch.get("sg_max_running_requests"),
+                "sg_mem_fraction": launch.get("sg_mem_fraction"),
+                "sg_image": launch.get("sg_image"),
+                "llama_artifact": None,
+                "llama_context_length": None,
+                "llama_parallel_slots": None,
+                "llama_gpu_layers": None,
+            }
+            tasks, member_specs = self._build_grouped_sharded_members(
+                deployment_id=deployment_id,
+                engine=engine,
+                base=base,
+                node_ids=requested,
+                available=available,
+                fabrics=fabrics,
+                local_port=local_port,
+                tensor_parallel_size=tensor_parallel_size,
+                instances=1,
+                first_instance=next_instance,
+            )
+            deployment["members"] = members + member_specs
+            deployment["instances"] = next_instance + 1
+            launch["instances"] = deployment["instances"]
+            merged_nodes = list(dict.fromkeys(
+                [
+                    *(str(item) for item in deployment.get("node_ids") or []),
+                    *requested,
+                ]
+            ))
+            deployment["node_ids"] = merged_nodes
+            launch["node_ids"] = merged_nodes
+            # "launching" during the pull window keeps the health monitor
+            # away from the not-yet-existing containers, and if the
+            # controller dies here the startup resume path rebuilds the
+            # whole (already extended) topology coherently.
+            deployment["status"] = "launching"
+            deployment["status_message"] = (
+                f"Launching another deployment on {', '.join(requested)}"
+            )
+            self._save_deployments()
+
+            created = await asyncio.gather(*tasks, return_exceptions=True)
+            errors = []
+            for spec, result in zip(member_specs, created):
+                if isinstance(result, Exception):
+                    spec["status"] = "error"
+                    spec["error"] = str(result)
+                    spec["phase"] = {
+                        "phase": "error",
+                        "message": f"Launch failed: {result}",
+                    }
+                    errors.append(f"{spec['node_name']}: {result}")
+                else:
+                    spec["status"] = result.get("status", "starting")
+                    spec["phase"] = result.get("phase") or {
+                        "phase": "starting",
+                        "message": "Container created; starting the model server",
+                    }
+                    spec["container_id"] = result.get("id")
+                    spec["port"] = result.get("port") or spec.get("port")
+            if errors:
+                # Roll the failed group back: a partially created engine
+                # holds GPU memory without serving. The previous groups keep
+                # serving regardless, so the card returns to its derived
+                # state instead of a stale failure.
+                await asyncio.gather(
+                    *[
+                        self._member_action(spec, "remove")
+                        for spec in member_specs if spec.get("container_id")
+                    ],
+                    return_exceptions=True,
+                )
+                failed = {id(spec) for spec in member_specs}
+                deployment["members"] = [
+                    member for member in deployment["members"]
+                    if id(member) not in failed
+                ]
+                deployment["instances"] = next_instance
+                launch["instances"] = next_instance
+                deployment["node_ids"] = [
+                    str(item) for item in deployment.get("node_ids")
+                    if item not in requested
+                ]
+                launch["node_ids"] = list(deployment["node_ids"])
+                # A converted sharded record goes back to exactly what
+                # it was: no phantom grouped topology may survive. Keys the
+                # conversion introduced are removed, not nulled.
+                if pre_conversion is not None:
+                    deployment["mode"] = pre_conversion["mode"]
+                    launch["deployment_mode"] = pre_conversion["launch_mode"]
+                    for member in deployment["members"]:
+                        member.pop("instance_id", None)
+                    if pre_conversion["instances"] is None:
+                        deployment.pop("instances", None)
+                        launch.pop("instances", None)
+                    else:
+                        deployment["instances"] = pre_conversion["instances"]
+                        launch["instances"] = pre_conversion["launch_instances"]
+                    if pre_conversion["launch_tensor"] is None:
+                        launch.pop("tensor_parallel_size", None)
+                    else:
+                        launch["tensor_parallel_size"] = pre_conversion["launch_tensor"]
+                deployment.pop("status_message", None)
+                # With the failed group removed the remaining ranks derive
+                # the honest state (a sharded record's ranks read as one
+                # group here, which matches its health semantics).
+                deployment["status"] = self._grouped_deployment_status(
+                    deployment
+                )
+                deployment["error"] = "; ".join(errors)
+                self._save_deployments()
+                return {
+                    "ok": False,
+                    "errors": errors,
+                    "status": deployment.get("status"),
+                    "node_ids": list(deployment["node_ids"]),
+                }
+            deployment["error"] = None
+            deployment["last_deployed_at"] = time.time()
+            deployment["status"] = self._grouped_deployment_status(deployment)
+            deployment["status_message"] = None
+            self._save_deployments()
+            return {
+                "ok": True,
+                "errors": [],
+                "status": deployment.get("status"),
+                "node_ids": list(deployment["node_ids"]),
+            }
 
     @staticmethod
     def _container_started_epoch(value: Any) -> float | None:
@@ -7624,6 +9016,11 @@ class Manager:
         for member in deployment.get("members") or []:
             if str(member.get("desired_state") or "running") == "stopped":
                 continue
+            if str(member.get("status") or "") in {"queued", "creating"}:
+                # A launch still represented by a synthetic agent row is not
+                # a failed runtime (create_deployment and instance adds set
+                # this while containers are being pulled).
+                continue
             node = node_by_id.get(member.get("node_id"))
             if not node or not node.get("online") or not node.get("docker_ready"):
                 return None
@@ -7836,7 +9233,97 @@ class Manager:
             + (deployment.get("error") or "split instance(s) restarted")
         )
 
+    async def _reconcile_stopped_members(self) -> None:
+        """Finish explicit stops when workers return, including failed stops.
+
+        Stop intent must survive an unreachable agent and Docker restarting
+        its containers. Serialize with Start and inspect intent under the lock
+        so a delayed reconciliation cannot undo a newer lifecycle action.
+        """
+        async with self._cluster_action_lock():
+            candidates = [
+                deployment for deployment in self.deployments
+                if deployment.get("members") and (
+                    deployment.get("desired_state") == "stopped"
+                    or (deployment.get("mode") == "grouped_sharded" and any(
+                        member.get("desired_state") == "stopped"
+                        for member in deployment["members"]
+                    )))
+            ]
+            if not candidates:
+                return
+            nodes = {node["id"]: node for node in await self.cluster_nodes()}
+            for deployment in candidates:
+                previous = copy.deepcopy(deployment)
+                previous_stop_error = "; ".join(dict.fromkeys(
+                    str(member["failed_stop_error"]) for member in deployment["members"]
+                    if member.get("failed_stop_error")
+                ))
+                whole_stop = deployment.get("desired_state") == "stopped"
+                selected = [member for member in deployment["members"]
+                            if whole_stop or member.get("desired_state") == "stopped"]
+                pending = []
+                confirmed = []
+                for member in selected:
+                    node = nodes.get(member.get("node_id"), {})
+                    if (not node.get("online") or not node.get("docker_ready")
+                            or not isinstance(node.get("containers"), list)):
+                        continue
+                    container = next((item for item in node.get("containers") or []
+                                      if item.get("name") == member.get("container_name")), None)
+                    if node.get("inventory_available") is False:
+                        continue
+                    if container is None and node.get("inventory_available") is not True:
+                        # Older agents can synthesize an empty inventory after
+                        # enumeration fails; absence needs explicit confirmation.
+                        continue
+                    if container is None:
+                        confirmed.append(member)
+                    elif (container.get("status") in {"created", "exited", "stopped", "dead"}
+                          and not member.get("failed_stop_error")):
+                        confirmed.append(member)
+                    else:
+                        # Reissue even for an exited container after a failed
+                        # stop: explicit stop also disarms its restart policy.
+                        pending.append(member)
+                results = await asyncio.gather(*(
+                    self._member_action(member, "stop") for member in pending
+                ), return_exceptions=True)
+                for member, result in zip(pending, results):
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                    errors = self._member_action_errors([result], "stop")
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        errors.append(str(result.get("error") or result.get("errors") or "Stop failed"))
+                    if errors:
+                        member["failed_stop_error"] = "; ".join(errors)
+                    else:
+                        confirmed.append(member)
+                for member in confirmed:
+                    member["status"] = "stopped"
+                    member["phase"] = {"phase": "stopped"}
+                    member.pop("failed_stop_error", None)
+                # Offline/unknown inventories never count as confirmation.
+                # Preserve their reservation and retry on the next health tick.
+                if whole_stop and len(confirmed) == len(selected):
+                    deployment["status"] = "stopped"
+                    deployment["error"] = None
+                    deployment.pop("status_message", None)
+                elif any(member.get("failed_stop_error") for member in selected):
+                    deployment["error"] = "; ".join(dict.fromkeys(
+                        str(member["failed_stop_error"]) for member in selected
+                        if member.get("failed_stop_error")
+                    ))
+                elif (len(confirmed) == len(selected) and previous_stop_error
+                      and deployment.get("error") == previous_stop_error):
+                    deployment["error"] = None
+                    if deployment.get("status") == "degraded":
+                        deployment["status"] = self._grouped_deployment_status(deployment)
+                if deployment != previous:
+                    self._save_deployments()
+
     async def _cluster_health_tick(self) -> None:
+        await self._reconcile_stopped_members()
         candidates = [
             deployment for deployment in list(self.deployments)
             if len(deployment.get("members") or []) >= 2
@@ -10073,6 +11560,8 @@ class Manager:
         usage: dict | None,
         gen_time_s: float | None = None,
         pp_time_s: float | None = None,
+        *,
+        startup_benchmark: bool = False,
     ):
         """Record an OpenAI-style usage object {prompt_tokens, completion_tokens}.
 
@@ -10080,6 +11569,10 @@ class Manager:
         (OpenAI / vLLM prefix-cache hits).
         """
         if not usage:
+            return
+        if startup_benchmark:
+            # A synthetic startup probe must not pollute the user's ordinary
+            # token/throughput history. Admission tracking is unaffected.
             return
         prompt_tokens, cached = self._usage_prompt_counts(usage)
         self._record_tokens(
@@ -10090,6 +11583,11 @@ class Manager:
             cached_tokens=cached,
             pp_time_s=pp_time_s,
         )
+
+    @staticmethod
+    def _startup_probe_kwargs(startup_benchmark: bool) -> dict[str, bool]:
+        """Only forward the probe marker when a startup benchmark is active."""
+        return {"startup_benchmark": True} if startup_benchmark else {}
 
     @staticmethod
     def _usage_from_sse_line(line: str) -> dict | None:
@@ -10162,8 +11660,6 @@ class Manager:
         interrupt: asyncio.Event | None = None,
     ):
         """Await a coroutine, aborting it on disconnect or a stream nudge."""
-        if cancel is None and interrupt is None:
-            return await coro
         t = asyncio.create_task(coro)
         cw = asyncio.create_task(cancel.wait()) if cancel is not None else None
         iw = (
@@ -10171,23 +11667,34 @@ class Manager:
             if interrupt is not None else None
         )
         watchers = {task for task in (cw, iw) if task is not None}
-        done, _ = await asyncio.wait(
-            {t, *watchers}, return_when=asyncio.FIRST_COMPLETED,
-        )
-        for watcher in watchers:
-            watcher.cancel()
-        if t in done:
-            return t.result()
-        t.cancel()
         try:
-            await t
-        except BaseException:
-            pass
-        if cw is not None and cw in done:
+            done, _ = await asyncio.wait(
+                {t, *watchers}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if t in done:
+                return t.result()
+            if cw is not None and cw in done:
+                raise ClientAbort("client disconnected")
+            if iw is not None and iw in done:
+                raise StreamNudge("stream selected for transparent replay")
             raise ClientAbort("client disconnected")
-        if iw is not None and iw in done:
-            raise StreamNudge("stream selected for transparent replay")
-        raise ClientAbort("client disconnected")
+        finally:
+            # The prompt gate may cancel this owner before its own disconnect
+            # watcher wins. Always join upstream cleanup before releasing it.
+            for task in {t, *watchers}:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            cleanup = asyncio.gather(t, *watchers, return_exceptions=True)
+            cancelled = None
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    # A second disconnect cancellation must not interrupt the
+                    # transport's finally block. Propagate it after cleanup.
+                    cancelled = exc
+            if cancelled is not None:
+                raise cancelled
 
     @staticmethod
     async def _aiter_lines_cancellable(
@@ -10266,6 +11773,38 @@ class Manager:
                 pending.cancel()
 
     # ----- live request tracking (Tokens widget) -----
+    def _request_group(self, model: str, deployment_id: str | None = None,
+                       container_name: str | None = None) -> dict:
+        """Identify the selected engine, including all of its shard nodes."""
+        metadata = {"model": model, "deployment_id": deployment_id,
+                    "instance_id": None, "node_ids": ["local"], "node_names": []}
+        for deployment in getattr(self, "deployments", []):
+            if deployment_id and deployment.get("id") != deployment_id:
+                continue
+            members = deployment.get("members") or []
+            selected = next((m for m in members
+                             if container_name and m.get("container_name") == container_name), None)
+            if selected is None:
+                continue
+            instance = selected.get("instance_id")
+            if instance is not None:
+                group = [m for m in members if m.get("instance_id") == instance]
+            elif deployment.get("mode") == "replicated":
+                group = [selected]
+            else:
+                group = members
+            metadata.update(
+                deployment_id=deployment.get("id"), instance_id=instance,
+                node_ids=list(dict.fromkeys(str(m["node_id"]) for m in group if m.get("node_id"))),
+                node_names=list(dict.fromkeys(
+                    str(m.get("node_name") or m.get("node_id") or "This node")
+                    for m in group)),
+            )
+            metadata["group_id"] = self._cluster_member_key(deployment["id"], selected)
+            return metadata
+        metadata["group_id"] = str(deployment_id or container_name or model)
+        return metadata
+
     def _track_start(
         self,
         key: str,
@@ -10274,12 +11813,23 @@ class Manager:
         nudge_event: asyncio.Event | None = None,
         deployment_id: str | None = None,
         caller_ip: str | None = None,
+        container_name: str | None = None,
+        *,
+        startup_benchmark: bool = False,
     ) -> int:
+        if not hasattr(self, "_active_reqs"):
+            self._active_reqs = {}
+            self._req_seq = 0
         self._req_seq += 1
         rid = self._req_seq
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
         self._active_reqs[rid] = {
             "key": key, "thinking": deque(), "output": deque(),
             "streaming": streaming,
+            "owner_task": owner,
             "started_at": time.monotonic(),
             "pp_tokens": 0,
             "pp_time_s": 0.0,
@@ -10290,8 +11840,19 @@ class Manager:
             "deployment_id": deployment_id,
             "caller_ip": caller_ip,
             "paused": False,
+            "startup_benchmark": startup_benchmark,
+            "group": self._request_group(key, deployment_id, container_name),
         }
-        self._mark_deployment_used(deployment_id)
+        sequences = getattr(self, "_inference_scope_sequences", None)
+        if sequences is None:
+            sequences = self._inference_scope_sequences = {}
+        for node_id in self._active_reqs[rid]["group"].get("node_ids") or ["local"]:
+            scope = f"node:{node_id}"
+            sequences[scope] = sequences.get(scope, 0) + 1
+        if not startup_benchmark:
+            # A synthetic startup probe must not refresh the deployment's
+            # "last used" timestamps or skew ordinary usage metrics.
+            self._mark_deployment_used(deployment_id)
         return rid
 
     def _track_prompt_processing(
@@ -10311,14 +11872,130 @@ class Manager:
             rec["total_tokens"] = rec.get("total_tokens", 0) + count
             timestamps = rec[kind]
             timestamps.extend([ts] * count)
-            cutoff = ts - self._trailing_window
+            cutoff = ts - getattr(self, "_trailing_window", 5.0)
             while timestamps and timestamps[0] < cutoff:
                 timestamps.popleft()
 
     def _track_end(self, rid: int):
         rec = self._active_reqs.pop(rid, None)
         if rec:
-            self._mark_deployment_used(rec.get("deployment_id"))
+            if not rec.get("startup_benchmark"):
+                # A synthetic startup probe must not refresh the deployment's
+                # "last used" timestamps at completion either.
+                self._mark_deployment_used(rec.get("deployment_id"))
+
+    def _transfer_inference_ownership(
+        self, admission=None, request_id=None, *,
+        owner=_CURRENT_INFERENCE_OWNER, cancel=None, release_callback=None,
+        cleanup_stream=None,
+    ) -> None:
+        """Transfer to a producer task, or detach during a stream handoff.
+
+        Detached streams remain live until explicitly canceled; completion of
+        the preparing HTTP task is not evidence that their consumers died.
+        """
+        if owner is _CURRENT_INFERENCE_OWNER:
+            owner = asyncio.current_task()
+        rec = getattr(self, "_active_reqs", {}).get(request_id)
+        if rec is not None:
+            rec["owner_task"] = owner
+            if admission is not None:
+                rec["admission_target"] = admission
+            if cancel is not None:
+                rec["owner_cancel"] = cancel
+            if release_callback is not None:
+                rec["release_callback"] = release_callback
+            if cleanup_stream is not None:
+                rec["cleanup_stream"] = cleanup_stream
+                rec.pop("cleanup_task", None)
+            if admission is None:
+                admission = rec.get("admission_target")
+        if isinstance(admission, _AdmissionLease) and not admission.released:
+            admission.owner = owner
+            if cancel is not None:
+                admission.cancel = cancel
+
+    @staticmethod
+    def _inference_owner_is_dead(owner, cancel) -> bool:
+        return bool(cancel is not None and cancel.is_set()) or bool(owner is not None and owner.done())
+
+    async def _close_inference_transport(self, request_id) -> None:
+        """Share transport completion between a reaper and a resumed stream."""
+        rec = getattr(self, "_active_reqs", {}).get(request_id)
+        if rec is None or rec.get("cleanup_stream") is None:
+            return
+        task = rec.get("cleanup_task")
+        if task is None:
+            task = asyncio.create_task(close_async_stream(rec["cleanup_stream"]))
+            rec["cleanup_task"] = task
+        with anyio.CancelScope(shield=True):
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if not asyncio.current_task().cancelling():
+                    # A transport can cancel its own cleanup without canceling
+                    # its caller. Treat that as a failed close so the reaper
+                    # still releases abandoned accounting and keeps running.
+                    raise RuntimeError("inference transport cleanup was cancelled") from exc
+                # Native task cancellation must not release capacity while
+                # the shielded transport task is still closing upstream.
+                try:
+                    await task
+                except (Exception, asyncio.CancelledError):
+                    # A failed close must not mask the caller's cancellation.
+                    pass
+                raise
+
+    async def _reap_dead_inference_owners(self) -> list[str]:
+        """Release abandoned requests using task/cancellation evidence only."""
+        reaped = set()
+        for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
+            admission = rec.get("admission_target")
+            if not self._inference_owner_is_dead(rec.get("owner_task"), rec.get("owner_cancel")):
+                continue
+            cancel = rec.get("owner_cancel")
+            if cancel is not None:
+                cancel.set()
+            cleanup_stream = rec.get("cleanup_stream")
+            owner = rec.get("owner_task")
+            # Streaming and non-streaming consumers both own transport
+            # cancellation until their task has finished unwinding.
+            if owner is not None and not owner.done():
+                continue
+            if cleanup_stream is not None:
+                # An active consumer owns its finally block. Do not race its
+                # transport close or release its capacity ahead of cleanup.
+                try:
+                    await self._close_inference_transport(rid)
+                except Exception:
+                    logger.exception("failed to close abandoned inference stream")
+            if admission is not None:
+                reaped.add(str(admission))
+                self._release_inference_slot(admission)
+            callback = rec.pop("release_callback", None)
+            try:
+                if callback is not None:
+                    callback()
+            except Exception:
+                logger.exception("failed to release abandoned inference reservation")
+            finally:
+                self._track_end(rid)
+        owned_leases = {
+            id(rec.get("admission_target"))
+            for rec in getattr(self, "_active_reqs", {}).values()
+        }
+        for target, state in list(self._admission_store().items()):
+            for lease in list(state.get("leases", {}).values()):
+                if id(lease) in owned_leases:
+                    continue
+                if lease.owner is not None and not lease.owner.done():
+                    continue
+                if self._inference_owner_is_dead(lease.owner, lease.cancel):
+                    if lease.cancel is not None:
+                        lease.cancel.set()
+                    self._release_inference_slot(lease)
+                    reaped.add(target)
+        return sorted(reaped)
 
     def _mark_deployment_used(self, deployment_id: str | None) -> None:
         """Record cluster inference activity, persisting at a bounded rate."""
@@ -10342,22 +12019,30 @@ class Manager:
                     pass
             return
 
-    def active_requests(self) -> dict:
+    def active_request_groups(self) -> dict:
+        """Per-engine sessions and rolling rates for the dashboard."""
+        return self.active_requests(_grouped=True)
+
+    def active_requests(self, *, _grouped: bool = False) -> dict:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
         out: dict[str, dict] = {}
-        for rid, rec in list(self._active_reqs.items()):
+        for rid, rec in list(getattr(self, "_active_reqs", {}).items()):
             # A zero-output stream selected for transparent replay stays in
             # _active_reqs so its downstream connection remains open, but it
             # has released its admission slot and is waiting in the FIFO.
             # Do not report that paused request as running.
             if rec.get("paused"):
                 continue
-            e = out.setdefault(rec["key"], {
+            group = rec.get("group") or self._request_group(rec["key"])
+            entry_key = group["group_id"] if _grouped else rec["key"]
+            e = out.setdefault(entry_key, {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
                 "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
             })
+            if _grouped:
+                e.update(group)
             e["connections"] += 1
             caller_ip = rec.get("caller_ip")
             if caller_ip:
@@ -10367,46 +12052,56 @@ class Manager:
             if rec.get("pp_tokens") and rec.get("pp_time_s"):
                 e["pp_tokens"] += int(rec["pp_tokens"])
                 e["pp_time_s"] += float(rec["pp_time_s"])
+                if _grouped:
+                    e["pp_tok_s"] = (e.get("pp_tok_s") or 0.0) + (
+                        float(rec["pp_tokens"]) / float(rec["pp_time_s"])
+                    )
             else:
                 e["pp_measuring"] += 1
             for kind, field in (("thinking", "thinking_tok_s"), ("output", "output_tok_s")):
                 timestamps = rec[kind]
-                cutoff = now - self._trailing_window
+                cutoff = now - getattr(self, "_trailing_window", 5.0)
                 while timestamps and timestamps[0] < cutoff:
                     timestamps.popleft()
                 if timestamps:
-                    observed = min(self._trailing_window, max(1.0, now - timestamps[0]))
+                    observed = min(getattr(self, "_trailing_window", 5.0), max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
-        # clean up per-model entries when all their streams ended
-        active_keys = {rec["key"] for rec in self._active_reqs.values()}
-        for key in list(out.keys()):
-            if key not in active_keys:
-                del out[key]
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
-            e["pp_tok_s"] = (
-                round(e["pp_tokens"] / e["pp_time_s"], 1)
-                if e["pp_time_s"] > 0
-                else None
-            )
+            if _grouped:
+                e["pp_tok_s"] = round(e["pp_tok_s"], 1) if e.get("pp_tok_s") is not None else None
+            else:
+                e["pp_tok_s"] = (
+                    round(e["pp_tokens"] / e["pp_time_s"], 1)
+                    if e["pp_time_s"] > 0
+                    else None
+                )
         admission_running: dict[str, int] = {}
-        for admission in self.inference_admission().values():
+        for target, admission in self.inference_admission().items():
             model = admission.get("model")
             if not model:
                 continue
-            e = out.setdefault(model, {
+            group = {
+                key: admission[key]
+                for key in ("group_id", "model", "deployment_id", "instance_id", "node_names")
+                if key in admission
+            } if admission.get("group_id") else self._request_group(model)
+            entry_key = group["group_id"] if _grouped else model
+            e = out.setdefault(entry_key, {
                 "connections": 0, "decoded_tokens": 0,
                 "thinking_tok_s": 0.0, "output_tok_s": 0.0,
                 "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
                 "pp_tok_s": None,
             })
+            if _grouped:
+                e.update(group)
             e["queued"] = e.get("queued", 0) + admission["queued"]
             e["admission_limit"] = admission.get(
                 "effective_limit", admission["limit"]
             )
-            admission_running[model] = (
-                admission_running.get(model, 0) + admission["running"]
+            admission_running[entry_key] = (
+                admission_running.get(entry_key, 0) + admission["running"]
             )
         # Admission owns the authoritative running count from slot grant until
         # release.  max() includes non-streaming/prefill work that has no live
@@ -10455,6 +12150,9 @@ class Manager:
                 continue
             waiter["granted"] = True
             state["running"] += 1
+            lease = waiter.get("lease")
+            if lease is not None:
+                state.setdefault("leases", {})[id(lease)] = lease
             future.set_result(None)
 
     async def _acquire_inference_slot(
@@ -10476,13 +12174,18 @@ class Manager:
         })
         state["limit"] = limit
         state["model"] = stats_key
+        state["group"] = self._request_group(
+            stats_key, container.get("deployment_id"), container.get("name"),
+        )
 
         loop = asyncio.get_running_loop()
         waiter = {
             "future": loop.create_future(),
             "created_at": time.monotonic(),
             "granted": False,
+            "lease": _AdmissionLease(target, state, asyncio.current_task()),
         }
+        waiter["lease"].cancel = cancel
         state["waiters"].append(waiter)
         self._drain_inference_waiters(state)
 
@@ -10508,10 +12211,10 @@ class Manager:
             if cancel_waiter is not None and cancel_waiter in done:
                 raise ClientAbort("client disconnected while queued")
             await waiter["future"]
-            return target
+            return waiter["lease"]
         except BaseException:
             if waiter["granted"]:
-                self._release_inference_slot(target)
+                self._release_inference_slot(waiter["lease"])
             else:
                 try:
                     state["waiters"].remove(waiter)
@@ -10528,6 +12231,19 @@ class Manager:
         if target is None:
             return
         state = self._admission_store().get(target)
+        if isinstance(target, _AdmissionLease):
+            if target.released:
+                return
+            target.released = True
+            target.owner = None
+            target.state.get("leases", {}).pop(id(target), None)
+            if state is not target.state:
+                return
+        elif state is not None and state.get("leases"):
+            # Compatibility for administrative/legacy target-only callers.
+            # Runtime paths retain the exact lease returned by acquisition.
+            self._release_inference_slot(next(iter(state["leases"].values())))
+            return
         if state is None:
             return
         state["running"] = max(0, state["running"] - 1)
@@ -10535,6 +12251,140 @@ class Manager:
         if not state["running"] and not state["waiters"]:
             self._admission_store().pop(target, None)
             getattr(self, "_nudger_slow_since", {}).pop(target, None)
+
+    @staticmethod
+    def _admission_target_matches(target: str, container: dict) -> bool:
+        """Whether an admission target id refers to this container."""
+        if target.startswith("port:"):
+            try:
+                return container.get("port") == int(target[5:])
+            except (TypeError, ValueError):
+                return False
+        return (
+            container.get("deployment_id") == target
+            or container.get("name") == target
+        )
+
+    def _fail_admission_target(self, target: str, state: dict) -> None:
+        """Fail the target's queued waiters and clear its slot accounting.
+
+        Streaming generators still holding a released grant unwind against
+        the missing entry: ``_release_inference_slot`` treats an unknown
+        target as a no-op.
+        """
+        waiters = state.get("waiters")
+        while waiters:
+            waiter = waiters.popleft()
+            future = waiter["future"]
+            if not future.done():
+                future.set_exception(LookupError(
+                    f"inference target '{target}' is no longer running; "
+                    "queued request was dropped"
+                ))
+        state["running"] = 0
+        for lease in state.pop("leases", {}).values():
+            lease.released = True
+            lease.owner = None
+        if self._admission_store().get(target) is state:
+            self._admission_store().pop(target, None)
+        getattr(self, "_nudger_slow_since", {}).pop(target, None)
+
+    async def reap_stale_admission_targets(self) -> list[str]:
+        """Reap abandoned owners, then targets with confirmed dead containers.
+
+        Owner completion or explicit request cancellation proves a request is
+        abandoned, including remote requests and requests on live containers.
+        Neither request age nor a lack of generated tokens proves abandonment.
+
+        A crashed or exited container cannot release its granted concurrency
+        slots, so its admission counter stays saturated and every later
+        request queues forever behind ghost slots (stuck ``running`` counts
+        that no live stream backs). After a target has had no live container
+        for ``ADMISSION_REAP_GRACE_SECONDS``, its queued waiters are failed
+        with a clear error and its accounting is dropped. Targets matching
+        no local container may belong to remote cluster members and are not
+        removed by the container-status fallback.
+        """
+        reaped = await self._reap_dead_inference_owners()
+        store = self._admission_store()
+        if not store:
+            return reaped
+        if getattr(self, "_capacity_redeploying_models", None):
+            # A capacity-triggered replacement briefly has no container for
+            # the intended deployment; _resolve_vllm_target waits it out too.
+            return reaped
+        containers = await self.list_containers()
+        now = time.monotonic()
+        for target, state in list(store.items()):
+            matches = [
+                c for c in containers
+                if self._admission_target_matches(target, c)
+            ]
+            if not matches:
+                state.pop("_dead_since", None)
+                continue
+            if any(
+                c.get("status") in ("running", "created", "restarting")
+                for c in matches
+            ):
+                state.pop("_dead_since", None)
+                continue
+            dead_since = state.setdefault("_dead_since", now)
+            if now - dead_since < ADMISSION_REAP_GRACE_SECONDS:
+                continue
+            self._fail_admission_target(target, state)
+            if target not in reaped:
+                reaped.append(target)
+        return reaped
+
+    async def _reap_container_admission(
+        self, name: str, deployment_id: str | None = None,
+    ) -> None:
+        """Immediately release admission slots tied to a stopped container.
+
+        An explicit stop or remove is unambiguous intent, so unlike
+        ``reap_stale_admission_targets`` no grace window applies: hanging on
+        to the slots would only block new requests against a target the
+        operator just tore down.
+        """
+        store = self._admission_store()
+        if not store:
+            return
+        containers = await self.list_containers()
+        for target, state in list(store.items()):
+            if target == name or (
+                deployment_id and target == deployment_id
+            ):
+                self._fail_admission_target(target, state)
+                continue
+            matches = [
+                c for c in containers
+                if self._admission_target_matches(target, c)
+            ]
+            if matches and all(
+                c.get("status") not in ("running", "created", "restarting")
+                for c in matches
+            ):
+                # Sibling containers of the torn-down deployment are gone.
+                self._fail_admission_target(target, state)
+
+    def reset_inference_admission(self) -> dict[str, list[str]]:
+        """Fail every queued waiter and clear all admission slot counts."""
+        store = self._admission_store()
+        reset = sorted(store)
+        for target in reset:
+            self._fail_admission_target(target, store[target])
+        return {"reset": reset}
+
+    async def _admission_reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(ADMISSION_REAP_SWEEP_SECONDS)
+            try:
+                await self.reap_stale_admission_targets()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("inference admission reaper failed")
 
     async def _admit_vllm_target(
         self,
@@ -10597,12 +12447,44 @@ class Manager:
                     max(0.0, now - queued[0]["created_at"]), 1
                 ) if queued else 0.0,
             }
+            if state.get("group"):
+                snapshot.update(state["group"])
             effective_limit = state.get("effective_limit")
             if effective_limit is not None and effective_limit != state["limit"]:
                 snapshot["effective_limit"] = effective_limit
             if state.get("nudger"):
                 snapshot["nudger"] = dict(state["nudger"])
             out[target] = snapshot
+        # PP waiters have not acquired total-inference admission yet. Merge
+        # them into their engine's queue, never its running count.
+        groups = {
+            snapshot["group_id"]: snapshot
+            for snapshot in out.values() if snapshot.get("group_id")
+        }
+        for waiter in getattr(self, "_prompt_waiting_requests", {}).values():
+            group = waiter["group"]
+            group_id = group["group_id"]
+            snapshot = groups.get(group_id)
+            if snapshot is None:
+                # Unlimited total concurrency creates no admission state;
+                # dispatched streams still contribute to the active count.
+                running = sum(
+                    1 for rec in getattr(self, "_active_reqs", {}).values()
+                    if not rec.get("paused") and (
+                        rec.get("group") or self._request_group(rec["key"])
+                    )["group_id"] == group_id
+                )
+                snapshot = {
+                    **group, "limit": None, "running": running,
+                    "queued": 0, "oldest_wait_seconds": 0.0,
+                }
+                groups[group_id] = snapshot
+                out[f"prompt:{group_id}"] = snapshot
+            snapshot["queued"] += 1
+            snapshot["oldest_wait_seconds"] = max(
+                snapshot["oldest_wait_seconds"],
+                round(max(0.0, now - waiter["created_at"]), 1),
+            )
         return out
 
     def _inference_nudger_tick(self, now: float | None = None) -> None:
@@ -13382,7 +15264,30 @@ class Manager:
                 logs = await self.get_logs(c["name"], tail=150)
             except Exception as e:
                 return {"phase": "starting", "progress": None, "message": f"starting… ({e})"}
-        return self._parse_phase(logs)
+        strict_api_rank = c.get("deployment_mode") in _SHARDED_MEMBER_MODES and c.get("rank") == 0
+        if strict_api_rank:
+            # The last successful startup separates historical loading from
+            # current progress. After a failed probe, only its suffix can
+            # explain this startup; old 100% shard lines must not resurface.
+            lines = logs.splitlines()
+            last_ready = max((
+                index for index, line in enumerate(lines)
+                if "Application startup complete" in line or "Uvicorn running on" in line
+            ), default=-1)
+            logs = "\n".join(lines[last_ready + 1:])
+        phase = self._parse_phase(logs)
+        if (
+            strict_api_rank and phase.get("phase") in {"ready", "starting"}
+        ):
+            # A stopped/restarted container keeps old startup log markers.
+            # The failed current probe above must win for an engine group's
+            # API rank. Include sharded labels: an existing TP group retains
+            # those labels when another group is added to its deployment.
+            return {
+                "phase": "starting", "progress": None,
+                "message": "Waiting for the model API to become ready",
+            }
+        return phase
 
     async def _used_host_ports(
         self, *, exclude_deployment_id: str | None = None,
@@ -13441,13 +15346,20 @@ class Manager:
             if (
                 not isinstance(deployment, dict)
                 or deployment.get("id") == exclude_deployment_id
-                or deployment.get("status") in {"error", "stopped", "removed"}
             ):
                 continue
             members = [
                 member for member in (deployment.get("members") or [])
                 if isinstance(member, dict)
             ]
+            inactive = deployment.get("status") in {"error", "stopped", "removed"}
+            if inactive:
+                # Independent group recreation deliberately keeps its ranks
+                # stopped until every create settles. Keep the durable port
+                # reservation while Docker has no container left to inspect.
+                members = [member for member in members if member.get("recreate_pending")]
+                if not members:
+                    continue
             # Persisted member order is the compatibility fallback. Inspect
             # ranks individually so one corrupt entry cannot hide a later
             # valid rank 0, and never infer primary ownership from negatives.
@@ -13476,7 +15388,7 @@ class Manager:
             # and must not consume the same number on the controller.
             values = (
                 [deployment.get("api_port")]
-                if primary_member
+                if not inactive and primary_member
                 and primary_member.get("node_id") == LOCAL_NODE_ID
                 else []
             )
@@ -13550,6 +15462,7 @@ class Manager:
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
+        runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         reserved_port = None
         if cluster_member is not None and port is None:
@@ -13567,6 +15480,7 @@ class Manager:
             model=model, port=port, engine=engine,
             gpu_memory_utilization=gpu_memory_utilization,
             gpu_memory_gb=gpu_memory_gb, environment=environment,
+            runtime_file_mounts=runtime_file_mounts,
             extra_args=extra_args,
             name=name, image=image, sg_tp_size=sg_tp_size,
             sg_context_length=sg_context_length,
@@ -13805,11 +15719,21 @@ class Manager:
         llama_gpu_layers: int | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
+        runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
         if engine not in {"vllm", "sglang", "llama.cpp"}:
             raise ValueError("engine must be vllm, sglang, or llama.cpp")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
+        runtime_file_mounts = normalize_runtime_file_mounts(runtime_file_mounts, engine)
+        # Validate before image pulls, GPU eviction, or any Docker mutation.
+        if runtime_file_mounts:
+            runtime_file_volumes(
+                runtime_file_mounts,
+                self._build_volumes(
+                    model, self.settings["hf_cache"], image or self.settings.get("vllm_image"),
+                ),
+            )
         managed_shm_size = (
             self._normalized_shm_size(shm_size)
             or self.settings["shm_size"]
@@ -14103,6 +16027,16 @@ class Manager:
                     "labels": labels,
                     "restart_policy": {"Name": "unless-stopped"},
                 }
+                if runtime_file_mounts:
+                    # Mount API bind mounts never create missing host paths,
+                    # even if a file disappears after validation/image pull.
+                    runtime_file_volumes(runtime_file_mounts, run_options["volumes"])
+                    run_options["mounts"] = [
+                        docker.types.Mount(
+                            target=entry["target"], source=entry["source"],
+                            type="bind", read_only=True,
+                        ) for entry in runtime_file_mounts
+                    ]
                 if runtime_environment:
                     run_options["environment"] = dict(runtime_environment)
                 hf_environment = self._container_hf_environment(hf_token)
@@ -14691,8 +16625,13 @@ class Manager:
             if stopped is None:
                 stopped = self._explicitly_stopped_containers = set()
             stopped.add(name)
+        stopped_deployment: list[str] = []
+
         def _do():
             container = self.client.containers.get(name)
+            stopped_deployment.append(
+                _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+            )
             # Prevent Docker's restart policy from resurrecting a model that
             # the user explicitly stopped. Do this before signalling SGLang,
             # whose shutdown can end in SIGKILL under GPU memory pressure.
@@ -14711,22 +16650,44 @@ class Manager:
             await asyncio.wait_for(asyncio.to_thread(_do), timeout=30)
         except asyncio.TimeoutError:
             raise RuntimeError(f"container stop timed out after 30s")
+        try:
+            await self._reap_container_admission(
+                name, stopped_deployment[0] if stopped_deployment else None,
+            )
+        except Exception:
+            logger.exception("admission reap after stopping %s failed", name)
         return {"ok": True}
 
     async def remove_container(self, name: str) -> dict:
+        removed_deployment: list[str] = []
+
         def _do():
             ledger = getattr(self, "managed_workload_ledger", None)
             if ledger is None:
-                self.client.containers.get(name).remove(force=True)
+                container = self.client.containers.get(name)
+                removed_deployment.append(
+                    _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                )
+                container.remove(force=True)
                 return
             with ledger.locked():
                 try:
-                    self.client.containers.get(name).remove(force=True)
+                    container = self.client.containers.get(name)
+                    removed_deployment.append(
+                        _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                    )
+                    container.remove(force=True)
                 except docker.errors.NotFound:
                     ledger.release(name)
                     raise
                 ledger.release(name)
         await asyncio.to_thread(_do)
+        try:
+            await self._reap_container_admission(
+                name, removed_deployment[0] if removed_deployment else None,
+            )
+        except Exception:
+            logger.exception("admission reap after removing %s failed", name)
         getattr(self, "_explicitly_stopped_containers", set()).discard(name)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
         aliases = getattr(self, "container_aliases", {})
@@ -14773,6 +16734,7 @@ class Manager:
                 tags = img.tags or []
                 out.append({
                     "id": img.short_id,
+                    "full_id": img.id,
                     "tags": tags,
                     "size": img.attrs.get("Size", 0),
                     "created": img.attrs.get("Created"),
@@ -14913,6 +16875,7 @@ class Manager:
 
     async def remove_image_on_nodes(
         self, image_id: str, node_ids: list[str],
+        *, node_image_ids: dict[str, str] | None = None,
     ) -> dict:
         """Remove an image from every recorded owner without failing fast."""
         image_id = str(image_id or "").strip()
@@ -14921,18 +16884,25 @@ class Manager:
             raise ValueError("image ID is required")
         if not requested or any(not value for value in requested):
             raise ValueError("image owners are required")
+        if node_image_ids is not None and (
+            set(node_image_ids) != set(requested)
+            or any(not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                   for value in node_image_ids.values())
+        ):
+            raise ValueError("verified image IDs are required for every owner")
 
         available = {node["id"]: node for node in await self.cluster_nodes()}
 
         async def remove(node_id: str) -> Any:
+            local_image_id = node_image_ids[node_id] if node_image_ids is not None else image_id
             node = available.get(node_id)
             if not node:
                 raise RuntimeError("owning node is no longer registered")
             if node_id == LOCAL_NODE_ID:
-                return await self.remove_image(image_id)
+                return await self.remove_image(local_image_id)
             return await self.node_registry.request(
                 node_id, "DELETE",
-                f"/api/agent/images/{quote(image_id, safe='')}", timeout=120,
+                f"/api/agent/images/{quote(local_image_id, safe='')}", timeout=120,
             )
 
         removed = await asyncio.gather(
@@ -16229,7 +18199,8 @@ class Manager:
                          cancel: asyncio.Event | None = None, *,
                          container_name: str | None = None,
                          deployment_id: str | None = None,
-                         caller_ip: str | None = None):
+                         caller_ip: str | None = None,
+                         startup_benchmark: bool = False):
         """Route /v1/chat/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -16242,7 +18213,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             await result.prepare()
             return result
@@ -16257,7 +18228,8 @@ class Manager:
             url = f"http://localhost:{container['port']}/v1/chat/completions"
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=container.get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
             try:
                 r = await self._await_or_cancel(
@@ -16265,7 +18237,9 @@ class Manager:
                 )
                 r.raise_for_status()
                 data = r.json()
-                self._record_usage(key, data.get("usage"))
+                self._record_usage(
+                    key, data.get("usage"), startup_benchmark=startup_benchmark,
+                )
                 return data
             finally:
                 self._track_end(rid)
@@ -16275,7 +18249,8 @@ class Manager:
                                 cancel: asyncio.Event | None = None, *,
                                 container_name: str | None = None,
                                 deployment_id: str | None = None,
-                                caller_ip: str | None = None):
+                                caller_ip: str | None = None,
+                                startup_benchmark: bool = False):
         """Route /v1/completions to the appropriate vLLM container."""
         container = await self._resolve_vllm_target(
             model, container_name=container_name, deployment_id=deployment_id,
@@ -16288,7 +18263,7 @@ class Manager:
             result = self._vllm_stream(
                 url, body, key, cancel, container, requested_model=model,
                 container_name=container_name, deployment_id=deployment_id,
-                caller_ip=caller_ip,
+                caller_ip=caller_ip, startup_benchmark=startup_benchmark,
             )
             await result.prepare()
             return result
@@ -16303,7 +18278,8 @@ class Manager:
             url = f"http://localhost:{container['port']}/v1/completions"
             rid = self._track_start(
                 key, deployment_id=container.get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=container.get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
             )
             try:
                 r = await self._await_or_cancel(
@@ -16311,7 +18287,9 @@ class Manager:
                 )
                 r.raise_for_status()
                 data = r.json()
-                self._record_usage(key, data.get("usage"))
+                self._record_usage(
+                    key, data.get("usage"), startup_benchmark=startup_benchmark,
+                )
                 return data
             finally:
                 self._track_end(rid)
@@ -16561,7 +18539,7 @@ class Manager:
 
     async def inference_target_health(
         self, model: str, *, container_name: str | None = None,
-        deployment_id: str | None = None,
+        deployment_id: str | None = None, strict_health: bool = False,
     ) -> bool:
         """Observe an exact inference target without waking a stopped model."""
         if deployment_id:
@@ -16581,7 +18559,9 @@ class Manager:
                 and container.get("status") == "running"
                 and not self._container_is_durably_stopped(container)
             ):
-                return bool(await self._check_ready(container))
+                return bool(await self._check_ready(
+                    container, **({"strict_health": True} if strict_health else {}),
+                ))
         return False
 
     def _vllm_stream(self, url: str, body: dict, key: str,
@@ -16590,12 +18570,17 @@ class Manager:
                      requested_model: str | None = None, *,
                      container_name: str | None = None,
                      deployment_id: str | None = None,
-                     caller_ip: str | None = None):
-        return PreparedAsyncStream(self._vllm_stream_events(
+                     caller_ip: str | None = None,
+                     startup_benchmark: bool = False):
+        lifecycle = {}
+        result = PreparedAsyncStream(self._vllm_stream_events(
             url, body, key, cancel, container, requested_model,
             container_name=container_name, deployment_id=deployment_id,
-            caller_ip=caller_ip,
+            caller_ip=caller_ip, lifecycle=lifecycle,
+            startup_benchmark=startup_benchmark,
         ))
+        result.inference_lifecycle = lifecycle
+        return result
 
     async def _vllm_stream_events(
         self, url: str, body: dict, key: str,
@@ -16605,6 +18590,8 @@ class Manager:
         container_name: str | None = None,
         deployment_id: str | None = None,
         caller_ip: str | None = None,
+        lifecycle: dict | None = None,
+        startup_benchmark: bool = False,
     ):
         """Stream vLLM SSE response, passing through chunks as-is.
         Forces continuous usage stats so prompt counts are available as soon
@@ -16654,7 +18641,15 @@ class Manager:
                 admission_target=admission,
                 nudge_event=nudge_event,
                 deployment_id=(container or {}).get("deployment_id"),
-                caller_ip=caller_ip,
+                container_name=(container or {}).get("name"), caller_ip=caller_ip,
+                startup_benchmark=startup_benchmark,
+            )
+            def release_member():
+                callback = (lifecycle or {}).get("release_member")
+                if callback is not None:
+                    callback()
+            self._transfer_inference_ownership(
+                admission, rid, cancel=cancel, release_callback=release_member,
             )
             while True:
                 attempt_started_at = time.monotonic()
@@ -16668,6 +18663,9 @@ class Manager:
                         stream_context.__aenter__(), cancel, nudge_event,
                     )
                     entered = True
+                    self._transfer_inference_ownership(
+                        admission, rid, cancel=cancel, cleanup_stream=r,
+                    )
                     if r.status_code != 200:
                         detail = (await r.aread()).decode("utf-8", errors="replace")
                         if (
@@ -16708,7 +18706,11 @@ class Manager:
                         # ``PreparedAsyncStream.prepare`` consumes this marker;
                         # no generated event is pulled while response headers
                         # and status are validated.
+                        self._transfer_inference_ownership(
+                            admission, rid, owner=None, cancel=cancel,
+                        )
                         yield _STREAM_READY
+                        self._transfer_inference_ownership(admission, rid)
                     first_out_ts = None
                     last_out_ts = None
                     latest_usage = None
@@ -16760,6 +18762,8 @@ class Manager:
                                 rec.get("forwarded_chunks", 0) + 1
                             )
                         yield f"{line}\n\n"
+                        if line.startswith("data:") and line[5:].strip() == "[DONE]":
+                            break
                     if latest_usage:
                         gen_time = (
                             last_out_ts - first_out_ts
@@ -16780,14 +18784,19 @@ class Manager:
                             else None
                         )
                         self._record_usage(
-                            key, latest_usage, gen_time, measured_pp_time
+                            key, latest_usage, gen_time, measured_pp_time,
+                            startup_benchmark=startup_benchmark,
                         )
                     return
                 except StreamNudge:
                     nudged = True
                 finally:
                     if entered:
-                        await stream_context.__aexit__(None, None, None)
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                await self._close_inference_transport(rid)
+                            finally:
+                                await stream_context.__aexit__(None, None, None)
                 if nudged:
                     rec = self._active_reqs.get(rid)
                     if rec is None:
@@ -16821,6 +18830,9 @@ class Manager:
                     )
                     url = f"http://localhost:{container['port']}{endpoint}"
                     rec["key"] = key
+                    rec["group"] = self._request_group(
+                        key, container.get("deployment_id"), container.get("name"),
+                    )
                     rec["admission_target"] = admission
                     rec["paused"] = False
         except ClientAbort:
@@ -17183,7 +19195,7 @@ class Manager:
         now = time.time()
         if now - self._stats_ts < 0.8 and self._stats_cache:
             self._record_temperature_sample(self._stats_cache, now)
-            return {**self._stats_cache, "active_requests": self.active_requests()}
+            return {**self._stats_cache, "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups()}
 
         def _gather():
             cpu_clock = self._read_cpu_clock_mhz()
@@ -17206,7 +19218,7 @@ class Manager:
         self._stats_cache = stats
         self._stats_ts = now
         self._record_temperature_sample(stats, stats.get("ts", now))
-        return {**stats, "active_requests": self.active_requests()}
+        return {**stats, "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups()}
 
     def _record_temperature_sample(
         self,
@@ -17930,7 +19942,7 @@ class Manager:
                 await asyncio.sleep(2.0)
             raise TimeoutError(f"{model} not ready after {int(timeout)}s")
 
-    async def _check_ready(self, container: dict) -> bool:
+    async def _check_ready(self, container: dict, *, strict_health: bool = False) -> bool:
         port = container.get("port")
         if not port:
             return False
@@ -17940,6 +19952,8 @@ class Manager:
                 return True
         except Exception:
             pass
+        if strict_health:
+            return False
         # Fall back to /v1/models
         try:
             r = await self.http.get(f"http://localhost:{port}/v1/models", timeout=2)
@@ -18038,6 +20052,10 @@ class Manager:
         # it would perform the same Docker container scan a second time for
         # every deployment snapshot.
         nodes = await self.cluster_nodes(stats, containers)
+        if containers_unavailable:
+            for node in nodes:
+                if node.get("local") or node.get("id") == LOCAL_NODE_ID:
+                    node["inventory_available"] = False
         local_docker_ready = next(
             (
                 bool(node.get("docker_ready"))
@@ -18069,8 +20087,15 @@ class Manager:
                 container = containers_by_node.get(member.get("node_id"), {}).get(
                     member.get("container_name")
                 )
+                member["has_live_container"] = bool(
+                    node.get("online") and node.get("docker_ready")
+                    and node.get("inventory_available") is True
+                    and container and container.get("status") in {"running", "restarting", "paused"}
+                )
                 if not node.get("online"):
-                    member["status"] = "unreachable"
+                    # Offline nodes are treated as stopped for public runtime
+                    # state; retain node connectivity separately from intent.
+                    member["status"] = "stopped"
                     if saved.get("status") == "recovering":
                         member["phase"] = {
                             "phase": "recovering",
@@ -18080,12 +20105,17 @@ class Manager:
                         }
                     else:
                         member["phase"] = {
-                            "phase": "unreachable",
+                            "phase": "stopped",
                             "message": (
                                 f"{member.get('node_name') or member.get('node_id')} "
-                                "is unreachable"
+                                "is offline; container is assumed stopped"
                             ),
                         }
+                elif node.get("inventory_available") is False:
+                    member["status"] = "unknown"
+                    member["status_message"] = "Container inventory is unavailable"
+                    member["phase"] = {"phase": "unknown", "message": member["status_message"]}
+                    member_inventory_unknown = True
                 elif container:
                     member["status"] = container.get("status", "unknown")
                     member["phase"] = container.get("phase")
@@ -18102,8 +20132,11 @@ class Manager:
                     if primary_container is None or member.get("rank") == 0:
                         primary_container = container
                 elif (
-                    containers_unavailable
-                    and member.get("node_id") == LOCAL_NODE_ID
+                    (
+                        containers_unavailable
+                        and member.get("node_id") == LOCAL_NODE_ID
+                    )
+                    or node.get("docker_ready") is False
                 ):
                     member["status"] = "unknown"
                     member["status_message"] = "Docker is unavailable"
@@ -18118,22 +20151,88 @@ class Manager:
                         "phase": "missing",
                         "message": "Managed container is missing",
                     }
-                member["node_status"] = node.get("status", "unknown")
+                member["node_status"] = (
+                    node.get("status", "unknown") if node.get("online") else "offline"
+                )
+                # A remote node that is online but reports docker_ready=false
+                # advertises no container summary, so an absent container there
+                # means the inventory is unreliable rather than a confirmed loss.
+                member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             if saved.get("status") != "error":
+                # A completed Stop is durable even when a node subsequently
+                # disconnects. Keep the member's offline node observation, but
+                # do not turn a stopped deployment into a degraded workload.
+                # Stop intent alone is not proof that its containers stopped.
+                confirmed_stopped = (
+                    saved.get("status") == "stopped"
+                    and saved.get("desired_state") != "running"
+                    and not saved.get("error")
+                    and all(
+                        state in {"stopped", "exited", "missing", "unreachable"}
+                        for state in member_states
+                    )
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        or member.get("error")
+                        for member in deployment["members"]
+                    )
+                )
                 if member_inventory_unknown:
                     deployment["status"] = "unknown"
                     deployment["status_message"] = "Docker is unavailable"
+                elif confirmed_stopped:
+                    deployment["status"] = "stopped"
+                elif (
+                    member_states
+                    and all(state in {"stopped", "exited"} for state in member_states)
+                    and saved.get("status") not in {"recovering", "stopping", "launching"}
+                    and not any(
+                        member.get("failed_stop_error") or member.get("recreate_pending")
+                        for member in deployment["members"]
+                    )
+                ):
+                    deployment["status"] = "stopped"
+                elif saved.get("mode") == "grouped_sharded":
+                    failed_stops = [str(member["failed_stop_error"]) for member in deployment["members"] if member.get("failed_stop_error")]
+                    if failed_stops:
+                        # Failed group stops already carry stopped intent,
+                        # but ranks may still be alive or unreachable. Keep
+                        # the action failure visible until explicitly retried.
+                        deployment["status"] = "degraded"
+                        deployment["error"] = "; ".join(failed_stops)
+                    elif saved.get("status") == "stopping":
+                        deployment["status"] = "stopping"
+                    elif saved.get("desired_state") == "stopped" or (
+                        saved.get("desired_state") != "running" and saved.get("status") == "stopped"
+                    ):
+                        deployment["status"] = (
+                            "stopped" if all(
+                                state in {"stopped", "exited", "missing"}
+                                for state in member_states
+                            ) else "degraded"
+                        )
+                    else:
+                        deployment["status"] = self._grouped_deployment_status(deployment)
+                        if deployment["status"] == "stopped" and any(
+                            state not in {"stopped", "exited", "missing", "unreachable"}
+                            for state in member_states
+                        ):
+                            deployment["status"] = "degraded"
+                        if deployment["status"] == "running":
+                            deployment["error"] = None
+                        if saved.get("status") == "recovering" and deployment["status"] == "degraded":
+                            deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
-                    s in {"unreachable", "missing", "dead", "error"}
+                    s in {"stopped", "unreachable", "missing", "dead", "error"}
                     for s in member_states
                 ):
                     # Startup recovery owns this deployment and will retry when
                     # its selected nodes reconnect. Keep the public deployment
                     # active while its member phase carries the honest wait.
                     deployment["status"] = "recovering"
-                elif any(s in {"unreachable", "missing", "dead", "error"} for s in member_states):
+                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in member_states):
                     deployment["status"] = "degraded"
                 elif member_states and all(s == "exited" for s in member_states):
                     deployment["status"] = "stopped"
@@ -18208,6 +20307,10 @@ class Manager:
         return {
             "containers": containers,
             "images": images,
+            # Container snapshot success is authoritative for absence even when
+            # the separate image inventory fails; only container listing being
+            # unavailable means we cannot trust a missing container.
+            "containers_ready": not containers_unavailable,
             "docker_ready": bool(
                 local_docker_ready
                 and not containers_unavailable
@@ -18229,7 +20332,7 @@ class Manager:
             "usage_cache_estimates": copy.deepcopy(self.usage_cache_estimates),
             "usage_rows": self.usage_rows(),
             "session_token_stats": self.session_token_stats,
-            "active_requests": self.active_requests(),
+            "active_requests": self.active_requests(), "active_request_groups": self.active_request_groups(),
             "inference_admission": self.inference_admission(),
             "queue": [self._public_job(j) for j in self.jobs.values()],
             "summary": {

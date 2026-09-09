@@ -1,0 +1,920 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+
+from manager import Manager, SourceRoutingUnavailable
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from sparkdeck.service import SparkDeckService
+
+
+def _replicated_deployment():
+    return {
+        "id": "manager-1",
+        "sparkdeck_record_id": "record-1",
+        "mode": "replicated",
+        "desired_state": "running",
+        "members": [
+            {"node_id": "node-a", "rank": 0, "status": "running"},
+            {"node_id": "node-b", "rank": 1, "status": "running"},
+        ],
+    }
+
+
+def _rule(**updates):
+    value = {
+        "source_ip": "2001:0db8::1",
+        "requested_model": "shared-model",
+        "enabled": True,
+        "deployment_id": "record-1",
+        "instance_id": None,
+        "node_ids": ["node-b"],
+    }
+    value.update(updates)
+    return value
+
+
+def _grouped_deployment(
+    manager_id="manager-1",
+    record_id="record-1",
+    served_models=("shared-model",),
+):
+    members = []
+    for instance_id, nodes in enumerate((("node-a", "node-b"), ("node-c", "node-d"))):
+        for rank, node_id in enumerate(nodes):
+            members.append({
+                "node_id": node_id,
+                "rank": rank,
+                "instance_id": instance_id,
+                "status": "running",
+                "desired_state": "running",
+            })
+    deployment = {
+        "id": manager_id,
+        "sparkdeck_record_id": record_id,
+        "mode": "grouped_sharded",
+        "desired_state": "running",
+        "status": "running",
+        "model": "org/shared",
+        "members": members,
+    }
+    if served_models is not None:
+        deployment["launch_settings"] = {
+            "extra_args": ["--served-model-name", *served_models],
+        }
+    return deployment
+
+
+class SourceRoutingPersistenceTests(unittest.TestCase):
+    def manager(self, directory):
+        manager = Manager.__new__(Manager)
+        manager.source_ip_routing_rules_path = Path(directory) / "rules.json"
+        manager.source_ip_routing_rules = {}
+        manager.deployments = [_replicated_deployment()]
+        return manager
+
+    def test_versioned_round_trip_is_canonical_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            saved = manager.upsert_source_ip_routing_rule(_rule())
+            again = manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="2001:db8:0:0:0:0:0:1",
+            ))
+
+            self.assertEqual(saved, again)
+            self.assertEqual(saved["source_ip"], "2001:db8::1")
+            payload = json.loads(
+                manager.source_ip_routing_rules_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload, {"version": 1, "rules": [saved]})
+            reloaded = self.manager(directory)
+            reloaded.source_ip_routing_rules = reloaded._load_source_ip_routing_rules()
+            self.assertEqual(reloaded.list_source_ip_routing_rules(), [saved])
+
+    def test_rejects_network_zone_unknown_and_wrong_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            for source in ("10.0.0.0/24", "fe80::1%eth0", "unknown"):
+                with self.subTest(source=source), self.assertRaises(ValueError):
+                    manager.upsert_source_ip_routing_rule(_rule(source_ip=source))
+            with self.assertRaisesRegex(LookupError, "replica was not found"):
+                manager.upsert_source_ip_routing_rule(_rule(node_ids=["node-x"]))
+
+    def test_failed_atomic_write_does_not_publish_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            with patch(
+                "manager._atomic_private_json_write",
+                side_effect=OSError("disk full"),
+            ), self.assertRaises(OSError):
+                manager.upsert_source_ip_routing_rule(_rule())
+            self.assertEqual(manager.source_ip_routing_rules, {})
+
+    def test_disabled_stale_rule_can_be_saved_and_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            stale = _rule(
+                enabled=False, deployment_id="deleted", node_ids=["gone"],
+            )
+            manager.upsert_source_ip_routing_rule(stale)
+            self.assertIsNone(manager.source_ip_routing_rule(
+                "2001:db8::1", "shared-model",
+            ))
+            self.assertTrue(manager.delete_source_ip_routing_rule(
+                "2001:0db8::1", "shared-model",
+            ))
+
+    def test_malformed_enabled_row_blocks_listing_and_inference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            malformed = _rule(enabled="yes")
+            manager.source_ip_routing_rules_path.write_text(json.dumps({
+                "version": 1,
+                "rules": [_rule(node_ids=["node-b"]), malformed],
+            }), encoding="utf-8")
+
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            self.assertEqual(manager.source_ip_routing_rules, {})
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "rule 1 is invalid: enabled",
+            ):
+                manager.list_source_ip_routing_rules()
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "rule 1 is invalid: enabled",
+            ):
+                manager.source_ip_routing_rule("2001:db8::1", "shared-model")
+
+    def test_invalid_json_and_version_block_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            cases = (
+                ("{broken", "not valid JSON"),
+                (json.dumps({"version": 2, "rules": []}), "unsupported version"),
+            )
+            for contents, message in cases:
+                with self.subTest(message=message):
+                    manager.source_ip_routing_rules_path.write_text(
+                        contents, encoding="utf-8",
+                    )
+                    manager.source_ip_routing_rules = (
+                        manager._load_source_ip_routing_rules()
+                    )
+                    with self.assertRaisesRegex(
+                        SourceRoutingUnavailable, message,
+                    ):
+                        manager.source_ip_routing_rule(
+                            "2001:db8::1", "shared-model",
+                        )
+
+    def test_read_error_blocks_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules_path.write_text(
+                json.dumps({"version": 1, "rules": []}), encoding="utf-8",
+            )
+            with patch.object(
+                Path, "read_text", side_effect=OSError("access denied"),
+            ):
+                manager.source_ip_routing_rules = (
+                    manager._load_source_ip_routing_rules()
+                )
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "cannot be read: access denied",
+            ):
+                manager.list_source_ip_routing_rules()
+
+    def test_invalid_utf8_blocks_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules_path.write_bytes(b"\xff\xfe\xfa")
+
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "cannot be read",
+            ):
+                manager.source_ip_routing_rule(
+                    "2001:db8::1", "shared-model",
+                )
+
+    def test_absent_file_keeps_ordinary_routing_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            self.assertEqual(manager.list_source_ip_routing_rules(), [])
+            self.assertIsNone(manager.source_ip_routing_rule(
+                "2001:db8::1", "shared-model",
+            ))
+
+    def test_invalid_config_blocks_mutation_until_valid_file_is_reloaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            corrupt = b'{"version":1,"rules":[{"enabled":"broken"}]}'
+            manager.source_ip_routing_rules_path.write_bytes(corrupt)
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+
+            with self.assertRaises(SourceRoutingUnavailable):
+                manager.upsert_source_ip_routing_rule(_rule())
+            with self.assertRaises(SourceRoutingUnavailable):
+                manager.delete_source_ip_routing_rule(
+                    "2001:db8::1", "shared-model",
+                )
+            self.assertEqual(manager.source_ip_routing_rules, {})
+            self.assertEqual(
+                manager.source_ip_routing_rules_path.read_bytes(), corrupt,
+            )
+
+            valid = _rule(source_ip="2001:db8::1")
+            manager.source_ip_routing_rules_path.write_text(json.dumps({
+                "version": 1, "rules": [valid],
+            }), encoding="utf-8")
+            manager.source_ip_routing_rules = manager._load_source_ip_routing_rules()
+            self.assertEqual(manager.list_source_ip_routing_rules(), [valid])
+
+
+class SourceRoutingPlacementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pins_secondary_replica_and_skips_balancing_and_affinity(self):
+        manager = Manager.__new__(Manager)
+        manager.deployments = [_replicated_deployment()]
+        manager._proxy_cluster_member = AsyncMock(return_value={"choices": []})
+        manager._cluster_route_order = Mock(
+            side_effect=AssertionError("load balancing must not run")
+        )
+        manager._cluster_affinity_context = Mock(
+            side_effect=AssertionError("affinity must not run")
+        )
+
+        result = await manager.proxy_cluster_inference(
+            "manager-1", "org/model", {"stream": False}, "chat/completions",
+            source_route=_rule(source_ip="10.0.0.8"),
+        )
+
+        self.assertEqual(result, {"choices": []})
+        selected = manager._proxy_cluster_member.await_args.args[1]
+        self.assertEqual(selected["node_id"], "node-b")
+
+    async def test_changed_fingerprint_fails_closed_without_proxying(self):
+        manager = Manager.__new__(Manager)
+        deployment = _replicated_deployment()
+        deployment["members"][1]["node_id"] = "replacement"
+        manager.deployments = [deployment]
+        manager._proxy_cluster_member = AsyncMock()
+
+        with self.assertRaisesRegex(SourceRoutingUnavailable, "topology"):
+            await manager.proxy_cluster_inference(
+                "manager-1", "org/model", {"stream": False},
+                "chat/completions", source_route=_rule(),
+            )
+        manager._proxy_cluster_member.assert_not_awaited()
+
+    async def test_pinned_transport_failure_never_fails_over(self):
+        manager = Manager.__new__(Manager)
+        manager.deployments = [_replicated_deployment()]
+        manager._proxy_cluster_member = AsyncMock(
+            side_effect=httpx.ConnectError("offline")
+        )
+
+        with self.assertRaisesRegex(SourceRoutingUnavailable, "unavailable"):
+            await manager.proxy_cluster_inference(
+                "manager-1", "org/model", {"stream": False},
+                "chat/completions", source_route=_rule(),
+            )
+        self.assertEqual(manager._proxy_cluster_member.await_count, 1)
+
+
+class SourceRoutingServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def _service(self, directory, deployments):
+        manager = Manager.__new__(Manager)
+        manager.http = httpx.AsyncClient()
+        manager.deployments = deployments
+        manager.source_ip_routing_rules_path = Path(directory) / "routes.json"
+        manager.source_ip_routing_rules = {}
+        manager._proxy_cluster_member = AsyncMock(
+            side_effect=lambda deployment, member, *args, **kwargs: {
+                "choices": [], "usage": {}, "selected_node": member["node_id"],
+            }
+        )
+        service = SparkDeckService(manager, Path(directory))
+        service._record_response = Mock()
+        service._managed_hardware_snapshot = AsyncMock(return_value=({}, True))
+        live = []
+        for cluster in deployments:
+            record_id = cluster["sparkdeck_record_id"]
+            served_models = manager._deployment_served_models(cluster)
+            service.store.add_deployment(Deployment(
+                id=record_id,
+                alias=f"alias-{record_id}",
+                runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/shared"),
+                settings={
+                    "manager_deployment_id": cluster["id"],
+                    **(cluster.get("launch_settings") or {}),
+                },
+            ))
+            live.append({
+                "id": record_id,
+                "alias": f"alias-{record_id}",
+                "runtime": RuntimeKind.VLLM.value,
+                "kind": DeploymentKind.MANAGED.value,
+                "status": "running",
+                "desired_state": "running",
+                "deployment_mode": "grouped_sharded",
+                "model": {"repository": "org/shared"},
+                "served_models": served_models,
+                "settings": {
+                    "manager_deployment_id": cluster["id"],
+                    **(cluster.get("launch_settings") or {}),
+                },
+                "instances": [
+                    {
+                        "instance_id": 0, "status": "running",
+                        "node_ids": ["node-a", "node-b"],
+                    },
+                    {
+                        "instance_id": 1, "status": "running",
+                        "node_ids": ["node-c", "node-d"],
+                    },
+                ],
+            })
+        service.deployments = AsyncMock(return_value=live)
+        service._source_routing_snapshot = AsyncMock(
+            side_effect=lambda stored, rule: [
+                item for item in live if item["id"] == stored["id"]
+            ],
+        )
+        return manager, service
+
+    async def test_two_source_ips_pin_distinct_groups_before_ambiguous_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _grouped_deployment("manager-1", "record-1")
+            second = _grouped_deployment("manager-2", "record-2")
+            manager, service = await self._service(directory, [first, second])
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", deployment_id="record-1",
+                instance_id=1, node_ids=["node-c", "node-d"],
+            ))
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.2", deployment_id="record-2",
+                instance_id=0, node_ids=["node-a", "node-b"],
+            ))
+
+            one = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            two = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.2",
+            )
+
+            self.assertEqual(one["selected_node"], "node-c")
+            self.assertEqual(two["selected_node"], "node-a")
+            selected_deployments = [
+                call.args[0]["sparkdeck_record_id"]
+                for call in manager._proxy_cluster_member.await_args_list
+            ]
+            self.assertEqual(selected_deployments, ["record-1", "record-2"])
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_two_source_ips_pin_two_groups_in_one_deployment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            for source_ip, instance_id, nodes in (
+                ("10.0.0.1", 0, ["node-a", "node-b"]),
+                ("10.0.0.2", 1, ["node-c", "node-d"]),
+            ):
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip=source_ip, instance_id=instance_id, node_ids=nodes,
+                ))
+            first = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            second = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.2",
+            )
+            self.assertEqual(
+                (first["selected_node"], second["selected_node"]),
+                ("node-a", "node-c"),
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_source_route_pins_alternate_naming_for_same_deployment(self):
+        # A rule keyed on one request id form must still pin a client that
+        # sends another id for the same deployment (here the served name vs
+        # the alias). Without the deployment-ownership re-match the request
+        # bypasses the rule and cache-affinity routing can send it to another
+        # group.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                instance_id=1, node_ids=["node-c", "node-d"],
+            ))
+            pinned = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            self.assertEqual(pinned["selected_node"], "node-c")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_alias_rule_resolves_duplicate_served_name_before_ambiguity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [
+                _grouped_deployment("manager-1", "record-1"),
+                _grouped_deployment("manager-2", "record-2"),
+            ])
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                deployment_id="record-1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            ))
+
+            response = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+
+            self.assertEqual(response["selected_node"], "node-c")
+            self.assertEqual(
+                manager._proxy_cluster_member.await_args.args[0]["sparkdeck_record_id"],
+                "record-1",
+            )
+            service.deployments.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_alias_pin_covers_stable_deployment_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [_grouped_deployment()])
+            try:
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="alias-record-1",
+                    instance_id=1, node_ids=["node-c", "node-d"],
+                ))
+                response = await service.proxy(
+                    {"model": "record-1", "stream": False}, "chat/completions",
+                    caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-c")
+                service.deployments.assert_not_awaited()
+                # An exact stable-ID rule also passes downstream ownership validation.
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="record-1",
+                    instance_id=0, node_ids=["node-a", "node-b"],
+                ))
+                response = await service.proxy(
+                    {"model": "record-1"}, "completions", caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-a")
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_dirty_running_name_keeps_alias_pin_before_duplicate_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _grouped_deployment("manager-1", "record-1")
+            second = _grouped_deployment("manager-2", "record-2")
+            manager, service = await self._service(directory, [first, second])
+            try:
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model="alias-record-1",
+                    instance_id=1, node_ids=["node-c", "node-d"],
+                ))
+                first["settings_dirty"] = True
+                first["launch_settings"]["extra_args"] = ["--served-model-name", "next-name"]
+                response = await service.proxy(
+                    {"model": "shared-model"}, "completions", caller_ip="10.0.0.1",
+                )
+                self.assertEqual(response["selected_node"], "node-c")
+                self.assertEqual(manager._proxy_cluster_member.await_args.args[0]["id"], "manager-1")
+                service.deployments.assert_not_awaited()
+                # Failed observation cannot turn this dirty pin into ordinary routing.
+                service._source_routing_snapshot.side_effect = SourceRoutingUnavailable("unavailable")
+                with self.assertRaises(SourceRoutingUnavailable):
+                    await service.proxy({"model": "shared-model"}, "completions", caller_ip="10.0.0.1")
+                self.assertEqual(manager._proxy_cluster_member.await_count, 1)
+                # Once relaunched, the old name no longer belongs to this pin.
+                first["settings_dirty"] = False
+                self.assertIsNone(await service._source_rule_for_request("10.0.0.1", "shared-model"))
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_alternate_lookup_skips_admin_listing_and_reads_each_owner_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [_grouped_deployment()])
+            try:
+                for name in ("alias-record-1", "shared-model", "record-1"):
+                    manager.upsert_source_ip_routing_rule(_rule(
+                        source_ip="10.0.0.1", requested_model=name,
+                        instance_id=1, node_ids=["node-c", "node-d"],
+                    ))
+                with (
+                    patch.object(manager, "list_source_ip_routing_rules", side_effect=AssertionError("admin scan")),
+                    patch.object(service.store, "deployment", wraps=service.store.deployment) as lookup,
+                ):
+                    self.assertIsNone(await service._source_rule_for_request("10.0.0.2", "unrelated"))
+                    lookup.assert_not_called()
+                    self.assertIsNone(await service._source_rule_for_request("10.0.0.1", "unrelated"))
+                    lookup.assert_called_once_with("record-1", include_private=True)
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_exact_disabled_rule_suppresses_enabled_alternate_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                instance_id=1, node_ids=["node-c", "node-d"],
+            ))
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="shared-model",
+                enabled=False, instance_id=0, node_ids=["node-a", "node-b"],
+            ))
+
+            response = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+
+            self.assertEqual(response["selected_node"], "node-a")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_unavailable_alternate_pin_never_falls_through_to_healthy_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deployments = [
+                _grouped_deployment("manager-1", "record-1"),
+                _grouped_deployment("manager-2", "record-2"),
+            ]
+            manager, service = await self._service(directory, deployments)
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                deployment_id="record-1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            ))
+            deployments[0]["desired_state"] = "stopped"
+            live = await service.deployments()
+            live[0]["status"] = "stopped"
+            live[0]["desired_state"] = "stopped"
+            for instance in live[0]["instances"]:
+                instance["status"] = "stopped"
+
+            with self.assertRaises(SourceRoutingUnavailable):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            manager._proxy_cluster_member.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_conflicting_alternate_name_pins_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [
+                _grouped_deployment("manager-1", "record-1"),
+                _grouped_deployment("manager-2", "record-2"),
+            ])
+            for record_id in ("record-1", "record-2"):
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model=f"alias-{record_id}",
+                    deployment_id=record_id, instance_id=0,
+                    node_ids=["node-a", "node-b"],
+                ))
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "conflicting alternate-name pins",
+            ):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            manager._proxy_cluster_member.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_same_target_alternate_rules_deduplicate_deterministically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [
+                _grouped_deployment(
+                    served_models=("shared-model", "second-model"),
+                ),
+            ])
+            for requested_model in ("alias-record-1", "second-model"):
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model=requested_model,
+                    instance_id=1, node_ids=["node-c", "node-d"],
+                ))
+
+            resolved = await service._source_rule_for_request(
+                "10.0.0.1", "shared-model",
+            )
+
+            self.assertEqual(resolved["requested_model"], "alias-record-1")
+            self.assertEqual(
+                await service._source_rule_for_request(
+                    "10.0.0.1", "shared-model",
+                ),
+                resolved,
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_exact_enabled_rule_precedes_conflicting_alternate_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(directory, [
+                _grouped_deployment("manager-1", "record-1"),
+                _grouped_deployment("manager-2", "record-2"),
+            ])
+            for record_id in ("record-1", "record-2"):
+                manager.upsert_source_ip_routing_rule(_rule(
+                    source_ip="10.0.0.1", requested_model=f"alias-{record_id}",
+                    deployment_id=record_id, instance_id=0,
+                    node_ids=["node-a", "node-b"],
+                ))
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="shared-model",
+                deployment_id="record-2", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            ))
+
+            response = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+
+            self.assertEqual(response["selected_node"], "node-c")
+            self.assertEqual(
+                manager._proxy_cluster_member.await_args.args[0]["sparkdeck_record_id"],
+                "record-2",
+            )
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_canonical_model_and_plain_alias_are_alternate_names(self):
+        for rule_model, request_model in (
+            ("alias-record-1", "org/shared"),
+            ("org/shared", "alias-record-1"),
+        ):
+            with self.subTest(rule_model=rule_model, request_model=request_model):
+                with tempfile.TemporaryDirectory() as directory:
+                    manager, service = await self._service(
+                        directory, [_grouped_deployment(served_models=None)],
+                    )
+                    manager.upsert_source_ip_routing_rule(_rule(
+                        source_ip="10.0.0.1", requested_model=rule_model,
+                        instance_id=1, node_ids=["node-c", "node-d"],
+                    ))
+
+                    response = await service.proxy(
+                        {"model": request_model, "stream": False},
+                        "chat/completions", caller_ip="10.0.0.1",
+                    )
+                    self.assertEqual(response["selected_node"], "node-c")
+                    self.assertIsNone(
+                        await service._source_rule_for_request("10.0.0.1", "shared"),
+                    )
+                    await manager.http.aclose()
+                    await service.close()
+
+    async def test_missing_pinned_owner_fails_closed_before_healthy_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = _grouped_deployment("manager-1", "record-1")
+            second = _grouped_deployment("manager-2", "record-2")
+            manager, service = await self._service(directory, [first, second])
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", requested_model="alias-record-1",
+                deployment_id="record-1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            ))
+            manager.deployments = [second]
+            live = await service.deployments()
+            live.pop(0)
+
+            with self.assertRaises(SourceRoutingUnavailable):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            manager._proxy_cluster_member.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_selected_group_uses_observed_health_not_stale_saved_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = _grouped_deployment()
+            for member in cluster["members"]:
+                if member["instance_id"] == 1:
+                    member["status"] = "exited"
+            manager, service = await self._service(directory, [cluster])
+            active = _rule(
+                source_ip="10.0.0.1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            )
+
+            await service.upsert_source_ip_routing_rule(active)
+            response = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            self.assertEqual(response["selected_node"], "node-c")
+
+            live = await service.deployments()
+            live[0]["instances"][1]["status"] = "starting"
+            service._source_routing_cache = None
+            service._source_routing_retry_after = 0.0
+            with self.assertRaisesRegex(LookupError, "engine group is unavailable"):
+                await service.upsert_source_ip_routing_rule(active)
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "engine group is unavailable",
+            ):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            self.assertEqual(manager._proxy_cluster_member.await_count, 1)
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_stopped_group_fails_closed_and_disabled_rule_uses_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = _grouped_deployment()
+            manager, service = await self._service(directory, [cluster])
+            active = _rule(
+                source_ip="10.0.0.1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            )
+            manager.upsert_source_ip_routing_rule(active)
+            for member in cluster["members"]:
+                if member["instance_id"] == 1:
+                    member["desired_state"] = "stopped"
+            with self.assertRaises(SourceRoutingUnavailable):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            manager._proxy_cluster_member.assert_not_awaited()
+
+            # A disabled exact match returns to ordinary group selection.
+            manager.upsert_source_ip_routing_rule({**active, "enabled": False})
+            fallback = await service.proxy(
+                {"model": "shared-model", "stream": False},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            self.assertEqual(fallback["selected_node"], "node-a")
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_streaming_pin_never_retries_another_group(self):
+        async def broken_stream():
+            raise httpx.ConnectError("group offline")
+            yield ""  # pragma: no cover
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", instance_id=1,
+                node_ids=["node-c", "node-d"],
+            ))
+            manager._proxy_cluster_member = AsyncMock(return_value=broken_stream())
+            stream = await service.proxy(
+                {"model": "shared-model", "stream": True},
+                "chat/completions", caller_ip="10.0.0.1",
+            )
+            chunks = [chunk async for chunk in stream]
+            self.assertEqual(manager._proxy_cluster_member.await_count, 1)
+            self.assertIn("upstream_error", "".join(chunks))
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_runtime_change_fails_closed_before_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = await self._service(
+                directory, [_grouped_deployment()],
+            )
+            manager.upsert_source_ip_routing_rule(_rule(
+                source_ip="10.0.0.1", instance_id=0,
+                node_ids=["node-a", "node-b"],
+            ))
+            live = await service.deployments()
+            live[0]["runtime"] = RuntimeKind.LLAMA_CPP.value
+            service.deployments = AsyncMock(return_value=live)
+
+            with self.assertRaisesRegex(
+                SourceRoutingUnavailable, "supported managed runtime",
+            ):
+                await service.proxy(
+                    {"model": "shared-model", "stream": False},
+                    "chat/completions", caller_ip="10.0.0.1",
+                )
+            manager._proxy_cluster_member.assert_not_awaited()
+            await manager.http.aclose()
+            await service.close()
+
+
+class SourceRoutingApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import server
+
+        self.server = server
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app),
+            base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    async def test_get_put_and_ipv6_query_delete_contract(self):
+        expected = _rule(source_ip="2001:db8::1")
+        with patch.object(
+            self.server.sparkdeck, "upsert_source_ip_routing_rule",
+            AsyncMock(return_value=expected),
+        ) as upsert, patch.object(
+            self.server.sparkdeck, "source_ip_routing_rules",
+            return_value=[expected],
+        ), patch.object(
+            self.server.sparkdeck, "delete_source_ip_routing_rule",
+            return_value=True,
+        ) as delete:
+            put = await self.client.put(
+                "/api/v1/inference-routing-rules", json=expected,
+            )
+            listing = await self.client.get("/api/v1/inference-routing-rules")
+            deleted = await self.client.delete(
+                "/api/v1/inference-routing-rules",
+                params={
+                    "source_ip": "2001:db8::1",
+                    "requested_model": "shared-model",
+                },
+            )
+
+        self.assertEqual(put.status_code, 200)
+        self.assertEqual(listing.json(), {"items": [expected]})
+        self.assertEqual(deleted.json(), {"ok": True})
+        upsert.assert_awaited_once_with(expected)
+        delete.assert_called_once_with("2001:db8::1", "shared-model")
+
+    async def test_inference_maps_unavailable_pin_to_503(self):
+        with patch.object(
+            self.server.sparkdeck, "proxy",
+            AsyncMock(side_effect=SourceRoutingUnavailable("pinned group offline")),
+        ):
+            response = await self.client.post(
+                "/v1/chat/completions",
+                json={"model": "shared-model", "messages": []},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "pinned group offline")
+
+    async def test_list_maps_invalid_persisted_configuration_to_503(self):
+        with patch.object(
+            self.server.sparkdeck, "source_ip_routing_rules",
+            side_effect=SourceRoutingUnavailable("routing file is invalid"),
+        ):
+            response = await self.client.get("/api/v1/inference-routing-rules")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "routing file is invalid")
+
+    async def test_mutations_map_invalid_persisted_configuration_to_503(self):
+        error = SourceRoutingUnavailable("routing file is invalid")
+        with patch.object(
+            self.server.sparkdeck, "upsert_source_ip_routing_rule",
+            AsyncMock(side_effect=error),
+        ), patch.object(
+            self.server.sparkdeck, "delete_source_ip_routing_rule",
+            side_effect=error,
+        ):
+            put = await self.client.put(
+                "/api/v1/inference-routing-rules", json=_rule(),
+            )
+            deleted = await self.client.delete(
+                "/api/v1/inference-routing-rules",
+                params={
+                    "source_ip": "2001:db8::1",
+                    "requested_model": "shared-model",
+                },
+            )
+        self.assertEqual(put.status_code, 503)
+        self.assertEqual(deleted.status_code, 503)

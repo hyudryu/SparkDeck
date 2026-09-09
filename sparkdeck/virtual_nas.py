@@ -19,7 +19,9 @@ import threading
 import time
 import uuid
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
@@ -370,6 +372,20 @@ def _validate_file_stream_entry_budget(
     return entries
 
 
+def _validate_file_stream_sources(entries: list[dict[str, Any]]) -> None:
+    """Fail before shipping weights if a required source file cannot be read."""
+    for entry in entries:
+        if entry["type"] != "file" or "source" not in entry:
+            continue
+        try:
+            with entry["source"].open("rb"):
+                pass
+        except OSError as exc:
+            raise ValueError(
+                f"cannot read source model file {entry['path']}: {exc.strerror or str(exc)}"
+            ) from exc
+
+
 def _open_file_stream_destination(destination: Path):
     """Create an incoming file without transiently widening its permissions."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -443,12 +459,17 @@ class _AsyncFileStreamReader:
         self.received = 0
         self._progress = progress
 
-    async def readexactly(self, size: int) -> bytes:
+    async def readexactly(self, size: int, *, context: str = "stream header") -> bytes:
         while len(self._buffer) < size:
             try:
                 chunk = await self._chunks.__anext__()
             except StopAsyncIteration as exc:
-                raise ValueError("file stream ended unexpectedly") from exc
+                raise ValueError(
+                    f"file stream ended unexpectedly while reading {context} "
+                    f"at byte {self.received - len(self._buffer)} "
+                    f"({len(self._buffer)} of {size} bytes available); "
+                    "the source disconnected or stopped exporting before the copy was complete"
+                ) from exc
             if not isinstance(chunk, (bytes, bytearray, memoryview)):
                 raise ValueError("file stream yielded non-bytes data")
             data = bytes(chunk)
@@ -494,6 +515,15 @@ class _TrackedExport:
             self._finalizer()
 
 
+def _transfer_operation(method):
+    """Keep downloads and relays admitted until all their nested work finishes."""
+    @wraps(method)
+    async def guarded(self, model_id, *args, **kwargs):
+        with self.transfer_operation(model_id):
+            return await method(self, model_id, *args, **kwargs)
+    return guarded
+
+
 class VirtualNAS:
     """Inventory, safe file streaming, and the controller's durable transfer queue."""
 
@@ -524,6 +554,10 @@ class VirtualNAS:
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._last_progress_save: dict[str, float] = {}
         self._streaming_models: dict[str, int] = {}
+        self._update_reserved = False
+        self._update_loop: asyncio.AbstractEventLoop | None = None
+        self._update_generation = 0
+        self._transfer_tasks: dict[asyncio.Task, int] = {}
         self._download_locks: dict[str, threading.Lock] = {}
         self._download_locks_guard = threading.Lock()
         self._download_size_cache: dict[
@@ -540,11 +574,30 @@ class VirtualNAS:
 
     async def _await_uncancelable(self, operation: Awaitable[Any]) -> Any:
         """Finish work that cannot be safely stopped after it has begun."""
+        parent = asyncio.current_task()
         task = asyncio.ensure_future(operation)
+        admitted = parent in self._transfer_tasks or parent in self._active.values()
+        if admitted:
+            # Downloads run in a shielded child task. Carry its parent's
+            # admission across that task boundary so a pending update does
+            # not reject work belonging to an already running transfer.
+            self._transfer_tasks[task] = self._transfer_tasks.get(task, 0) + 1
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            return await task
+            while True:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Repeated caller cancellation must not cancel a remote
+                    # download or release its update reservation prematurely.
+                    if task.done():
+                        return task.result()
+        finally:
+            if admitted:
+                remaining = self._transfer_tasks[task] - 1
+                if remaining:
+                    self._transfer_tasks[task] = remaining
+                else:
+                    self._transfer_tasks.pop(task, None)
 
     def _model_path(self, model_id: str) -> Path:
         hub = self._hub()
@@ -700,16 +753,20 @@ class VirtualNAS:
         self._dispatcher = asyncio.create_task(self._dispatch_loop())
         self._wake.set()
 
-    async def stop(self) -> None:
+    async def stop_dispatcher(self) -> None:
+        """Stop admitting queued work before application teardown begins."""
         dispatcher = self._dispatcher
         self._dispatcher = None
         if dispatcher and not dispatcher.done():
             dispatcher.cancel()
+        if dispatcher:
+            await asyncio.gather(dispatcher, return_exceptions=True)
+
+    async def stop(self) -> None:
+        await self.stop_dispatcher()
         active = list(self._active.values())
         for task in active:
             task.cancel()
-        if dispatcher:
-            await asyncio.gather(dispatcher, return_exceptions=True)
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()
@@ -844,6 +901,7 @@ class VirtualNAS:
 
         return await asyncio.to_thread(inspect)
 
+    @_transfer_operation
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
@@ -890,6 +948,7 @@ class VirtualNAS:
             ),
         )
 
+    @_transfer_operation
     async def download_model_files_checked(
         self, model_id: str, revision: str, filenames: list[str],
         explicit_token: str | None = None,
@@ -1215,6 +1274,10 @@ class VirtualNAS:
             transfer_entry_count = 1
             last_modified = 0.0
             for root, directories, files in os.walk(repository, followlinks=False):
+                if Path(root) == repository:
+                    # Match export's exclusion before counting entries/bytes:
+                    # API listing caches consume neither wire nor staging space.
+                    directories[:] = [name for name in directories if name != "trees"]
                 transfer_entry_count += len(directories) + len(files)
                 directories[:] = [
                     name for name in directories
@@ -1391,6 +1454,11 @@ class VirtualNAS:
                 directories.sort()
                 files.sort()
                 root_path = Path(root)
+                if root_path == repository:
+                    # Hub's trees/ is a disposable API listing cache, not model
+                    # data. Container-created listings may be root-only and
+                    # must not abort a completed weights copy at its very end.
+                    directories[:] = [name for name in directories if name != "trees"]
                 for name in list(directories):
                     source = root_path / name
                     relative = source.relative_to(repository).as_posix()
@@ -1468,6 +1536,7 @@ class VirtualNAS:
             try:
                 stream_entries = entries() if callable(entries) else entries
                 _validate_file_stream_entry_budget(stream_entries)
+                _validate_file_stream_sources(stream_entries)
                 publish(_FILE_STREAM_MAGIC)
                 for entry in stream_entries:
                     public = {
@@ -1590,6 +1659,7 @@ class VirtualNAS:
         finally:
             self._release_stream(model_id)
 
+    @_transfer_operation
     async def import_model_from_peer(
         self,
         model_id: str,
@@ -1757,6 +1827,20 @@ class VirtualNAS:
             or (revision and not self._has_revision(model, revision, revision))
         ):
             raise LookupError("source node does not have the complete requested revision")
+        repository = self._model_path(model_id)
+        external_files = None
+        if (
+            not repository.is_dir() or repository.is_symlink()
+            or not _is_complete_repository(repository)
+        ):
+            external_files = _external_comfyui_bundle_files(
+                self._external_model_roots_provider(), model_id,
+            )
+            if external_files is None:
+                raise LookupError("cached model not found")
+        _validate_file_stream_sources(
+            self._whole_model_stream_entries(repository, external_files),
+        )
         capability = secrets.token_urlsafe(32)
         self._direct_export_capabilities[hashlib.sha256(capability.encode()).hexdigest()] = {
             "model_id": model_id, "revision": revision, "expires_at": time.monotonic() + 300,
@@ -1797,7 +1881,9 @@ class VirtualNAS:
         while True:
             if cancel is not None and cancel.is_set():
                 raise TransferCanceled()
-            header_size = struct.unpack(">I", await reader.readexactly(4))[0]
+            header_size = struct.unpack(
+                ">I", await reader.readexactly(4, context="next entry or completion marker"),
+            )[0]
             if header_size == 0:
                 break
             if header_size > _FILE_STREAM_HEADER_MAX_BYTES:
@@ -1871,6 +1957,7 @@ class VirtualNAS:
                         raise TransferCanceled()
                     data = await reader.readexactly(
                         min(FILE_STREAM_CHUNK_BYTES, remaining),
+                        context=f"file {path} payload ({size - remaining} of {size} bytes copied)",
                     )
                     await asyncio.to_thread(output.write, data)
                     digest.update(data)
@@ -1879,7 +1966,9 @@ class VirtualNAS:
                 await asyncio.to_thread(os.fsync, output.fileno())
             finally:
                 await asyncio.to_thread(output.close)
-            expected_digest = await reader.readexactly(hashlib.sha256().digest_size)
+            expected_digest = await reader.readexactly(
+                hashlib.sha256().digest_size, context=f"file {path} checksum",
+            )
             if not secrets.compare_digest(digest.digest(), expected_digest):
                 raise ValueError("model file failed transfer integrity verification")
             await asyncio.to_thread(os.chmod, destination, mode)
@@ -2249,6 +2338,7 @@ class VirtualNAS:
             )
         shutil.rmtree(extracted, ignore_errors=True)
 
+    @_transfer_operation
     async def transfer_model_files(
         self, model_id: str, revision: str, filenames: list[str],
         source_node_id: str, target_node_id: str,
@@ -2899,7 +2989,32 @@ class VirtualNAS:
             for job in self.jobs
         )
 
+    @contextmanager
+    def transfer_operation(self, model_id: str):
+        """Admit controller operations outside the durable transfer queue."""
+        task = asyncio.current_task()
+        self._reserve_stream(model_id)
+        self._transfer_tasks[task] = self._transfer_tasks.get(task, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._transfer_tasks[task] - 1
+            if remaining:
+                self._transfer_tasks[task] = remaining
+            else:
+                self._transfer_tasks.pop(task, None)
+            self._release_stream(model_id)
+
     def _reserve_stream(self, model_id: str) -> None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if self._update_reserved and not (
+            task is not None
+            and (task in self._transfer_tasks or task in self._active.values())
+        ):
+            raise RuntimeError("node update is pending; retry the transfer after the update")
         self._streaming_models[model_id] = self._streaming_models.get(model_id, 0) + 1
 
     def _release_stream(self, model_id: str) -> None:
@@ -2908,6 +3023,43 @@ class VirtualNAS:
             self._streaming_models[model_id] = remaining
         else:
             self._streaming_models.pop(model_id, None)
+
+    def reserve_update(self) -> None:
+        """Atomically stop admitting new work before waiting for current copies."""
+        self._update_loop = asyncio.get_running_loop()
+        self._update_generation += 1
+        self._update_reserved = True
+        self._wake.set()
+
+    async def wait_for_transfers(self) -> None:
+        """Include both endpoint streams and controller-coordinated peer jobs."""
+        while self._streaming_models or any(
+            not task.done() for task in self._active.values()
+        ):
+            await asyncio.sleep(0.1)
+
+    def end_update(self) -> None:
+        """Release on the owning loop, including status checks in worker threads."""
+        owner = self._update_loop
+        generation = self._update_generation
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if owner is not None and owner is not current:
+            try:
+                owner.call_soon_threadsafe(self._end_update_on_loop, generation)
+            except RuntimeError:
+                if not owner.is_closed():
+                    raise
+            return
+        self._end_update_on_loop(generation)
+
+    def _end_update_on_loop(self, generation: int) -> None:
+        if generation != self._update_generation:
+            return
+        self._update_reserved = False
+        self._wake.set()
 
     def _validate_node(self, node_id: str) -> None:
         if node_id == LOCAL_NODE_ID:
@@ -2969,7 +3121,7 @@ class VirtualNAS:
                         self._active.pop(target, None)
                 # A single global transfer prevents a multi-target copy from
                 # saturating the source disk and cluster network.
-                if not self._active:
+                if not self._active and not self._update_reserved:
                     job = None
                     for candidate in self.jobs:
                         if candidate["status"] != "queued":
@@ -2998,7 +3150,11 @@ class VirtualNAS:
                         task.add_done_callback(lambda _task: self._wake.set())
                 self._wake.clear()
                 try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=0.5)
+                    # Keep cancellation in this task. On Python 3.11 wait_for
+                    # can swallow shutdown cancellation when its child waiter
+                    # completes at the same moment a transfer wakes the queue.
+                    async with asyncio.timeout(0.5):
+                        await self._wake.wait()
                 except TimeoutError:
                     pass
         except asyncio.CancelledError:
@@ -4196,6 +4352,10 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
         return True
     if not _required_files_are_nonempty([config]):
         return False
+    if _is_tokenizer_free_dflash2_config(config):
+        # This draft is loaded inside the target model's speculative decoder
+        # and uses its tokenizer. Its Hub repository has no tokenizer assets.
+        return True
     tokenizer = [
         path for name, path in lowered.items()
         if Path(name).name in _TOKENIZER_FILES
@@ -4208,6 +4368,24 @@ def _is_complete_snapshot(snapshot: Path, blob_root: Path | None) -> bool:
     if not _required_files_are_nonempty(tokenizer):
         return False
     return True
+
+
+def _is_tokenizer_free_dflash2_config(config: Path) -> bool:
+    """Recognize the explicit DFlash 2 draft architecture, not a model name."""
+    try:
+        # Cache metadata is untrusted; never parse an unbounded config file.
+        with config.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return False
+        value = json.loads(raw)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("architectures") == ["DFlash2DraftModel"]
+        and isinstance(value.get("dflash_config"), dict)
+    )
 
 
 def _is_complete_diffusers_snapshot(files: dict[str, Path]) -> bool:

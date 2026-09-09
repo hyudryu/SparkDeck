@@ -819,9 +819,12 @@ describe('community features sign-in', () => {
 
   it('renews a long-open node session before its browser authorization expires', async () => {
     const callbacks: Array<() => void> = []
-    const interval = vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
-      if (typeof handler === 'function') callbacks.push(handler as () => void)
-      return 1
+    const setInterval = window.setInterval.bind(window)
+    const interval = vi.spyOn(window, 'setInterval').mockImplementation((handler, delay, ...args) => {
+      if (delay === COMMUNITY_SESSION_RENEW_MS && typeof handler === 'function') {
+        callbacks.push(handler as () => void)
+      }
+      return setInterval(handler, delay, ...args)
     })
     const fetchMock = stubSettingsFetch(vi.fn<typeof fetch>(), {
       session: { status: 'signed-in', email: 'driver@example.com', token_invalid: false },
@@ -830,9 +833,9 @@ describe('community features sign-in', () => {
     render(<AuthProvider><AuthStatus /></AuthProvider>)
 
     expect(await screen.findByText('signed-in:driver@example.com')).toBeInTheDocument()
-    expect(interval).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RENEW_MS)
-    expect(callbacks.length).toBeGreaterThan(0)
-    await act(async () => callbacks.at(-1)?.())
+    await waitFor(() => expect(interval).toHaveBeenCalledWith(expect.any(Function), COMMUNITY_SESSION_RENEW_MS))
+    expect(callbacks).toHaveLength(1)
+    await act(async () => callbacks[0]())
     await waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => (
       String(input) === '/api/v1/community/session'
     ))).toHaveLength(2))
@@ -840,9 +843,12 @@ describe('community features sign-in', () => {
 
   it('ignores a delayed session renewal after sign-out completes', async () => {
     const callbacks: Array<() => void> = []
-    vi.spyOn(window, 'setInterval').mockImplementation((handler: TimerHandler) => {
-      if (typeof handler === 'function') callbacks.push(handler as () => void)
-      return 1
+    const setInterval = window.setInterval.bind(window)
+    vi.spyOn(window, 'setInterval').mockImplementation((handler, delay, ...args) => {
+      if (delay === COMMUNITY_SESSION_RENEW_MS && typeof handler === 'function') {
+        callbacks.push(handler as () => void)
+      }
+      return setInterval(handler, delay, ...args)
     })
     let sessionCalls = 0
     let resolveRenewal: ((response: Response) => void) | undefined
@@ -864,7 +870,8 @@ describe('community features sign-in', () => {
     render(<MemoryRouter><AuthProvider><SettingsPage /></AuthProvider></MemoryRouter>)
 
     expect(await screen.findByText('driver@example.com')).toBeInTheDocument()
-    act(() => callbacks.at(-1)?.())
+    await waitFor(() => expect(callbacks).toHaveLength(1))
+    act(() => callbacks[0]())
     await waitFor(() => expect(resolveRenewal).toBeDefined())
     await submitCommunitySignOut(user)
     expect(await screen.findByLabelText('Email')).toBeInTheDocument()

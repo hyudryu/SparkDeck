@@ -34,6 +34,7 @@ from .catalog import (
     canonical_quantization,
     quantization_from_text,
 )
+from .codex_models import codex_model
 from .envfile_settings import (
     EnvFileConflictError,
     apply_env_updates,
@@ -6712,7 +6713,10 @@ class SparkDeckService:
                     "artifact": None, "quantization": None,
                 },
             })
-        return {"object": "list", "data": data}
+        return {
+            "object": "list", "data": data,
+            "models": [codex_model(item["id"]) for item in data],
+        }
 
     def _deployment_public_model_ids(self, deployment: dict[str, Any]) -> list[str]:
         """Return the request ids explicitly served by one deployment.

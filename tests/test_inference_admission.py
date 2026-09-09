@@ -50,6 +50,7 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             "deployment_id": "deployment-a",
             "group_id": "deployment-a",
             "instance_id": None,
+            "node_ids": ["local"],
             "node_names": [],
         })
 

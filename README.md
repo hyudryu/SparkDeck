@@ -111,7 +111,7 @@ _Set one Hugging Face credential for gated and private models across the cluster
 
 ![Explore pull-weights dialog for deepseek-ai/DeepSeek-V4-Flash-0731 across four cluster nodes](docs/screenshots/readme/feature-explore-pull.png)
 
-_Pulling `deepseek-ai/DeepSeek-V4-Flash-0731` (155 GB weights) to all four nodes, with gx10-node-1 as the download seed. Real capture from the author's cluster._
+_Pulling `deepseek-ai/DeepSeek-V4-Flash-0731` (155 GB weights) to all four nodes, with gx10-node-1 as the download seed. Real capture from the author's cluster. The dialog's "downloads once" summary describes transfer-eligible targets; a node that already holds a partial cache resumes from Hugging Face independently._
 </details>
 
 ## Documentation

@@ -1217,3 +1217,54 @@ export interface BenchmarkRunnerRunDetail extends BenchmarkRunnerRunSummary {
     prefix_caching_enabled?: boolean | null
   } | null
 }
+
+/** One five-second bucket of a serving unit's trailing live throughput. */
+export interface LiveHistoryBucket {
+  at: number
+  output_tok_s: number
+  thinking_tok_s: number
+  /** Aggregate prompt-processing rate. Measured once a prefill completes. */
+  prefill_tok_s: number | null
+  /** True when the engine measured the rate; false for a live estimate. */
+  prefill_measured: boolean
+  /** Mean concurrent sessions over the bucket. */
+  concurrent: number
+  concurrent_peak: number
+  output_sessions: number
+  thinking_sessions: number
+  prefill_sessions: number
+  output_active: boolean
+  thinking_active: boolean
+  output_peak_tok_s: number
+  thinking_peak_tok_s: number
+  prefill_peak_tok_s: number | null
+}
+
+export interface LiveHistorySessionState {
+  output_sessions: number
+  thinking_sessions: number
+  prefill_sessions: number
+}
+
+/** One graph: a deployment, pair, or sharded serving group. */
+export interface LiveHistorySeries {
+  key: string
+  group_id: string
+  model: string
+  deployment_id?: string | null
+  instance_id?: number | null
+  node_names: string[]
+  live_sessions: number
+  state: LiveHistorySessionState
+  last_at: number
+  bucket_seconds: number
+  buckets: LiveHistoryBucket[]
+}
+
+export interface LiveHistorySnapshot {
+  generated_at: number
+  bucket_seconds: number
+  range_seconds: number
+  sample_seconds: number
+  series: LiveHistorySeries[]
+}

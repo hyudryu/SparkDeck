@@ -11842,7 +11842,31 @@ class Manager:
             # A synthetic startup probe must not refresh the deployment's
             # "last used" timestamps or skew ordinary usage metrics.
             self._mark_deployment_used(deployment_id)
+        self._live_history_hook("start", self._active_reqs[rid]["group"])
         return rid
+
+    def _live_history_hook(self, event: str, group=None, rec=None) -> None:
+        """Notify the History panel's collector when one is attached.
+
+        Live-history recording is optional: the collector is created by the
+        service, so a bare manager (including lightweight tests built with
+        ``Manager.__new__``) simply has no observer.  Token accounting reads the
+        cumulative per-request counters on the collector's own tick, so only
+        request admission and completion are pushed from here.  Completion
+        carries the record itself because a request that ends between two
+        samples is gone from ``_active_reqs`` by the next one.
+        """
+        history = getattr(self, "live_history", None)
+        if history is None:
+            return
+        try:
+            handler = getattr(history, event)
+        except AttributeError:
+            return
+        if event == "end":
+            handler(group, rec)
+        else:
+            handler(group)
 
     def _track_prompt_processing(
         self, rid: int, prompt_tokens: int, pp_time_s: float,
@@ -11872,6 +11896,7 @@ class Manager:
                 # A synthetic startup probe must not refresh the deployment's
                 # "last used" timestamps at completion either.
                 self._mark_deployment_used(rec.get("deployment_id"))
+            self._live_history_hook("end", rec.get("group"), rec)
 
     def _transfer_inference_ownership(
         self, admission=None, request_id=None, *,

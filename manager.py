@@ -680,6 +680,19 @@ def _community_consent_fanout(nodes: list[dict], results: list) -> dict:
     return {"applied": applied, "conflicts": [], "errors": errors}
 
 
+def notify_live_history(manager: Any, event: str, group: Any = None, rec: Any = None) -> None:
+    """Report one inference lifecycle event to the live-history collector.
+
+    Recording is optional and the manager is not always a ``Manager``:
+    several callers drive the tracking methods on a stub object that only
+    carries the attributes they need, so the hook is looked up defensively and
+    an ordinary request never depends on the observer existing.
+    """
+    hook = getattr(manager, "_live_history_hook", None)
+    if hook is not None:
+        hook(event, group, rec)
+
+
 class Manager:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -11842,26 +11855,16 @@ class Manager:
             # A synthetic startup probe must not refresh the deployment's
             # "last used" timestamps or skew ordinary usage metrics.
             self._mark_deployment_used(deployment_id)
-        self._live_history_hook("start", self._active_reqs[rid]["group"])
+        notify_live_history(self, "start", self._active_reqs[rid]["group"])
         return rid
 
     def _live_history_hook(self, event: str, group=None, rec=None) -> None:
-        """Notify the History panel's collector when one is attached.
-
-        Live-history recording is optional: the collector is created by the
-        service, so a bare manager (including lightweight tests built with
-        ``Manager.__new__``) simply has no observer.  Token accounting reads the
-        cumulative per-request counters on the collector's own tick, so only
-        request admission and completion are pushed from here.  Completion
-        carries the record itself because a request that ends between two
-        samples is gone from ``_active_reqs`` by the next one.
-        """
+        """Forward one lifecycle event to the collector, if one is attached."""
         history = getattr(self, "live_history", None)
         if history is None:
             return
-        try:
-            handler = getattr(history, event)
-        except AttributeError:
+        handler = getattr(history, event, None)
+        if handler is None:
             return
         if event == "end":
             handler(group, rec)
@@ -11896,7 +11899,7 @@ class Manager:
                 # A synthetic startup probe must not refresh the deployment's
                 # "last used" timestamps at completion either.
                 self._mark_deployment_used(rec.get("deployment_id"))
-            self._live_history_hook("end", rec.get("group"), rec)
+            notify_live_history(self, "end", rec.get("group"), rec)
 
     def _transfer_inference_ownership(
         self, admission=None, request_id=None, *,

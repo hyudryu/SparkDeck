@@ -140,8 +140,16 @@ class LiveHistory:
         self._task: asyncio.Task | None = None
 
     # ----- event hooks -------------------------------------------------
-    def start(self, group: Mapping[str, Any] | None = None) -> None:
-        """Count a newly admitted inference request."""
+    def start(
+        self, group: Mapping[str, Any] | None = None,
+        rec: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Count a newly admitted inference request.
+
+        ``rec`` is accepted and ignored so every lifecycle hook shares one
+        signature: only :meth:`end` needs the request record, and the manager
+        forwards the record it already has to whichever event it reports.
+        """
         key = _series_key(group) if group else ""
         if key:
             self._live[key] = self._live.get(key, 0) + 1

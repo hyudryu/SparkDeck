@@ -9,8 +9,10 @@ with a manual clock, so no sleeping or event loop is involved.
 from __future__ import annotations
 
 from collections import deque
+from types import SimpleNamespace
 from unittest import TestCase
 
+from manager import Manager
 from sparkdeck.live_metrics import BUCKET_SECONDS, LiveHistory
 
 GROUP_A = {
@@ -293,8 +295,6 @@ class ManagerIntegrationTests(TestCase):
     """The manager's lifecycle hooks feed the collector, not just the tests."""
 
     def _manager(self):
-        from manager import Manager
-
         instance = Manager.__new__(Manager)
         instance._active_reqs = {}
         instance._req_seq = 0
@@ -367,6 +367,28 @@ class ManagerIntegrationTests(TestCase):
 
         self.assertEqual(manager._active_reqs, {})
         self.assertIsNone(getattr(manager, "live_history", None))
+
+    def test_a_stub_manager_without_the_hook_still_tracks_requests(self) -> None:
+        """Some callers drive the tracking methods on a minimal stub object.
+
+        Several suites pass a ``SimpleNamespace`` as the manager, so the
+        lifecycle notification must tolerate an object that has neither the hook
+        method nor a collector.
+        """
+        stub = SimpleNamespace(
+            _active_reqs={}, _req_seq=0, _trailing_window=5.0,
+            _mark_deployment_used=lambda deployment_id: None,
+            _request_group=lambda key, deployment_id=None, container_name=None: {
+                "group_id": key, "model": key, "node_ids": ["local"], "node_names": [],
+            },
+        )
+
+        rid = Manager._track_start(stub, "model-a", streaming=True)
+        Manager._track_output(stub, rid, 0.0, "output", 2)
+        Manager._track_prompt_processing(stub, rid, 100, 1.0)
+        Manager._track_end(stub, rid)
+
+        self.assertEqual(stub._active_reqs, {})
 
 
 class SeriesShapeTests(TestCase):

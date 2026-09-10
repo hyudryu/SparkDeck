@@ -64,6 +64,8 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "theme": "dark",
             "default_runtime": "sglang",
             "default_context_length": 24576,
+            "history_enabled": True,
+            "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
             "vllm_image": server.manager.settings["vllm_image"],
             "hf_token_configured": True,
         })
@@ -98,6 +100,8 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "theme": "light",
             "default_runtime": "sglang",
             "default_context_length": 32768,
+            "history_enabled": True,
+            "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
             "vllm_image": server.manager.settings["vllm_image"],
             "hf_token_configured": True,
         })
@@ -108,6 +112,8 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             call("theme", "light"),
             call("default_runtime", "sglang"),
             call("default_context_length", 32768),
+            call("history_enabled", True),
+            call("history_sample_seconds", server.DEFAULT_HISTORY_SAMPLE_SECONDS),
         ])
 
     async def test_prompt_limit_requires_positive_integer_without_partial_writes(self):

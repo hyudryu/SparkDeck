@@ -650,6 +650,10 @@ export interface ImagePullResult {
 export interface AppSettings {
   max_concurrent_prompt_processing?: number
   theme?: 'system' | 'light' | 'dark'
+  /** Record trailing throughput history for the History panel. */
+  history_enabled?: boolean
+  /** History sampling cadence in seconds, between 1 and 30. */
+  history_sample_seconds?: number
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.
   default_runtime?: RuntimeKind
@@ -1263,6 +1267,9 @@ export interface LiveHistorySeries {
 
 export interface LiveHistorySnapshot {
   generated_at: number
+  /** False when recording is switched off; the series list is then empty. */
+  enabled: boolean
+  /** Span of one bucket, which equals the sampling interval. */
   bucket_seconds: number
   range_seconds: number
   sample_seconds: number

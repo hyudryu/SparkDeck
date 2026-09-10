@@ -42,6 +42,11 @@ from sparkdeck.service import (
 )
 from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
+from sparkdeck.live_metrics import (
+    DEFAULT_HISTORY_ENABLED,
+    DEFAULT_HISTORY_SAMPLE_SECONDS,
+    clamp_sample_seconds,
+)
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
@@ -810,8 +815,40 @@ async def get_live_history():
     """Trailing per-serving-unit throughput history for the History panel.
 
     The sampler is started on the first request and then runs for the life of
-    the process, so every bucket is worth its full five seconds.
+    the process, at whatever cadence the history settings currently say.  While
+    recording is switched off it idles and returns no series.
     """
+    sparkdeck.history.ensure_sampler()
+    return sparkdeck.history.snapshot()
+
+
+@app.put("/api/v1/live-history/settings")
+async def update_live_history_settings(req: Request):
+    """Turn history recording on or off and set its sampling cadence.
+
+    Kept separate from the full settings update so the panel can flip its own
+    switch without round-tripping every unrelated app setting.
+    """
+    body = await req.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "history settings must be an object")
+    if "enabled" in body:
+        if not isinstance(body["enabled"], bool):
+            raise HTTPException(400, "enabled must be a boolean")
+        sparkdeck.store.set_setting("history_enabled", body["enabled"])
+    if "sample_seconds" in body:
+        raw_seconds = body["sample_seconds"]
+        if isinstance(raw_seconds, bool) or not isinstance(raw_seconds, (int, float, str)):
+            raise HTTPException(400, "sample_seconds must be a number of seconds")
+        try:
+            # Reject junk instead of silently recording the default cadence.
+            float(raw_seconds)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "sample_seconds must be a number of seconds") from exc
+        sparkdeck.store.set_setting("history_sample_seconds", clamp_sample_seconds(raw_seconds))
+    if "enabled" in body and not body["enabled"]:
+        # A disabled panel should not keep a trailing hour in memory.
+        sparkdeck.history.forget()
     sparkdeck.history.ensure_sampler()
     return sparkdeck.history.snapshot()
 
@@ -2890,6 +2927,8 @@ _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "default_runtime": "vllm",
     "default_context_length": 8192,
+    "history_enabled": DEFAULT_HISTORY_ENABLED,
+    "history_sample_seconds": DEFAULT_HISTORY_SAMPLE_SECONDS,
 }
 
 
@@ -2934,11 +2973,27 @@ async def v1_update_settings(req: Request):
     )
     if type(prompt_limit) is not int or prompt_limit < 1:
         raise HTTPException(400, "max_concurrent_prompt_processing must be a positive integer")
+    raw_history_enabled = body.get(
+        "history_enabled",
+        sparkdeck.store.get_setting("history_enabled", DEFAULT_HISTORY_ENABLED),
+    )
+    if not isinstance(raw_history_enabled, bool):
+        raise HTTPException(400, "history_enabled must be a boolean")
+    # An out-of-range interval is clamped rather than rejected, so a stale saved
+    # value or a slightly different client bound can never break recording.
+    history_sample_seconds = clamp_sample_seconds(body.get(
+        "history_sample_seconds",
+        sparkdeck.store.get_setting(
+            "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
+        ),
+    ))
     values = {
         "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
         "default_runtime": default_runtime,
         "default_context_length": default_context_length,
+        "history_enabled": raw_history_enabled,
+        "history_sample_seconds": history_sample_seconds,
     }
     credential = body.get("hf_token")
     if credential is not None:

@@ -35,8 +35,8 @@ interface HistoryChartProps {
   series: LiveHistorySeries
   /** Trailing window to draw, in seconds. */
   rangeSeconds: number
-  /** Seconds between server refreshes, shown in the caption. */
-  refreshSeconds: number
+  /** Sampling interval, which is also the span of one point on the graph. */
+  sampleSeconds: number
   metrics: ReadonlySet<HistoryMetric>
   colorByConcurrency: boolean
 }
@@ -74,16 +74,29 @@ function rateLabel(value: number | null | undefined): string {
     : 'pending'
 }
 
-const METRIC_STYLE: Record<HistoryMetric, { label: string; className: string }> = {
+/**
+ * Line style carries the metric, so the three lines stay distinguishable even
+ * when colour is encoding concurrency: solid for output, dotted for thinking,
+ * dashed for prompt processing.  The dash pattern is applied inline alongside
+ * the concurrency colour, because that colour is what the metric CSS class
+ * would otherwise be overridden by.
+ */
+const METRIC_STYLE: Record<HistoryMetric, { label: string; className: string; dash?: string }> = {
   output: { label: 'Token generation', className: 'history-line-output' },
-  thinking: { label: 'Thinking', className: 'history-line-thinking' },
-  prefill: { label: 'Prompt processing', className: 'history-line-prefill' },
+  thinking: { label: 'Thinking', className: 'history-line-thinking', dash: '1 4' },
+  prefill: { label: 'Prompt processing', className: 'history-line-prefill', dash: '7 4' },
 }
 
 const METRIC_VALUE: Record<HistoryMetric, (bucket: LiveHistoryBucket) => number | null> = {
   output: (bucket) => bucket.output_tok_s,
   thinking: (bucket) => bucket.thinking_tok_s,
   prefill: (bucket) => bucket.prefill_tok_s,
+}
+
+function lineStyle(metric: HistoryMetric, color?: string): React.CSSProperties | undefined {
+  const dash = METRIC_STYLE[metric].dash
+  if (color === undefined && dash === undefined) return undefined
+  return { ...(color === undefined ? {} : { stroke: color }), ...(dash === undefined ? {} : { strokeDasharray: dash }) }
 }
 
 /**
@@ -95,7 +108,7 @@ const METRIC_VALUE: Record<HistoryMetric, (bucket: LiveHistoryBucket) => number 
  * otherwise flatten the generation lines against the baseline.
  */
 export function HistoryChart({
-  series, rangeSeconds, refreshSeconds, metrics, colorByConcurrency,
+  series, rangeSeconds, sampleSeconds, metrics, colorByConcurrency,
 }: HistoryChartProps) {
   const [hover, setHover] = useState<HoverPoint>()
 
@@ -212,13 +225,13 @@ export function HistoryChart({
         ))}
 
         {metrics.has('output') && seriesPath('output', yLeft).map((segment) => (
-          <path key={segment.key} className={`history-line ${METRIC_STYLE.output.className}${colorByConcurrency ? ' history-colored' : ''}`} style={colorByConcurrency ? { stroke: segment.color } : undefined} d={segment.d} />
+          <path key={segment.key} className={`history-line ${METRIC_STYLE.output.className}`} style={lineStyle('output', colorByConcurrency ? segment.color : undefined)} d={segment.d} />
         ))}
         {metrics.has('thinking') && seriesPath('thinking', yLeft).map((segment) => (
-          <path key={segment.key} className={`history-line ${METRIC_STYLE.thinking.className}${colorByConcurrency ? ' history-colored' : ''}`} style={colorByConcurrency ? { stroke: segment.color } : undefined} d={segment.d} />
+          <path key={segment.key} className={`history-line ${METRIC_STYLE.thinking.className}`} style={lineStyle('thinking', colorByConcurrency ? segment.color : undefined)} d={segment.d} />
         ))}
         {metrics.has('prefill') && seriesPath('prefill', yRight).map((segment) => (
-          <path key={segment.key} className={`history-line ${METRIC_STYLE.prefill.className}${colorByConcurrency ? ' history-colored' : ''}`} style={colorByConcurrency ? { stroke: segment.color } : undefined} d={segment.d} />
+          <path key={segment.key} className={`history-line ${METRIC_STYLE.prefill.className}`} style={lineStyle('prefill', colorByConcurrency ? segment.color : undefined)} d={segment.d} />
         ))}
 
         {hovered && (
@@ -274,17 +287,32 @@ export function HistoryChart({
       )}
 
       <div className="history-chart-legend">
-        {colorByConcurrency
-          ? Array.from({ length: MAX_COLORED_CONCURRENCY }, (_, index) => (
-            <span key={index}><i style={{ background: CONCURRENCY_COLORS[index] }} />C{index + 1}</span>
-          ))
-          : (Object.keys(METRIC_STYLE) as HistoryMetric[]).filter((metric) => metrics.has(metric)).map((metric) => (
-            <span key={metric}><i className={`history-legend-line ${METRIC_STYLE[metric].className}`} />{METRIC_STYLE[metric].label}</span>
+        <span className="history-legend-styles">
+          {(Object.keys(METRIC_STYLE) as HistoryMetric[]).filter((metric) => metrics.has(metric)).map((metric) => (
+            <span key={metric}>
+              <svg className="history-legend-line" viewBox="0 0 18 10" aria-hidden="true">
+                <line
+                  className={`history-line ${METRIC_STYLE[metric].className}`}
+                  x1="1" x2="17" y1="5" y2="5"
+                  style={lineStyle(metric, 'currentColor')}
+                />
+              </svg>
+              {METRIC_STYLE[metric].label}
+            </span>
           ))}
+        </span>
+        <span className="history-legend-concurrency">
+          {colorByConcurrency
+            ? Array.from({ length: MAX_COLORED_CONCURRENCY }, (_, index) => (
+              <span key={index}><i style={{ background: CONCURRENCY_COLORS[index] }} />C{index + 1}</span>
+            ))
+            : null}
+        </span>
       </div>
       <p className="history-chart-caption">
-        Five-second buckets over the last {Math.round(rangeSeconds / 60)} minutes, refreshed every {refreshSeconds} seconds.
-        {colorByConcurrency && ' Line colour is the mean concurrent session count for that bucket.'}
+        One point every {sampleSeconds} second{sampleSeconds === 1 ? '' : 's'} over the last {Math.round(rangeSeconds / 60)} minutes.
+        {colorByConcurrency && ' Line colour is the mean concurrent session count for that point.'}
+        {' '}Solid is token generation, dotted is thinking, dashed is prompt processing.
       </p>
 
       <table className="sr-only">

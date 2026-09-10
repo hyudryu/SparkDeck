@@ -12117,6 +12117,17 @@ class Manager:
         """Per-engine sessions and rolling rates for the dashboard."""
         return self.active_requests(_grouped=True)
 
+    @staticmethod
+    def _blank_session_rates() -> dict:
+        """Fresh per-model/per-group counters for one dashboard entry."""
+        return {
+            "connections": 0, "decoded_tokens": 0,
+            "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+            "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
+            "output_sessions": 0, "thinking_sessions": 0,
+            "prefill_sessions": 0, "prefill_seconds": None,
+        }
+
     def active_requests(self, *, _grouped: bool = False) -> dict:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
@@ -12130,11 +12141,7 @@ class Manager:
                 continue
             group = rec.get("group") or self._request_group(rec["key"])
             entry_key = group["group_id"] if _grouped else rec["key"]
-            e = out.setdefault(entry_key, {
-                "connections": 0, "decoded_tokens": 0,
-                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
-                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
-            })
+            e = out.setdefault(entry_key, self._blank_session_rates())
             if _grouped:
                 e.update(group)
             e["connections"] += 1
@@ -12160,6 +12167,40 @@ class Manager:
                 if timestamps:
                     observed = min(getattr(self, "_trailing_window", 5.0), max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
+            # Classify this live session so the dashboard can report what the
+            # engine is doing with it right now. Two precedence rules matter:
+            #
+            # 1. A session that has generated nothing at all is the only one
+            #    that can be called prompt processing. Once a request has
+            #    decoded, it is never prefilling again even if its tokens have
+            #    drained out of the trailing window.
+            # 2. Within the window, visible output wins over reasoning, so a
+            #    session that moved on from thinking to answering is counted
+            #    once as outputting.
+            #
+            # A decoded request whose tokens aged out of the window matches
+            # neither bucket and is left uncounted, so it cannot be reported as
+            # prefilling on the strength of a stale window.
+            output_tokens = len(rec.get("output") or ())
+            thinking_tokens = len(rec.get("thinking") or ())
+            if not (output_tokens or thinking_tokens or rec.get("total_tokens")):
+                # Tracked, held a slot, and has emitted no token yet: this
+                # request is still being prefilled. Requests waiting for a FIFO
+                # slot are not tracked here at all -- they are reported through
+                # the admission queue instead.
+                e["prefill_sessions"] += 1
+                rec_started = rec.get("started_at")
+                if rec_started is not None:
+                    held_seconds = max(0.0, now - float(rec_started))
+                    current = e["prefill_seconds"]
+                    e["prefill_seconds"] = (
+                        held_seconds if current is None
+                        else max(current, held_seconds)
+                    )
+            elif output_tokens:
+                e["output_sessions"] += 1
+            elif thinking_tokens:
+                e["thinking_sessions"] += 1
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
@@ -12182,12 +12223,7 @@ class Manager:
                 if key in admission
             } if admission.get("group_id") else self._request_group(model)
             entry_key = group["group_id"] if _grouped else model
-            e = out.setdefault(entry_key, {
-                "connections": 0, "decoded_tokens": 0,
-                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
-                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
-                "pp_tok_s": None,
-            })
+            e = out.setdefault(entry_key, self._blank_session_rates())
             if _grouped:
                 e.update(group)
             e["queued"] = e.get("queued", 0) + admission["queued"]

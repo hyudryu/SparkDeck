@@ -804,6 +804,14 @@ export interface ActiveRequestStats {
   output_tok_s?: number
   pp_tok_s?: number | null
   admission_limit?: number
+  /** Live sessions whose trailing window shows generated output tokens. */
+  output_sessions?: number
+  /** Live sessions currently emitting reasoning tokens only. */
+  thinking_sessions?: number
+  /** Live sessions held with no token emitted yet, i.e. still prefilling. */
+  prefill_sessions?: number
+  /** Longest time any of those prefilling sessions has been held, in seconds. */
+  prefill_seconds?: number | null
 }
 
 export interface ActiveRequestGroupStats extends ActiveRequestStats {

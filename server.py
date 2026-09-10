@@ -806,6 +806,17 @@ async def get_active_request_rates():
     return manager.active_requests()
 
 
+@app.get("/api/v1/live-history")
+async def get_live_history():
+    """Trailing per-serving-unit throughput history for the History panel.
+
+    The sampler is started on the first request and then runs for the life of
+    the process, so every bucket is worth its full five seconds.
+    """
+    sparkdeck.history.ensure_sampler()
+    return sparkdeck.history.snapshot()
+
+
 # ---------- cluster nodes / node agent ----------
 @app.get("/api/agent/info")
 async def agent_info():

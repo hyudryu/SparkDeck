@@ -26,6 +26,7 @@ import type {
   SystemStats,
   AdmissionStats,
   LogEntry,
+  LiveHistorySnapshot,
   SyncStatus,
   CommunityClusterSync,
   CommunityPairResponse,
@@ -1075,5 +1076,8 @@ export const api = {
       if (data.entries) return data.entries
       return (data.logs ?? []).map(normalizeLegacyLog)
     },
+  },
+  liveHistory: {
+    get: (signal?: AbortSignal) => request<LiveHistorySnapshot>('/api/v1/live-history', { signal }),
   },
 }

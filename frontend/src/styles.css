@@ -725,3 +725,69 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .session-metrics dd { margin: 0; color: var(--text-primary); font: 11px/1.5 "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
 .dashboard-list-row small.session-states { color: var(--text-primary); font: 11px/1.5 "SFMono-Regular", Consolas, monospace; }
 @media (max-width: 760px) { .session-row .session-metrics { grid-column: 2 / -1; width: 100%; } .session-metrics dl { grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 4px 18px; } }
+
+/* ----- History panel: trailing live throughput per serving unit ----- */
+.history-controls-panel { padding: 14px 16px; margin-bottom: 12px; }
+.history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 22px; }
+.history-control-group { display: flex; align-items: center; gap: 8px; }
+.history-control-label { color: var(--text-tertiary); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.history-toggle { display: flex; gap: 3px; padding: 3px; background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 9px; }
+.history-toggle button { min-height: 28px; padding: 5px 10px; color: var(--text-secondary); background: transparent; border: 0; border-radius: 6px; font-size: 11px; font-weight: 650; cursor: pointer; }
+.history-toggle button[aria-pressed='true'] { color: var(--text-primary); background: var(--bg-surface); box-shadow: 0 1px 4px rgba(0, 0, 0, .1); }
+.history-toggle button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.history-summary { display: flex; align-items: center; gap: 10px; margin-left: auto; color: var(--text-secondary); font-size: 11px; }
+.history-note { margin-top: 12px; color: var(--text-secondary); font-size: 11px; line-height: 1.55; }
+.history-note em { color: var(--text-primary); font-style: normal; font-weight: 600; }
+.history-stale { margin-bottom: 12px; color: var(--warning); background: var(--warning-soft); border: 1px solid var(--border-subtle); border-radius: 9px; padding: 9px 12px; font-size: 12px; }
+.history-grid { display: grid; gap: 12px; }
+.history-panel { min-width: 0; overflow: hidden; }
+.history-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 68px; padding: 14px 16px; border-bottom: 1px solid var(--border-subtle); }
+.history-panel-heading h2 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.history-panel-heading p { margin: 2px 0 0; color: var(--text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.history-panel-state { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.history-panel-counts { color: var(--text-tertiary); font: 10px/1.5 "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+
+.history-chart-wrap { position: relative; min-width: 0; padding: 12px 14px 14px; overflow: hidden; }
+.history-chart { display: block; width: 100%; height: auto; overflow: visible; touch-action: none; }
+.history-grid-line { stroke: var(--border-subtle); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
+.history-grid-vertical { opacity: .5; }
+.history-axis-label { fill: var(--text-tertiary); font-size: 9.5px; }
+.history-axis-title { fill: var(--text-tertiary); font-size: 9px; }
+.history-axis-right { fill: var(--text-tertiary); }
+.history-line { fill: none; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.history-line-output { stroke: var(--accent); }
+.history-line-thinking { stroke: #bf5af2; }
+.history-line-prefill { stroke: var(--success); stroke-dasharray: 7 4; }
+.history-colored.history-line-prefill { stroke-dasharray: 7 4; }
+.history-cursor line { stroke: var(--text-tertiary); stroke-width: 1; stroke-dasharray: 2 3; vector-effect: non-scaling-stroke; }
+.history-cursor circle { stroke: var(--bg-surface); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.history-cursor circle:not([style]) { fill: var(--accent); }
+
+.history-chart-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 10px; color: var(--text-secondary); font-size: 10px; }
+.history-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.history-chart-legend i { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+.history-legend-line { width: 14px; height: 0; border-top: 2.4px solid currentColor; border-radius: 0; background: none !important; }
+.history-legend-line.history-line-output { color: var(--accent); }
+.history-legend-line.history-line-thinking { color: #bf5af2; }
+.history-legend-line.history-line-prefill { color: var(--success); border-top-style: dashed; }
+.history-chart-caption { margin: 8px 0 0; color: var(--text-tertiary); font-size: 10px; }
+
+.history-tooltip { position: absolute; z-index: 40; top: 6px; max-width: 260px; display: grid; gap: 2px; padding: 9px 11px; color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-strong); border-radius: 9px; box-shadow: 0 8px 26px rgba(0, 0, 0, .18); font-size: 11px; line-height: 1.45; pointer-events: none; }
+.history-tooltip strong { font-size: 12px; }
+.history-tooltip > span { color: var(--text-secondary); white-space: nowrap; }
+.history-tooltip em { color: var(--warning); font-style: normal; font-weight: 600; }
+.history-tooltip-state { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.history-tooltip-state i { width: 7px; height: 7px; border-radius: 50%; }
+.history-state-output { background: var(--accent); }
+.history-state-thinking { background: #bf5af2; }
+.history-state-prefill { background: var(--success); }
+.history-tooltip-note { color: var(--text-tertiary) !important; font-size: 10px; white-space: normal !important; }
+
+@media (max-width: 760px) {
+  .history-summary { margin-left: 0; }
+  .history-panel-heading { align-items: flex-start; flex-direction: column; }
+  .history-panel-counts { white-space: normal; }
+  .history-chart { min-width: 560px; }
+  .history-chart-wrap { overflow-x: auto; }
+  .history-tooltip { max-width: 220px; }
+}

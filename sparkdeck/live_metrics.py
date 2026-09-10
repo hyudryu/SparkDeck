@@ -33,16 +33,20 @@ Three properties drive this design:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from typing import Any, Callable, Mapping
 
-# One sample per second keeps a five-second bucket representative while staying
-# cheap: each tick only reads in-memory request records.
-SAMPLE_SECONDS = 1.0
-BUCKET_SECONDS = 5.0
-# One trailing hour at five seconds per bucket.
-KEEP_BUCKETS = 720
+# Trailing window the panel draws, independent of how often it is sampled.
+KEEP_SECONDS = 3_600.0
+# Sampling cadence, in seconds, chosen by the user between these bounds.  The
+# bucket span follows the cadence, so a longer interval means a coarser graph
+# over the same trailing hour rather than gaps in it.
+MIN_SAMPLE_SECONDS = 1
+MAX_SAMPLE_SECONDS = 30
+DEFAULT_HISTORY_SAMPLE_SECONDS = 5
+DEFAULT_HISTORY_ENABLED = True
 # A serving unit that has been silent this long is dropped from the panel.
 RETAIN_ACTIVE_SECONDS = 900.0
 # Bound on simultaneously tracked serving units; least recently active go first.
@@ -51,6 +55,24 @@ MAX_SERIES = 32
 MIN_PREFILL_SECONDS = 0.25
 
 _GROUP_FIELDS = ("group_id", "model", "deployment_id", "instance_id", "node_names")
+
+
+def clamp_sample_seconds(value: Any) -> int:
+    """Bound a requested sampling interval to the supported range."""
+    try:
+        seconds = int(round(float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_HISTORY_SAMPLE_SECONDS
+    if seconds < MIN_SAMPLE_SECONDS:
+        return MIN_SAMPLE_SECONDS
+    return min(seconds, MAX_SAMPLE_SECONDS)
+
+
+def buckets_for(keep_seconds: float, bucket_seconds: float) -> int:
+    """How many buckets cover the trailing window at this cadence."""
+    if bucket_seconds <= 0:
+        return 1
+    return max(2, int(math.ceil(keep_seconds / bucket_seconds)))
 
 
 class _Series:
@@ -69,7 +91,11 @@ class _Series:
 
     def __init__(self, meta: dict[str, Any], now: float) -> None:
         self.meta = meta
-        self.buckets: deque[dict[str, Any]] = deque(maxlen=KEEP_BUCKETS)
+        # Sized for the fastest cadence the user can choose, so any trailing hour
+        # fits no matter which interval produced it.
+        self.buckets: deque[dict[str, Any]] = deque(
+            maxlen=buckets_for(KEEP_SECONDS, MIN_SAMPLE_SECONDS),
+        )
         self.open_started_at = now
         self.previous: dict[Any, tuple[str, int]] = {}
         self.counted_prompt: dict[Any, int] = {}
@@ -119,25 +145,58 @@ class LiveHistory:
 
     The object is a read-only observer: the manager keeps owning request
     tracking, and this collector only reads the same records the dashboard
-    reads.  :meth:`tick` is called once a second by :meth:`sampler` and is also
-    safe to call directly from tests.
+    reads.  :meth:`tick` is called by :meth:`sampler` at the configured cadence
+    and is also safe to call directly from tests.
+
+    Recording can be switched off, in which case every hook and tick returns
+    immediately so a disabled History panel costs nothing at all.
     """
 
     def __init__(
         self,
         manager: Any,
         *,
-        sample_seconds: float = SAMPLE_SECONDS,
-        keep_buckets: int = KEEP_BUCKETS,
+        interval_provider: Callable[[], Any] | None = None,
+        enabled_provider: Callable[[], Any] | None = None,
+        keep_seconds: float = KEEP_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.manager = manager
-        self.sample_seconds = float(sample_seconds)
-        self.keep_buckets = int(keep_buckets)
         self.clock = clock
+        self.keep_seconds = float(keep_seconds)
+        # Both settings are read live on every tick: the operator can change the
+        # cadence or switch recording off without restarting the controller.
+        self._interval_provider = interval_provider
+        self._enabled_provider = enabled_provider
         self._series: dict[str, _Series] = {}
         self._live: dict[str, int] = {}
         self._task: asyncio.Task | None = None
+
+    # ----- settings ----------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        if self._enabled_provider is None:
+            return True
+        try:
+            return bool(self._enabled_provider())
+        except Exception:
+            # A failed settings read must not silently stop recording.
+            return True
+
+    @property
+    def interval_seconds(self) -> int:
+        """Sampling cadence, which is also the span of one bucket."""
+        if self._interval_provider is None:
+            return DEFAULT_HISTORY_SAMPLE_SECONDS
+        try:
+            return clamp_sample_seconds(self._interval_provider())
+        except Exception:
+            return DEFAULT_HISTORY_SAMPLE_SECONDS
+
+    def forget(self) -> None:
+        """Drop every recorded bucket, e.g. once recording is switched off."""
+        self._series.clear()
+        self._live.clear()
 
     # ----- event hooks -------------------------------------------------
     def start(
@@ -150,6 +209,8 @@ class LiveHistory:
         signature: only :meth:`end` needs the request record, and the manager
         forwards the record it already has to whichever event it reports.
         """
+        if not self.enabled:
+            return
         key = _series_key(group) if group else ""
         if key:
             self._live[key] = self._live.get(key, 0) + 1
@@ -165,6 +226,8 @@ class LiveHistory:
         Its final cumulative counters are captured here and folded into the
         bucket that was open when it ended.
         """
+        if not self.enabled:
+            return
         key = _series_key(group) if group else ""
         if not key:
             return
@@ -207,6 +270,8 @@ class LiveHistory:
     # ----- sampling ----------------------------------------------------
     def tick(self, now: float | None = None) -> None:
         """Fold the current instant into every open series and its bucket."""
+        if not self.enabled:
+            return
         now = self.clock() if now is None else now
         observed: dict[str, dict[str, Any]] = {}
         admission = self._admission()
@@ -280,12 +345,15 @@ class LiveHistory:
         # Counters from requests that finished since the last sample belong to
         # the bucket that was open when they ended, so fold them in first.
         series.flush_pending()
-        # This sample belongs to the bucket that is open now.  The bucket is
-        # closed at the very end, after the sample has been folded in, so no
-        # measurement is attributed to the bucket that follows it.
+        # This sample belongs to the bucket that is open now.  One bucket spans
+        # exactly one sampling interval, so the chosen cadence is the graph's
+        # time resolution.  The bucket is closed at the very end, after the
+        # sample has been folded in, so no measurement is attributed to a bucket
+        # that follows it.
+        bucket_seconds = float(self.interval_seconds)
         close_at = (
-            series.open_started_at + BUCKET_SECONDS
-            if now - series.open_started_at >= BUCKET_SECONDS
+            series.open_started_at + bucket_seconds
+            if now - series.open_started_at >= bucket_seconds
             else None
         )
         series.samples += 1
@@ -474,16 +542,27 @@ class LiveHistory:
             self._series.pop(oldest, None)
 
     async def sampler(self) -> None:
-        """Advance the timeline once a second until the service shuts down."""
+        """Advance the timeline at the configured cadence until shutdown.
+
+        The interval is re-read every tick, so changing it takes effect on the
+        next sample.  While recording is switched off the loop idles on the
+        slowest cadence instead of spinning, and keeps nothing in memory.
+        """
         while True:
-            self.tick()
-            await asyncio.sleep(self.sample_seconds)
+            if self.enabled:
+                self.tick()
+                delay = float(self.interval_seconds)
+            else:
+                if self._series or self._live:
+                    self.forget()
+                delay = float(MAX_SAMPLE_SECONDS)
+            await asyncio.sleep(delay)
 
     # ----- reads -------------------------------------------------------
     def series(self, now: float | None = None) -> list[dict[str, Any]]:
         """Return the trailing timeline for every tracked serving unit."""
         now = self.clock() if now is None else now
-        cutoff = now - self.keep_buckets * BUCKET_SECONDS
+        cutoff = now - self.keep_seconds
         result: list[dict[str, Any]] = []
         for key, series in self._series.items():
             buckets = [bucket for bucket in series.buckets if bucket["at"] >= cutoff]
@@ -496,7 +575,7 @@ class LiveHistory:
             entry["live_sessions"] = self._live.get(key, 0)
             entry["state"] = _state_record(series.last_state)
             entry["last_at"] = round(float(series.last_at), 3)
-            entry["bucket_seconds"] = BUCKET_SECONDS
+            entry["bucket_seconds"] = float(self.interval_seconds)
             entry["buckets"] = buckets
             result.append(entry)
         result.sort(
@@ -510,12 +589,15 @@ class LiveHistory:
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         now = self.clock() if now is None else now
+        interval = self.interval_seconds
+        enabled = self.enabled
         return {
             "generated_at": round(now, 3),
-            "bucket_seconds": BUCKET_SECONDS,
-            "range_seconds": self.keep_buckets * BUCKET_SECONDS,
-            "sample_seconds": self.sample_seconds,
-            "series": self.series(now),
+            "enabled": enabled,
+            "bucket_seconds": float(interval),
+            "range_seconds": self.keep_seconds,
+            "sample_seconds": float(interval),
+            "series": self.series(now) if enabled else [],
         }
 
     # ----- lifecycle ---------------------------------------------------

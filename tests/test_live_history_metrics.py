@@ -1,9 +1,11 @@
 """Trailing live-inference history for the History panel.
 
-The panel needs complete five-second buckets rather than instantaneous samples,
-so the collector ticks once a second and accumulates deltas from the manager's
-cumulative per-request counters.  These tests drive that accumulation directly
-with a manual clock, so no sleeping or event loop is involved.
+The panel needs complete buckets rather than instantaneous samples, so the
+collector ticks at the configured cadence and accumulates deltas from the
+manager's cumulative per-request counters.  One bucket spans one sampling
+interval, so the graph's time resolution follows the setting.  These tests drive
+that accumulation directly with a manual clock, so no sleeping or event loop is
+involved.
 """
 
 from __future__ import annotations
@@ -13,7 +15,18 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from manager import Manager
-from sparkdeck.live_metrics import BUCKET_SECONDS, LiveHistory
+from sparkdeck.live_metrics import (
+    DEFAULT_HISTORY_SAMPLE_SECONDS,
+    KEEP_SECONDS,
+    MAX_SAMPLE_SECONDS,
+    MIN_SAMPLE_SECONDS,
+    LiveHistory,
+    buckets_for,
+    clamp_sample_seconds,
+)
+
+# The default cadence, and therefore the default bucket span.
+BUCKET_SECONDS = DEFAULT_HISTORY_SAMPLE_SECONDS
 
 GROUP_A = {
     "group_id": "deployment-a:0", "model": "model-a", "deployment_id": "deployment-a",
@@ -75,8 +88,19 @@ class _Manager:
         self._active_reqs.pop(rid, None)
 
 
-def _collector(manager: _Manager, clock: _Clock) -> LiveHistory:
-    return LiveHistory(manager, clock=clock)
+def _collector(
+    manager: _Manager,
+    clock: _Clock,
+    *,
+    interval: object = None,
+    enabled: object = None,
+) -> LiveHistory:
+    return LiveHistory(
+        manager,
+        clock=clock,
+        interval_provider=None if interval is None else (lambda: interval),
+        enabled_provider=None if enabled is None else (lambda: enabled),
+    )
 
 
 class BucketAccumulationTests(TestCase):
@@ -447,8 +471,10 @@ class SeriesShapeTests(TestCase):
         history = _collector(manager, clock)
         snapshot = history.snapshot()
 
-        self.assertEqual(snapshot["bucket_seconds"], BUCKET_SECONDS)
-        self.assertEqual(snapshot["range_seconds"], 720 * BUCKET_SECONDS)
+        self.assertTrue(snapshot["enabled"])
+        self.assertEqual(snapshot["bucket_seconds"], float(BUCKET_SECONDS))
+        self.assertEqual(snapshot["sample_seconds"], float(BUCKET_SECONDS))
+        self.assertEqual(snapshot["range_seconds"], KEEP_SECONDS)
         self.assertEqual(snapshot["series"], [])
 
     def test_live_session_counts_are_reported_per_unit(self) -> None:
@@ -483,3 +509,162 @@ class SeriesShapeTests(TestCase):
             "output_sessions": 1, "thinking_sessions": 1, "prefill_sessions": 1,
         })
         self.assertEqual(manager._active_reqs[prefilling]["total_tokens"], 0)
+
+
+class SampleIntervalTests(TestCase):
+    """The sampling cadence is a setting between one and thirty seconds."""
+
+    def test_interval_is_clamped_to_the_supported_range(self) -> None:
+        self.assertEqual(clamp_sample_seconds(0), MIN_SAMPLE_SECONDS)
+        self.assertEqual(clamp_sample_seconds(-4), MIN_SAMPLE_SECONDS)
+        self.assertEqual(clamp_sample_seconds(1), 1)
+        self.assertEqual(clamp_sample_seconds("12"), 12)
+        self.assertEqual(clamp_sample_seconds(30), MAX_SAMPLE_SECONDS)
+        self.assertEqual(clamp_sample_seconds(45), MAX_SAMPLE_SECONDS)
+        self.assertEqual(clamp_sample_seconds(10_000), MAX_SAMPLE_SECONDS)
+
+    def test_unusable_settings_fall_back_to_the_default(self) -> None:
+        for value in (None, "abc", "", float("nan"), object()):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    clamp_sample_seconds(value), DEFAULT_HISTORY_SAMPLE_SECONDS,
+                )
+
+    def test_a_bucket_spans_one_sampling_interval(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        history = _collector(manager, clock, interval=10)
+        rid = manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        manager.output(rid, 100)
+        clock.advance(10)
+        history.tick()
+
+        series = history.series()[0]
+        self.assertEqual(series["bucket_seconds"], 10.0)
+        # One hundred tokens over the ten seconds the bucket was open.
+        self.assertAlmostEqual(series["buckets"][0]["output_tok_s"], 10.0, places=2)
+
+    def test_changing_the_interval_takes_effect_on_the_next_tick(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        setting = [4]
+        history = LiveHistory(manager, clock=clock, interval_provider=lambda: setting[0])
+        rid = manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        manager.output(rid, 40)
+        clock.advance(4)
+        history.tick()
+        self.assertEqual(len(history.series()[0]["buckets"]), 1)
+
+        # The operator slows the cadence down; the open bucket now spans longer.
+        setting[0] = 20
+        manager.output(rid, 100)
+        clock.advance(5)
+        history.tick()
+        self.assertEqual(len(history.series()[0]["buckets"]), 1)
+        clock.advance(15)
+        history.tick()
+        self.assertEqual(len(history.series()[0]["buckets"]), 2)
+        self.assertAlmostEqual(
+            history.series()[0]["buckets"][1]["output_tok_s"], 100.0 / 20.0, places=2,
+        )
+
+    def test_retention_covers_a_full_hour_at_every_cadence(self) -> None:
+        # At the fastest cadence the window needs the most buckets; the deque is
+        # sized for it so a chosen interval can never truncate the trailing hour.
+        for seconds in (MIN_SAMPLE_SECONDS, 5, 17, MAX_SAMPLE_SECONDS):
+            with self.subTest(seconds=seconds):
+                self.assertGreaterEqual(buckets_for(KEEP_SECONDS, seconds) * seconds, KEEP_SECONDS)
+
+    def test_an_unreadable_interval_falls_back_without_breaking_recording(self) -> None:
+        manager, clock = _Manager(), _Clock()
+
+        def explode():
+            raise RuntimeError("settings are unavailable")
+
+        history = LiveHistory(manager, clock=clock, interval_provider=explode)
+        rid = manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        manager.output(rid, 50)
+        clock.advance(DEFAULT_HISTORY_SAMPLE_SECONDS)
+        history.tick()
+
+        self.assertEqual(history.interval_seconds, DEFAULT_HISTORY_SAMPLE_SECONDS)
+        self.assertEqual(len(history.series()[0]["buckets"]), 1)
+
+
+class HistoryToggleTests(TestCase):
+    """Recording can be switched off so a disabled panel costs nothing."""
+
+    def test_tick_and_hooks_do_nothing_while_disabled(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        history = _collector(manager, clock, enabled=False)
+        manager.start()
+        history.start(GROUP_A)
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        self.assertEqual(history.live_keys(), ())
+        self.assertEqual(history.series(), [])
+        self.assertEqual(history.snapshot()["series"], [])
+
+    def test_snapshot_reports_that_recording_is_off(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        history = _collector(manager, clock, enabled=False)
+
+        self.assertFalse(history.snapshot()["enabled"])
+        self.assertFalse(history.enabled)
+
+    def test_re_enabling_records_from_scratch(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        setting = [False]
+        history = LiveHistory(manager, clock=clock, enabled_provider=lambda: setting[0])
+        rid = manager.start()
+        history.start(GROUP_A)
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+        self.assertEqual(history.series(), [])
+
+        setting[0] = True
+        history.start(GROUP_A)
+        history.tick()
+        manager.output(rid, 30)
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        series = history.series()
+        self.assertEqual(len(series), 1)
+        self.assertAlmostEqual(series[0]["buckets"][0]["output_tok_s"], 6.0, places=2)
+
+    def test_forget_drops_recorded_buckets(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        setting = [True]
+        history = LiveHistory(manager, clock=clock, enabled_provider=lambda: setting[0])
+        rid = manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        manager.output(rid, 30)
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+        self.assertEqual(len(history.series()), 1)
+
+        setting[0] = False
+        history.forget()
+
+        self.assertEqual(history.series(), [])
+        self.assertEqual(history.live_keys(), ())
+
+    def test_an_unreadable_toggle_keeps_recording(self) -> None:
+        """A failed settings read must not silently stop recording."""
+
+        def explode():
+            raise RuntimeError("settings are unavailable")
+
+        manager = _Manager()
+        history = LiveHistory(manager, clock=_Clock(), enabled_provider=explode)
+
+        self.assertTrue(history.enabled)

@@ -5,10 +5,15 @@ import type { LiveHistorySeries } from '../api/types'
 import { HistoryChart, type HistoryMetric } from '../components/HistoryChart'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
+import {
+  MAX_HISTORY_SAMPLE_SECONDS,
+  MIN_HISTORY_SAMPLE_SECONDS,
+  clampHistorySampleSeconds,
+} from '../utils/historySettings'
 
-// The collector publishes a five-second bucket every five seconds, so polling
-// any faster only re-renders the same points.
-const REFRESH_SECONDS = 5
+// The panel polls on a short fixed beat so a changed interval takes effect
+// promptly; the chart's own resolution is the sampling interval, not this.
+const POLL_SECONDS = 3
 
 const RANGES = [
   { label: '5 min', seconds: 300 },
@@ -16,6 +21,8 @@ const RANGES = [
   { label: '30 min', seconds: 1_800 },
   { label: '1 hour', seconds: 3_600 },
 ] as const
+
+const INTERVALS = [1, 2, 5, 10, 15, 30] as const
 
 const METRICS: Array<{ id: HistoryMetric; label: string }> = [
   { id: 'output', label: 'Token generation' },
@@ -36,13 +43,32 @@ export function HistoryPage() {
   const [rangeSeconds, setRangeSeconds] = useState<number>(RANGES[2].seconds)
   const [metrics, setMetrics] = useState<ReadonlySet<HistoryMetric>>(() => new Set(METRICS.map((metric) => metric.id)))
   const [colorByConcurrency, setColorByConcurrency] = useState(true)
+  const [savingSettings, setSavingSettings] = useState(false)
+  const [settingsError, setSettingsError] = useState<string>()
   const resource = useResource((signal) => api.liveHistory.get(signal))
+  const snapshot = resource.data
+  const interval = snapshot?.sample_seconds ?? MIN_HISTORY_SAMPLE_SECONDS
+  const enabled = snapshot?.enabled !== false
 
   useEffect(() => {
     if (resource.loading || resource.error) return
-    const timer = window.setTimeout(resource.reload, REFRESH_SECONDS * 1_000)
+    const timer = window.setTimeout(resource.reload, POLL_SECONDS * 1_000)
     return () => window.clearTimeout(timer)
-  }, [resource.error, resource.loading, resource.reload])
+  }, [resource.error, resource.loading, resource.reload, snapshot])
+
+  const applySettings = async (change: { enabled?: boolean; sample_seconds?: number }) => {
+    setSavingSettings(true)
+    setSettingsError(undefined)
+    try {
+      // The response is the new snapshot, so the panel reflects the change
+      // without waiting for the next poll.
+      resource.apply(await api.liveHistory.updateSettings(change))
+    } catch (reason) {
+      setSettingsError(reason instanceof Error ? reason.message : 'Could not save the history setting')
+    } finally {
+      setSavingSettings(false)
+    }
+  }
 
   const toggleMetric = (metric: HistoryMetric) => {
     setMetrics((current) => {
@@ -57,7 +83,7 @@ export function HistoryPage() {
     })
   }
 
-  const series = resource.data?.series ?? []
+  const series: LiveHistorySeries[] = enabled ? snapshot?.series ?? [] : []
   const active = series.filter((item) => item.live_sessions > 0).length
   const totalSessions = series.reduce((sum, item) => sum + item.live_sessions, 0)
 
@@ -74,6 +100,50 @@ export function HistoryPage() {
 
       <Panel className="history-controls-panel">
         <div className="history-controls">
+          <div className="history-control-group">
+            <span className="history-control-label">Recording</span>
+            <div className="history-toggle" role="group" aria-label="History recording">
+              <button
+                type="button"
+                aria-pressed={enabled}
+                disabled={savingSettings || !snapshot}
+                onClick={() => void applySettings({ enabled: true })}
+              >On</button>
+              <button
+                type="button"
+                aria-pressed={!enabled}
+                disabled={savingSettings || !snapshot}
+                onClick={() => void applySettings({ enabled: false })}
+              >Off</button>
+            </div>
+          </div>
+          <div className="history-control-group">
+            <span className="history-control-label">Sample every</span>
+            <label className="history-interval">
+              <input
+                aria-label="History sampling interval in seconds"
+                type="number"
+                min={MIN_HISTORY_SAMPLE_SECONDS}
+                max={MAX_HISTORY_SAMPLE_SECONDS}
+                step="1"
+                inputMode="numeric"
+                list="history-interval-presets"
+                disabled={savingSettings || !snapshot || !enabled}
+                value={interval}
+                onChange={(event) => {
+                  // Commit only a usable value: every keystroke must not rewrite
+                  // the saved cadence, and 1-30 is the supported range.
+                  if (Number.isNaN(event.target.valueAsNumber)) return
+                  const next = clampHistorySampleSeconds(event.target.valueAsNumber)
+                  if (next !== interval) void applySettings({ sample_seconds: next })
+                }}
+              />
+              <datalist id="history-interval-presets">
+                {INTERVALS.map((value) => <option key={value} value={value} />)}
+              </datalist>
+              <span className="history-interval-hint" aria-hidden="true">seconds, 1–{MAX_HISTORY_SAMPLE_SECONDS}</span>
+            </label>
+          </div>
           <div className="history-control-group">
             <span className="history-control-label">Window</span>
             <div className="history-toggle" role="group" aria-label="History window">
@@ -112,11 +182,13 @@ export function HistoryPage() {
             <span>{series.length} graph{series.length === 1 ? '' : 's'} · {totalSessions} live session{totalSessions === 1 ? '' : 's'}</span>
           </div>
         </div>
+        {settingsError && <p className="form-error" role="alert">{settingsError}</p>}
         <p className="history-note">
           Output and thinking use the left axis and describe tokens a client is receiving. Prompt processing uses the
           right axis: a completed prefill reports the rate the engine measured, and a prefill still running reports the
           best live estimate from the prompt tokens it holds, marked <em>estimated</em> in the card. A blank segment means
-          no prefill has been measured in that bucket yet.
+          no prefill has been measured in that point yet. Recording off stops all sampling; the sampling interval is also
+          the span of one graph point.
         </p>
       </Panel>
 
@@ -124,10 +196,16 @@ export function HistoryPage() {
 
       {!resource.data && resource.loading && <LoadingState label="Loading throughput history" />}
       {!resource.data && resource.error && <ErrorState message={resource.error} onRetry={resource.reload} />}
-      {resource.data && series.length === 0 && (
+      {snapshot && !enabled && (
+        <EmptyState
+          title="History recording is off"
+          description="Nothing is sampled and nothing is kept in memory while recording is off. Switch it back on to start a fresh trailing hour."
+        />
+      )}
+      {snapshot && enabled && series.length === 0 && (
         <EmptyState
           title="No throughput history yet"
-          description="History is recorded while this controller runs. Send a request to a deployment and its graph appears within five seconds."
+          description={`History is recorded while this controller runs, one point every ${interval} second${interval === 1 ? '' : 's'}. Send a request to a deployment and its graph appears shortly after.`}
         />
       )}
 
@@ -151,7 +229,7 @@ export function HistoryPage() {
             <HistoryChart
               series={item}
               rangeSeconds={rangeSeconds}
-              refreshSeconds={REFRESH_SECONDS}
+              sampleSeconds={interval}
               metrics={metrics}
               colorByConcurrency={colorByConcurrency}
             />

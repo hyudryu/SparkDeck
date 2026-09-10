@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LiveHistoryBucket, LiveHistorySeries } from '../api/types'
 import { concurrencyColor, concurrencyLabel } from '../components/HistoryChart'
@@ -62,16 +62,48 @@ function series(overrides: Partial<LiveHistorySeries> = {}): LiveHistorySeries {
   }
 }
 
-function stubHistoryFetch(items: LiveHistorySeries[]) {
+function snapshot(items: LiveHistorySeries[], overrides: Partial<{
+  enabled: boolean
+  sample_seconds: number
+  bucket_seconds: number
+}> = {}) {
+  return {
+    generated_at: 1_700_000_005,
+    enabled: true,
+    bucket_seconds: 5,
+    range_seconds: 3_600,
+    sample_seconds: 5,
+    series: items,
+    ...overrides,
+  }
+}
+
+function stubHistoryFetch(items: LiveHistorySeries[], overrides: Parameters<typeof snapshot>[1] = {}) {
   return vi.fn<typeof fetch>().mockImplementation(async (input) => {
-    if (String(input).includes('/api/v1/live-history')) {
-      return json({
-        generated_at: 1_700_000_005, bucket_seconds: 5, range_seconds: 3_600,
-        sample_seconds: 1, series: items,
-      })
+    if (String(input).includes('/api/v1/live-history')) return json(snapshot(items, overrides))
+    return json({})
+  })
+}
+
+/** Records each settings write and answers it with the resulting snapshot. */
+function stubHistorySettings(initial: LiveHistorySeries[]) {
+  const calls: Array<{ enabled?: boolean; sample_seconds?: number }> = []
+  const state = { enabled: true, sample_seconds: 5 }
+  const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path.includes('/api/v1/live-history/settings')) {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { enabled?: boolean; sample_seconds?: number }
+      calls.push(body)
+      if (body.enabled !== undefined) state.enabled = body.enabled
+      if (body.sample_seconds !== undefined) state.sample_seconds = body.sample_seconds
+      return json(snapshot(initial, { ...state, bucket_seconds: state.sample_seconds }))
+    }
+    if (path.includes('/api/v1/live-history')) {
+      return json(snapshot(initial, { ...state, bucket_seconds: state.sample_seconds }))
     }
     return json({})
   })
+  return { fetchMock, calls }
 }
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
@@ -220,7 +252,7 @@ describe('HistoryPage', () => {
     render(<HistoryPage />)
 
     expect(await screen.findByText('No throughput history yet')).toBeInTheDocument()
-    expect(screen.getByText(/appears within five seconds/)).toBeInTheDocument()
+    expect(screen.getByText(/one point every 5 seconds/i)).toBeInTheDocument()
   })
 
   it('keeps the last snapshot visible when a refresh fails', async () => {
@@ -229,13 +261,82 @@ describe('HistoryPage', () => {
       if (!String(input).includes('/api/v1/live-history')) return json({})
       calls += 1
       if (calls > 1) return new Response('boom', { status: 500 })
-      return json({
-        generated_at: 1_700_000_005, bucket_seconds: 5, range_seconds: 3_600,
-        sample_seconds: 1, series: [series()],
-      })
+      return json(snapshot([series()]))
     }))
     render(<HistoryPage />)
     expect(await screen.findByText('qwen3-32b')).toBeInTheDocument()
+  })
+
+  it('turns recording off from the panel and stops showing graphs', async () => {
+    const { fetchMock, calls } = stubHistorySettings([series()])
+    vi.stubGlobal('fetch', fetchMock)
+    render(<HistoryPage />)
+    await screen.findByText('qwen3-32b')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Off' }))
+
+    expect(await screen.findByText('History recording is off')).toBeInTheDocument()
+    expect(screen.queryByText('qwen3-32b')).not.toBeInTheDocument()
+    expect(calls).toEqual([{ enabled: false }])
+  })
+
+  it('turns recording back on from the panel', async () => {
+    const { fetchMock, calls } = stubHistorySettings([series()])
+    vi.stubGlobal('fetch', fetchMock)
+    render(<HistoryPage />)
+    await screen.findByText('qwen3-32b')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Off' }))
+    await screen.findByText('History recording is off')
+    fireEvent.click(screen.getByRole('button', { name: 'On' }))
+
+    expect(await screen.findByText('qwen3-32b')).toBeInTheDocument()
+    expect(calls).toEqual([{ enabled: false }, { enabled: true }])
+  })
+
+  it('changes the sampling interval from the panel and follows the new resolution', async () => {
+    const { fetchMock, calls } = stubHistorySettings([series()])
+    vi.stubGlobal('fetch', fetchMock)
+    render(<HistoryPage />)
+    await screen.findByText('qwen3-32b')
+
+    const interval = screen.getByLabelText('History sampling interval in seconds')
+    expect(interval).toHaveValue(5)
+    fireEvent.change(interval, { target: { value: '15' } })
+
+    await waitFor(() => expect(calls).toEqual([{ sample_seconds: 15 }]))
+    expect(screen.getByLabelText('History sampling interval in seconds')).toHaveValue(15)
+    await waitFor(() => expect(screen.getByText(/One point every 15 seconds/)).toBeInTheDocument())
+  })
+
+  it('clamps an out-of-range interval instead of saving it', async () => {
+    const { fetchMock, calls } = stubHistorySettings([series()])
+    vi.stubGlobal('fetch', fetchMock)
+    render(<HistoryPage />)
+    await screen.findByText('qwen3-32b')
+
+    fireEvent.change(screen.getByLabelText('History sampling interval in seconds'), { target: { value: '90' } })
+
+    await waitFor(() => expect(calls).toEqual([{ sample_seconds: 30 }]))
+  })
+
+  it('surfaces a settings write that fails', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/live-history/settings')) {
+        return new Response('nope', { status: 500 })
+      }
+      if (path.includes('/api/v1/live-history')) return json(snapshot([series()]))
+      return json({})
+    }))
+    render(<HistoryPage />)
+    await screen.findByText('qwen3-32b')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Off' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/500/)
+    // The graph stays until the write actually succeeds.
+    expect(screen.getByText('qwen3-32b')).toBeInTheDocument()
   })
 })
 

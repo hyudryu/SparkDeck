@@ -75,6 +75,72 @@ describe('DashboardPage', () => {
     expect(second.getByText('Thinking')).toBeInTheDocument()
   })
 
+  it('reports how many sessions are outputting, thinking, and prompt processing', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 4, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10,
+        output_sessions: 2, thinking_sessions: 1, prefill_sessions: 1, prefill_seconds: 7.4,
+      },
+      second: {
+        group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 2'],
+        connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 0,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    // Panel total across both groups: 3 outputting, 1 thinking, 1 prompt processing.
+    expect(await screen.findByText('5 active · 3 outputting · 1 thinking · 1 prompt processing · 0 queued')).toBeInTheDocument()
+    const firstRow = screen.getByText('4 active · 0 queued').closest('.session-row')
+    expect(firstRow).not.toBeNull()
+    expect(within(firstRow as HTMLElement).getByText('2 outputting · 1 thinking · 1 prompt processing')).toBeInTheDocument()
+    const secondRow = screen.getByText('1 active · 0 queued').closest('.session-row')
+    expect(within(secondRow as HTMLElement).getByText('1 outputting')).toBeInTheDocument()
+    expect(within(secondRow as HTMLElement).queryByText(/thinking/)).not.toBeInTheDocument()
+  })
+
+  it('shows prompt processing as a held prefill instead of an unmeasurable rate', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 2, pp_tok_s: 900, output_tok_s: 40, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 1, prefill_seconds: 12.6,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const rates = within((await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement)
+    // The prefill has no first token yet, so no tok/s is invented for it.
+    expect(rates.getByText('Prefilling 13s')).toBeInTheDocument()
+    expect(rates.queryByText('900.0 tok/s')).not.toBeInTheDocument()
+    expect(rates.getByText('40.0 tok/s')).toBeInTheDocument()
+  })
+
+  it('falls back to the measured prompt rate once the prefill completes', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 1, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 0, prefill_seconds: null,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const rates = within((await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement)
+    expect(rates.getByText('1200.0 tok/s')).toBeInTheDocument()
+    expect(rates.queryByText(/Prefilling/)).not.toBeInTheDocument()
+  })
+
+  it('omits state counts for entries from an older telemetry payload', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'], connections: 1, pp_tok_s: 500, output_tok_s: 20, thinking_tok_s: 0 },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByRole('heading', { name: 'Current inference' })).toBeInTheDocument()
+    const rates = within(screen.getByText('Group 1 · Node 1').closest('.session-row') as HTMLElement)
+    expect(rates.getByText('500.0 tok/s')).toBeInTheDocument()
+    // No session-state payload means no state line is claimed at all.
+    expect(document.querySelector('.session-states')).toBeNull()
+  })
+
   it('keeps a booting group yellow independently of the ready peer group', async () => {
     const fallback = stubDashboardFetch({})
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

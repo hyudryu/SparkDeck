@@ -207,6 +207,41 @@ export function inferenceSessionSnapshot(stats?: SystemStats, admission?: Record
     })), ...legacyRows]
 }
 
+interface SessionStates {
+  output: number
+  thinking: number
+  prefill: number
+  prefillSeconds: number
+}
+
+/** Count live sessions by what the engine is doing with them right now. */
+export function sessionStateCounts(requests: { request: ActiveRequestStats }[]) {
+  const states: SessionStates = { output: 0, thinking: 0, prefill: 0, prefillSeconds: 0 }
+  requests.forEach(({ request }) => {
+    states.output += request.output_sessions ?? 0
+    states.thinking += request.thinking_sessions ?? 0
+    states.prefill += request.prefill_sessions ?? 0
+    const seconds = request.prefill_seconds
+    if (typeof seconds === 'number' && Number.isFinite(seconds)) states.prefillSeconds = Math.max(states.prefillSeconds, seconds)
+  })
+  return states
+}
+
+/**
+ * Describe live session states for the dashboard. Prompt processing is reported
+ * as a held session count with elapsed time rather than a rate: the engine sends
+ * no prompt-token evidence until the first output token, so a live prefill rate
+ * cannot be measured and must not be invented.
+ */
+export function sessionStateSummary(requests: { request: ActiveRequestStats }[]) {
+  const states = sessionStateCounts(requests)
+  const parts: string[] = []
+  if (states.output > 0) parts.push(`${states.output} outputting`)
+  if (states.thinking > 0) parts.push(`${states.thinking} thinking`)
+  if (states.prefill > 0) parts.push(`${states.prefill} prompt processing`)
+  return { ...states, labels: parts, text: parts.join(' · ') }
+}
+
 export function DashboardPage() {
   const resourcesRef = useRef<DashboardStreamResources | null>(null)
   const stream = useDashboardStream(resourcesRef)
@@ -251,6 +286,7 @@ export function DashboardPage() {
   const sync = syncResource.data
   const activeRequests = inferenceSessionSnapshot(stats, admissionForSessions)
   const runningSessions = activeRequests.reduce((sum, { request }) => sum + (request.connections ?? 0), 0)
+  const sessionStates = sessionStateSummary(activeRequests)
   const queuedRequests = Object.values(admission ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
   const freshQueuedRequests = Object.values(admissionForSessions ?? {}).reduce((sum, item) => sum + (item.queued ?? 0), 0)
   // Admission only covers concurrency-limited vLLM targets. A non-empty feed
@@ -387,7 +423,7 @@ export function DashboardPage() {
 
             <Panel className="dashboard-panel">
               <div className="dashboard-panel-heading">
-                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{inferenceAvailable ? `${runningSessions} active` : 'Active sessions loading'} · {queueSummary}</p></div></div>
+                <div><span className="panel-icon"><Users size={17} /></span><div><h2>Current inference</h2><p>{inferenceAvailable ? `${runningSessions} active${sessionStates.text ? ` · ${sessionStates.text}` : ''}` : 'Active sessions loading'} · {queueSummary}</p></div></div>
                 <Link className="text-link" to="/chat">Open chat</Link>
               </div>
               {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
@@ -440,6 +476,21 @@ function stageRate(value: number | null | undefined, waiting: boolean) {
 
 function SessionRow({ model, request, groupLabel }: { model: string; request: ActiveRequestStats; groupLabel: string }) {
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
+  const outputSessions = request.output_sessions ?? 0
+  const thinkingSessions = request.thinking_sessions ?? 0
+  const prefillSessions = request.prefill_sessions ?? 0
+  // A prefill has no rate until the first token arrives, so report how many
+  // sessions are held and how long the longest has been waiting instead of a
+  // number the engine cannot provide yet.
+  const prefillSeconds = request.prefill_seconds
+  const prefillLabel = typeof prefillSeconds === 'number' && Number.isFinite(prefillSeconds)
+    ? `Prefilling ${Math.round(prefillSeconds)}s`
+    : 'Prefilling…'
+  const states = [
+    outputSessions > 0 ? `${outputSessions} outputting` : '',
+    thinkingSessions > 0 ? `${thinkingSessions} thinking` : '',
+    prefillSessions > 0 ? `${prefillSessions} prompt processing` : '',
+  ].filter(Boolean)
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
     .map(([ip, connections]) => `${connections} from ${ip}`)
@@ -450,10 +501,11 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
         <strong>{model}</strong>
         {groupLabel && <small className="deployment-group-nodes">{groupLabel}</small>}
         <small>{request.connections} active · {request.queued ?? 0} queued</small>
+        {states.length > 0 && <small className="session-states">{states.join(' · ')}</small>}
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
       <div className="session-stages" role="group" aria-label="Token rate by stage">
-        <span className="session-stage"><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{stageRate(request.pp_tok_s, waiting)}</span></span>
+        <span className="session-stage"><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{prefillSessions > 0 ? prefillLabel : stageRate(request.pp_tok_s, waiting)}</span></span>
         <span className="session-stage"><span className="session-stage-label">Output</span><span className="session-stage-value">{stageRate(request.output_tok_s, waiting)}</span></span>
         <span className="session-stage"><span className="session-stage-label">Thinking</span><span className="session-stage-value">{stageRate(request.thinking_tok_s, waiting)}</span></span>
       </div>

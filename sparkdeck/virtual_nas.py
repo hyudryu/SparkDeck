@@ -1,4 +1,10 @@
-"""Secure, durable model-cache transfers between SparkDeck nodes."""
+"""Secure, durable model-cache transfers between SparkDeck nodes.
+
+The transfer queue copies between independent node pairs at the same time. A
+queued job waits while any node it names as its source or destination is
+already occupied by a running job, so one node's disk and link carry a single
+copy at a time.
+"""
 
 from __future__ import annotations
 
@@ -606,6 +612,7 @@ class VirtualNAS:
         self._wake = asyncio.Event()
         self._dispatcher: asyncio.Task | None = None
         self._active: dict[str, asyncio.Task] = {}
+        self._active_endpoints: dict[str, frozenset[str]] = {}
         self._direct_export_capabilities: dict[str, dict[str, Any]] = {}
         self._peer_imports: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -827,6 +834,7 @@ class VirtualNAS:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()
+        self._active_endpoints.clear()
 
     def list_transfers(self) -> dict[str, Any]:
         return {"items": [dict(job) for job in self.jobs]}
@@ -3198,41 +3206,70 @@ class VirtualNAS:
             "free_size": (payload or {}).get("free_size"),
         }
 
+    @staticmethod
+    def _job_endpoints(job: dict[str, Any]) -> frozenset[str]:
+        """Cluster nodes one queue job occupies for as long as it runs.
+
+        A Hub download reads from Hugging Face instead of a paired node, so it
+        occupies only the node that receives the weights.
+        """
+        endpoints = {job["target_node_id"]}
+        source = job.get("source_node_id")
+        if source and job.get("kind") != "download":
+            endpoints.add(source)
+        return frozenset(endpoints)
+
+    def _busy_nodes(self) -> set[str]:
+        """Cluster nodes already occupied by a running job at either endpoint."""
+        busy: set[str] = set()
+        for endpoints in self._active_endpoints.values():
+            busy |= endpoints
+        return busy
+
+    def _next_queue_job(self, busy: set[str]) -> dict[str, Any] | None:
+        """Oldest queued job whose dependency and cluster nodes are free."""
+        for candidate in self.jobs:
+            if candidate["status"] != "queued":
+                continue
+            dependency_id = candidate.get("depends_on_job_id")
+            if dependency_id:
+                dependency = next((
+                    item for item in self.jobs
+                    if item["id"] == dependency_id
+                ), None)
+                if dependency is None or dependency["status"] in {"failed", "canceled"}:
+                    candidate["status"] = "failed"
+                    candidate["completed_at"] = time.time()
+                    candidate["error"] = "required source download did not complete"
+                    self._save()
+                    continue
+                if dependency["status"] != "completed":
+                    continue
+            if self._job_endpoints(candidate) & busy:
+                continue
+            return candidate
+        return None
+
     async def _dispatch_loop(self) -> None:
         try:
             while True:
                 for target, task in list(self._active.items()):
                     if task.done():
                         self._active.pop(target, None)
-                # A single global transfer prevents a multi-target copy from
-                # saturating the source disk and cluster network.
-                if not self._active and not self._update_reserved:
-                    job = None
-                    for candidate in self.jobs:
-                        if candidate["status"] != "queued":
-                            continue
-                        dependency_id = candidate.get("depends_on_job_id")
-                        if dependency_id:
-                            dependency = next((
-                                item for item in self.jobs
-                                if item["id"] == dependency_id
-                            ), None)
-                            if dependency is None or dependency["status"] in {"failed", "canceled"}:
-                                candidate["status"] = "failed"
-                                candidate["completed_at"] = time.time()
-                                candidate["error"] = "required source download did not complete"
-                                self._save()
-                                continue
-                            if dependency["status"] != "completed":
-                                continue
-                        job = candidate
+                        self._active_endpoints.pop(target, None)
+                # Jobs on independent node pairs copy at the same time. A job
+                # waits while any node it names is already copying, so one
+                # node's disk and link still carry a single transfer.
+                while not self._update_reserved:
+                    job = self._next_queue_job(self._busy_nodes())
+                    if job is None:
                         break
-                    if job is not None:
-                        target = job["target_node_id"]
-                        runner = self._run_download if job.get("kind") == "download" else self._run_transfer
-                        task = asyncio.create_task(runner(job))
-                        self._active[target] = task
-                        task.add_done_callback(lambda _task: self._wake.set())
+                    target = job["target_node_id"]
+                    runner = self._run_download if job.get("kind") == "download" else self._run_transfer
+                    task = asyncio.create_task(runner(job))
+                    self._active[target] = task
+                    self._active_endpoints[target] = self._job_endpoints(job)
+                    task.add_done_callback(lambda _task: self._wake.set())
                 self._wake.clear()
                 try:
                     # Keep cancellation in this task. On Python 3.11 wait_for

@@ -500,6 +500,7 @@ _STORAGE_INSTRUCTIONS = [
     "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
     "ComfyUI weights can be deleted in place; recognized complete bundles can also be transferred.",
     "Choose an online source and one or more online targets with enough free space.",
+    "Independent node pairs copy at the same time; a node that is already reading or receiving a model waits for that copy to finish.",
 ]
 
 

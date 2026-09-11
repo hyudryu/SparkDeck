@@ -1987,7 +1987,7 @@ class Manager:
     async def virtual_nas_inventory(self) -> dict:
         instructions = [
             "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
-            "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
+            "Transfers between independent node pairs run concurrently and remain local to your authenticated SparkDeck cluster.",
             "ComfyUI weights can be deleted in place; only recognized complete bundles can be transferred between nodes.",
         ]
         if not self.virtual_nas_enabled():

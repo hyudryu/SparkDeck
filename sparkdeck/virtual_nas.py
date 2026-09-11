@@ -162,6 +162,37 @@ def _default_comfyui_model_roots() -> list[Path]:
     return roots
 
 
+def holds_requested_revision(
+    model: dict[str, Any] | None, resolved_revision: str | None,
+    requested_revision: str | None,
+) -> bool:
+    """Return whether a cache holds the weights a resolved revision asks for.
+
+    ``resolved_revision`` is the immutable commit the Hub currently resolves
+    ``requested_revision`` to, so a complete snapshot of that commit is exactly
+    the requested weight set.  The cache's own revision aliases can only veto
+    the answer when one of them records the requested ref as some other
+    snapshot; a ref the cache never recorded is not a conflict.  Caches
+    materialized by a plain copy, by an older transfer, or by a download
+    interrupted after its snapshot landed carry no refs at all, and treating
+    that as "weights missing" would both misreport a node that demonstrably
+    holds them and leave a plan with no transfer source to fill the nodes that
+    really are empty.
+    """
+    if not model or not resolved_revision:
+        return False
+    if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+        return False
+    if not requested_revision or requested_revision == resolved_revision:
+        return True
+    if requested_revision in (model.get("partial_revision_refs") or {}):
+        # The cache's own ref resolves to an incomplete snapshot, which is not
+        # the commit the request resolved to.
+        return False
+    recorded = (model.get("revision_refs") or {}).get(requested_revision)
+    return recorded is None or recorded == resolved_revision
+
+
 def partial_download_size_bytes(
     model: dict[str, Any] | None, revision: str | None = None,
 ) -> int:
@@ -611,7 +642,14 @@ class VirtualNAS:
         model: dict[str, Any], resolved_revision: str,
         requested_revision: str | None = None,
     ) -> bool:
-        if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+        """Return whether a cache already reflects the requested revision ref.
+
+        Stricter than :func:`holds_requested_revision` by one alias check, and
+        deliberately so: the Hub download path uses this to decide whether a
+        cache still needs its ref written, so a ref the cache never recorded
+        must keep that download running instead of short-circuiting it.
+        """
+        if not holds_requested_revision(model, resolved_revision, requested_revision):
             return False
         if not requested_revision or requested_revision == resolved_revision:
             return True
@@ -2648,7 +2686,7 @@ class VirtualNAS:
             (
                 item for item in source_inventory
                 if item.get("model_id") == model_id
-                and (not revision or self._has_revision(
+                and (not revision or holds_requested_revision(
                     item, revision, requested_revision,
                 ))
             ),
@@ -2876,7 +2914,7 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == model_id
-                and self._has_revision(item, revision, requested_revision)
+                and holds_requested_revision(item, revision, requested_revision)
             ), None)
             if source_model is None:
                 raise LookupError("cached source model revision not found")
@@ -3361,7 +3399,7 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and (not job.get("revision") or self._has_revision(
+                and (not job.get("revision") or holds_requested_revision(
                     item, job["revision"],
                     job.get("requested_revision") or job["revision"],
                 ))
@@ -3540,7 +3578,7 @@ class VirtualNAS:
             imported_model = next((
                 item for item in imported_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and (not job.get("revision") or self._has_revision(
+                and (not job.get("revision") or holds_requested_revision(
                     item, job["revision"],
                     job.get("requested_revision") or job["revision"],
                 ))

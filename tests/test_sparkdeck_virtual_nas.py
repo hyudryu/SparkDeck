@@ -188,6 +188,60 @@ class DirectTransferRegistry(FakeRegistry):
         }
 
 
+class PairConcurrencyRegistry(DirectTransferRegistry):
+    """Direct peer copies across four nodes that hold their imports open."""
+
+    def __init__(self):
+        super().__init__()
+        self.nodes.update({
+            "worker-c": {"id": "worker-c", "name": "Worker C", "enabled": True},
+            "worker-d": {"id": "worker-d", "name": "Worker D", "enabled": True},
+        })
+        self.import_started = {node_id: asyncio.Event() for node_id in self.nodes}
+        self.release_imports = asyncio.Event()
+        self.active_imports = 0
+        self.max_active_imports = 0
+
+    def direct_transfer_source(self, node_id):
+        return {
+            "worker-a": "http://169.254.10.4:7878",
+            "worker-b": "http://169.254.10.3:7878",
+            "worker-c": "http://169.254.10.2:7878",
+            "worker-d": "http://169.254.10.1:7878",
+        }.get(node_id)
+
+    async def request(self, node_id, method, path, **kwargs):
+        if not path.endswith("/import-from-peer"):
+            return await super().request(node_id, method, path, **kwargs)
+        self.active_imports += 1
+        self.max_active_imports = max(self.max_active_imports, self.active_imports)
+        self.import_started[node_id].set()
+        try:
+            await self.release_imports.wait()
+        finally:
+            self.active_imports -= 1
+        return await super().request(node_id, method, path, **kwargs)
+
+
+def remote_model_entry(size_bytes: int = 123) -> dict:
+    return {
+        "model_id": "org/model", "size_bytes": size_bytes,
+        "partial": False, "transferable": True,
+        "revisions": ["revision-1"],
+    }
+
+
+def queued_transfer_job(job_id: str, source: str, target: str) -> dict:
+    return {
+        "id": job_id, "kind": "transfer", "model_id": "org/model",
+        "source_node_id": source, "target_node_id": target,
+        "revision": "revision-1", "requested_revision": "revision-1",
+        "depends_on_job_id": None, "workflow_id": None, "workflow_node_ids": [],
+        "status": "queued", "bytes_total": 123, "bytes_transferred": 0,
+        "created_at": 0, "started_at": None, "completed_at": None, "error": None,
+    }
+
+
 class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_export_capability_is_single_use_and_revision_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2436,7 +2490,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
         return await asyncio.wait_for(wait(), timeout)
 
-    async def test_multi_target_jobs_are_globally_serialized_and_persisted(self):
+    async def test_multi_target_jobs_from_one_source_stay_serialized_and_persisted(self):
         registry = FakeRegistry(slow=True)
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
 
@@ -2447,11 +2501,76 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result["job_ids"]), 2)
         self.assertTrue(all(job["status"] == "completed" for job in final))
+        # Both jobs read the same source node, so they cannot overlap.
         self.assertEqual(registry.max_active, 1)
         self.assertEqual(set(registry.received), {"worker-a", "worker-b"})
         saved = json.loads((Path(self.temp.name) / "virtual_nas_transfers.json").read_text())
         self.assertTrue(all(job["status"] == "completed" for job in saved))
         await nas.stop()
+
+    async def test_independent_node_pairs_copy_concurrently(self):
+        registry = PairConcurrencyRegistry()
+        for node_id in ("worker-a", "worker-c"):
+            registry.remote_models[node_id] = [remote_model_entry()]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.jobs = [queued_transfer_job("pair-1", "worker-a", "worker-b")]
+        nas.start()
+        await asyncio.wait_for(registry.import_started["worker-b"].wait(), 2)
+
+        nas.jobs.append(queued_transfer_job("pair-2", "worker-c", "worker-d"))
+        nas._wake.set()
+
+        # The second pair copies while the first pair is still receiving.
+        await asyncio.wait_for(registry.import_started["worker-d"].wait(), 2)
+        self.assertEqual(registry.max_active_imports, 2)
+
+        registry.release_imports.set()
+        final = await self.wait_final(nas, 2)
+
+        self.assertTrue(all(job["status"] == "completed" for job in final))
+        self.assertEqual(registry.max_active_imports, 2)
+        await nas.stop()
+
+    async def test_a_copy_waits_while_a_node_it_names_is_in_use(self):
+        registry = PairConcurrencyRegistry()
+        registry.remote_models["worker-a"] = [remote_model_entry()]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.jobs = [queued_transfer_job("pair-1", "worker-a", "worker-b")]
+        nas.start()
+        await asyncio.wait_for(registry.import_started["worker-b"].wait(), 2)
+
+        # worker-b is still receiving, so it cannot also serve as a source.
+        waiting = queued_transfer_job("waits", "worker-b", "worker-d")
+        nas.jobs.append(waiting)
+        nas._wake.set()
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(waiting["status"], "queued")
+        self.assertEqual(set(nas._active), {"worker-b"})
+        self.assertEqual(registry.max_active_imports, 1)
+
+        registry.release_imports.set()
+        final = await self.wait_final(nas, 2)
+
+        self.assertTrue(all(job["status"] == "completed" for job in final))
+        self.assertEqual(registry.max_active_imports, 1)
+        await nas.stop()
+
+    def test_queue_selection_skips_busy_endpoints(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        first = queued_transfer_job("pair-1", "worker-a", "worker-b")
+        second = queued_transfer_job("pair-2", "worker-c", "worker-d")
+        nas.jobs = [first, second]
+
+        self.assertEqual(nas._job_endpoints(first), frozenset({"worker-a", "worker-b"}))
+        # The running copy holds both of its nodes, so the other pair runs.
+        self.assertIs(nas._next_queue_job(nas._job_endpoints(first)), second)
+        # A Hub download reads from Hugging Face, not a paired node, so it
+        # occupies only the node that receives the weights.
+        download = {**queued_transfer_job("hub", "huggingface", "worker-b"), "kind": "download"}
+        self.assertEqual(nas._job_endpoints(download), frozenset({"worker-b"}))
 
     async def test_concurrent_queues_cannot_persist_duplicate_targets(self):
         registry = FakeRegistry()
@@ -2732,6 +2851,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs[0]["status"], "queued")
         self.assertEqual(nas._active, {})
+        self.assertEqual(nas._active_endpoints, {})
 
     async def test_existing_target_is_rejected_without_persisting_jobs(self):
         registry = FakeRegistry()

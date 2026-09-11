@@ -3449,6 +3449,82 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["source"])
         self.assertFalse(result["targets"][0]["has_required_weights"])
 
+    async def test_complete_snapshot_without_recorded_ref_seeds_the_transfer(self):
+        # A cache copied onto a node, or written by a download that never
+        # recorded its refs, still holds the resolved commit. It must be a
+        # usable source instead of leaving every node reported as missing.
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {
+                "id": "populated", "name": "Populated", "online": True,
+                "cache_free_size": 10**9,
+                "virtual_nas_download_capable": True,
+                "models": [{
+                    "model_id": "org/model", "size_bytes": 20,
+                    "partial": False,
+                    "revisions": ["a" * 40], "revision_refs": {},
+                }],
+            },
+            {
+                "id": "empty", "name": "Empty", "online": True,
+                "cache_free_size": 10**9,
+                "virtual_nas_download_capable": True, "models": [],
+            },
+        ])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": "a" * 40,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertEqual(result["source"]["node_id"], "populated")
+        targets = {item["node_id"]: item for item in result["targets"]}
+        self.assertTrue(targets["populated"]["has_required_weights"])
+        self.assertFalse(targets["empty"]["has_required_weights"])
+
+        plan = await manager.recipe_model_preparation_preflight(
+            "org/model", "main", ["populated", "empty"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["action"], "transfer")
+        self.assertEqual(plan["source"]["node_id"], "populated")
+        self.assertEqual(plan["transfer_target_node_ids"], ["empty"])
+
+    async def test_partial_ref_alias_still_blocks_the_seeded_transfer(self):
+        # A ref the cache records as an incomplete snapshot is a real conflict:
+        # the requested ref is not what this node would serve.
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "pending", "name": "Pending", "online": True,
+            "cache_free_size": 10**9,
+            "virtual_nas_download_capable": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 20,
+                "partial": False,
+                "revisions": ["a" * 40], "revision_refs": {},
+                "partial_revision_refs": {"main": "b" * 40},
+            }],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": "a" * 40,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertIsNone(result["source"])
+        self.assertFalse(result["targets"][0]["has_required_weights"])
+
     async def test_legacy_agent_is_transfer_capable_but_not_download_capable(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}

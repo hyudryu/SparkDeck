@@ -59,6 +59,7 @@ from sparkdeck.virtual_nas import (
     VirtualNAS,
     cached_download_bytes,
     download_required_free_bytes,
+    holds_requested_revision,
     partial_download_size_bytes,
     transfer_required_free_bytes,
     validate_model_id,
@@ -2144,17 +2145,14 @@ class Manager:
     def _model_has_pinned_revision(
         model: dict, requested_revision: str, resolved_revision: str | None,
     ) -> bool:
-        if (
-            not resolved_revision
-            or model.get("partial")
-            or resolved_revision not in (model.get("revisions") or [])
-        ):
-            return False
-        if requested_revision == resolved_revision:
-            return True
-        return (
-            (model.get("revision_refs") or {}).get(requested_revision)
-            == resolved_revision
+        """Return whether a node's cache holds the requested revision's weights.
+
+        A cache that never recorded the requested ref still holds the weights
+        when it carries a complete snapshot of the commit the Hub resolved the
+        ref to; see :func:`holds_requested_revision`.
+        """
+        return holds_requested_revision(
+            model, resolved_revision, requested_revision,
         )
 
     async def model_cache_inventory(

@@ -443,6 +443,15 @@ GPU_VRAM_BUFFER_GB = 10.0
 # queue before it is rejected instead of lingering as a stale entry.
 INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS = 120.0
 
+# A model transfer reports its live rate from two consecutive cluster
+# inventory samples. The inventory is cached for ten seconds and every node
+# then has to answer, so consecutive samples are routinely further apart than
+# the ten second cache alone suggests. Measure the interval that actually
+# elapsed, and only forget a sample pair once it is too old to describe the
+# current rate.
+VIRTUAL_NAS_RATE_MIN_SAMPLE_GAP_SECONDS = 0.5
+VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS = 300.0
+
 FAN_MODE_DEFAULTS = {
     "curve": {
         "curve_points": [[40.0, 0.0], [60.0, 30.0], [75.0, 60.0], [90.0, 100.0]],
@@ -2085,7 +2094,14 @@ class Manager:
     def _sample_virtual_nas_transfer_rate(
         self, job: dict, sampled_at: float,
     ) -> float | None:
-        """Measure current transfer throughput between inventory samples."""
+        """Measure current transfer throughput between inventory samples.
+
+        The byte count behind ``bytes_transferred`` only advances when the
+        cluster inventory is refreshed, so a sample pair can legitimately span
+        far more than the inventory cache lifetime. Divide by the interval that
+        really elapsed instead of discarding slow samples, which left live
+        transfers without any reported rate.
+        """
         samples = getattr(self, "_virtual_nas_rate_samples", None)
         if samples is None:
             samples = {}
@@ -2101,9 +2117,11 @@ class Manager:
             return None
         previous_at, previous_bytes, previous_rate = previous
         elapsed = sampled_at - previous_at
-        if elapsed < 0.5:
+        if elapsed < VIRTUAL_NAS_RATE_MIN_SAMPLE_GAP_SECONDS:
+            # Repeat requests serve the same cached inventory snapshot, so the
+            # rate measured for that snapshot still describes the job.
             return previous_rate
-        if elapsed > 15:
+        if elapsed > VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS:
             samples[job_id] = (sampled_at, transferred, None)
             return None
         if transferred < previous_bytes:

@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from manager import DEFAULT_SETTINGS, Manager
+from manager import (
+    DEFAULT_SETTINGS,
+    VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS,
+    Manager,
+)
 from sparkdeck import virtual_nas
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
@@ -3642,6 +3646,53 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["bytes_per_second"], 625_000_000)
         self.assertIsNone(unsampled["bytes_per_second"])
+
+    def test_live_transfer_rate_spans_real_inventory_refresh_intervals(self):
+        manager = Manager.__new__(Manager)
+        manager._virtual_nas_rate_samples = {}
+        job = {"id": "transfer-1", "status": "running", "bytes_transferred": 0}
+
+        # The first sample only establishes a baseline.
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 100.0))
+
+        job["bytes_transferred"] = 20_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.0), 800_000.0,
+        )
+
+        # Requests that reuse the cached inventory snapshot keep the rate that
+        # was measured for it instead of dividing by a zero interval.
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.0), 800_000.0,
+        )
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.2), 800_000.0,
+        )
+
+        # A refresh gap of more than the old fifteen second cutoff still
+        # reports the throughput of the interval that actually elapsed.
+        job["bytes_transferred"] = 60_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 175.0), 800_000.0,
+        )
+
+        # A sample pair older than the staleness ceiling cannot describe the
+        # current rate, so it establishes a fresh baseline instead.
+        job["bytes_transferred"] = 90_000_000
+        self.assertIsNone(
+            manager._sample_virtual_nas_transfer_rate(
+                job, 175.0 + VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS + 1,
+            ),
+        )
+
+        # A byte count that regresses never produces a negative rate.
+        job["bytes_transferred"] = 10_000_000
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 700.0))
+
+        # Terminal jobs drop their samples so a later run starts clean.
+        job["status"] = "completed"
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 701.0))
+        self.assertEqual(manager._virtual_nas_rate_samples, {})
 
 
 if __name__ == "__main__":

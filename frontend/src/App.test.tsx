@@ -412,7 +412,7 @@ describe('model discovery', () => {
     const user = userEvent.setup()
     const row = await screen.findByRole('button', { name: 'Expand org/model' })
     expect(row).toHaveTextContent('7B')
-    expect(row).toHaveTextContent('14 GB')
+    expect(row).toHaveTextContent('15 GB')
     expect(screen.queryByLabelText('Compatible runtimes')).not.toBeInTheDocument()
     await user.click(row)
     expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
@@ -805,7 +805,7 @@ describe('model deployments', () => {
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
 
-    expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
+    expect(await screen.findByText('2.1 GB each · 4.3 GB total on 2 nodes')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Recipes' })).toBeInTheDocument()
     await user.click(await screen.findByRole('button', { name: 'org 1' }))
     expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
@@ -999,7 +999,7 @@ describe('model deployments', () => {
     await user.click(await within(dialog).findByRole('button', { name: 'Prepare selected nodes' }))
     const confirmation = await screen.findByRole('dialog', { name: 'Prepare model weights?' })
     expect(confirmation).toHaveTextContent(
-      'Download org/new-model revision main (4.0 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
+      'Download org/new-model revision main (4.3 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
     )
     await user.click(within(confirmation).getByRole('button', { name: 'Start preparation' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(

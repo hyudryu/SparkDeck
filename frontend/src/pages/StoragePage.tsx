@@ -92,6 +92,17 @@ function formatTransferRate(job: StorageTransferJob) {
   return `${rate.toFixed(digits)} ${units[exponent]}`
 }
 
+function transferRateText(job: StorageTransferJob) {
+  const rate = formatTransferRate(job)
+  if (rate) return ` · ${rate}`
+  // A live rate needs two cluster inventory samples, which can be more than
+  // half a minute apart. Say that a speed is being measured instead of
+  // rendering nothing at all, which reads as if no speed were reported.
+  return job.status.toLowerCase() === 'running' && !isFinalizing(job)
+    ? ' · Measuring speed…'
+    : ''
+}
+
 function SmoothProgress({ value, label }: { value: number; label: string }) {
   const progress = Math.max(0, Math.min(100, value))
   return <div
@@ -467,7 +478,6 @@ export function StoragePage() {
                   </li>
                   if (!job) return null
                   const progress = jobProgress(job)
-                  const transferRate = formatTransferRate(job)
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
                   const finalizing = isFinalizing(job)
@@ -482,7 +492,7 @@ export function StoragePage() {
                     style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
                   >
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <ArrowLeftRight size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</small>{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</small>{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
                     {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
                   </li>
                 })}
@@ -528,14 +538,13 @@ export function StoragePage() {
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Route</span><span role="columnheader">Status</span><span role="columnheader">Progress</span><span role="columnheader">Actions</span></div>
             {visibleRecentJobs.map((job) => {
               const progress = jobProgress(job)
-              const transferRate = formatTransferRate(job)
               const finalizing = isFinalizing(job)
               const phaseLabel = finalizationLabel(job)
               return <div className="table-row" role="row" key={job.id}>
                 <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
                 <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
                 <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert" title={job.error}>{job.error}</small>}</div>
-                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRate ? ` · ${transferRate}` : ''}</span>{finalizing && <><span className="storage-finalization-label">{phaseLabel}</span><FinalizationProgress label={phaseLabel} /></>}</div>
+                <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</span>{finalizing && <><span className="storage-finalization-label">{phaseLabel}</span><FinalizationProgress label={phaseLabel} /></>}</div>
                 <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
               </div>
             })}

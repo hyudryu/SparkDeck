@@ -527,6 +527,33 @@ describe('StoragePage', () => {
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 
+  it('marks a running job as measuring its speed until the cluster reports one', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [
+        {
+          id: 'measuring-download', model_id: 'org/measuring', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
+          bytes_total: 1000, bytes_transferred: 400, progress: 0.4, created_at: '2026-08-26T12:00:00Z',
+        },
+        {
+          id: 'queued-copy', model_id: 'org/queued', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'queued', kind: 'transfer',
+          bytes_total: 1000, bytes_transferred: 0, progress: 0, created_at: '2026-08-26T11:00:00Z',
+        },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const download = within(nodePanel).getByLabelText('Downloading from Hugging Face org/measuring on Backup Spark')
+    expect(within(download).getByText(/Measuring speed…/)).toBeInTheDocument()
+    // A job that has not started moving bytes has no speed to measure yet.
+    const queued = within(nodePanel).getByLabelText('Transfer queued org/queued on Backup Spark')
+    expect(queued).not.toHaveTextContent('Measuring speed…')
+  })
+
   it('keeps completed bytes visible while the receiver syncs and registers the cache', async () => {
     const storage: StorageState = {
       ...enabledStorage,

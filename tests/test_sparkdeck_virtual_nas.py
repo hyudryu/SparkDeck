@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -2373,6 +2374,176 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                     nas.delete_model("org/model")
 
             self.assertTrue(repository.exists())
+
+    @staticmethod
+    def _foreign_owned_cache_tree(directory: str, hub: Path):
+        """Build a cached model whose reported failure looks root-written."""
+        repository = create_cached_model(hub)
+        refs = repository / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("revision-1")
+
+        def fail_on_foreign_owned_entry(path, *, onerror):
+            # rmtree reports the entry it cannot remove; a chmod cannot help
+            # because the file belongs to the container's root user.
+            error = PermissionError("simulated root-owned cache entry")
+            onerror(os.unlink, refs / "main", (PermissionError, error, None))
+
+        return repository, fail_on_foreign_owned_entry
+
+    def test_delete_removes_foreign_owned_cache_entry_with_privilege(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            privileged: list[Path] = []
+            real_rmtree = shutil.rmtree
+
+            def remove_with_privilege(path, hub_path):
+                privileged.append((path, hub_path))
+                real_rmtree(path)
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch(
+                    "sparkdeck.virtual_nas._remove_repository_with_privilege",
+                    remove_with_privilege,
+                ),
+            ):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(privileged, [(repository, hub)])
+            self.assertFalse(repository.exists())
+
+    def test_delete_reports_actionable_error_without_passwordless_sudo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch("sparkdeck.virtual_nas.shutil.which", return_value=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "passwordless sudo"):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(repository.exists())
+
+    def test_delete_reports_privileged_removal_failure_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            denied = subprocess.CompletedProcess(
+                ["sudo"], 1, "", "sudo: a password is required",
+            )
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch(
+                    "sparkdeck.virtual_nas.shutil.which",
+                    return_value="/usr/bin/sudo",
+                ),
+                patch("sparkdeck.virtual_nas.subprocess.run", return_value=denied),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "a password is required"):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(repository.exists())
+
+    def test_privileged_removal_passes_the_path_as_one_argv_element(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            real_rmtree = shutil.rmtree
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **kwargs):
+                calls.append(argv)
+                self.assertIsNot(kwargs.get("shell"), True)
+                real_rmtree(repository)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                patch(
+                    "sparkdeck.virtual_nas.shutil.which",
+                    return_value="/usr/bin/sudo",
+                ),
+                patch("sparkdeck.virtual_nas.subprocess.run", fake_run),
+            ):
+                virtual_nas._remove_repository_with_privilege(repository, hub)
+
+            self.assertEqual(
+                calls,
+                [["/usr/bin/sudo", "-n", "rm", "-rf", "--", str(repository)]],
+            )
+            self.assertFalse(repository.exists())
+
+    def test_privileged_removal_refuses_paths_outside_the_hub(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            hub.mkdir()
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("keep")
+
+            with patch(
+                "sparkdeck.virtual_nas.subprocess.run",
+                side_effect=AssertionError("must not elevate outside the hub"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "escapes the Hugging Face hub",
+                ):
+                    virtual_nas._remove_repository_with_privilege(outside, hub)
+
+            self.assertTrue((outside / "keep").exists())
+
+    def test_delete_repairs_directory_that_blocks_entry_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            refs = repository / "refs"
+            refs.mkdir()
+            (refs / "main").write_text("revision-1")
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            # Removing an entry needs write access to its containing directory,
+            # but rmtree reports the entry itself, not that directory.
+            refs.chmod(0o500)
+            real_rmtree = shutil.rmtree
+            calls = 0
+
+            def unwritable_directory_once(path, *, onerror):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    error = PermissionError("simulated unwritable cache directory")
+                    onerror(os.unlink, refs / "main", (PermissionError, error, None))
+                    return None
+                mode = refs.stat().st_mode
+                self.assertTrue(mode & stat.S_IWUSR)
+                self.assertTrue(mode & stat.S_IXUSR)
+                return real_rmtree(path)
+
+            with patch("sparkdeck.virtual_nas.shutil.rmtree", unwritable_directory_once):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, 2)
+            self.assertFalse(repository.exists())
 
     async def test_import_rejects_traversal_and_escaping_symlink(self):
         with tempfile.TemporaryDirectory() as directory:

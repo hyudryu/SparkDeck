@@ -14,6 +14,7 @@ import shutil
 import secrets
 import stat
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -522,6 +523,62 @@ def _transfer_operation(method):
         with self.transfer_operation(model_id):
             return await method(self, model_id, *args, **kwargs)
     return guarded
+
+
+_FOREIGN_OWNER_REASON = (
+    "the cached files are owned by another user (model containers run as root "
+    "and write into the mounted Hugging Face cache)"
+)
+
+
+def _current_user_id() -> int | None:
+    """Return this process's POSIX user id, or ``None`` where unsupported."""
+    getuid = getattr(os, "getuid", None)
+    return getuid() if getuid is not None else None
+
+
+def _metadata_owner_id(metadata: os.stat_result) -> int | None:
+    """Return the owning POSIX user id of an ``lstat`` result, if it has one."""
+    return getattr(metadata, "st_uid", None)
+
+
+def _remove_repository_with_privilege(repository: Path, hub: Path) -> None:
+    """Remove a cache tree that contains entries owned by another user.
+
+    Model containers run as root, and SparkDeck mounts the host Hugging Face
+    cache into them, so a repository that has ever been served accumulates
+    root-owned hub metadata (``refs``, ``.no_exist``, ``trees``). Only the
+    owner may ``chmod`` a path, so permission repair cannot unlock those and
+    the unprivileged agent cannot unlink them. The repository is therefore
+    removed through the node's passwordless sudo.
+
+    The target is re-validated here, immediately before elevating, so this
+    privileged removal can only ever act on the repository itself: a real
+    directory whose resolved parent is the Hugging Face hub. The path is
+    passed as one argv element and never through a shell.
+    """
+    if repository.is_symlink() or not repository.is_dir():
+        raise ValueError("cached model repository is not a safe directory")
+    if repository.resolve().parent != hub:
+        raise ValueError("model cache path escapes the Hugging Face hub")
+    sudo = shutil.which("sudo")
+    if not sudo:
+        raise RuntimeError(
+            "could not delete cached model files; " + _FOREIGN_OWNER_REASON
+            + " and passwordless sudo is unavailable"
+        )
+    completed = subprocess.run(
+        [sudo, "-n", "rm", "-rf", "--", str(repository)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+    )
+    if completed.returncode == 0 and not repository.exists():
+        return
+    detail = (completed.stderr or completed.stdout or "").strip()
+    raise RuntimeError(
+        "could not delete cached model files; " + _FOREIGN_OWNER_REASON
+        + " and passwordless sudo could not remove them"
+        + (f" ({detail})" if detail else "")
+    )
 
 
 class VirtualNAS:
@@ -2508,17 +2565,20 @@ class VirtualNAS:
                 _is_complete_repository(repository)
                 or not has_external_copy
             ):
-                self._delete_cached_repository(repository)
+                self._delete_cached_repository(repository, hub)
                 return {"ok": True, "model_id": model_id}
             # The hub copy is partial residue while inventory displays the
             # complete external install: delete the externally managed files.
         return self._delete_external_model(model_id)
 
     @staticmethod
-    def _delete_cached_repository(repository: Path) -> None:
+    def _delete_cached_repository(repository: Path, hub: Path) -> None:
         """Delete a validated cache tree, repairing exact failed paths."""
 
-        def repair_failed_path(_function, raw_path, exc_info) -> None:
+        current_uid = _current_user_id()
+        foreign_owned: list[Path] = []
+
+        def repair_failed_path(function, raw_path, exc_info) -> None:
             path = Path(raw_path)
             try:
                 metadata = path.lstat()
@@ -2530,10 +2590,31 @@ class VirtualNAS:
                     raise OSError(
                         "refusing to change permissions through a link or reparse point"
                     )
-                permissions = stat.S_IWUSR
-                if stat.S_ISDIR(metadata.st_mode):
-                    permissions |= stat.S_IRUSR | stat.S_IXUSR
-                path.chmod(metadata.st_mode | permissions)
+                repairs = [(path, metadata)]
+                # Removing an entry needs write access to the directory that
+                # holds it, and rmtree reports the entry rather than that
+                # directory. Repair the parent too, but never above the
+                # repository this call already validated.
+                if function in {os.rmdir, os.unlink}:
+                    parent = path.parent
+                    if parent != repository and parent.is_relative_to(repository):
+                        repairs.append((parent, parent.lstat()))
+                for candidate, candidate_metadata in repairs:
+                    owner = _metadata_owner_id(candidate_metadata)
+                    if (
+                        current_uid is not None
+                        and owner is not None
+                        and owner != current_uid
+                    ):
+                        # Only the owner may change a path's mode, so an entry
+                        # written by root cannot be repaired from this process.
+                        foreign_owned.append(candidate)
+                        raise OSError("cached model entry is owned by another user")
+                for candidate, candidate_metadata in repairs:
+                    permissions = stat.S_IWUSR
+                    if stat.S_ISDIR(candidate_metadata.st_mode):
+                        permissions |= stat.S_IRUSR | stat.S_IXUSR
+                    candidate.chmod(candidate_metadata.st_mode | permissions)
             except OSError as repair_error:
                 raise repair_error from exc_info[1]
 
@@ -2548,10 +2629,14 @@ class VirtualNAS:
             if repository.exists():
                 raise PermissionError("cached model repository remains")
         except OSError as exc:
-            raise RuntimeError(
-                "could not delete cached model files; check cache ownership "
-                "and permissions"
-            ) from exc
+            if not foreign_owned:
+                raise RuntimeError(
+                    "could not delete cached model files; check cache ownership "
+                    "and permissions"
+                ) from exc
+            # A root-writing model container leaves root-owned hub metadata in
+            # the cache this node mounts into it; that needs privilege to go.
+            _remove_repository_with_privilege(repository, hub)
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.

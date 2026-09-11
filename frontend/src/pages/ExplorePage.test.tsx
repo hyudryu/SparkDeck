@@ -153,7 +153,7 @@ describe('ExplorePage model rows', () => {
 
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     const row = await screen.findByRole('button', { name: 'Expand org/model-GGUF' })
-    expect(within(row).getByText('12 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(within(row).getByText('13 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'vllm')
     await user.click(screen.getByRole('button', { name: 'Expand org/model-GGUF' }))
 
@@ -165,9 +165,9 @@ describe('ExplorePage model rows', () => {
     await user.selectOptions(deploymentType, 'llama.cpp')
     expect(deploymentType).toHaveValue('llama.cpp')
     const selectedRow = screen.getByRole('button', { name: 'Collapse org/model-GGUF' })
-    expect(within(selectedRow).getByText('6.0 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
-    expect(screen.getByText(/Tight fit · 6\.0 GB/)).toBeInTheDocument()
-    expect(screen.getByText(/Llama server deployments run on the controller/)).toHaveTextContent('8.0 GB on the controller node')
+    expect(within(selectedRow).getByText('6.4 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
+    expect(screen.getByText(/Tight fit · 6\.4 GB/)).toBeInTheDocument()
+    expect(screen.getByText(/Llama server deployments run on the controller/)).toHaveTextContent('8.6 GB on the controller node')
     expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('unknown\u0000model.gguf')
     expect(screen.getByRole('link', { name: 'Deploy org/model-GGUF' })).toHaveAttribute(
       'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&artifact=model.gguf',
@@ -328,7 +328,7 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
     expect(await screen.findByRole('button', { name: 'Expand org/small-artifact' })).toBeInTheDocument()
     await user.selectOptions(screen.getByRole('combobox', { name: 'Runtime' }), 'llama.cpp')
-    expect(await screen.findByText('16 GB controller memory for Llama server')).toBeInTheDocument()
+    expect(await screen.findByText('17 GB controller memory for Llama server')).toBeInTheDocument()
 
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
@@ -405,24 +405,24 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     expect(await screen.findByRole('button', { name: 'Expand org/easy' })).toBeInTheDocument()
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
-    expect(screen.getByText('306 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
-    expect(screen.getByText('400 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
-    expect(screen.getByText('600 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
-    expect(screen.getByText('512 GB aggregate sharded memory across 4 measured nodes')).toBeInTheDocument()
+    expect(screen.getByText('215 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(screen.getByText('329 GB').closest('.catalog-model-size')).toHaveClass('fit-easy')
+    expect(screen.getByText('429 GB').closest('.catalog-model-size')).toHaveClass('fit-tight')
+    expect(screen.getByText('644 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText('550 GB aggregate sharded memory across 4 measured nodes')).toBeInTheDocument()
 
     // Minimum node counts pool the largest measured nodes first.
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 2+ nodes')
-    expect(screen.getByText('306 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 3+ nodes')
-    expect(screen.getByText('400 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 4+ nodes')
-    expect(screen.getByText('600 GB').closest('.catalog-model-size')).not.toHaveTextContent('node')
-    expect(screen.getByText('600 GB').closest('.catalog-model-size')).not.toHaveTextContent('Fits on')
+    expect(screen.getByText('215 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 2+ nodes')
+    expect(screen.getByText('329 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 3+ nodes')
+    expect(screen.getByText('429 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 4+ nodes')
+    expect(screen.getByText('644 GB').closest('.catalog-model-size')).not.toHaveTextContent('node')
+    expect(screen.getByText('644 GB').closest('.catalog-model-size')).not.toHaveTextContent('Fits on')
 
     await user.click(screen.getByRole('button', { name: 'Expand zai-org/GLM-5.3-Flash' }))
     const fitDetails = screen.getByText(/Fit assumes a sharded deployment/)
-    expect(fitDetails).toHaveTextContent('512 GB aggregate memory across 4 measured nodes')
+    expect(fitDetails).toHaveTextContent('550 GB aggregate memory across 4 measured nodes')
     expect(fitDetails).toHaveTextContent('replicated deployments still require the full model weights')
-    expect(fitDetails.closest('.catalog-model-details')).toHaveTextContent('Fits easily · 306 GB · Fits on 3+ nodes')
+    expect(fitDetails.closest('.catalog-model-details')).toHaveTextContent('Fits easily · 329 GB · Fits on 3+ nodes')
     expect(screen.getByRole('link', { name: 'Deploy zai-org/GLM-5.3-Flash' })).toHaveAttribute(
       'href', '/models?model=zai-org%2FGLM-5.3-Flash&runtime=vllm&layout=sharded',
     )
@@ -457,7 +457,7 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     expect(await screen.findByRole('button', { name: 'Expand org/compact' })).toBeInTheDocument()
-    expect(screen.getByText('80 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 1 node')
+    expect(screen.getByText('86 GB').closest('.catalog-model-size')).toHaveTextContent('Fits easily · 1 node')
   })
 
   it('always counts the controller toward the sharded minimum node count', async () => {
@@ -480,7 +480,7 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     expect(await screen.findByRole('button', { name: 'Expand org/small-controller' })).toBeInTheDocument()
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 3+ nodes')
+    expect(screen.getByText('215 GB').closest('.catalog-model-size')).toHaveTextContent('Tight fit · 3+ nodes')
   })
 
   it('does not pool worker memory when the controller cannot join a sharded deployment', async () => {
@@ -502,8 +502,8 @@ describe('ExplorePage model rows', () => {
     render(<MemoryRouter><ExplorePage /></MemoryRouter>)
 
     const expand = await screen.findByRole('button', { name: 'Expand org/worker-pool-only' })
-    expect(screen.getByText('200 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
-    expect(screen.getByText('128 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
+    expect(screen.getByText('215 GB').closest('.catalog-model-size')).toHaveClass('fit-no-fit')
+    expect(screen.getByText('137 GB largest per-node memory across 2 measured nodes')).toBeInTheDocument()
     await user.click(expand)
     expect(screen.getByRole('link', { name: 'Deploy org/worker-pool-only' })).toHaveAttribute(
       'href', '/models?model=org%2Fworker-pool-only&runtime=vllm',
@@ -580,7 +580,7 @@ describe('ExplorePage model rows', () => {
 
     await user.click(screen.getByRole('tab', { name: 'Community Run Models' }))
 
-    expect(await screen.findByText('24 GB aggregate sharded memory across 2 measured nodes')).toBeInTheDocument()
+    expect(await screen.findByText('26 GB aggregate sharded memory across 2 measured nodes')).toBeInTheDocument()
     expect(await screen.findByRole('button', {
       name: 'Expand org/community-mixed',
     })).toBeInTheDocument()
@@ -637,7 +637,7 @@ describe('ExplorePage model rows', () => {
     await user.click(screen.getByRole('checkbox', { name: /Only what fits/ }))
 
     const fittingRow = screen.getByRole('button', { name: 'Expand org/community-llama' })
-    expect(within(fittingRow).getByText('8.0 GB')).toBeInTheDocument()
+    expect(within(fittingRow).getByText('8.6 GB')).toBeInTheDocument()
     await user.click(fittingRow)
     expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/community-llama' })).toHaveValue('Q4_K_M\u0000community-q4_k_m.gguf')
     expect(screen.getByRole('link', { name: 'Deploy org/community-llama' })).toHaveAttribute(
@@ -681,7 +681,7 @@ describe('ExplorePage model rows', () => {
       'Expand org/twelve-gib',
       'Expand org/grouped-vllm',
     ])
-    expect(within(rows[1]).getByText('8.0 GB')).toBeInTheDocument()
+    expect(within(rows[1]).getByText('8.6 GB')).toBeInTheDocument()
     await user.click(rows[1])
     expect(screen.getByRole('link', { name: 'Deploy org/grouped-vllm' })).toHaveAttribute(
       'href', '/models?model=org%2Fgrouped-vllm&runtime=vllm&quantization=Q4_K_M',

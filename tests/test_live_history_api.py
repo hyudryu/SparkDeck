@@ -6,12 +6,13 @@ in ``server.py`` rather than a copy of them, calling the async view functions
 directly so no cluster lifespan and no real settings database are needed:
 
 * the sampler starts on first use, and the payload carries the cadence and the
-  trailing range the graph draws;
+  trailing range the graph draws, with timestamps the panel can render as times;
 * the settings route turns recording on and off and clamps the sampling
   interval, rejecting unusable values instead of silently rewriting the cadence.
 """
 
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -97,6 +98,20 @@ class LiveHistoryEndpointTests(unittest.TestCase):
         self.assertEqual(payload["sample_seconds"], 5.0)
         self.assertEqual(payload["series"], [])
         self.assertIsInstance(payload["generated_at"], float)
+
+    def test_the_payload_dates_itself_with_the_wall_clock(self) -> None:
+        async def run() -> dict:
+            payload = await server.get_live_history()
+            await server.sparkdeck.history.stop()
+            return payload
+
+        with _Harness():
+            payload = asyncio.run(run())
+
+        # The panel renders this as a time, so it has to be epoch seconds: the
+        # collector's monotonic clock reports seconds since boot, which reads as
+        # a 1970 date rather than the moment the reading was taken.
+        self.assertLess(abs(payload["generated_at"] - time.time()), 5)
 
     def test_snapshot_never_exposes_manager_internals(self) -> None:
         snapshot = LiveHistory(SimpleNamespace(_active_reqs={})).snapshot()

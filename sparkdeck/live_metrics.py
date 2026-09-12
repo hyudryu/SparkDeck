@@ -11,7 +11,7 @@ serving unit (deployment, pair, or sharded group), one bucket every five
 seconds for the last hour, each bucket carrying output, thinking, and prompt
 processing tokens per second plus the session states behind them.
 
-Three properties drive this design:
+Four properties drive this design:
 
 * **Buckets must be complete, not instantaneous.**  A five-second point sampled
   once would miss every request that started and finished between samples, so the
@@ -28,6 +28,13 @@ Three properties drive this design:
   they hold and how long they have held them -- into one group-level estimate,
   and reports ``null`` (rendered as "pending") when no prompt token count is
   known yet.  No rate is ever invented from an empty measurement.
+* **Spans are monotonic; displayed times are wall-clock.**  The panel renders
+  every timestamp it receives as a time -- ``bucket["at"]`` on the axis and in
+  the hover card, ``series["last_at"]`` to order the graphs, ``generated_at``
+  to date the payload -- so those are Unix epoch seconds.  Bucket boundaries,
+  elapsed spans, how long a prefill has been held, and retirement stay on the
+  monotonic clock, which is the clock :meth:`Manager._track_start` stamps
+  ``started_at`` with and the only one a forward wall-clock step cannot move.
 """
 
 from __future__ import annotations
@@ -79,23 +86,27 @@ class _Series:
     """One serving unit's trailing buckets plus its open bucket state."""
 
     __slots__ = (
-        "meta", "buckets", "open_started_at", "samples",
+        "meta", "buckets", "bucket_times", "open_started_at", "samples",
         "output_tokens", "thinking_tokens", "prompt_tokens", "prompt_seconds",
         "previous", "counted_prompt",
         "pending", "pending_prompt_tokens", "pending_prompt_seconds",
         "concurrency_sum", "concurrency_peak",
         "state_high",
         "output_peak", "thinking_peak", "prefill_peak", "live_prefill_rate",
-        "last_state", "last_at",
+        "last_state", "last_seen_at", "last_at",
     )
 
-    def __init__(self, meta: dict[str, Any], now: float) -> None:
+    def __init__(self, meta: dict[str, Any], now: float, epoch: float) -> None:
         self.meta = meta
         # Sized for the fastest cadence the user can choose, so any trailing hour
         # fits no matter which interval produced it.
-        self.buckets: deque[dict[str, Any]] = deque(
-            maxlen=buckets_for(KEEP_SECONDS, MIN_SAMPLE_SECONDS),
-        )
+        maxlen = buckets_for(KEEP_SECONDS, MIN_SAMPLE_SECONDS)
+        # ``buckets`` carries the wall-clock ``at`` the panel displays;
+        # ``bucket_times`` carries the monotonic close time of the same bucket,
+        # appended in lockstep, so the trailing-window filter and retirement
+        # compare one clock only.
+        self.buckets: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self.bucket_times: deque[float] = deque(maxlen=maxlen)
         self.open_started_at = now
         self.previous: dict[Any, tuple[str, int]] = {}
         self.counted_prompt: dict[Any, int] = {}
@@ -103,8 +114,17 @@ class _Series:
         self.pending_prompt_tokens = 0
         self.pending_prompt_seconds = 0.0
         self.last_state: tuple[int, int, int] | None = None
-        self.last_at = now
+        # ``last_seen_at`` is the monotonic instant of the last sample and only
+        # decides when the serving unit is retired; ``last_at`` is the same
+        # instant as a wall-clock time, which is what the panel sorts on.
+        self.last_seen_at = now
+        self.last_at = epoch
         self.reset_open()
+
+    def append_bucket(self, bucket: dict[str, Any], closed_at: float) -> None:
+        """Publish one closed bucket under both of its timelines."""
+        self.buckets.append(bucket)
+        self.bucket_times.append(closed_at)
 
     def flush_pending(self) -> None:
         """Fold counters captured from finished requests into the open bucket."""
@@ -160,9 +180,16 @@ class LiveHistory:
         enabled_provider: Callable[[], Any] | None = None,
         keep_seconds: float = KEEP_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.manager = manager
+        # ``clock`` measures spans and must stay monotonic: it is the clock the
+        # manager stamps ``started_at`` with, and a wall-clock step would corrupt
+        # a half-finished bucket.  ``wall_clock`` supplies the epoch timestamps
+        # the panel displays, because a monotonic reading is seconds since boot
+        # and renders as a 1970 date no reader can place.
         self.clock = clock
+        self._wall_clock = wall_clock
         self.keep_seconds = float(keep_seconds)
         # Both settings are read live on every tick: the operator can change the
         # cadence or switch recording off without restarting the controller.
@@ -171,6 +198,21 @@ class LiveHistory:
         self._series: dict[str, _Series] = {}
         self._live: dict[str, int] = {}
         self._task: asyncio.Task | None = None
+        # Wall clock minus monotonic, refreshed by every tick.  Only used to
+        # convert a caller-supplied monotonic instant back to wall-clock time.
+        self._epoch_offset = self._wall_clock() - self.clock()
+
+    def _instants(self, now: float | None) -> tuple[float, float]:
+        """Return one monotonic instant and the wall-clock time it represents.
+
+        Both clocks are read together so the conversion is exact, and a caller
+        that supplies its own monotonic instant is mapped through the offset the
+        last tick measured.
+        """
+        if now is None:
+            monotonic = self.clock()
+            return monotonic, self._wall_clock()
+        return now, now + self._epoch_offset
 
     # ----- settings ----------------------------------------------------
     @property
@@ -272,7 +314,8 @@ class LiveHistory:
         """Fold the current instant into every open series and its bucket."""
         if not self.enabled:
             return
-        now = self.clock() if now is None else now
+        now, epoch = self._instants(now)
+        self._epoch_offset = epoch - now
         observed: dict[str, dict[str, Any]] = {}
         admission = self._admission()
         live_records: dict[str, set[Any]] = {}
@@ -319,28 +362,30 @@ class LiveHistory:
         for key, entry in observed.items():
             series = self._series.get(key)
             if series is None:
-                series = self._series[key] = _Series(entry["meta"], now)
+                series = self._series[key] = _Series(entry["meta"], now, epoch)
             else:
                 series.meta.update(entry["meta"])
-            series.last_at = now
+            series.last_seen_at = now
+            series.last_at = epoch
             # Drop baselines for requests that are no longer tracked, so a
             # recycled record id can never inherit another request's counters.
             series.previous = {
                 rid: value for rid, value in series.previous.items()
                 if rid in live_records.get(key, ())
             }
-            self._accumulate(series, entry, now)
+            self._accumulate(series, entry, now, epoch)
         for key, series in self._series.items():
             if key not in observed:
                 # A serving unit with no live request still needs its clock
                 # advanced so a zero-traffic stretch is drawn as zero rather
                 # than silently skipped.
                 series.previous = {}
-                self._accumulate(series, None, now)
+                self._accumulate(series, None, now, epoch)
         self._retire(now)
 
     def _accumulate(
         self, series: _Series, entry: dict[str, Any] | None, now: float,
+        epoch: float,
     ) -> None:
         # Counters from requests that finished since the last sample belong to
         # the bucket that was open when they ended, so fold them in first.
@@ -361,7 +406,10 @@ class LiveHistory:
             self._fold_sample(series, entry, now)
 
         if close_at is not None:
-            self._close_bucket(series, close_at)
+            # The bucket closes on a boundary that fell between two samples, so
+            # its displayed time is this sample's wall-clock instant shifted back
+            # by how long ago that boundary passed.
+            self._close_bucket(series, close_at, epoch - (now - close_at))
             # ``previous`` deliberately survives the rollover: the tokens the
             # first sample of the new bucket sees were emitted before it opened
             # and still belong to the bucket that just closed.
@@ -462,13 +510,15 @@ class LiveHistory:
                 return float(value)
         return 0.0
 
-    def _close_bucket(self, series: _Series, closed_at: float) -> None:
+    def _close_bucket(
+        self, series: _Series, closed_at: float, closed_epoch: float,
+    ) -> None:
         if series.samples == 0:
             return
         elapsed = max(0.001, closed_at - series.open_started_at)
         measured = series.prompt_seconds > 0 and series.prompt_tokens > 0
-        series.buckets.append({
-            "at": round(closed_at, 3),
+        series.append_bucket({
+            "at": round(closed_epoch, 3),
             "output_tok_s": round(series.output_tokens / elapsed, 2),
             "thinking_tok_s": round(series.thinking_tokens / elapsed, 2),
             "prefill_tok_s": (
@@ -486,7 +536,7 @@ class LiveHistory:
             "output_peak_tok_s": round(series.output_peak, 2),
             "thinking_peak_tok_s": round(series.thinking_peak, 2),
             "prefill_peak_tok_s": round(series.prefill_peak, 2),
-        })
+        }, closed_at)
 
     def _admission(self) -> dict[str, Mapping[str, Any]]:
         """One admission snapshot per tick, shared by every lookup."""
@@ -534,11 +584,11 @@ class LiveHistory:
         for key in [
             key for key, series in self._series.items()
             if key not in self._live
-            and now - float(series.last_at) > RETAIN_ACTIVE_SECONDS
+            and now - float(series.last_seen_at) > RETAIN_ACTIVE_SECONDS
         ]:
             self._series.pop(key, None)
         while len(self._series) > MAX_SERIES:
-            oldest = min(self._series, key=lambda key: self._series[key].last_at)
+            oldest = min(self._series, key=lambda key: self._series[key].last_seen_at)
             self._series.pop(oldest, None)
 
     async def sampler(self) -> None:
@@ -560,12 +610,21 @@ class LiveHistory:
 
     # ----- reads -------------------------------------------------------
     def series(self, now: float | None = None) -> list[dict[str, Any]]:
-        """Return the trailing timeline for every tracked serving unit."""
+        """Return the trailing timeline for every tracked serving unit.
+
+        ``last_at`` and each bucket's ``at`` are Unix epoch seconds, ready for
+        the panel to render as a time; the trailing-hour cut is taken on the
+        monotonic timeline the buckets were closed on.
+        """
         now = self.clock() if now is None else now
         cutoff = now - self.keep_seconds
         result: list[dict[str, Any]] = []
         for key, series in self._series.items():
-            buckets = [bucket for bucket in series.buckets if bucket["at"] >= cutoff]
+            buckets = [
+                bucket for bucket, closed_at
+                in zip(series.buckets, series.bucket_times)
+                if closed_at >= cutoff
+            ]
             # A serving unit is worth a graph once it has any bucket behind it,
             # whether or not it has a session live at this instant.
             if not buckets:
@@ -588,11 +647,11 @@ class LiveHistory:
         return result
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
-        now = self.clock() if now is None else now
+        now, epoch = self._instants(now)
         interval = self.interval_seconds
         enabled = self.enabled
         return {
-            "generated_at": round(now, 3),
+            "generated_at": round(epoch, 3),
             "enabled": enabled,
             "bucket_seconds": float(interval),
             "range_seconds": self.keep_seconds,

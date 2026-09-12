@@ -10,6 +10,7 @@ involved.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest import TestCase
@@ -38,6 +39,13 @@ GROUP_B = {
 }
 
 
+# An arbitrary but realistic epoch: the panel renders the collector's timestamps
+# as times, so the tests pin the wall clock instead of whatever today happens to
+# be.  The offset from the manual monotonic clock is what a real controller sees,
+# where a monotonic reading is seconds since boot and days away from epoch.
+EPOCH_BASE = 1_700_000_000.0
+
+
 class _Clock:
     def __init__(self, now: float = 1_000.0) -> None:
         self.now = now
@@ -47,6 +55,26 @@ class _Clock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+class _WallClock:
+    """Wall clock running alongside a manual monotonic clock.
+
+    Reading the monotonic clock plus a fixed offset keeps the timestamps the
+    panel receives deterministic while still exercising the two-clock mapping.
+    """
+
+    def __init__(self, clock: _Clock, epoch: float = EPOCH_BASE) -> None:
+        self.clock = clock
+        self.epoch = epoch
+        self.started_at = clock.now
+
+    def __call__(self) -> float:
+        return self.at(self.clock.now)
+
+    def at(self, monotonic: float) -> float:
+        """The wall-clock second the manual monotonic clock reads *monotonic*."""
+        return self.epoch + (monotonic - self.started_at)
 
 
 class _Manager:
@@ -94,10 +122,12 @@ def _collector(
     *,
     interval: object = None,
     enabled: object = None,
+    wall: _WallClock | None = None,
 ) -> LiveHistory:
     return LiveHistory(
         manager,
         clock=clock,
+        wall_clock=wall or _WallClock(clock),
         interval_provider=None if interval is None else (lambda: interval),
         enabled_provider=None if enabled is None else (lambda: enabled),
     )
@@ -413,6 +443,71 @@ class ManagerIntegrationTests(TestCase):
         Manager._track_end(stub, rid)
 
         self.assertEqual(stub._active_reqs, {})
+
+
+class TimestampTests(TestCase):
+    """Every timestamp the panel receives is a wall-clock time it can render."""
+
+    def test_bucket_and_series_timestamps_are_epoch_seconds(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        wall = _WallClock(clock)
+        history = _collector(manager, clock, wall=wall)
+        manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        series = history.series()[0]
+        # The bucket closed on the boundary between the two samples, so its
+        # published time is the wall-clock instant of that boundary.
+        self.assertAlmostEqual(
+            series["buckets"][0]["at"], wall.at(1_000.0 + BUCKET_SECONDS), places=3,
+        )
+        self.assertAlmostEqual(series["last_at"], wall.at(clock.now), places=3)
+        self.assertAlmostEqual(history.snapshot()["generated_at"], wall.at(clock.now), places=3)
+
+    def test_a_bucket_that_closes_between_samples_keeps_its_own_time(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        wall = _WallClock(clock)
+        history = _collector(manager, clock, wall=wall)
+        manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        # The boundary passed a second ago: the sample that closes the bucket
+        # lands after it, and the bucket must not inherit the later time.
+        clock.advance(BUCKET_SECONDS + 1.0)
+        history.tick()
+
+        bucket = history.series()[0]["buckets"][0]
+        self.assertAlmostEqual(bucket["at"], wall.at(1_000.0 + BUCKET_SECONDS), places=3)
+
+    def test_the_panel_receives_the_wall_clock_not_seconds_since_boot(self) -> None:
+        """A monotonic reading renders as a 1970 date, so it cannot be published."""
+        manager = _Manager()
+        manager.start()
+        history = LiveHistory(
+            manager,
+            interval_provider=lambda: MIN_SAMPLE_SECONDS,
+            enabled_provider=lambda: True,
+        )
+        history.start(GROUP_A)
+        history.tick()
+        # Close a bucket without sleeping: the collector's instant is monotonic.
+        history.tick(now=time.monotonic() + MIN_SAMPLE_SECONDS + 1)
+
+        series = history.series()[0]
+        published = {
+            "bucket at": series["buckets"][0]["at"],
+            "series last_at": series["last_at"],
+            "generated_at": history.snapshot()["generated_at"],
+        }
+        for label, value in published.items():
+            with self.subTest(label):
+                self.assertLess(
+                    abs(value - time.time()), 5,
+                    f"{label} must be a wall-clock time, not a monotonic reading",
+                )
 
 
 class SeriesShapeTests(TestCase):

@@ -186,6 +186,64 @@ describe('DashboardPage', () => {
     expect(screen.queryByText('Stopped model')).not.toBeInTheDocument()
   })
 
+  it('does not keep reporting a finished stop as a running model', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        // A stop the controller could not verify latches at degraded, but its
+        // inventory already confirms every rank is idle.
+        id: 'dep', alias: 'Stopped long ago', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {},
+        node_ids: ['gx10-node-1', 'gx10-node-2'], occupied_node_ids: [],
+      }, {
+        id: 'live', alias: 'Still serving', model: { repository: 'org/other' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {},
+        node_ids: ['gx10-node-3'], occupied_node_ids: ['gx10-node-3'],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Still serving')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.getByText('gx10-node-3')).toBeInTheDocument()
+    expect(screen.queryByText('Stopped long ago')).not.toBeInTheDocument()
+    expect(screen.queryByText('gx10-node-1 + gx10-node-2')).not.toBeInTheDocument()
+    expect(screen.getByText('1 of 2 deployments active')).toBeInTheDocument()
+  })
+
+  it('keeps a stop pending while no inventory has judged its ranks', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Unjudged stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {}, node_ids: ['gx10-node-1'],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Unjudged stop')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+  })
+
+  it('hides stopped groups and keeps the ones still holding containers', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'degraded', desired_state: 'stopped', has_live_containers: false },
+          { instance_id: 1, node_names: ['Node 3', 'Node 4'], status: 'running', desired_state: 'stopped', has_live_containers: true },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Group 2 · Node 3 + Node 4')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.queryByText('Group 1 · Node 1 + Node 2')).not.toBeInTheDocument()
+    expect(screen.getByText('1 of 1 deployments active')).toBeInTheDocument()
+  })
+
   it.each([false, undefined])('hides rolled-back groups without live inventory confirmation (%s)', async (hasLiveContainers) => {
     const fallback = stubDashboardFetch({})
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

@@ -35,21 +35,48 @@ function temperatureTone(value: number | null | undefined) {
 
 const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'ready', 'starting', 'launching', 'degraded'])
 
+/**
+ * Whether the controller still observes live ranks for a whole deployment.
+ * An empty `occupied_node_ids` is its confirmation that every rank is idle;
+ * `undefined` means it had no inventory to judge with, so absent evidence must
+ * never be read as proof that a stop finished.
+ */
+function hasLiveRanks(deployment: Deployment) {
+  return deployment.occupied_node_ids === undefined || deployment.occupied_node_ids.length > 0
+}
+
+/**
+ * The rows of the "Running models" panel.
+ *
+ * Stop intent outlives the stop: the controller keeps a stop it could not verify
+ * latched at a non-stopped status (a peer that stays offline is never confirmed),
+ * so intent alone says nothing about what still runs. A stopped deployment is
+ * only still pending while live containers are observed; once none are, the stop
+ * has finished and the row belongs to the Models page instead.
+ */
 function runningDeploymentGroups(deployment: Deployment) {
+  const stopRequested = deployment.desired_state === 'stopped'
   if (deployment.instances?.length) {
-    return deployment.instances.filter((group) => ACTIVE_DEPLOYMENT_STATUSES.has(group.status)
-      && (deployment.status !== 'error' || group.has_live_containers === true)).map((group) => ({
+    return deployment.instances.filter((group) => {
+      if (!ACTIVE_DEPLOYMENT_STATUSES.has(group.status)) return false
+      // Live containers are the only evidence that an errored group is still
+      // serving, or that a Stop is still pending rather than already finished.
+      if ((deployment.status === 'error' || group.desired_state === 'stopped' || stopRequested)
+        && group.has_live_containers !== true) return false
+      return true
+    }).map((group) => ({
       key: `${deployment.id}:${group.instance_id}`,
       status: group.status,
-      stopPending: group.desired_state === 'stopped' || deployment.desired_state === 'stopped',
+      stopPending: group.desired_state === 'stopped' || stopRequested,
       label: `Group ${group.instance_id + 1} · ${group.node_names.join(' + ')}`,
     }))
   }
   if (!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status)) return []
+  if (stopRequested && !hasLiveRanks(deployment)) return []
   return [{
     key: deployment.id,
     status: deployment.status,
-    stopPending: deployment.desired_state === 'stopped',
+    stopPending: stopRequested,
     label: (deployment.selected_nodes?.map((node) => node.name || node.id) ?? deployment.node_ids ?? []).join(' + '),
   }]
 }

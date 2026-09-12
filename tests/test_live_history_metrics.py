@@ -281,6 +281,10 @@ class PrefillEstimateTests(TestCase):
         bucket = history.series()[0]["buckets"][0]
         self.assertTrue(bucket["prefill_measured"])
         self.assertAlmostEqual(bucket["prefill_tok_s"], 500.0, places=2)
+        # The panel shows what the rate came from, so the bucket publishes the
+        # prompt tokens that were counted and the seconds they were divided by.
+        self.assertEqual(bucket["prefill_tokens"], 1_000)
+        self.assertAlmostEqual(bucket["prefill_seconds"], 2.0, places=2)
 
     def test_held_prefill_without_token_counts_reports_pending(self) -> None:
         manager, clock = _Manager(), _Clock()
@@ -298,6 +302,10 @@ class PrefillEstimateTests(TestCase):
         self.assertFalse(bucket["prefill_measured"])
         self.assertIsNone(bucket["prefill_tok_s"])
         self.assertEqual(bucket["prefill_sessions"], 1)
+        # Nothing was measured and no prompt token count is known, so there is
+        # no prompt size for the panel to show.
+        self.assertEqual(bucket["prefill_tokens"], 0)
+        self.assertEqual(bucket["prefill_seconds"], 0.0)
 
     def test_in_flight_prefill_estimates_from_held_tokens(self) -> None:
         manager, clock = _Manager(), _Clock()
@@ -319,6 +327,10 @@ class PrefillEstimateTests(TestCase):
         bucket = history.series()[0]["buckets"][0]
         self.assertFalse(bucket["prefill_measured"])
         self.assertAlmostEqual(bucket["prefill_tok_s"], 800.0 / 9.0, places=1)
+        # An estimate publishes the tokens being held and how long the longest
+        # one has been held, which is what the panel reports beside the rate.
+        self.assertEqual(bucket["prefill_tokens"], 800)
+        self.assertAlmostEqual(bucket["prefill_seconds"], 9.0, places=2)
 
     def test_estimate_falls_back_to_the_last_measured_rate(self) -> None:
         manager, clock = _Manager(), _Clock()
@@ -350,6 +362,27 @@ class PrefillEstimateTests(TestCase):
         self.assertAlmostEqual(measured["prefill_tok_s"], 600.0, places=1)
         self.assertAlmostEqual(fallback["prefill_tok_s"], 600.0, places=1)
         self.assertFalse(fallback["prefill_measured"])
+        self.assertEqual(measured["prefill_tokens"], 900)
+        self.assertAlmostEqual(measured["prefill_seconds"], 1.5, places=2)
+        # The carried-over rate was not computed from anything in this bucket, so
+        # the panel must not attach this bucket's prompt tokens to it.
+        self.assertEqual(fallback["prefill_tokens"], 0)
+        self.assertEqual(fallback["prefill_seconds"], 0.0)
+
+    def test_every_bucket_publishes_the_prompt_evidence_fields(self) -> None:
+        """The panel reads these unconditionally, so a silent bucket carries zero."""
+        manager, clock = _Manager(), _Clock()
+        history = _collector(manager, clock)
+        manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        bucket = history.series()[0]["buckets"][0]
+        self.assertIsNone(bucket["prefill_tok_s"])
+        self.assertEqual(bucket["prefill_tokens"], 0)
+        self.assertEqual(bucket["prefill_seconds"], 0.0)
 
 
 class ManagerIntegrationTests(TestCase):

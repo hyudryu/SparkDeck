@@ -186,7 +186,8 @@ export function HistoryPage() {
         <p className="history-note">
           Output and thinking use the left axis and describe tokens a client is receiving. Prompt processing uses the
           right axis: a completed prefill reports the rate the engine measured, and a prefill still running reports the
-          best live estimate from the prompt tokens it holds, marked <em>estimated</em> in the card. A blank segment means
+          best live estimate from the prompt tokens it holds, marked <em>estimated</em> in the card. Hovering any point
+          also shows the prompt size and the seconds its prompt-processing rate was computed from. A blank segment means
           no prefill has been measured in that point yet. Recording off stops all sampling; the sampling interval is also
           the span of one graph point.
         </p>

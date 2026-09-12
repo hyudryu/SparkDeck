@@ -96,6 +96,7 @@ class _Series:
         "concurrency_sum", "concurrency_peak",
         "state_high",
         "output_peak", "thinking_peak", "prefill_peak", "live_prefill_rate",
+        "live_prefill_tokens", "live_prefill_seconds",
         "last_state", "last_seen_at", "last_at", "epoch_offset",
     )
 
@@ -165,6 +166,10 @@ class _Series:
         self.thinking_peak = 0.0
         self.prefill_peak = 0.0
         self.live_prefill_rate = 0.0
+        # The prompt tokens and seconds behind ``live_prefill_rate``, so the
+        # panel can show what the in-flight estimate was computed from.
+        self.live_prefill_tokens = 0
+        self.live_prefill_seconds = 0.0
         # ``previous`` deliberately survives a bucket rollover, so it is not
         # reset here: the tokens the first sample of a new bucket sees were
         # emitted before that bucket opened and belong to the one just closed.
@@ -483,14 +488,16 @@ class LiveHistory:
         series.output_peak = max(series.output_peak, series.output_tokens / elapsed)
         series.thinking_peak = max(series.thinking_peak, series.thinking_tokens / elapsed)
         if prefill_states:
-            estimate = self._estimate_prefill_rate(entry, series)
+            estimate, tokens, seconds = self._estimate_prefill_rate(entry, series)
             series.live_prefill_rate = estimate
+            series.live_prefill_tokens = tokens
+            series.live_prefill_seconds = seconds
             if estimate:
                 series.prefill_peak = max(series.prefill_peak, estimate)
 
     def _estimate_prefill_rate(
         self, entry: dict[str, Any], series: _Series,
-    ) -> float:
+    ) -> tuple[float, int, float]:
         """Best available prompt-processing rate for the held prefills.
 
         Aggregate the in-flight prompts' prompt token counts over the longest
@@ -498,6 +505,11 @@ class LiveHistory:
         a prefill completes.  When no prompt token count is known yet, fall back
         to this serving unit's most recently measured rate so the panel shows a
         labelled estimate instead of a blank while the first prompt runs.
+
+        Returns the rate with the prompt tokens it was computed from and the
+        seconds it was divided by, because the panel shows that evidence beside
+        the rate.  A fallback estimate is not computed from anything in this
+        bucket and so reports no tokens and no seconds.
         """
         tokens = 0
         for _, rec in entry["records"]:
@@ -508,8 +520,8 @@ class LiveHistory:
                 tokens += prompt_tokens
         held = float(entry["prefill_oldest"])
         if tokens > 0 and held >= MIN_PREFILL_SECONDS:
-            return tokens / held
-        return self._recent_measured_prefill(series)
+            return tokens / held, tokens, held
+        return self._recent_measured_prefill(series), 0, 0.0
 
     @staticmethod
     def _recent_measured_prefill(series: _Series) -> float:
@@ -535,6 +547,19 @@ class LiveHistory:
                 else (round(series.live_prefill_rate, 2) if series.live_prefill_rate else None)
             ),
             "prefill_measured": measured,
+            # What ``prefill_tok_s`` was computed from: the prompt tokens counted
+            # in this bucket and the seconds they were divided by, so the panel
+            # can show the prompt size behind the rate.  A measured bucket
+            # reports every completed prefill's tokens over the longest of their
+            # wall times; an in-flight estimate reports the held prompts' tokens
+            # over how long the longest has been held; a rate carried over from
+            # an earlier measurement has no evidence here and reports zero.
+            "prefill_tokens": int(
+                series.prompt_tokens if measured else series.live_prefill_tokens
+            ),
+            "prefill_seconds": round(
+                series.prompt_seconds if measured else series.live_prefill_seconds, 2,
+            ),
             "concurrent": round(series.concurrency_sum / series.samples, 2),
             "concurrent_peak": series.concurrency_peak,
             "output_sessions": series.state_high[0],

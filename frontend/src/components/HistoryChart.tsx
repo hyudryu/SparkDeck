@@ -74,6 +74,26 @@ function rateLabel(value: number | null | undefined): string {
     : 'pending'
 }
 
+function secondsLabel(value: number): string {
+  return `${value < 1 ? value.toFixed(2) : value.toFixed(1)} s`
+}
+
+/**
+ * The evidence behind one bucket's prompt-processing rate: how many prompt
+ * tokens it was computed from and how long they took.  A measured rate counts
+ * the prompt tokens that finished prefilling in the bucket over the longest of
+ * their wall times; a live estimate counts the tokens an in-flight prompt holds
+ * over how long it has held them.  A rate carried over from an earlier
+ * measurement has no evidence in this bucket, so nothing is shown for it.
+ */
+function promptEvidenceLabel(bucket: LiveHistoryBucket): string | undefined {
+  const tokens = Number(bucket.prefill_tokens ?? 0)
+  const seconds = Number(bucket.prefill_seconds ?? 0)
+  if (!(tokens > 0) || !(seconds > 0)) return undefined
+  const size = `${tokens.toLocaleString()} prompt token${tokens === 1 ? '' : 's'}`
+  return `${size} ${bucket.prefill_measured ? 'in' : 'held'} ${secondsLabel(seconds)}`
+}
+
 /**
  * Line style carries the metric, so the three lines stay distinguishable even
  * when colour is encoding concurrency: solid for output, dotted for thinking,
@@ -139,6 +159,7 @@ export function HistoryChart({
 
   const hovered = hover?.bucket
   const hoverIsEstimated = Boolean(hovered && !hovered.prefill_measured && hovered.prefill_tok_s !== null)
+  const hoverPrefillEvidence = hovered === undefined ? undefined : promptEvidenceLabel(hovered)
 
   const pickBucket = (event: React.PointerEvent<SVGSVGElement>) => {
     if (visible.length === 0) return
@@ -278,6 +299,9 @@ export function HistoryChart({
               {hoverIsEstimated && <em> estimated</em>}
             </span>
           )}
+          {metrics.has('prefill') && hoverPrefillEvidence !== undefined && (
+            <span className="history-tooltip-note">{hoverPrefillEvidence}</span>
+          )}
           {metrics.has('prefill') && hover.bucket.prefill_measured && <span className="history-tooltip-note">Measured by the engine</span>}
           <span className="history-tooltip-note">
             {clockLabel(hover.bucket.at)} · {hover.bucket.concurrent_peak} peak
@@ -317,7 +341,7 @@ export function HistoryChart({
 
       <table className="sr-only">
         <caption>{series.model} throughput history</caption>
-        <thead><tr><th>Bucket</th><th>Concurrent</th><th>Thinking tok/s</th><th>Output tok/s</th><th>Prompt processing tok/s</th></tr></thead>
+        <thead><tr><th>Bucket</th><th>Concurrent</th><th>Thinking tok/s</th><th>Output tok/s</th><th>Prompt processing tok/s</th><th>Prompt tokens</th><th>Prompt processing time</th></tr></thead>
         <tbody>
           {visible.slice(-40).map((bucket) => (
             <tr key={bucket.at}>
@@ -326,6 +350,8 @@ export function HistoryChart({
               <td>{bucket.thinking_tok_s}</td>
               <td>{bucket.output_tok_s}</td>
               <td>{bucket.prefill_tok_s === null ? 'pending' : bucket.prefill_tok_s}</td>
+              <td>{bucket.prefill_tokens > 0 ? bucket.prefill_tokens : '—'}</td>
+              <td>{bucket.prefill_seconds > 0 ? secondsLabel(bucket.prefill_seconds) : '—'}</td>
             </tr>
           ))}
         </tbody>

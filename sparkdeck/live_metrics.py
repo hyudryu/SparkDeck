@@ -35,6 +35,9 @@ Four properties drive this design:
   elapsed spans, how long a prefill has been held, and retirement stay on the
   monotonic clock, which is the clock :meth:`Manager._track_start` stamps
   ``started_at`` with and the only one a forward wall-clock step cannot move.
+  Each graph converts once, through the wall-to-monotonic mapping measured when
+  that graph was anchored, so a clock correction can neither reorder nor erase
+  a timeline whose points were placed by the mapping in force when they closed.
 """
 
 from __future__ import annotations
@@ -93,7 +96,7 @@ class _Series:
         "concurrency_sum", "concurrency_peak",
         "state_high",
         "output_peak", "thinking_peak", "prefill_peak", "live_prefill_rate",
-        "last_state", "last_seen_at", "last_at",
+        "last_state", "last_seen_at", "last_at", "epoch_offset",
     )
 
     def __init__(self, meta: dict[str, Any], now: float, epoch: float) -> None:
@@ -118,6 +121,13 @@ class _Series:
         # decides when the serving unit is retired; ``last_at`` is the same
         # instant as a wall-clock time, which is what the panel sorts on.
         self.last_seen_at = now
+        # The wall-to-monotonic mapping this graph's whole timeline is drawn on,
+        # measured once.  Keeping it fixed is what makes a clock correction
+        # harmless: every point of one graph is placed by the same mapping, so
+        # its published times stay ordered and none of them move.  A corrected
+        # clock is picked up by the next graph, which is anchored again when the
+        # serving unit is next sampled after being retired.
+        self.epoch_offset = epoch - now
         self.last_at = epoch
         self.reset_open()
 
@@ -198,14 +208,14 @@ class LiveHistory:
         self._series: dict[str, _Series] = {}
         self._live: dict[str, int] = {}
         self._task: asyncio.Task | None = None
-        # Wall clock minus monotonic, refreshed by every tick.  Only used to
-        # convert a caller-supplied monotonic instant back to wall-clock time.
+        # Wall clock minus monotonic as of the last tick.  Used to date a
+        # caller-supplied monotonic instant; each graph keeps its own mapping.
         self._epoch_offset = self._wall_clock() - self.clock()
 
     def _instants(self, now: float | None) -> tuple[float, float]:
         """Return one monotonic instant and the wall-clock time it represents.
 
-        Both clocks are read together so the conversion is exact, and a caller
+        Both clocks are read together so the mapping is exact, and a caller
         that supplies its own monotonic instant is mapped through the offset the
         last tick measured.
         """
@@ -366,26 +376,25 @@ class LiveHistory:
             else:
                 series.meta.update(entry["meta"])
             series.last_seen_at = now
-            series.last_at = epoch
+            series.last_at = now + series.epoch_offset
             # Drop baselines for requests that are no longer tracked, so a
             # recycled record id can never inherit another request's counters.
             series.previous = {
                 rid: value for rid, value in series.previous.items()
                 if rid in live_records.get(key, ())
             }
-            self._accumulate(series, entry, now, epoch)
+            self._accumulate(series, entry, now)
         for key, series in self._series.items():
             if key not in observed:
                 # A serving unit with no live request still needs its clock
                 # advanced so a zero-traffic stretch is drawn as zero rather
                 # than silently skipped.
                 series.previous = {}
-                self._accumulate(series, None, now, epoch)
+                self._accumulate(series, None, now)
         self._retire(now)
 
     def _accumulate(
         self, series: _Series, entry: dict[str, Any] | None, now: float,
-        epoch: float,
     ) -> None:
         # Counters from requests that finished since the last sample belong to
         # the bucket that was open when they ended, so fold them in first.
@@ -407,9 +416,9 @@ class LiveHistory:
 
         if close_at is not None:
             # The bucket closes on a boundary that fell between two samples, so
-            # its displayed time is this sample's wall-clock instant shifted back
-            # by how long ago that boundary passed.
-            self._close_bucket(series, close_at, epoch - (now - close_at))
+            # its displayed time is the boundary itself -- how long ago it
+            # passed does not move it -- mapped onto this graph's own timeline.
+            self._close_bucket(series, close_at, close_at + series.epoch_offset)
             # ``previous`` deliberately survives the rollover: the tokens the
             # first sample of the new bucket sees were emitted before it opened
             # and still belong to the bucket that just closed.

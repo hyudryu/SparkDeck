@@ -21,6 +21,7 @@ from sparkdeck.live_metrics import (
     KEEP_SECONDS,
     MAX_SAMPLE_SECONDS,
     MIN_SAMPLE_SECONDS,
+    RETAIN_ACTIVE_SECONDS,
     LiveHistory,
     buckets_for,
     clamp_sample_seconds,
@@ -62,6 +63,8 @@ class _WallClock:
 
     Reading the monotonic clock plus a fixed offset keeps the timestamps the
     panel receives deterministic while still exercising the two-clock mapping.
+    ``shift`` moves the wall clock on its own, which is how a clock correction
+    reaches the collector without touching the monotonic timeline.
     """
 
     def __init__(self, clock: _Clock, epoch: float = EPOCH_BASE) -> None:
@@ -75,6 +78,10 @@ class _WallClock:
     def at(self, monotonic: float) -> float:
         """The wall-clock second the manual monotonic clock reads *monotonic*."""
         return self.epoch + (monotonic - self.started_at)
+
+    def shift(self, seconds: float) -> None:
+        """Correct the wall clock by *seconds* without moving monotonic time."""
+        self.epoch += seconds
 
 
 class _Manager:
@@ -508,6 +515,77 @@ class TimestampTests(TestCase):
                     abs(value - time.time()), 5,
                     f"{label} must be a wall-clock time, not a monotonic reading",
                 )
+
+
+    def test_a_forward_clock_correction_cannot_erase_a_running_graph(self) -> None:
+        """A host clock jump must not drop the points already collected."""
+        manager, clock = _Manager(), _Clock()
+        wall = _WallClock(clock)
+        history = _collector(manager, clock, wall=wall)
+        manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+        before = history.series()[0]
+
+        # The clock is stepped two hours forward while the release keeps serving.
+        wall.shift(7_200.0)
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+        after = history.series()[0]
+
+        # The graph is one timeline: the earlier point keeps the time it was
+        # published with, so nothing jumps out of the trailing window.
+        self.assertEqual(
+            [bucket["at"] for bucket in after["buckets"][:len(before["buckets"])]],
+            [bucket["at"] for bucket in before["buckets"]],
+        )
+        self.assertEqual(len(after["buckets"]), 2)
+        self.assertAlmostEqual(after["last_at"], wall.at(clock.now) - 7_200.0, places=3)
+
+    def test_a_backward_clock_correction_cannot_reorder_a_running_graph(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        wall = _WallClock(clock)
+        history = _collector(manager, clock, wall=wall)
+        manager.start()
+        history.start(GROUP_A)
+        for _ in range(3):
+            history.tick()
+            clock.advance(BUCKET_SECONDS)
+        wall.shift(-900.0)
+        history.tick()
+
+        times = [bucket["at"] for bucket in history.series()[0]["buckets"]]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(len(set(times)), len(times))
+
+    def test_a_graph_anchored_after_a_correction_uses_the_corrected_clock(self) -> None:
+        manager, clock = _Manager(), _Clock()
+        wall = _WallClock(clock)
+        history = _collector(manager, clock, wall=wall)
+        stale = manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        # The corrected clock is picked up by the next graph: the serving unit
+        # goes idle long enough to be retired, then serves again.
+        manager.finish(stale)
+        history.end(GROUP_A)
+        wall.shift(7_200.0)
+        clock.advance(RETAIN_ACTIVE_SECONDS + 1.0)
+        history.tick()
+        manager.start()
+        history.start(GROUP_A)
+        for _ in range(2):
+            clock.advance(BUCKET_SECONDS)
+            history.tick()
+
+        series = history.series()[0]
+        self.assertEqual(len(series["buckets"]), 1)
+        self.assertAlmostEqual(series["buckets"][0]["at"], wall.at(clock.now), places=3)
 
 
 class SeriesShapeTests(TestCase):

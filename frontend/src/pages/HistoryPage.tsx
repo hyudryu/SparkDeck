@@ -185,10 +185,11 @@ export function HistoryPage() {
         {settingsError && <p className="form-error" role="alert">{settingsError}</p>}
         <p className="history-note">
           Output and thinking use the left axis and describe tokens a client is receiving. Prompt processing uses the
-          right axis: a completed prefill reports the rate the engine measured, and a prefill still running reports the
-          best live estimate from the prompt tokens it holds, marked <em>estimated</em> in the card. A blank segment means
-          no prefill has been measured in that point yet. Recording off stops all sampling; the sampling interval is also
-          the span of one graph point.
+          right axis: a completed prefill reports the rate the engine measured, and while a prefill is still running the
+          point carries this serving unit's most recent measured rate, marked <em>estimated</em> in the card. The engine
+          only reports a prompt token count when a prefill finishes, so hovering a point shows the prompt size and the
+          seconds behind the rate only where one completed. A blank segment means no prefill has been measured in that
+          point yet. Recording off stops all sampling; the sampling interval is also the span of one graph point.
         </p>
       </Panel>
 

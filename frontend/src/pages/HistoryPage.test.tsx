@@ -170,8 +170,11 @@ describe('HistoryPage', () => {
 
   it('shows the prompt size and seconds behind a measured prompt processing rate', async () => {
     const buckets = trailingBuckets(720, {
-      prefill_tok_s: 900, prefill_measured: true, prefill_sessions: 1,
-      prefill_tokens: 1_800, prefill_seconds: 2,
+      // 1,000 tokens over 1.96 s is the 510.2 tok/s the card also reports, so
+      // the evidence line has to keep both published decimals: "2.0 s" would
+      // read as 500 tok/s and contradict the rate it explains.
+      prefill_tok_s: 510.2, prefill_measured: true, prefill_sessions: 1,
+      prefill_tokens: 1_000, prefill_seconds: 1.96,
     })
     vi.stubGlobal('fetch', stubHistoryFetch([series({ buckets })]))
     render(<HistoryPage />)
@@ -179,23 +182,8 @@ describe('HistoryPage', () => {
 
     fireEvent.pointerMove(chart, { clientX: lastBucketPointer(chart), clientY: 50 })
     const card = await screen.findByRole('status')
-    // A measured rate was computed from prompt tokens that finished prefilling
-    // in the bucket, over the longest of their wall times.
-    expect(within(card).getByText(`${(1_800).toLocaleString()} prompt tokens in 2.0 s`)).toBeInTheDocument()
-  })
-
-  it('shows how many prompt tokens a live estimate is holding and for how long', async () => {
-    const buckets = trailingBuckets(720, {
-      prefill_tok_s: 800, prefill_measured: false, prefill_sessions: 1,
-      prefill_tokens: 1_200, prefill_seconds: 1.5,
-    })
-    vi.stubGlobal('fetch', stubHistoryFetch([series({ buckets })]))
-    render(<HistoryPage />)
-    const chart = await screen.findByLabelText('qwen3-32b throughput history coloured by concurrent sessions')
-
-    fireEvent.pointerMove(chart, { clientX: lastBucketPointer(chart), clientY: 50 })
-    const card = await screen.findByRole('status')
-    expect(within(card).getByText(`${(1_200).toLocaleString()} prompt tokens held 1.5 s`)).toBeInTheDocument()
+    expect(within(card).getByText('Prompt processing: 510.2 tok/s')).toBeInTheDocument()
+    expect(within(card).getByText(`${(1_000).toLocaleString()} prompt tokens in 1.96 s`)).toBeInTheDocument()
   })
 
   it('shows no prompt size for a rate carried over from an earlier measurement', async () => {
@@ -228,7 +216,7 @@ describe('HistoryPage', () => {
     const table = screen.getByRole('table', { name: /qwen3-32b throughput history/ })
     expect(within(table).getAllByRole('columnheader').map((cell) => cell.textContent)).toContain('Prompt tokens')
     expect(within(table).getAllByText('1600').length).toBe(4)
-    expect(within(table).getAllByText('2.0 s').length).toBe(4)
+    expect(within(table).getAllByText('2 s').length).toBe(4)
   })
 
   it('reports pending prompt processing when the engine has measured no prefill', async () => {

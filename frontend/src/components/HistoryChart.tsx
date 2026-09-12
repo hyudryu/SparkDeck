@@ -75,23 +75,26 @@ function rateLabel(value: number | null | undefined): string {
 }
 
 function secondsLabel(value: number): string {
-  return `${value < 1 ? value.toFixed(2) : value.toFixed(1)} s`
+  // The collector publishes hundredths and the displayed rate is computed from
+  // that exact value, so rounding to one decimal here would contradict the very
+  // rate the number explains: 1,000 tokens over 1.96 s is 510.2 tok/s, and
+  // "2.0 s" would read as 500.
+  return `${Number(value.toFixed(2))} s`
 }
 
 /**
- * The evidence behind one bucket's prompt-processing rate: how many prompt
- * tokens it was computed from and how long they took.  A measured rate counts
- * the prompt tokens that finished prefilling in the bucket over the longest of
- * their wall times; a live estimate counts the tokens an in-flight prompt holds
- * over how long it has held them.  A rate carried over from an earlier
- * measurement has no evidence in this bucket, so nothing is shown for it.
+ * The evidence behind one bucket's prompt-processing rate: the prompt tokens it
+ * was computed from and the seconds they took.  Only a prefill that completed in
+ * the bucket has this -- the engine reports the prompt token count with the first
+ * output token, which is what ends the prefill -- so a bucket whose rate is an
+ * earlier measurement, or a prefill still running, shows no prompt size at all
+ * rather than one that was never measured.
  */
 function promptEvidenceLabel(bucket: LiveHistoryBucket): string | undefined {
   const tokens = Number(bucket.prefill_tokens ?? 0)
   const seconds = Number(bucket.prefill_seconds ?? 0)
   if (!(tokens > 0) || !(seconds > 0)) return undefined
-  const size = `${tokens.toLocaleString()} prompt token${tokens === 1 ? '' : 's'}`
-  return `${size} ${bucket.prefill_measured ? 'in' : 'held'} ${secondsLabel(seconds)}`
+  return `${tokens.toLocaleString()} prompt token${tokens === 1 ? '' : 's'} in ${secondsLabel(seconds)}`
 }
 
 /**

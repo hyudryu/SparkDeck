@@ -22,22 +22,26 @@ Four properties drive this design:
 * **Concurrency is time-averaged.**  A bucket reports the mean live-session
   count over its samples, so the colour of a segment describes what the serving
   unit actually carried rather than one instant inside it.
-* **Prompt processing must be estimated honestly.**  Only a completed prefill
-  has an engine-measured rate.  While a prefill is still running the collector
-  aggregates the in-flight prompts' only real evidence -- how many prompt tokens
-  they hold and how long they have held them -- into one group-level estimate,
-  and reports ``null`` (rendered as "pending") when no prompt token count is
-  known yet.  No rate is ever invented from an empty measurement.
+* **Prompt processing is only ever reported as measured.**  A completed prefill
+  reports the rate the engine measured, together with the prompt tokens it was
+  computed from and the seconds it was divided by, so the panel can show the
+  prompt size behind the rate.  A prefill still running has no such measurement:
+  the engine reports the prompt token count with the first output token, which is
+  what ends the prefill, and nothing else in this process knows it.  Those
+  buckets therefore carry this serving unit's most recent measured rate (the
+  panel labels it as an estimate) and no prompt size at all, and report ``null``
+  (rendered as "pending") when there is no earlier measurement either.  Neither a
+  rate nor a prompt size is ever invented from an empty measurement.
 * **Spans are monotonic; displayed times are wall-clock.**  The panel renders
   every timestamp it receives as a time -- ``bucket["at"]`` on the axis and in
   the hover card, ``series["last_at"]`` to order the graphs, ``generated_at``
   to date the payload -- so those are Unix epoch seconds.  Bucket boundaries,
-  elapsed spans, how long a prefill has been held, and retirement stay on the
-  monotonic clock, which is the clock :meth:`Manager._track_start` stamps
-  ``started_at`` with and the only one a forward wall-clock step cannot move.
-  Each graph converts once, through the wall-to-monotonic mapping measured when
-  that graph was anchored, so a clock correction can neither reorder nor erase
-  a timeline whose points were placed by the mapping in force when they closed.
+  elapsed spans, and retirement stay on the monotonic clock, which is the clock
+  :meth:`Manager._track_start` stamps ``started_at`` with and the only one a
+  forward wall-clock step cannot move.  Each graph converts once, through the
+  wall-to-monotonic mapping measured when that graph was anchored, so a clock
+  correction can neither reorder nor erase a timeline whose points were placed by
+  the mapping in force when they closed.
 """
 
 from __future__ import annotations
@@ -61,8 +65,6 @@ DEFAULT_HISTORY_ENABLED = True
 RETAIN_ACTIVE_SECONDS = 900.0
 # Bound on simultaneously tracked serving units; least recently active go first.
 MAX_SERIES = 32
-# A prefill younger than this has too little evidence to estimate a rate from.
-MIN_PREFILL_SECONDS = 0.25
 
 _GROUP_FIELDS = ("group_id", "model", "deployment_id", "instance_id", "node_names")
 
@@ -96,7 +98,6 @@ class _Series:
         "concurrency_sum", "concurrency_peak",
         "state_high",
         "output_peak", "thinking_peak", "prefill_peak", "live_prefill_rate",
-        "live_prefill_tokens", "live_prefill_seconds",
         "last_state", "last_seen_at", "last_at", "epoch_offset",
     )
 
@@ -166,10 +167,6 @@ class _Series:
         self.thinking_peak = 0.0
         self.prefill_peak = 0.0
         self.live_prefill_rate = 0.0
-        # The prompt tokens and seconds behind ``live_prefill_rate``, so the
-        # panel can show what the in-flight estimate was computed from.
-        self.live_prefill_tokens = 0
-        self.live_prefill_seconds = 0.0
         # ``previous`` deliberately survives a bucket rollover, so it is not
         # reset here: the tokens the first sample of a new bucket sees were
         # emitted before that bucket opened and belong to the one just closed.
@@ -348,10 +345,6 @@ class LiveHistory:
             live_records.setdefault(key, set()).add(id(rec))
             state = _session_state(rec)
             entry["states"][_STATE_FIELDS[state]] += 1
-            if state == "prefill":
-                started = rec.get("started_at")
-                held = max(0.0, now - float(started)) if started is not None else 0.0
-                entry["prefill_oldest"] = max(entry["prefill_oldest"], held)
             if int(rec.get("pp_tokens") or 0) > 0 and float(rec.get("pp_time_s") or 0) > 0:
                 # Aggregating per record id lets the sample fold add a measurement
                 # exactly once: the record keeps reporting the same prompt token
@@ -488,43 +481,22 @@ class LiveHistory:
         series.output_peak = max(series.output_peak, series.output_tokens / elapsed)
         series.thinking_peak = max(series.thinking_peak, series.thinking_tokens / elapsed)
         if prefill_states:
-            estimate, tokens, seconds = self._estimate_prefill_rate(entry, series)
+            # Only a prefill that has *finished* has a rate this process can
+            # report: the engine sends the prompt token count with the first
+            # output token, which is exactly what ends the prefill, and
+            # ``_session_state`` stops calling a record a prefill as soon as that
+            # token is tracked.  A prefill that is still running therefore has no
+            # measurement behind it, so the bucket carries this serving unit's
+            # most recent measured rate -- labelled an estimate by the panel --
+            # rather than a number derived from something that was never measured.
+            estimate = self._recent_measured_prefill(series)
             series.live_prefill_rate = estimate
-            series.live_prefill_tokens = tokens
-            series.live_prefill_seconds = seconds
             if estimate:
                 series.prefill_peak = max(series.prefill_peak, estimate)
 
-    def _estimate_prefill_rate(
-        self, entry: dict[str, Any], series: _Series,
-    ) -> tuple[float, int, float]:
-        """Best available prompt-processing rate for the held prefills.
-
-        Aggregate the in-flight prompts' prompt token counts over the longest
-        prefill currently held -- the same relationship the engine measures when
-        a prefill completes.  When no prompt token count is known yet, fall back
-        to this serving unit's most recently measured rate so the panel shows a
-        labelled estimate instead of a blank while the first prompt runs.
-
-        Returns the rate with the prompt tokens it was computed from and the
-        seconds it was divided by, because the panel shows that evidence beside
-        the rate.  A fallback estimate is not computed from anything in this
-        bucket and so reports no tokens and no seconds.
-        """
-        tokens = 0
-        for _, rec in entry["records"]:
-            if _session_state(rec) != "prefill":
-                continue
-            prompt_tokens = int(rec.get("pp_tokens") or 0)
-            if prompt_tokens > 0:
-                tokens += prompt_tokens
-        held = float(entry["prefill_oldest"])
-        if tokens > 0 and held >= MIN_PREFILL_SECONDS:
-            return tokens / held, tokens, held
-        return self._recent_measured_prefill(series), 0, 0.0
-
     @staticmethod
     def _recent_measured_prefill(series: _Series) -> float:
+        """The last prompt-processing rate the engine actually measured."""
         for bucket in reversed(series.buckets):
             value = bucket.get("prefill_tok_s")
             if bucket.get("prefill_measured") and value:
@@ -547,19 +519,14 @@ class LiveHistory:
                 else (round(series.live_prefill_rate, 2) if series.live_prefill_rate else None)
             ),
             "prefill_measured": measured,
-            # What ``prefill_tok_s`` was computed from: the prompt tokens counted
-            # in this bucket and the seconds they were divided by, so the panel
-            # can show the prompt size behind the rate.  A measured bucket
-            # reports every completed prefill's tokens over the longest of their
-            # wall times; an in-flight estimate reports the held prompts' tokens
-            # over how long the longest has been held; a rate carried over from
-            # an earlier measurement has no evidence here and reports zero.
-            "prefill_tokens": int(
-                series.prompt_tokens if measured else series.live_prefill_tokens
-            ),
-            "prefill_seconds": round(
-                series.prompt_seconds if measured else series.live_prefill_seconds, 2,
-            ),
+            # What ``prefill_tok_s`` was computed from, so the panel can show the
+            # prompt size behind the rate: every prefill that completed in this
+            # bucket, over the longest of their wall times.  A bucket whose rate
+            # is a prefill still running -- or a carried-over earlier measurement
+            # -- has no evidence of its own and reports zero for both, which the
+            # panel renders as no prompt size rather than a made-up one.
+            "prefill_tokens": int(series.prompt_tokens if measured else 0),
+            "prefill_seconds": round(series.prompt_seconds if measured else 0.0, 2),
             "concurrent": round(series.concurrency_sum / series.samples, 2),
             "concurrent_peak": series.concurrency_peak,
             "output_sessions": series.state_high[0],
@@ -588,7 +555,7 @@ class LiveHistory:
     ) -> dict[str, Any]:
         entry = observed[key] = {
             "meta": _clean_meta(group), "states": [0, 0, 0],
-            "prompt_records": {}, "prefill_oldest": 0.0,
+            "prompt_records": {},
             "records": [],
         }
         return entry

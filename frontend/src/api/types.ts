@@ -1248,8 +1248,8 @@ export interface LiveHistoryBucket {
   prefill_measured: boolean
   /**
    * Prompt tokens `prefill_tok_s` was computed from, and the seconds it was
-   * divided by. Both are 0 when the rate carries over an earlier measurement,
-   * which leaves no evidence of its own in this bucket.
+   * divided by. Both are 0 unless a prefill completed inside this bucket, which
+   * is the only moment the engine reports a prompt token count.
    */
   prefill_tokens: number
   prefill_seconds: number

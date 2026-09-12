@@ -247,6 +247,22 @@ describe('HistoryPage', () => {
     expect(within(legend).getByText('Token generation')).toBeInTheDocument()
   })
 
+  it('dates the hovered point with that bucket’s own time', async () => {
+    const buckets = trailingBuckets(360)
+    vi.stubGlobal('fetch', stubHistoryFetch([series({ buckets })]))
+    render(<HistoryPage />)
+    const chart = await screen.findByLabelText('qwen3-32b throughput history coloured by concurrent sessions')
+
+    fireEvent.pointerMove(chart, { clientX: lastBucketPointer(chart), clientY: 50 })
+    const card = await screen.findByRole('status')
+    // The newest bucket is the one the pointer resolves to, so the card must
+    // report that point's own wall-clock time rather than the page's clock.
+    const pointTime = new Date(buckets[buckets.length - 1].at * 1_000).toLocaleTimeString(undefined, {
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    })
+    expect(within(card).getByText(pointTime, { exact: false })).toBeInTheDocument()
+  })
+
   it('explains how to get history when nothing has run yet', async () => {
     vi.stubGlobal('fetch', stubHistoryFetch([]))
     render(<HistoryPage />)

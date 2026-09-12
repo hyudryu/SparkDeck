@@ -1238,6 +1238,7 @@ export interface BenchmarkRunnerRunDetail extends BenchmarkRunnerRunSummary {
 
 /** One five-second bucket of a serving unit's trailing live throughput. */
 export interface LiveHistoryBucket {
+  /** When the bucket closed, in Unix epoch seconds. */
   at: number
   output_tok_s: number
   thinking_tok_s: number
@@ -1274,12 +1275,14 @@ export interface LiveHistorySeries {
   node_names: string[]
   live_sessions: number
   state: LiveHistorySessionState
+  /** When this serving unit was last sampled, in Unix epoch seconds. */
   last_at: number
   bucket_seconds: number
   buckets: LiveHistoryBucket[]
 }
 
 export interface LiveHistorySnapshot {
+  /** When the snapshot was taken, in Unix epoch seconds. */
   generated_at: number
   /** False when recording is switched off; the series list is then empty. */
   enabled: boolean

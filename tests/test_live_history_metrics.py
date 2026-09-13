@@ -281,13 +281,17 @@ class PrefillEstimateTests(TestCase):
         bucket = history.series()[0]["buckets"][0]
         self.assertTrue(bucket["prefill_measured"])
         self.assertAlmostEqual(bucket["prefill_tok_s"], 500.0, places=2)
+        # The panel shows what the rate came from, so the bucket publishes the
+        # prompt tokens that were counted and the seconds they were divided by.
+        self.assertEqual(bucket["prefill_tokens"], 1_000)
+        self.assertAlmostEqual(bucket["prefill_seconds"], 2.0, places=2)
 
-    def test_held_prefill_without_token_counts_reports_pending(self) -> None:
+    def test_a_prefill_with_no_measurement_at_all_reports_pending(self) -> None:
         manager, clock = _Manager(), _Clock()
         history = _collector(manager, clock)
-        rid = manager.start()
+        manager.start()
         history.start(GROUP_A)
-        manager._active_reqs[rid]["started_at"] = clock.now
+        manager._active_reqs[1]["started_at"] = clock.now
         for _ in range(3):
             history.tick()
             clock.advance(1.0)
@@ -298,27 +302,35 @@ class PrefillEstimateTests(TestCase):
         self.assertFalse(bucket["prefill_measured"])
         self.assertIsNone(bucket["prefill_tok_s"])
         self.assertEqual(bucket["prefill_sessions"], 1)
+        # Nothing was measured and no prompt token count is known, so there is
+        # no prompt size for the panel to show.
+        self.assertEqual(bucket["prefill_tokens"], 0)
+        self.assertEqual(bucket["prefill_seconds"], 0.0)
 
-    def test_in_flight_prefill_estimates_from_held_tokens(self) -> None:
+    def test_a_prefill_still_running_publishes_no_measurement_of_its_own(self) -> None:
+        """A prefill in flight has no prompt token count anywhere to publish.
+
+        The engine reports that count with the first output token, and the first
+        output token is what ends the prefill, so a request that is still
+        prompt processing has nothing but the time it has been running -- which
+        is not a measurement of anything the engine did.  Thirty seconds of held
+        time must therefore produce no rate and no prompt size rather than a
+        number derived from the clock.
+        """
         manager, clock = _Manager(), _Clock()
         history = _collector(manager, clock)
         rid = manager.start()
         history.start(GROUP_A)
-        # The engine reports the prompt token count only with the first output
-        # token, so the estimate only exists once that count is known.  It is
-        # the in-flight equivalent of the measured rate: prompt tokens over the
-        # time the prefill has been held, which is short of the real prefill
-        # speed because the prefill is not finished.
-        manager._active_reqs[rid]["started_at"] = clock.now - 4.0
-        manager.prefill(rid, 0, 0.0)
-        manager._active_reqs[rid]["pp_tokens"] = 800
+        manager._active_reqs[rid]["started_at"] = clock.now - 30.0
         history.tick()
         clock.advance(BUCKET_SECONDS)
         history.tick()
 
         bucket = history.series()[0]["buckets"][0]
-        self.assertFalse(bucket["prefill_measured"])
-        self.assertAlmostEqual(bucket["prefill_tok_s"], 800.0 / 9.0, places=1)
+        self.assertEqual(bucket["prefill_sessions"], 1)
+        self.assertIsNone(bucket["prefill_tok_s"])
+        self.assertEqual(bucket["prefill_tokens"], 0)
+        self.assertEqual(bucket["prefill_seconds"], 0.0)
 
     def test_estimate_falls_back_to_the_last_measured_rate(self) -> None:
         manager, clock = _Manager(), _Clock()
@@ -350,6 +362,27 @@ class PrefillEstimateTests(TestCase):
         self.assertAlmostEqual(measured["prefill_tok_s"], 600.0, places=1)
         self.assertAlmostEqual(fallback["prefill_tok_s"], 600.0, places=1)
         self.assertFalse(fallback["prefill_measured"])
+        self.assertEqual(measured["prefill_tokens"], 900)
+        self.assertAlmostEqual(measured["prefill_seconds"], 1.5, places=2)
+        # The carried-over rate was not computed from anything in this bucket, so
+        # the panel must not attach this bucket's prompt tokens to it.
+        self.assertEqual(fallback["prefill_tokens"], 0)
+        self.assertEqual(fallback["prefill_seconds"], 0.0)
+
+    def test_every_bucket_publishes_the_prompt_evidence_fields(self) -> None:
+        """The panel reads these unconditionally, so a silent bucket carries zero."""
+        manager, clock = _Manager(), _Clock()
+        history = _collector(manager, clock)
+        manager.start()
+        history.start(GROUP_A)
+        history.tick()
+        clock.advance(BUCKET_SECONDS)
+        history.tick()
+
+        bucket = history.series()[0]["buckets"][0]
+        self.assertIsNone(bucket["prefill_tok_s"])
+        self.assertEqual(bucket["prefill_tokens"], 0)
+        self.assertEqual(bucket["prefill_seconds"], 0.0)
 
 
 class ManagerIntegrationTests(TestCase):
@@ -394,6 +427,37 @@ class ManagerIntegrationTests(TestCase):
         self.assertAlmostEqual(bucket["output_tok_s"], 46.0 / 5.0, places=2)
         self.assertTrue(bucket["prefill_measured"])
         self.assertAlmostEqual(bucket["prefill_tok_s"], 600.0, places=2)
+
+    def test_only_a_finished_prefill_carries_a_prompt_measurement(self) -> None:
+        """The reason a prefill in flight can never show a prompt size.
+
+        Driving the real manager hooks: the record has no prompt token count
+        while it is still prompt processing, and the count arrives together with
+        the first output token, which is what stops it being a prefill.  A bucket
+        therefore never has both a prompt measurement and a prefill in flight,
+        which is exactly why the collector publishes no size in that case.
+        """
+        manager = self._manager()
+        clock = _Clock()
+        manager.live_history = LiveHistory(manager, clock=clock)
+
+        rid = manager._track_start("model-a", streaming=True)
+        for _ in range(2):
+            clock.advance(BUCKET_SECONDS)
+            manager.live_history.tick()
+        self.assertEqual(manager._active_reqs[rid]["pp_tokens"], 0)
+        self.assertEqual(
+            manager.live_history.series()[0]["state"]["prefill_sessions"], 1,
+        )
+
+        manager._track_output(rid, clock.now, "output", 1)
+        manager._track_prompt_processing(rid, 1_200, 2.0)
+        clock.advance(BUCKET_SECONDS)
+        manager.live_history.tick()
+        state = manager.live_history.series()[0]["state"]
+        self.assertEqual(manager._active_reqs[rid]["pp_tokens"], 1_200)
+        self.assertEqual(state["prefill_sessions"], 0)
+        self.assertEqual(state["output_sessions"], 1)
 
     def test_a_finished_request_is_released_from_the_live_count(self) -> None:
         manager = self._manager()

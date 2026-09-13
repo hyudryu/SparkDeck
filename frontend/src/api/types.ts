@@ -1246,6 +1246,13 @@ export interface LiveHistoryBucket {
   prefill_tok_s: number | null
   /** True when the engine measured the rate; false for a live estimate. */
   prefill_measured: boolean
+  /**
+   * Prompt tokens `prefill_tok_s` was computed from, and the seconds it was
+   * divided by. Both are 0 unless a prefill completed inside this bucket, which
+   * is the only moment the engine reports a prompt token count.
+   */
+  prefill_tokens: number
+  prefill_seconds: number
   /** Mean concurrent sessions over the bucket. */
   concurrent: number
   concurrent_peak: number

@@ -51,24 +51,32 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["environment"], {"NCCL_DEBUG": "WARN"})
         self.assertNotIn("id", payload)
 
-    async def test_delete_refuses_deployment_not_owned_by_mcp(self) -> None:
-        methods = []
+    async def test_remove_controls_deployment_not_owned_by_mcp(self) -> None:
+        requests = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
-            methods.append(request.method)
+            requests.append((request.method, request.url.path))
             if request.url.path == "/api/state":
                 return httpx.Response(200, json={
                     "deployments": [{"id": "user-1", "managed_by": None}]
                 })
-            return httpx.Response(200, json={
-                "items": [{"id": "user-record", "managed_by": None,
-                           "settings": {"manager_deployment_id": "user-1"}}],
-            })
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={
+                    "items": [{"id": "user-record", "managed_by": None,
+                               "settings": {"manager_deployment_id": "user-1"}}],
+                })
+            return httpx.Response(200, json={"ok": True, "id": "user-1"})
 
         client = ControllerClient(transport=httpx.MockTransport(handler))
-        with self.assertRaisesRegex(ControllerError, "not created by this MCP"):
-            await client.action("user-1", "remove")
-        self.assertEqual(methods, ["GET", "GET"])
+        result = await client.action("user-1", "remove")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(requests, [
+            ("GET", "/api/state"),
+            ("GET", "/api/v1/deployments"),
+            ("GET", "/api/state"),
+            ("POST", "/api/deployments/user-1/remove"),
+        ])
 
     async def test_deployment_configuration_and_lifecycle_use_stable_v1_id(self) -> None:
         requests: list[tuple[str, str, dict | None]] = []
@@ -223,7 +231,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ControllerError, "non-empty node IDs"):
             await client.action("record-1", "start", node_ids=[])
 
-    async def test_configuration_update_requires_explicit_unowned_override(self) -> None:
+    async def test_configuration_update_applies_to_unowned_deployment(self) -> None:
         requests: list[tuple[str, str]] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -244,18 +252,12 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"id": "user-record", "editable": True})
 
         client = ControllerClient(transport=httpx.MockTransport(handler))
-        with self.assertRaisesRegex(ControllerError, "not created by this MCP"):
-            await client.update_deployment_configuration(
-                "user-manager", {"environment": {}},
-            )
         updated = await client.update_deployment_configuration(
-            "user-record", {"environment": {}}, require_owned=False,
+            "user-manager", {"environment": {}},
         )
 
         self.assertTrue(updated["editable"])
         self.assertEqual(requests, [
-            ("GET", "/api/state"),
-            ("GET", "/api/v1/deployments"),
             ("GET", "/api/state"),
             ("GET", "/api/v1/deployments"),
             ("PUT", "/api/v1/deployments/user-record/settings"),
@@ -709,9 +711,16 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(name, tools)
         update = tools["update_cluster_deployment_configuration"]
-        self.assertIn("allow_unowned", update.input_schema["properties"])
         self.assertIn("environment", update.description)
         self.assertIn("extra_args", update.description)
+        for name in (
+            "start_cluster_deployment", "stop_cluster_deployment",
+            "delete_cluster_deployment",
+            "update_cluster_deployment_configuration",
+        ):
+            self.assertNotIn(
+                "allow_unowned", tools[name].input_schema.get("properties", {}),
+            )
         self.assertIn(
             "launch_controls",
             tools["get_cluster_deployment_configuration"].description,
@@ -742,13 +751,13 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
                 return {"id": deployment_id, "editable": True}
 
             async def update_deployment_configuration(
-                self, deployment_id, changes, *, require_owned,
+                self, deployment_id, changes,
             ):
-                calls.append(("update", deployment_id, changes, require_owned))
+                calls.append(("update", deployment_id, changes))
                 return {"id": deployment_id, "environment": changes["environment"]}
 
-            async def action(self, deployment_id, action, *, require_owned, node_ids=None):
-                calls.append((action, deployment_id, require_owned))
+            async def action(self, deployment_id, action, *, node_ids=None):
+                calls.append((action, deployment_id))
                 return {"ok": True, "id": deployment_id}
 
         server = build_server(FakeClient())
@@ -762,7 +771,7 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         started = await server.call_tool("start_cluster_deployment", {
-            "deployment_id": "dep-1", "allow_unowned": True,
+            "deployment_id": "dep-1",
         })
         stopped = await server.call_tool("stop_cluster_deployment", {
             "deployment_id": "dep-1",
@@ -776,9 +785,9 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stopped.structured_content["ok"])
         self.assertEqual(calls, [
             ("get", "dep-1"),
-            ("update", "dep-1", {"environment": {"NCCL_DEBUG": "WARN"}}, True),
-            ("start", "dep-1", False),
-            ("stop", "dep-1", True),
+            ("update", "dep-1", {"environment": {"NCCL_DEBUG": "WARN"}}),
+            ("start", "dep-1"),
+            ("stop", "dep-1"),
         ])
 
     async def test_storage_tools_delegate_and_require_delete_confirmation(self) -> None:
@@ -898,7 +907,7 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
                 rate = 10.0 if deployment_id.endswith("a") else 12.0
                 return {"metrics": {"output_tokens_per_second": rate}}
 
-            async def action(self, deployment_id, action, *, require_owned, node_ids=None):
+            async def action(self, deployment_id, action, *, node_ids=None):
                 events.append((action, deployment_id))
                 return {"ok": True, "errors": []}
 

@@ -368,7 +368,7 @@ The MCP server exposes the same guarded Storage operations as the app:
 
 Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. ComfyUI weights listed in Storage can be deleted in place; recognized complete bundles can also be transferred.
 
-MCP-created deployments use the current `managed_by=sparkdeck-mcp` marker. SparkDeck continues to recognize the legacy `managed_by=vllm-controller-mcp` marker solely so deployments created by older releases can still be managed safely.
+MCP-created deployments are stamped with `managed_by=sparkdeck-mcp` so the app can show where a deployment came from. That marker is informational and never gates a tool: the MCP server can start, stop, reconfigure, and remove any deployment in the catalog, including deployments created in the app or by an older release.
 
 ## Service installation
 

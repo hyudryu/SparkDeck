@@ -74,8 +74,33 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [
             ("GET", "/api/state"),
             ("GET", "/api/v1/deployments"),
+            ("DELETE", "/api/v1/deployments/user-record"),
+        ])
+
+    async def test_remove_deletes_saved_deployment_without_manager_entry(self) -> None:
+        requests = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/api/state":
+                # A saved deployment that was never launched has no Manager
+                # entry, so it is absent from Manager state entirely.
+                return httpx.Response(200, json={"deployments": []})
+            if request.url.path == "/api/v1/deployments":
+                return httpx.Response(200, json={"items": [{
+                    "id": "saved-1", "managed_by": None,
+                    "settings": {},
+                }]})
+            return httpx.Response(200, json={"ok": True, "id": "saved-1"})
+
+        client = ControllerClient(transport=httpx.MockTransport(handler))
+        result = await client.action("saved-1", "remove")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(requests, [
             ("GET", "/api/state"),
-            ("POST", "/api/deployments/user-1/remove"),
+            ("GET", "/api/v1/deployments"),
+            ("DELETE", "/api/v1/deployments/saved-1"),
         ])
 
     async def test_deployment_configuration_and_lifecycle_use_stable_v1_id(self) -> None:
@@ -85,7 +110,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         async def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content) if request.content else None
             requests.append((request.method, request.url.path, body))
-            if request.method == "POST":
+            if request.method in {"POST", "DELETE"}:
                 timeouts.append((
                     request.url.path,
                     request.extensions["timeout"]["read"],
@@ -143,7 +168,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
             }),
             ("POST", "/api/v1/deployments/record-1/start", None),
             ("POST", "/api/v1/deployments/record-1/stop", None),
-            ("POST", "/api/deployments/manager-1/remove", None),
+            ("DELETE", "/api/v1/deployments/record-1", None),
         ])
         self.assertEqual(
             sum(path == "/api/v1/deployments" for _, path, _ in requests), 5,
@@ -154,7 +179,7 @@ class ControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeouts, [
             ("/api/v1/deployments/record-1/start", 1800),
             ("/api/v1/deployments/record-1/stop", 300),
-            ("/api/deployments/manager-1/remove", 300),
+            ("/api/v1/deployments/record-1", 300),
         ])
 
     async def test_legacy_manager_id_is_reconciled_before_v1_action(self) -> None:
@@ -741,6 +766,28 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "ctx", tools["run_cluster_ab_test"].input_schema.get("properties", {})
         )
+
+    async def test_list_deployments_tool_reads_the_v1_catalog(self) -> None:
+        calls = []
+
+        class FakeClient:
+            async def deployment_catalog(self):
+                calls.append("catalog")
+                return [
+                    {"id": "manager-1", "status": "ready"},
+                    {"id": "saved-1", "status": "stopped"},
+                ]
+
+            async def state(self):
+                calls.append("state")
+                return {"deployments": [{"id": "manager-1", "status": "ready"}]}
+
+        server = build_server(FakeClient())
+        await server.call_tool("list_cluster_deployments", {})
+
+        # Manager state hides saved-but-never-launched deployments, so the
+        # listing tool must not fall back to it.
+        self.assertEqual(calls, ["catalog"])
 
     async def test_deployment_configuration_and_lifecycle_tools_delegate(self) -> None:
         calls = []

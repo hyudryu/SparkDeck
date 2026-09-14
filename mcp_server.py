@@ -185,6 +185,19 @@ class ControllerClient:
             raise ControllerError(f"deployment not found: {deployment_id}")
         return deployment
 
+    async def deployment_catalog(self) -> list[dict[str, Any]]:
+        """Return the controller's public deployment catalog.
+
+        The catalog reconciles Manager state with the saved records, so it also
+        holds deployments that were saved but never launched. Those have no
+        Manager entry and therefore never appear in Manager state.
+        """
+        catalog = await self._request("GET", "/api/v1/deployments")
+        items = catalog.get("items") if isinstance(catalog, dict) else None
+        if not isinstance(items, list):
+            raise ControllerError("controller returned an invalid deployment catalog")
+        return [item for item in items if isinstance(item, dict)]
+
     async def _deployment_record_id(self, deployment_id: str) -> str:
         """Resolve either a Manager ID or stable SparkDeck record ID."""
         state = await self.state()
@@ -202,10 +215,7 @@ class ControllerClient:
         # reconciliation and gives pre-stable-ID deployments a record ID on
         # their first MCP request. The catalog also stays authoritative when
         # Manager replaces a deployment during a configuration relaunch.
-        catalog = await self._request("GET", "/api/v1/deployments")
-        records = catalog.get("items") if isinstance(catalog, dict) else None
-        if not isinstance(records, list):
-            raise ControllerError("controller returned an invalid deployment catalog")
+        records = await self.deployment_catalog()
         manager_id = (
             str(manager_deployment.get("id"))
             if isinstance(manager_deployment, dict) and manager_deployment.get("id")
@@ -218,7 +228,7 @@ class ControllerClient:
         )
         record = next((
             item for item in records
-            if isinstance(item, dict) and (
+            if (
                 str(item.get("id") or "") == deployment_id
                 or (reverse_id and str(item.get("id") or "") == reverse_id)
                 or (
@@ -336,14 +346,16 @@ class ControllerClient:
         node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if action == "remove":
-            # Preserve the legacy Manager removal contract used by A/B cleanup
-            # and delete_cluster_deployment. v1 record deletion has a distinct
-            # DELETE route and must not be conflated with start/stop actions.
-            await self._deployment_record_id(deployment_id)
-            deployment = await self.deployment(deployment_id)
+            # v1 record deletion owns the whole removal: it takes the record's
+            # lifecycle lock, removes the Manager deployment linked to it, and
+            # then drops the saved record. The legacy Manager route
+            # (/api/deployments/{manager_id}/remove) can only reach a
+            # deployment that still has a Manager entry, so a deployment that
+            # was saved but never launched could not be removed through it even
+            # though it is listed in the catalog.
+            record_id = await self._deployment_record_id(deployment_id)
             return await self._request(
-                "POST",
-                f"/api/deployments/{quote(str(deployment['id']), safe='')}/remove",
+                "DELETE", f"/api/v1/deployments/{quote(record_id, safe='')}",
                 timeout=300,
             )
         if action not in {"start", "stop"}:
@@ -974,8 +986,13 @@ def build_server(
 
     @server.tool()
     async def list_cluster_deployments() -> list[dict[str, Any]]:
-        """List deployments with IDs, status, launch controls, ownership, and API ports."""
-        return (await client.state()).get("deployments", [])
+        """List every deployment in the catalog with ID, status, ownership, and API port.
+
+        This reads the deployment catalog, not Manager state, so it also lists
+        deployments that were saved but never launched. Those have no Manager
+        entry and are absent from ``get_cluster_state``.
+        """
+        return await client.deployment_catalog()
 
     @server.tool()
     async def get_cluster_deployment(deployment_id: str) -> dict[str, Any]:

@@ -6315,5 +6315,36 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         instance.node_registry.remove.assert_called_once_with("remote-1")
 
 
+class MemberActionIdempotencyTests(unittest.TestCase):
+    """A stop whose container is already gone has reached its end state."""
+
+    def test_stop_tolerates_a_rank_that_vanished_before_the_stop(self) -> None:
+        errors = Manager._member_action_errors(
+            [RuntimeError(
+                'gx10-node-2 agent error: HTTP 404: '
+                '{"detail":"managed container not found"}'
+            )],
+            "stop",
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_stop_still_reports_a_real_member_failure(self) -> None:
+        errors = Manager._member_action_errors(
+            [RuntimeError("agent disconnected")], "stop",
+        )
+
+        self.assertEqual(errors, ["agent disconnected"])
+
+    def test_start_never_treats_a_missing_container_as_success(self) -> None:
+        # A start must recreate or fail loudly; only stops and removals have
+        # "the container is absent" as their desired end state.
+        errors = Manager._member_action_errors(
+            [RuntimeError("managed container not found")], "start",
+        )
+
+        self.assertEqual(errors, ["managed container not found"])
+
+
 if __name__ == "__main__":
     unittest.main()

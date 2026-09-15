@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import tempfile
 import unittest
@@ -1098,6 +1099,133 @@ class WorkerSchedulerTests(unittest.IsolatedAsyncioTestCase):
             manager.inference_nudger_task, manager.temperature_history_task,
             return_exceptions=True,
         )
+
+
+class StaleStopIntentReservationTests(unittest.IsolatedAsyncioTestCase):
+    """A persisted stop frees the nodes a stale Manager intent still held.
+
+    A Manager-only launch can revive a cluster while the SparkDeck record keeps
+    the stop the operator requested. Nothing runs, yet every node stays
+    reserved and the health monitor retries a stop that can never complete.
+    """
+
+    NODES = ["local", "worker-1", "worker-2", "worker-3"]
+
+    def fixture(
+        self, *, member_statuses, cluster_status="degraded",
+        cluster_desired="running", record_desired="stopped",
+    ):
+        manager = FakeManager()
+        manager._save_deployments = Mock()
+        deployment = {
+            "id": "old-manager", "sparkdeck_record_id": "record-1",
+            "status": cluster_status, "desired_state": cluster_desired,
+            "mode": "sharded", "node_ids": list(self.NODES),
+            "members": [
+                {
+                    "node_id": node_id, "container_name": f"rank-{index}",
+                    "rank": index, "status": status,
+                }
+                for index, (node_id, status) in enumerate(
+                    zip(self.NODES, member_statuses)
+                )
+            ],
+        }
+        manager.deployments = [deployment]
+        service = SparkDeckService(manager, Path(self.directory.name))
+        service.store.add_deployment(
+            Deployment(
+                id="record-1", alias="friendly", runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                container_name="rank-0", desired_state=record_desired,
+                settings={
+                    "context_length": 8192,
+                    "node_ids": list(self.NODES),
+                    "manager_deployment_id": "old-manager",
+                },
+            ),
+            "http://127.0.0.1:8000",
+        )
+        self.assertEqual(
+            service.store.deployment("record-1")["desired_state"], record_desired,
+        )
+        self._open.append((service, manager))
+        return manager, service, deployment
+
+    async def test_persisted_stop_frees_nodes_held_by_a_stale_running_intent(self):
+        manager, service, deployment = self.fixture(
+            member_statuses=("exited", "missing", "missing", "exited"),
+        )
+        manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], [])
+        self.assertEqual(deployment["desired_state"], "stopped")
+        self.assertTrue(all(
+            member["desired_state"] == "stopped"
+            for member in deployment["members"]
+        ))
+        # The corrected intent must survive the next Manager restart, otherwise
+        # the nodes are pinned again by the recovered stale running state.
+        manager._save_deployments.assert_called()
+
+    async def test_serialized_state_copy_still_corrects_the_durable_cluster(self):
+        manager, service, deployment = self.fixture(
+            member_statuses=("exited", "missing", "missing", "exited"),
+        )
+        manager.get_state = AsyncMock(
+            return_value={"deployments": [copy.deepcopy(deployment)]},
+        )
+
+        listed = await service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], [])
+        self.assertEqual(deployment["desired_state"], "stopped")
+
+    async def test_a_live_rank_keeps_its_nodes_and_the_manager_intent(self):
+        manager, service, deployment = self.fixture(
+            member_statuses=("exited", "running", "missing", "missing"),
+        )
+        manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], sorted(self.NODES))
+        self.assertEqual(deployment["desired_state"], "running")
+
+    async def test_in_flight_generation_is_never_converged(self):
+        manager, service, deployment = self.fixture(
+            member_statuses=("missing",) * 4, cluster_status="starting",
+        )
+        manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], sorted(self.NODES))
+        self.assertEqual(deployment["desired_state"], "running")
+        manager._save_deployments.assert_not_called()
+
+    async def test_running_record_intent_keeps_its_nodes_for_recovery(self):
+        manager, service, deployment = self.fixture(
+            member_statuses=("exited",) * 4, record_desired="running",
+        )
+        manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], sorted(self.NODES))
+        self.assertEqual(deployment["desired_state"], "running")
+
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self._open: list[tuple[SparkDeckService, FakeManager]] = []
+
+    async def asyncTearDown(self):
+        for service, manager in self._open:
+            await service.close()
+            await manager.http.aclose()
+        self.directory.cleanup()
 
 
 if __name__ == "__main__":

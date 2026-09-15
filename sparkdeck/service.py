@@ -34,7 +34,6 @@ from .catalog import (
     canonical_quantization,
     quantization_from_text,
 )
-from .codex_models import codex_model
 from .envfile_settings import (
     EnvFileConflictError,
     apply_env_updates,
@@ -47,11 +46,6 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 from .runtime_file_mounts import normalize_runtime_file_mounts
 from .stream_cleanup import close_async_stream
 from .prompt_gate import PromptGates
-from .live_metrics import (
-    DEFAULT_HISTORY_ENABLED,
-    DEFAULT_HISTORY_SAMPLE_SECONDS,
-    LiveHistory,
-)
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -415,21 +409,6 @@ class SparkDeckService:
             lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
         )
         self.manager.prompt_gate = self.prompt_gate
-        # Trailing throughput history for the History panel.  The manager keeps
-        # owning live request tracking; this observer only reads those records.
-        # Its cadence and its on/off switch are live settings, so the collector
-        # asks for them on every tick rather than caching them at construction:
-        # turning history off has to stop the work immediately.
-        self.history = LiveHistory(
-            self.manager,
-            interval_provider=lambda: self.store.get_setting(
-                "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
-            ),
-            enabled_provider=lambda: bool(
-                self.store.get_setting("history_enabled", DEFAULT_HISTORY_ENABLED)
-            ),
-        )
-        self.manager.live_history = self.history
         self.manager._prompt_observation_dispatch = self._activate_group_observation
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
@@ -482,7 +461,6 @@ class SparkDeckService:
                 log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
-        await self.history.stop()
         refreshes = list(getattr(self, "_source_routing_refresh_tasks", {}).values())
         for refresh in refreshes:
             refresh.cancel()
@@ -1154,6 +1132,21 @@ class SparkDeckService:
                 if stored_desired != "running":
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
+            elif _reconcile_stale_running_intent(
+                _live_manager_cluster(raw_manager_deployments, cluster),
+                stored_desired,
+            ):
+                # The record keeps the operator's stop, so the Manager intent is
+                # the stale half of the disagreement. Correcting it releases the
+                # held nodes now and stops the health monitor from re-running a
+                # stop that can never complete.
+                cluster["desired_state"] = "stopped"
+                for member in cluster.get("members") or []:
+                    if isinstance(member, dict):
+                        member["desired_state"] = "stopped"
+                save_deployments = getattr(self.manager, "_save_deployments", None)
+                if callable(save_deployments):
+                    save_deployments()
             stored["status"] = _deployment_status(cluster.get("status"))
             if cluster in (cluster_state.get("deployments") or []):
                 occupied = _observed_occupied_node_ids(cluster)
@@ -1177,11 +1170,7 @@ class SparkDeckService:
                 public_settings["max_concurrency"] = launch_controls["max_concurrency"]
             stored["settings"] = public_settings
             if cluster.get("error"):
-                cluster_error = str(cluster["error"])
-                if _stale_missing_container_error(cluster, cluster_error):
-                    stored["last_error"] = None
-                else:
-                    stored["last_error"] = cluster_error
+                stored["last_error"] = str(cluster["error"])
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             if cluster.get("mode") == "grouped_sharded":
                 stored["instances"] = _grouped_instance_summary(cluster)
@@ -6734,10 +6723,7 @@ class SparkDeckService:
                     "artifact": None, "quantization": None,
                 },
             })
-        return {
-            "object": "list", "data": data,
-            "models": [codex_model(item["id"]) for item in data],
-        }
+        return {"object": "list", "data": data}
 
     def _deployment_public_model_ids(self, deployment: dict[str, Any]) -> list[str]:
         """Return the request ids explicitly served by one deployment.
@@ -8309,33 +8295,6 @@ def _deployment_status(value: Any) -> str:
     return "unknown"
 
 
-_MISSING_CONTAINER_ERROR_MARKERS = (
-    "no such container",
-    "managed container not found",
-    "cluster member not found",
-)
-
-
-def _missing_container_error(error: Any) -> bool:
-    text = str(error or "").casefold()
-    return any(marker in text for marker in _MISSING_CONTAINER_ERROR_MARKERS)
-
-
-def _stale_missing_container_error(cluster: dict[str, Any], error: str) -> bool:
-    """Whether a recorded error only reports an absent container for a
-    stopped deployment that never successfully launched.
-
-    Such a deployment owns no containers, so a Docker/agent 404 from probing
-    or stopping one is the expected state, not a persistent error worth
-    surfacing on the card.
-    """
-    return (
-        _missing_container_error(error)
-        and cluster.get("desired_state") == "stopped"
-        and not cluster.get("last_deployed_at")
-    )
-
-
 def _deployment_process_lost(cluster: dict[str, Any], instance: Any = None) -> bool:
     """Distinguish confirmed rank loss/health recovery from readiness or outages."""
     if cluster.get("desired_state") == "stopped" or cluster.get("status") in {"stopped", "stopping"}:
@@ -8383,6 +8342,75 @@ def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> boo
     )
 
 
+_ABSENT_MEMBER_STATUSES = {"exited", "stopped", "dead", "missing"}
+_IN_FLIGHT_CLUSTER_STATUSES = {"launching", "starting", "stopping", "recovering"}
+
+
+def _observed_absent_ranks(cluster: dict[str, Any]) -> bool:
+    """True when every rank is observed absent with no recreate pending.
+
+    An empty or unreadable member list proves nothing, so it never counts as
+    absence: stale members must not be mistaken for a stopped generation.
+    """
+    members = cluster.get("members")
+    if not isinstance(members, list) or not members:
+        return False
+    return all(
+        isinstance(member, dict)
+        and member.get("status") in _ABSENT_MEMBER_STATUSES
+        and not member.get("recreate_pending")
+        for member in members
+    )
+
+
+def _reconcile_stale_running_intent(
+    cluster: dict[str, Any], stored_desired: str | None,
+) -> bool:
+    """Correct a Manager running intent that outlived the operator's stop.
+
+    A Manager-only launch (automation, promotion, or the legacy action route)
+    can revive a cluster while the SparkDeck record keeps the persisted stop
+    the operator requested. The deployment then reports "stopped" and still
+    pins every node it holds: the stale running intent keeps it inside the
+    health monitor's recovery set, so an aborted stop is retried forever and
+    ``_observed_occupied_node_ids`` never releases the nodes.
+
+    Once nothing is observed running there is nothing left to interrupt, so
+    the record's stop wins and the Manager intent is corrected in place. Live
+    or in-flight ranks are never touched: they still need their reservation
+    and the operator's next explicit action.
+
+    Returns True when the cluster intent changed.
+    """
+    if stored_desired != "stopped" or cluster.get("desired_state") != "running":
+        return False
+    if cluster.get("status") in _IN_FLIGHT_CLUSTER_STATUSES:
+        return False
+    if not _observed_absent_ranks(cluster):
+        return False
+    cluster["desired_state"] = "stopped"
+    for member in cluster.get("members") or []:
+        if isinstance(member, dict):
+            member["desired_state"] = "stopped"
+    return True
+
+
+def _live_manager_cluster(
+    items: list[Any], cluster: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the durable Manager cluster behind a serialized state copy."""
+    cluster_id = cluster.get("id")
+    if not cluster_id:
+        return cluster
+    return next(
+        (
+            item for item in items
+            if isinstance(item, dict) and item.get("id") == cluster_id
+        ),
+        cluster,
+    )
+
+
 def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
     """Reserve online live ranks without claiming stopped or offline peers.
 
@@ -8411,16 +8439,9 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
             by_node.setdefault(member["node_id"], []).append(member)
     for node_id, ranks in by_node.items():
         idle = all(
-            # "error" is a persisted launch-failure marker: the rank's
-            # container was never created (or was rolled back), so with stopped
-            # intent it holds no reservation. Its stale failed-stop bookkeeping
-            # (for example a pre-fix phantom 404) must not pin the node either.
-            member.get("status") in {"exited", "stopped", "dead", "missing", "error"}
+            member.get("status") in {"exited", "stopped", "dead", "missing"}
             and not member.get("recreate_pending")
-            and (
-                not member.get("failed_stop_error")
-                or member.get("status") == "error"
-            )
+            and not member.get("failed_stop_error")
             and (
                 (member.get("desired_state") or cluster.get("desired_state")) == "stopped"
                 or cluster.get("status") == "stopped"

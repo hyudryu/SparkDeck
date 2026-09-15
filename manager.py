@@ -7663,28 +7663,39 @@ class Manager:
         return lock
 
     @staticmethod
+    def _member_already_absent(result: Any) -> bool:
+        """True when a lifecycle error only proves the container is gone."""
+        message = str(result).lower()
+        return any(
+            marker in message
+            for marker in (
+                "cluster member not found",
+                "managed container not found",
+                "no such container",
+            )
+        )
+
+    @staticmethod
     def _member_action_errors(results: list[Any], action: str) -> list[str]:
-        """Return actionable member errors, keeping DELETE idempotent.
+        """Return actionable member errors, keeping remove and stop idempotent.
 
         Older node agents return 404 after a cluster member has already been
         removed. That is the desired end state for a remove action, so it must
         not leave an undeletable deployment card behind.
+
+        A stop has the same end state: a rank whose container vanished before
+        the stop was issued cannot be stopped, and reporting that as a failure
+        would strand the deployment. A recorded per-rank stop failure blocks
+        the node reservation from ever being released, so the ranks would stay
+        pinned by a deployment that has nothing left running.
         """
         errors = []
         for result in results:
             if not isinstance(result, Exception):
                 continue
-            message = str(result)
-            already_absent = action == "remove" and any(
-                marker in message.lower()
-                for marker in (
-                    "cluster member not found",
-                    "managed container not found",
-                    "no such container",
-                )
-            )
-            if not already_absent:
-                errors.append(message)
+            if action in {"remove", "stop"} and Manager._member_already_absent(result):
+                continue
+            errors.append(str(result))
         return errors
 
     async def remove_orphaned_deployment_members(

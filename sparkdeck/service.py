@@ -1132,6 +1132,21 @@ class SparkDeckService:
                 if stored_desired != "running":
                     self.store.update_desired_state(stored["id"], "running")
                 stored["desired_state"] = "running"
+            elif _reconcile_stale_running_intent(
+                _live_manager_cluster(raw_manager_deployments, cluster),
+                stored_desired,
+            ):
+                # The record keeps the operator's stop, so the Manager intent is
+                # the stale half of the disagreement. Correcting it releases the
+                # held nodes now and stops the health monitor from re-running a
+                # stop that can never complete.
+                cluster["desired_state"] = "stopped"
+                for member in cluster.get("members") or []:
+                    if isinstance(member, dict):
+                        member["desired_state"] = "stopped"
+                save_deployments = getattr(self.manager, "_save_deployments", None)
+                if callable(save_deployments):
+                    save_deployments()
             stored["status"] = _deployment_status(cluster.get("status"))
             if cluster in (cluster_state.get("deployments") or []):
                 occupied = _observed_occupied_node_ids(cluster)
@@ -8324,6 +8339,75 @@ def _deployment_recreating(cluster: dict[str, Any], instance: Any = None) -> boo
         for member in cluster.get("members") or []
         if isinstance(member, dict)
         and (instance is None or str(member.get("instance_id") or 0) == str(instance))
+    )
+
+
+_ABSENT_MEMBER_STATUSES = {"exited", "stopped", "dead", "missing"}
+_IN_FLIGHT_CLUSTER_STATUSES = {"launching", "starting", "stopping", "recovering"}
+
+
+def _observed_absent_ranks(cluster: dict[str, Any]) -> bool:
+    """True when every rank is observed absent with no recreate pending.
+
+    An empty or unreadable member list proves nothing, so it never counts as
+    absence: stale members must not be mistaken for a stopped generation.
+    """
+    members = cluster.get("members")
+    if not isinstance(members, list) or not members:
+        return False
+    return all(
+        isinstance(member, dict)
+        and member.get("status") in _ABSENT_MEMBER_STATUSES
+        and not member.get("recreate_pending")
+        for member in members
+    )
+
+
+def _reconcile_stale_running_intent(
+    cluster: dict[str, Any], stored_desired: str | None,
+) -> bool:
+    """Correct a Manager running intent that outlived the operator's stop.
+
+    A Manager-only launch (automation, promotion, or the legacy action route)
+    can revive a cluster while the SparkDeck record keeps the persisted stop
+    the operator requested. The deployment then reports "stopped" and still
+    pins every node it holds: the stale running intent keeps it inside the
+    health monitor's recovery set, so an aborted stop is retried forever and
+    ``_observed_occupied_node_ids`` never releases the nodes.
+
+    Once nothing is observed running there is nothing left to interrupt, so
+    the record's stop wins and the Manager intent is corrected in place. Live
+    or in-flight ranks are never touched: they still need their reservation
+    and the operator's next explicit action.
+
+    Returns True when the cluster intent changed.
+    """
+    if stored_desired != "stopped" or cluster.get("desired_state") != "running":
+        return False
+    if cluster.get("status") in _IN_FLIGHT_CLUSTER_STATUSES:
+        return False
+    if not _observed_absent_ranks(cluster):
+        return False
+    cluster["desired_state"] = "stopped"
+    for member in cluster.get("members") or []:
+        if isinstance(member, dict):
+            member["desired_state"] = "stopped"
+    return True
+
+
+def _live_manager_cluster(
+    items: list[Any], cluster: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the durable Manager cluster behind a serialized state copy."""
+    cluster_id = cluster.get("id")
+    if not cluster_id:
+        return cluster
+    return next(
+        (
+            item for item in items
+            if isinstance(item, dict) and item.get("id") == cluster_id
+        ),
+        cluster,
     )
 
 

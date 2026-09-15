@@ -1,4 +1,10 @@
-"""Secure, durable model-cache transfers between SparkDeck nodes."""
+"""Secure, durable model-cache transfers between SparkDeck nodes.
+
+The transfer queue copies between independent node pairs at the same time. A
+queued job waits while any node it names as its source or destination is
+already occupied by a running job, so one node's disk and link carry a single
+copy at a time.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ import shutil
 import secrets
 import stat
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -160,6 +167,37 @@ def _default_comfyui_model_roots() -> list[Path]:
             seen.add(key)
             roots.append(expanded)
     return roots
+
+
+def holds_requested_revision(
+    model: dict[str, Any] | None, resolved_revision: str | None,
+    requested_revision: str | None,
+) -> bool:
+    """Return whether a cache holds the weights a resolved revision asks for.
+
+    ``resolved_revision`` is the immutable commit the Hub currently resolves
+    ``requested_revision`` to, so a complete snapshot of that commit is exactly
+    the requested weight set.  The cache's own revision aliases can only veto
+    the answer when one of them records the requested ref as some other
+    snapshot; a ref the cache never recorded is not a conflict.  Caches
+    materialized by a plain copy, by an older transfer, or by a download
+    interrupted after its snapshot landed carry no refs at all, and treating
+    that as "weights missing" would both misreport a node that demonstrably
+    holds them and leave a plan with no transfer source to fill the nodes that
+    really are empty.
+    """
+    if not model or not resolved_revision:
+        return False
+    if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+        return False
+    if not requested_revision or requested_revision == resolved_revision:
+        return True
+    if requested_revision in (model.get("partial_revision_refs") or {}):
+        # The cache's own ref resolves to an incomplete snapshot, which is not
+        # the commit the request resolved to.
+        return False
+    recorded = (model.get("revision_refs") or {}).get(requested_revision)
+    return recorded is None or recorded == resolved_revision
 
 
 def partial_download_size_bytes(
@@ -524,6 +562,62 @@ def _transfer_operation(method):
     return guarded
 
 
+_FOREIGN_OWNER_REASON = (
+    "the cached files are owned by another user (model containers run as root "
+    "and write into the mounted Hugging Face cache)"
+)
+
+
+def _current_user_id() -> int | None:
+    """Return this process's POSIX user id, or ``None`` where unsupported."""
+    getuid = getattr(os, "getuid", None)
+    return getuid() if getuid is not None else None
+
+
+def _metadata_owner_id(metadata: os.stat_result) -> int | None:
+    """Return the owning POSIX user id of an ``lstat`` result, if it has one."""
+    return getattr(metadata, "st_uid", None)
+
+
+def _remove_repository_with_privilege(repository: Path, hub: Path) -> None:
+    """Remove a cache tree that contains entries owned by another user.
+
+    Model containers run as root, and SparkDeck mounts the host Hugging Face
+    cache into them, so a repository that has ever been served accumulates
+    root-owned hub metadata (``refs``, ``.no_exist``, ``trees``). Only the
+    owner may ``chmod`` a path, so permission repair cannot unlock those and
+    the unprivileged agent cannot unlink them. The repository is therefore
+    removed through the node's passwordless sudo.
+
+    The target is re-validated here, immediately before elevating, so this
+    privileged removal can only ever act on the repository itself: a real
+    directory whose resolved parent is the Hugging Face hub. The path is
+    passed as one argv element and never through a shell.
+    """
+    if repository.is_symlink() or not repository.is_dir():
+        raise ValueError("cached model repository is not a safe directory")
+    if repository.resolve().parent != hub:
+        raise ValueError("model cache path escapes the Hugging Face hub")
+    sudo = shutil.which("sudo")
+    if not sudo:
+        raise RuntimeError(
+            "could not delete cached model files; " + _FOREIGN_OWNER_REASON
+            + " and passwordless sudo is unavailable"
+        )
+    completed = subprocess.run(
+        [sudo, "-n", "rm", "-rf", "--", str(repository)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+    )
+    if completed.returncode == 0 and not repository.exists():
+        return
+    detail = (completed.stderr or completed.stdout or "").strip()
+    raise RuntimeError(
+        "could not delete cached model files; " + _FOREIGN_OWNER_REASON
+        + " and passwordless sudo could not remove them"
+        + (f" ({detail})" if detail else "")
+    )
+
+
 class VirtualNAS:
     """Inventory, safe file streaming, and the controller's durable transfer queue."""
 
@@ -549,6 +643,7 @@ class VirtualNAS:
         self._wake = asyncio.Event()
         self._dispatcher: asyncio.Task | None = None
         self._active: dict[str, asyncio.Task] = {}
+        self._active_endpoints: dict[str, frozenset[str]] = {}
         self._direct_export_capabilities: dict[str, dict[str, Any]] = {}
         self._peer_imports: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -611,7 +706,14 @@ class VirtualNAS:
         model: dict[str, Any], resolved_revision: str,
         requested_revision: str | None = None,
     ) -> bool:
-        if model.get("partial") or resolved_revision not in (model.get("revisions") or []):
+        """Return whether a cache already reflects the requested revision ref.
+
+        Stricter than :func:`holds_requested_revision` by one alias check, and
+        deliberately so: the Hub download path uses this to decide whether a
+        cache still needs its ref written, so a ref the cache never recorded
+        must keep that download running instead of short-circuiting it.
+        """
+        if not holds_requested_revision(model, resolved_revision, requested_revision):
             return False
         if not requested_revision or requested_revision == resolved_revision:
             return True
@@ -770,6 +872,7 @@ class VirtualNAS:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()
+        self._active_endpoints.clear()
 
     def list_transfers(self) -> dict[str, Any]:
         return {"items": [dict(job) for job in self.jobs]}
@@ -2508,17 +2611,20 @@ class VirtualNAS:
                 _is_complete_repository(repository)
                 or not has_external_copy
             ):
-                self._delete_cached_repository(repository)
+                self._delete_cached_repository(repository, hub)
                 return {"ok": True, "model_id": model_id}
             # The hub copy is partial residue while inventory displays the
             # complete external install: delete the externally managed files.
         return self._delete_external_model(model_id)
 
     @staticmethod
-    def _delete_cached_repository(repository: Path) -> None:
+    def _delete_cached_repository(repository: Path, hub: Path) -> None:
         """Delete a validated cache tree, repairing exact failed paths."""
 
-        def repair_failed_path(_function, raw_path, exc_info) -> None:
+        current_uid = _current_user_id()
+        foreign_owned: list[Path] = []
+
+        def repair_failed_path(function, raw_path, exc_info) -> None:
             path = Path(raw_path)
             try:
                 metadata = path.lstat()
@@ -2530,10 +2636,31 @@ class VirtualNAS:
                     raise OSError(
                         "refusing to change permissions through a link or reparse point"
                     )
-                permissions = stat.S_IWUSR
-                if stat.S_ISDIR(metadata.st_mode):
-                    permissions |= stat.S_IRUSR | stat.S_IXUSR
-                path.chmod(metadata.st_mode | permissions)
+                repairs = [(path, metadata)]
+                # Removing an entry needs write access to the directory that
+                # holds it, and rmtree reports the entry rather than that
+                # directory. Repair the parent too, but never above the
+                # repository this call already validated.
+                if function in {os.rmdir, os.unlink}:
+                    parent = path.parent
+                    if parent != repository and parent.is_relative_to(repository):
+                        repairs.append((parent, parent.lstat()))
+                for candidate, candidate_metadata in repairs:
+                    owner = _metadata_owner_id(candidate_metadata)
+                    if (
+                        current_uid is not None
+                        and owner is not None
+                        and owner != current_uid
+                    ):
+                        # Only the owner may change a path's mode, so an entry
+                        # written by root cannot be repaired from this process.
+                        foreign_owned.append(candidate)
+                        raise OSError("cached model entry is owned by another user")
+                for candidate, candidate_metadata in repairs:
+                    permissions = stat.S_IWUSR
+                    if stat.S_ISDIR(candidate_metadata.st_mode):
+                        permissions |= stat.S_IRUSR | stat.S_IXUSR
+                    candidate.chmod(candidate_metadata.st_mode | permissions)
             except OSError as repair_error:
                 raise repair_error from exc_info[1]
 
@@ -2548,10 +2675,14 @@ class VirtualNAS:
             if repository.exists():
                 raise PermissionError("cached model repository remains")
         except OSError as exc:
-            raise RuntimeError(
-                "could not delete cached model files; check cache ownership "
-                "and permissions"
-            ) from exc
+            if not foreign_owned:
+                raise RuntimeError(
+                    "could not delete cached model files; check cache ownership "
+                    "and permissions"
+                ) from exc
+            # A root-writing model container leaves root-owned hub metadata in
+            # the cache this node mounts into it; that needs privilege to go.
+            _remove_repository_with_privilege(repository, hub)
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.
@@ -2648,7 +2779,7 @@ class VirtualNAS:
             (
                 item for item in source_inventory
                 if item.get("model_id") == model_id
-                and (not revision or self._has_revision(
+                and (not revision or holds_requested_revision(
                     item, revision, requested_revision,
                 ))
             ),
@@ -2876,7 +3007,7 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == model_id
-                and self._has_revision(item, revision, requested_revision)
+                and holds_requested_revision(item, revision, requested_revision)
             ), None)
             if source_model is None:
                 raise LookupError("cached source model revision not found")
@@ -3113,41 +3244,70 @@ class VirtualNAS:
             "free_size": (payload or {}).get("free_size"),
         }
 
+    @staticmethod
+    def _job_endpoints(job: dict[str, Any]) -> frozenset[str]:
+        """Cluster nodes one queue job occupies for as long as it runs.
+
+        A Hub download reads from Hugging Face instead of a paired node, so it
+        occupies only the node that receives the weights.
+        """
+        endpoints = {job["target_node_id"]}
+        source = job.get("source_node_id")
+        if source and job.get("kind") != "download":
+            endpoints.add(source)
+        return frozenset(endpoints)
+
+    def _busy_nodes(self) -> set[str]:
+        """Cluster nodes already occupied by a running job at either endpoint."""
+        busy: set[str] = set()
+        for endpoints in self._active_endpoints.values():
+            busy |= endpoints
+        return busy
+
+    def _next_queue_job(self, busy: set[str]) -> dict[str, Any] | None:
+        """Oldest queued job whose dependency and cluster nodes are free."""
+        for candidate in self.jobs:
+            if candidate["status"] != "queued":
+                continue
+            dependency_id = candidate.get("depends_on_job_id")
+            if dependency_id:
+                dependency = next((
+                    item for item in self.jobs
+                    if item["id"] == dependency_id
+                ), None)
+                if dependency is None or dependency["status"] in {"failed", "canceled"}:
+                    candidate["status"] = "failed"
+                    candidate["completed_at"] = time.time()
+                    candidate["error"] = "required source download did not complete"
+                    self._save()
+                    continue
+                if dependency["status"] != "completed":
+                    continue
+            if self._job_endpoints(candidate) & busy:
+                continue
+            return candidate
+        return None
+
     async def _dispatch_loop(self) -> None:
         try:
             while True:
                 for target, task in list(self._active.items()):
                     if task.done():
                         self._active.pop(target, None)
-                # A single global transfer prevents a multi-target copy from
-                # saturating the source disk and cluster network.
-                if not self._active and not self._update_reserved:
-                    job = None
-                    for candidate in self.jobs:
-                        if candidate["status"] != "queued":
-                            continue
-                        dependency_id = candidate.get("depends_on_job_id")
-                        if dependency_id:
-                            dependency = next((
-                                item for item in self.jobs
-                                if item["id"] == dependency_id
-                            ), None)
-                            if dependency is None or dependency["status"] in {"failed", "canceled"}:
-                                candidate["status"] = "failed"
-                                candidate["completed_at"] = time.time()
-                                candidate["error"] = "required source download did not complete"
-                                self._save()
-                                continue
-                            if dependency["status"] != "completed":
-                                continue
-                        job = candidate
+                        self._active_endpoints.pop(target, None)
+                # Jobs on independent node pairs copy at the same time. A job
+                # waits while any node it names is already copying, so one
+                # node's disk and link still carry a single transfer.
+                while not self._update_reserved:
+                    job = self._next_queue_job(self._busy_nodes())
+                    if job is None:
                         break
-                    if job is not None:
-                        target = job["target_node_id"]
-                        runner = self._run_download if job.get("kind") == "download" else self._run_transfer
-                        task = asyncio.create_task(runner(job))
-                        self._active[target] = task
-                        task.add_done_callback(lambda _task: self._wake.set())
+                    target = job["target_node_id"]
+                    runner = self._run_download if job.get("kind") == "download" else self._run_transfer
+                    task = asyncio.create_task(runner(job))
+                    self._active[target] = task
+                    self._active_endpoints[target] = self._job_endpoints(job)
+                    task.add_done_callback(lambda _task: self._wake.set())
                 self._wake.clear()
                 try:
                     # Keep cancellation in this task. On Python 3.11 wait_for
@@ -3361,7 +3521,7 @@ class VirtualNAS:
             source_model = next((
                 item for item in source_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and (not job.get("revision") or self._has_revision(
+                and (not job.get("revision") or holds_requested_revision(
                     item, job["revision"],
                     job.get("requested_revision") or job["revision"],
                 ))
@@ -3540,7 +3700,7 @@ class VirtualNAS:
             imported_model = next((
                 item for item in imported_storage["models"]
                 if item.get("model_id") == job["model_id"]
-                and (not job.get("revision") or self._has_revision(
+                and (not job.get("revision") or holds_requested_revision(
                     item, job["revision"],
                     job.get("requested_revision") or job["revision"],
                 ))

@@ -262,7 +262,7 @@ Use it to:
 
 ![Storage transfer queue with illustrative progress](screenshots/readme/virtual-nas-transfer-dark.png)
 
-Virtual NAS does not expose arbitrary directories or local cache paths. Deletion is refused while a model is serving or involved in an active transfer. Keep both nodes online and verify enough free space before copying large weights.
+Virtual NAS does not expose arbitrary directories or local cache paths. Deletion is refused while a model is serving or involved in an active transfer. Copies between independent node pairs run at the same time, while a copy that names a node already reading or receiving a model waits for that node to finish. Keep both nodes online and verify enough free space before copying large weights.
 
 ## Settings
 

@@ -250,6 +250,7 @@ SparkDeck exposes the familiar model and completion routes:
 GET  /v1/models
 POST /v1/chat/completions
 POST /v1/completions
+POST /v1/responses
 ```
 
 For example:
@@ -263,6 +264,22 @@ curl http://localhost:7878/v1/chat/completions \
     "max_tokens": 64
   }'
 ```
+
+`GET /v1/models` returns both the OpenAI `object`/`data` envelope and a top-level
+`models` catalog with Codex metadata. Both catalogs list the same routable model IDs.
+
+`POST /v1/responses` adapts stateless Responses requests to the existing Chat
+Completions engines. It supports text and image input, instructions, streaming
+Responses events, function calls and tool results, and custom tools represented
+as function calls upstream. Model support for images and tools still depends on
+the selected runtime. Requests use the same routing, per-group prompt-processing
+limits, cancellation, and token accounting as `/v1/chat/completions`.
+
+Send full conversation history in `input` and use `store: false`. Stored response
+retrieval, `previous_response_id`, hosted tools, and background responses are not
+supported; unsupported requests return an error before inference. Tool calls are
+returned to the client for execution. Text deltas stream as they arrive; tool-call
+arguments are assembled before their Responses tool events are emitted.
 
 Requests made through SparkDeck can be queued, measured, and used to refresh the deployment idle timer. Calls made directly to a runtime's own port bypass SparkDeck and cannot be included in its benchmark history.
 
@@ -351,7 +368,7 @@ The MCP server exposes the same guarded Storage operations as the app:
 
 Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. ComfyUI weights listed in Storage can be deleted in place; recognized complete bundles can also be transferred.
 
-MCP-created deployments use the current `managed_by=sparkdeck-mcp` marker. SparkDeck continues to recognize the legacy `managed_by=vllm-controller-mcp` marker solely so deployments created by older releases can still be managed safely.
+MCP-created deployments are stamped with `managed_by=sparkdeck-mcp` so the app can show where a deployment came from. That marker is informational and never gates a tool: the MCP server can start, stop, reconfigure, and remove any deployment in the catalog, including deployments created in the app or by an older release.
 
 ## Service installation
 

@@ -1,6 +1,10 @@
 import type { Deployment, DeploymentInstance } from '../api/types'
 
 const ACTIVE = new Set(['running', 'ready', 'starting', 'launching', 'recovering', 'stopping', 'degraded', 'error', 'unknown'])
+// Aggregate states that can still hold live containers under stopped intent.
+// 'error'/'unknown' with stopped intent describe a failed launch or unreadable
+// inventory — no runtime reservation without controller-observed occupancy.
+const LIVE = new Set(['running', 'ready', 'starting', 'launching', 'recovering', 'stopping', 'degraded'])
 
 function requestedNodeIds(deployment: Deployment): string[] {
   if (deployment.node_ids?.length) return deployment.node_ids
@@ -24,6 +28,11 @@ export function occupiedNodeReasons(deployments: Deployment[], exceptId?: string
       for (const id of deployment.occupied_node_ids) reasons[id] = `Already used by deployment ${deployment.alias}`
       continue
     }
+    // A stopped-intent record in a terminal/idle aggregate state (failed
+    // launch, unreadable inventory) is a bookmark, not a workload: without
+    // controller-observed reservations it must not block a sibling profile
+    // sharing its nodes from starting.
+    if (deployment.desired_state === 'stopped' && !LIVE.has(deployment.status)) continue
     const groupOccupied = (group: DeploymentInstance) => ACTIVE.has(group.status)
       || (deployment.desired_state !== 'stopped' && group.desired_state === 'running')
     if (!ACTIVE.has(deployment.status) && !(deployment.desired_state === 'running' && deployment.instances?.some(groupOccupied))) continue

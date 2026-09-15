@@ -294,6 +294,39 @@ class GroupedShardedRoutingTests(unittest.TestCase):
             ["cluster-d1-r2-model"],
         )
 
+    def test_route_order_excludes_starting_groups(self) -> None:
+        manager = Manager.__new__(Manager)
+        deployment = grouped_deployment()
+        deployment["members"][2]["status"] = "starting"
+        deployment["members"][3]["status"] = "starting"
+        order = manager._cluster_route_order(deployment)
+        self.assertEqual(
+            [member["container_name"] for member in order],
+            ["cluster-d1-r0-model"],
+            "a still-starting group must not take traffic while another "
+            "group is already running",
+        )
+
+    def test_route_order_excludes_not_running_groups(self) -> None:
+        for status in ("queued", "creating", "unreachable", "missing", "unknown"):
+            with self.subTest(status=status):
+                manager = Manager.__new__(Manager)
+                deployment = grouped_deployment()
+                deployment["members"][2]["status"] = status
+                deployment["members"][3]["status"] = status
+                order = manager._cluster_route_order(deployment)
+                self.assertEqual(
+                    [member["container_name"] for member in order],
+                    ["cluster-d1-r0-model"],
+                )
+
+    def test_route_order_rejects_when_no_group_is_running(self) -> None:
+        manager = Manager.__new__(Manager)
+        deployment = grouped_deployment()
+        for member in deployment["members"]:
+            member["status"] = "starting"
+        self.assertEqual(manager._cluster_route_order(deployment), [])
+
     def test_sharded_members_do_not_collide_with_instance_keys(self) -> None:
         # instance_id 0 must key per instance, not fall through to the
         # container-name identity (``0 or default`` is falsy in Python).
@@ -399,6 +432,15 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         instance, _, _ = self.lifecycle_manager()
         with self.assertRaisesRegex(ValueError, "instance"):
             await instance.deployment_action("d1", "stop", instance=5)
+
+    async def test_proxy_rejects_when_every_group_is_starting(self) -> None:
+        instance, deployment, _ = self.lifecycle_manager()
+        for member in deployment["members"]:
+            member["status"] = "starting"
+        with self.assertRaisesRegex(LookupError, "no inference member"):
+            await instance.proxy_cluster_inference(
+                "d1", "org/model", {"messages": []}, "chat/completions",
+            )
 
     async def test_health_ignores_targeted_stopped_group(self) -> None:
         instance, deployment, _ = self.lifecycle_manager()

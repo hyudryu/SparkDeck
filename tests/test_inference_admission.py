@@ -50,6 +50,7 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
             "deployment_id": "deployment-a",
             "group_id": "deployment-a",
             "instance_id": None,
+            "node_ids": ["local"],
             "node_names": [],
         })
 
@@ -73,6 +74,23 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ClientAbort):
             await queued
+        self.assertEqual(
+            instance.inference_admission()["deployment-a"]["queued"], 0,
+        )
+        instance._release_inference_slot(target)
+
+    async def test_queued_request_times_out_instead_of_waiting_forever(self) -> None:
+        instance = self.manager()
+        target = await instance._acquire_inference_slot(container(), "model", None)
+        with mock.patch(
+            "manager.INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS", 0.05,
+        ):
+            queued = asyncio.create_task(instance._acquire_inference_slot(
+                container(), "model", None,
+            ))
+            with self.assertRaises(TimeoutError):
+                await queued
+        # The stale waiter removed itself from the queue.
         self.assertEqual(
             instance.inference_admission()["deployment-a"]["queued"], 0,
         )

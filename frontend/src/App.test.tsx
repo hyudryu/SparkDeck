@@ -412,7 +412,7 @@ describe('model discovery', () => {
     const user = userEvent.setup()
     const row = await screen.findByRole('button', { name: 'Expand org/model' })
     expect(row).toHaveTextContent('7B')
-    expect(row).toHaveTextContent('14 GB')
+    expect(row).toHaveTextContent('15 GB')
     expect(screen.queryByLabelText('Compatible runtimes')).not.toBeInTheDocument()
     await user.click(row)
     expect(within(screen.getByLabelText('Compatible runtimes')).getByText('vLLM')).toBeInTheDocument()
@@ -805,7 +805,7 @@ describe('model deployments', () => {
 
     render(<MemoryRouter><ModelsPage /></MemoryRouter>)
 
-    expect(await screen.findByText('2.0 GB each · 4.0 GB total on 2 nodes')).toBeInTheDocument()
+    expect(await screen.findByText('2.1 GB each · 4.3 GB total on 2 nodes')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Recipes' })).toBeInTheDocument()
     await user.click(await screen.findByRole('button', { name: 'org 1' }))
     expect(screen.getByText('Spark One, Spark Two')).toBeInTheDocument()
@@ -999,7 +999,7 @@ describe('model deployments', () => {
     await user.click(await within(dialog).findByRole('button', { name: 'Prepare selected nodes' }))
     const confirmation = await screen.findByRole('dialog', { name: 'Prepare model weights?' })
     expect(confirmation).toHaveTextContent(
-      'Download org/new-model revision main (4.0 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
+      'Download org/new-model revision main (4.3 GB) from Hugging Face onto Node A, then transfer it via Virtual NAS to Node B?',
     )
     await user.click(within(confirmation).getByRole('button', { name: 'Start preparation' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
@@ -2416,6 +2416,76 @@ describe('model deployments', () => {
     expect(payload.launch_controls.draft_sample_method).toBe('probabilistic')
     expect(payload.launch_controls.kv_cache_dtype).toBe('fp8')
     expect(payload.gpu_memory_utilization).toBe(0.9)
+    expect(await screen.findByText('Saved.')).toBeInTheDocument()
+  })
+
+  it('shows SGLang-compatible launch fields in the recipe arguments editor', async () => {
+    const user = userEvent.setup()
+    const detail = {
+      id: 'recipe-sglang', name: 'SGLang config', model: 'org/model', engine: 'sglang',
+      deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+      pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 7,
+      extra_args: [
+        '--speculative-algorithm', 'NEXTN', '--speculative-num-draft-tokens', '6',
+        '--cuda-graph-max-bs', '160', '--chunked-prefill-size', '8192',
+      ],
+      launch_controls: {
+        context_window: 32768, max_concurrency: 8, thinking_mode: 'default',
+        sg_speculative_num_draft_tokens: 6, sg_cuda_graph_max_bs: 160,
+        sg_chunked_prefill_size: 8192,
+      },
+      sg_tp_size: 2, sg_mem_fraction: 0.88,
+    }
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/recipes/recipe-sglang' && init?.method === 'PUT') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes/recipe-sglang') {
+        return new Response(JSON.stringify(detail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-sglang', name: 'SGLang config', model: 'org/model', engine: 'sglang',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 7,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Arguments' }))
+
+    // SGLang-native fields replace the vLLM-only structured controls.
+    expect(await screen.findByRole('spinbutton', { name: 'Speculative draft tokens' })).toHaveValue(6)
+    expect(screen.getByRole('spinbutton', { name: 'CUDA graph max batch size' })).toHaveValue(160)
+    expect(screen.getByRole('spinbutton', { name: 'Chunked prefill size' })).toHaveValue(8192)
+    expect(screen.getByRole('spinbutton', { name: 'TP size' })).toHaveValue(2)
+    expect(screen.queryByRole('spinbutton', { name: 'Speculative tokens' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Cudagraph capture size' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Batched tokens' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Speculative method' })).not.toBeInTheDocument()
+
+    const draftTokens = screen.getByRole('spinbutton', { name: 'Speculative draft tokens' })
+    await user.clear(draftTokens)
+    await user.type(draftTokens, '4')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/recipes/recipe-sglang',
+      expect.objectContaining({ method: 'PUT' }),
+    ))
+    const putCall = fetchMock.mock.calls.find(([input, init]) => String(input) === '/api/v1/recipes/recipe-sglang' && init?.method === 'PUT')
+    const payload = JSON.parse(String(putCall?.[1]?.body))
+    expect(payload.launch_controls.sg_speculative_num_draft_tokens).toBe(4)
+    expect(payload.launch_controls.sg_cuda_graph_max_bs).toBe(160)
+    expect(payload.launch_controls.sg_chunked_prefill_size).toBe(8192)
+    expect(payload.sg_tp_size).toBe(2)
+    expect(payload.sg_mem_fraction).toBe(0.88)
     expect(await screen.findByText('Saved.')).toBeInTheDocument()
   })
 })

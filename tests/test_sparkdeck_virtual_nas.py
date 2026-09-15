@@ -4,13 +4,18 @@ import os
 import shutil
 import stat
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from manager import DEFAULT_SETTINGS, Manager
+from manager import (
+    DEFAULT_SETTINGS,
+    VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS,
+    Manager,
+)
 from sparkdeck import virtual_nas
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
@@ -186,6 +191,60 @@ class DirectTransferRegistry(FakeRegistry):
             "models": self.remote_models.get(node_id, []),
             "free_size": 10 * 1024 * 1024 * 1024,
         }
+
+
+class PairConcurrencyRegistry(DirectTransferRegistry):
+    """Direct peer copies across four nodes that hold their imports open."""
+
+    def __init__(self):
+        super().__init__()
+        self.nodes.update({
+            "worker-c": {"id": "worker-c", "name": "Worker C", "enabled": True},
+            "worker-d": {"id": "worker-d", "name": "Worker D", "enabled": True},
+        })
+        self.import_started = {node_id: asyncio.Event() for node_id in self.nodes}
+        self.release_imports = asyncio.Event()
+        self.active_imports = 0
+        self.max_active_imports = 0
+
+    def direct_transfer_source(self, node_id):
+        return {
+            "worker-a": "http://169.254.10.4:7878",
+            "worker-b": "http://169.254.10.3:7878",
+            "worker-c": "http://169.254.10.2:7878",
+            "worker-d": "http://169.254.10.1:7878",
+        }.get(node_id)
+
+    async def request(self, node_id, method, path, **kwargs):
+        if not path.endswith("/import-from-peer"):
+            return await super().request(node_id, method, path, **kwargs)
+        self.active_imports += 1
+        self.max_active_imports = max(self.max_active_imports, self.active_imports)
+        self.import_started[node_id].set()
+        try:
+            await self.release_imports.wait()
+        finally:
+            self.active_imports -= 1
+        return await super().request(node_id, method, path, **kwargs)
+
+
+def remote_model_entry(size_bytes: int = 123) -> dict:
+    return {
+        "model_id": "org/model", "size_bytes": size_bytes,
+        "partial": False, "transferable": True,
+        "revisions": ["revision-1"],
+    }
+
+
+def queued_transfer_job(job_id: str, source: str, target: str) -> dict:
+    return {
+        "id": job_id, "kind": "transfer", "model_id": "org/model",
+        "source_node_id": source, "target_node_id": target,
+        "revision": "revision-1", "requested_revision": "revision-1",
+        "depends_on_job_id": None, "workflow_id": None, "workflow_node_ids": [],
+        "status": "queued", "bytes_total": 123, "bytes_transferred": 0,
+        "created_at": 0, "started_at": None, "completed_at": None, "error": None,
+    }
 
 
 class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
@@ -2370,6 +2429,176 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(repository.exists())
 
+    @staticmethod
+    def _foreign_owned_cache_tree(directory: str, hub: Path):
+        """Build a cached model whose reported failure looks root-written."""
+        repository = create_cached_model(hub)
+        refs = repository / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("revision-1")
+
+        def fail_on_foreign_owned_entry(path, *, onerror):
+            # rmtree reports the entry it cannot remove; a chmod cannot help
+            # because the file belongs to the container's root user.
+            error = PermissionError("simulated root-owned cache entry")
+            onerror(os.unlink, refs / "main", (PermissionError, error, None))
+
+        return repository, fail_on_foreign_owned_entry
+
+    def test_delete_removes_foreign_owned_cache_entry_with_privilege(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            privileged: list[Path] = []
+            real_rmtree = shutil.rmtree
+
+            def remove_with_privilege(path, hub_path):
+                privileged.append((path, hub_path))
+                real_rmtree(path)
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch(
+                    "sparkdeck.virtual_nas._remove_repository_with_privilege",
+                    remove_with_privilege,
+                ),
+            ):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(privileged, [(repository, hub)])
+            self.assertFalse(repository.exists())
+
+    def test_delete_reports_actionable_error_without_passwordless_sudo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch("sparkdeck.virtual_nas.shutil.which", return_value=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "passwordless sudo"):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(repository.exists())
+
+    def test_delete_reports_privileged_removal_failure_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            denied = subprocess.CompletedProcess(
+                ["sudo"], 1, "", "sudo: a password is required",
+            )
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch(
+                    "sparkdeck.virtual_nas.shutil.which",
+                    return_value="/usr/bin/sudo",
+                ),
+                patch("sparkdeck.virtual_nas.subprocess.run", return_value=denied),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "a password is required"):
+                    nas.delete_model("org/model")
+
+            self.assertTrue(repository.exists())
+
+    def test_privileged_removal_passes_the_path_as_one_argv_element(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            real_rmtree = shutil.rmtree
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **kwargs):
+                calls.append(argv)
+                self.assertIsNot(kwargs.get("shell"), True)
+                real_rmtree(repository)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                patch(
+                    "sparkdeck.virtual_nas.shutil.which",
+                    return_value="/usr/bin/sudo",
+                ),
+                patch("sparkdeck.virtual_nas.subprocess.run", fake_run),
+            ):
+                virtual_nas._remove_repository_with_privilege(repository, hub)
+
+            self.assertEqual(
+                calls,
+                [["/usr/bin/sudo", "-n", "rm", "-rf", "--", str(repository)]],
+            )
+            self.assertFalse(repository.exists())
+
+    def test_privileged_removal_refuses_paths_outside_the_hub(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            hub.mkdir()
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("keep")
+
+            with patch(
+                "sparkdeck.virtual_nas.subprocess.run",
+                side_effect=AssertionError("must not elevate outside the hub"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "escapes the Hugging Face hub",
+                ):
+                    virtual_nas._remove_repository_with_privilege(outside, hub)
+
+            self.assertTrue((outside / "keep").exists())
+
+    def test_delete_repairs_directory_that_blocks_entry_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            refs = repository / "refs"
+            refs.mkdir()
+            (refs / "main").write_text("revision-1")
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+            # Removing an entry needs write access to its containing directory,
+            # but rmtree reports the entry itself, not that directory.
+            refs.chmod(0o500)
+            real_rmtree = shutil.rmtree
+            calls = 0
+
+            def unwritable_directory_once(path, *, onerror):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    error = PermissionError("simulated unwritable cache directory")
+                    onerror(os.unlink, refs / "main", (PermissionError, error, None))
+                    return None
+                mode = refs.stat().st_mode
+                self.assertTrue(mode & stat.S_IWUSR)
+                self.assertTrue(mode & stat.S_IXUSR)
+                return real_rmtree(path)
+
+            with patch("sparkdeck.virtual_nas.shutil.rmtree", unwritable_directory_once):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, 2)
+            self.assertFalse(repository.exists())
+
     async def test_import_rejects_traversal_and_escaping_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
@@ -2436,7 +2665,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
         return await asyncio.wait_for(wait(), timeout)
 
-    async def test_multi_target_jobs_are_globally_serialized_and_persisted(self):
+    async def test_multi_target_jobs_from_one_source_stay_serialized_and_persisted(self):
         registry = FakeRegistry(slow=True)
         nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
 
@@ -2447,11 +2676,76 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result["job_ids"]), 2)
         self.assertTrue(all(job["status"] == "completed" for job in final))
+        # Both jobs read the same source node, so they cannot overlap.
         self.assertEqual(registry.max_active, 1)
         self.assertEqual(set(registry.received), {"worker-a", "worker-b"})
         saved = json.loads((Path(self.temp.name) / "virtual_nas_transfers.json").read_text())
         self.assertTrue(all(job["status"] == "completed" for job in saved))
         await nas.stop()
+
+    async def test_independent_node_pairs_copy_concurrently(self):
+        registry = PairConcurrencyRegistry()
+        for node_id in ("worker-a", "worker-c"):
+            registry.remote_models[node_id] = [remote_model_entry()]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.jobs = [queued_transfer_job("pair-1", "worker-a", "worker-b")]
+        nas.start()
+        await asyncio.wait_for(registry.import_started["worker-b"].wait(), 2)
+
+        nas.jobs.append(queued_transfer_job("pair-2", "worker-c", "worker-d"))
+        nas._wake.set()
+
+        # The second pair copies while the first pair is still receiving.
+        await asyncio.wait_for(registry.import_started["worker-d"].wait(), 2)
+        self.assertEqual(registry.max_active_imports, 2)
+
+        registry.release_imports.set()
+        final = await self.wait_final(nas, 2)
+
+        self.assertTrue(all(job["status"] == "completed" for job in final))
+        self.assertEqual(registry.max_active_imports, 2)
+        await nas.stop()
+
+    async def test_a_copy_waits_while_a_node_it_names_is_in_use(self):
+        registry = PairConcurrencyRegistry()
+        registry.remote_models["worker-a"] = [remote_model_entry()]
+        nas = VirtualNAS(Path(self.temp.name), lambda: self.hub, registry, lambda: True)
+        nas.jobs = [queued_transfer_job("pair-1", "worker-a", "worker-b")]
+        nas.start()
+        await asyncio.wait_for(registry.import_started["worker-b"].wait(), 2)
+
+        # worker-b is still receiving, so it cannot also serve as a source.
+        waiting = queued_transfer_job("waits", "worker-b", "worker-d")
+        nas.jobs.append(waiting)
+        nas._wake.set()
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(waiting["status"], "queued")
+        self.assertEqual(set(nas._active), {"worker-b"})
+        self.assertEqual(registry.max_active_imports, 1)
+
+        registry.release_imports.set()
+        final = await self.wait_final(nas, 2)
+
+        self.assertTrue(all(job["status"] == "completed" for job in final))
+        self.assertEqual(registry.max_active_imports, 1)
+        await nas.stop()
+
+    def test_queue_selection_skips_busy_endpoints(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        first = queued_transfer_job("pair-1", "worker-a", "worker-b")
+        second = queued_transfer_job("pair-2", "worker-c", "worker-d")
+        nas.jobs = [first, second]
+
+        self.assertEqual(nas._job_endpoints(first), frozenset({"worker-a", "worker-b"}))
+        # The running copy holds both of its nodes, so the other pair runs.
+        self.assertIs(nas._next_queue_job(nas._job_endpoints(first)), second)
+        # A Hub download reads from Hugging Face, not a paired node, so it
+        # occupies only the node that receives the weights.
+        download = {**queued_transfer_job("hub", "huggingface", "worker-b"), "kind": "download"}
+        self.assertEqual(nas._job_endpoints(download), frozenset({"worker-b"}))
 
     async def test_concurrent_queues_cannot_persist_duplicate_targets(self):
         registry = FakeRegistry()
@@ -2732,6 +3026,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(nas.jobs[0]["status"], "queued")
         self.assertEqual(nas._active, {})
+        self.assertEqual(nas._active_endpoints, {})
 
     async def test_existing_target_is_rejected_without_persisting_jobs(self):
         registry = FakeRegistry()
@@ -3139,6 +3434,82 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "partial": False,
                 "revisions": ["main", "a" * 40, "b" * 40],
                 "revision_refs": {"main": "b" * 40},
+            }],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": "a" * 40,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertIsNone(result["source"])
+        self.assertFalse(result["targets"][0]["has_required_weights"])
+
+    async def test_complete_snapshot_without_recorded_ref_seeds_the_transfer(self):
+        # A cache copied onto a node, or written by a download that never
+        # recorded its refs, still holds the resolved commit. It must be a
+        # usable source instead of leaving every node reported as missing.
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {
+                "id": "populated", "name": "Populated", "online": True,
+                "cache_free_size": 10**9,
+                "virtual_nas_download_capable": True,
+                "models": [{
+                    "model_id": "org/model", "size_bytes": 20,
+                    "partial": False,
+                    "revisions": ["a" * 40], "revision_refs": {},
+                }],
+            },
+            {
+                "id": "empty", "name": "Empty", "online": True,
+                "cache_free_size": 10**9,
+                "virtual_nas_download_capable": True, "models": [],
+            },
+        ])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": "a" * 40,
+            "size_bytes": 20,
+        })
+
+        result = await manager.virtual_nas_transfer_preflight("org/model", "main")
+
+        self.assertEqual(result["source"]["node_id"], "populated")
+        targets = {item["node_id"]: item for item in result["targets"]}
+        self.assertTrue(targets["populated"]["has_required_weights"])
+        self.assertFalse(targets["empty"]["has_required_weights"])
+
+        plan = await manager.recipe_model_preparation_preflight(
+            "org/model", "main", ["populated", "empty"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["action"], "transfer")
+        self.assertEqual(plan["source"]["node_id"], "populated")
+        self.assertEqual(plan["transfer_target_node_ids"], ["empty"])
+
+    async def test_partial_ref_alias_still_blocks_the_seeded_transfer(self):
+        # A ref the cache records as an incomplete snapshot is a real conflict:
+        # the requested ref is not what this node would serve.
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "pending", "name": "Pending", "online": True,
+            "cache_free_size": 10**9,
+            "virtual_nas_download_capable": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 20,
+                "partial": False,
+                "revisions": ["a" * 40], "revision_refs": {},
+                "partial_revision_refs": {"main": "b" * 40},
             }],
         }])
         manager.virtual_nas_transfers = Mock(return_value={"items": []})
@@ -3642,6 +4013,53 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["bytes_per_second"], 625_000_000)
         self.assertIsNone(unsampled["bytes_per_second"])
+
+    def test_live_transfer_rate_spans_real_inventory_refresh_intervals(self):
+        manager = Manager.__new__(Manager)
+        manager._virtual_nas_rate_samples = {}
+        job = {"id": "transfer-1", "status": "running", "bytes_transferred": 0}
+
+        # The first sample only establishes a baseline.
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 100.0))
+
+        job["bytes_transferred"] = 20_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.0), 800_000.0,
+        )
+
+        # Requests that reuse the cached inventory snapshot keep the rate that
+        # was measured for it instead of dividing by a zero interval.
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.0), 800_000.0,
+        )
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 125.2), 800_000.0,
+        )
+
+        # A refresh gap of more than the old fifteen second cutoff still
+        # reports the throughput of the interval that actually elapsed.
+        job["bytes_transferred"] = 60_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 175.0), 800_000.0,
+        )
+
+        # A sample pair older than the staleness ceiling cannot describe the
+        # current rate, so it establishes a fresh baseline instead.
+        job["bytes_transferred"] = 90_000_000
+        self.assertIsNone(
+            manager._sample_virtual_nas_transfer_rate(
+                job, 175.0 + VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS + 1,
+            ),
+        )
+
+        # A byte count that regresses never produces a negative rate.
+        job["bytes_transferred"] = 10_000_000
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 700.0))
+
+        # Terminal jobs drop their samples so a later run starts clean.
+        job["status"] = "completed"
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 701.0))
+        self.assertEqual(manager._virtual_nas_rate_samples, {})
 
 
 if __name__ == "__main__":

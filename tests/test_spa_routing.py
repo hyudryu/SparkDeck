@@ -22,6 +22,7 @@ class SpaRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/fan-control", SPA_PATHS)
         self.assertIn("/storage", SPA_PATHS)
         self.assertIn("/usage", SPA_PATHS)
+        self.assertIn("/history", SPA_PATHS)
         self.assertIn("/switch", SPA_PATHS)
 
     def test_deployment_detail_route_is_in_direct_refresh_allowlist(self):

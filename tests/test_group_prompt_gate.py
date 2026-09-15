@@ -14,7 +14,7 @@ class GroupPromptGateTests(unittest.IsolatedAsyncioTestCase):
             'members': [
                 {'node_id': f'node-{group}-{rank}', 'instance_id': group,
                  'rank': rank, 'container_name': f'group-{group}-{rank}',
-                 'container_id': f'container-{group}-{rank}'}
+                 'container_id': f'container-{group}-{rank}', 'status': 'running'}
                 for group in (0, 1) for rank in (0, 1)
             ],
         }

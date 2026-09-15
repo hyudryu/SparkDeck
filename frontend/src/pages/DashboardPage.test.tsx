@@ -56,23 +56,89 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
-  it('shows each group aggregate prompt/output rates without merging separate thinking into output', async () => {
+  it('shows each group per-stage prompt/output/thinking rates without merging separate thinking into output', async () => {
     vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
       first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1', 'Node 2'], connections: 2, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10 },
       second: { group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 3', 'Node 4'], connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0 },
     } }))
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
-    const first = within(await screen.findByLabelText('Aggregate inference rates for Group 1 · Node 1 + Node 2'))
+    const first = within((await screen.findByText('Group 1 · Node 1 + Node 2')).closest('.session-row') as HTMLElement)
     expect(first.getByText('Prompt processing')).toBeInTheDocument()
     expect(first.getByText('1200.0 tok/s')).toBeInTheDocument()
     expect(first.getByText('40.0 tok/s')).toBeInTheDocument()
     expect(first.getByText('Thinking')).toBeInTheDocument()
     expect(first.getByText('10.0 tok/s')).toBeInTheDocument()
     expect(first.queryByText('50.0 tok/s')).not.toBeInTheDocument()
-    const second = within(screen.getByLabelText('Aggregate inference rates for Group 2 · Node 3 + Node 4'))
-    expect(second.getByText('Measuring…')).toBeInTheDocument()
+    const second = within(screen.getByText('Group 2 · Node 3 + Node 4').closest('.session-row') as HTMLElement)
+    expect(second.getAllByText('Measuring…')).toHaveLength(2)
     expect(second.getByText('70.0 tok/s')).toBeInTheDocument()
-    expect(second.queryByText('Thinking')).not.toBeInTheDocument()
+    expect(second.getByText('Thinking')).toBeInTheDocument()
+  })
+
+  it('reports how many sessions are outputting, thinking, and prompt processing', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 4, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10,
+        output_sessions: 2, thinking_sessions: 1, prefill_sessions: 1, prefill_seconds: 7.4,
+      },
+      second: {
+        group_id: 'second', instance_id: 1, model: 'shared', node_names: ['Node 2'],
+        connections: 1, pp_tok_s: null, output_tok_s: 70, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 0,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    // Panel total across both groups: 3 outputting, 1 thinking, 1 prompt processing.
+    expect(await screen.findByText('5 active · 3 outputting · 1 thinking · 1 prompt processing · 0 queued')).toBeInTheDocument()
+    const firstRow = screen.getByText('4 active · 0 queued').closest('.session-row')
+    expect(firstRow).not.toBeNull()
+    expect(within(firstRow as HTMLElement).getByText('2 outputting · 1 thinking · 1 prompt processing')).toBeInTheDocument()
+    const secondRow = screen.getByText('1 active · 0 queued').closest('.session-row')
+    expect(within(secondRow as HTMLElement).getByText('1 outputting')).toBeInTheDocument()
+    expect(within(secondRow as HTMLElement).queryByText(/thinking/)).not.toBeInTheDocument()
+  })
+
+  it('shows prompt processing as a held prefill instead of an unmeasurable rate', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 2, pp_tok_s: 900, output_tok_s: 40, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 1, prefill_seconds: 12.6,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const rates = within((await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement)
+    // The prefill has no first token yet, so no tok/s is invented for it.
+    expect(rates.getByText('Prefilling 13s')).toBeInTheDocument()
+    expect(rates.queryByText('900.0 tok/s')).not.toBeInTheDocument()
+    expect(rates.getByText('40.0 tok/s')).toBeInTheDocument()
+  })
+
+  it('falls back to the measured prompt rate once the prefill completes', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: {
+        group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 1, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 0,
+        output_sessions: 1, thinking_sessions: 0, prefill_sessions: 0, prefill_seconds: null,
+      },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const rates = within((await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement)
+    expect(rates.getByText('1200.0 tok/s')).toBeInTheDocument()
+    expect(rates.queryByText(/Prefilling/)).not.toBeInTheDocument()
+  })
+
+  it('omits state counts for entries from an older telemetry payload', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'], connections: 1, pp_tok_s: 500, output_tok_s: 20, thinking_tok_s: 0 },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByRole('heading', { name: 'Current inference' })).toBeInTheDocument()
+    const rates = within(screen.getByText('Group 1 · Node 1').closest('.session-row') as HTMLElement)
+    expect(rates.getByText('500.0 tok/s')).toBeInTheDocument()
+    // No session-state payload means no state line is claimed at all.
+    expect(document.querySelector('.session-states')).toBeNull()
   })
 
   it('keeps a booting group yellow independently of the ready peer group', async () => {
@@ -118,6 +184,64 @@ describe('DashboardPage', () => {
     expect(screen.getByText('1 of 2 deployments active')).toBeInTheDocument()
     expect(screen.queryByText('Group 2 · Node 1 + Node 2')).not.toBeInTheDocument()
     expect(screen.queryByText('Stopped model')).not.toBeInTheDocument()
+  })
+
+  it('does not keep reporting a finished stop as a running model', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        // A stop the controller could not verify latches at degraded, but its
+        // inventory already confirms every rank is idle.
+        id: 'dep', alias: 'Stopped long ago', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {},
+        node_ids: ['gx10-node-1', 'gx10-node-2'], occupied_node_ids: [],
+      }, {
+        id: 'live', alias: 'Still serving', model: { repository: 'org/other' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {},
+        node_ids: ['gx10-node-3'], occupied_node_ids: ['gx10-node-3'],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Still serving')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.getByText('gx10-node-3')).toBeInTheDocument()
+    expect(screen.queryByText('Stopped long ago')).not.toBeInTheDocument()
+    expect(screen.queryByText('gx10-node-1 + gx10-node-2')).not.toBeInTheDocument()
+    expect(screen.getByText('1 of 2 deployments active')).toBeInTheDocument()
+  })
+
+  it('keeps a stop pending while no inventory has judged its ranks', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Unjudged stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {}, node_ids: ['gx10-node-1'],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Unjudged stop')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+  })
+
+  it('hides stopped groups and keeps the ones still holding containers', async () => {
+    const fallback = stubDashboardFetch({})
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items: [{
+        id: 'dep', alias: 'Split stop', model: { repository: 'org/model' }, runtime: 'vllm', kind: 'managed',
+        status: 'degraded', desired_state: 'stopped', settings: {}, instances: [
+          { instance_id: 0, node_names: ['Node 1', 'Node 2'], status: 'degraded', desired_state: 'stopped', has_live_containers: false },
+          { instance_id: 1, node_names: ['Node 3', 'Node 4'], status: 'running', desired_state: 'stopped', has_live_containers: true },
+        ],
+      }] })
+      return fallback(input, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    expect(await screen.findByText('Group 2 · Node 3 + Node 4')).toBeInTheDocument()
+    expect(screen.getByText('Stop pending')).toBeInTheDocument()
+    expect(screen.queryByText('Group 1 · Node 1 + Node 2')).not.toBeInTheDocument()
+    expect(screen.getByText('1 of 1 deployments active')).toBeInTheDocument()
   })
 
   it.each([false, undefined])('hides rolled-back groups without live inventory confirmation (%s)', async (hasLiveContainers) => {
@@ -682,6 +806,44 @@ describe('DashboardPage', () => {
 
     expect(await screen.findByText('live-model')).toBeInTheDocument()
     expect(screen.getByText('2 from 192.0.2.10 · 1 from 192.0.2.20')).toBeInTheDocument()
+  })
+
+  it('shows live prompt processing, output, and thinking token rates per stage', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': {
+          connections: 1,
+          pp_tok_s: 2400,
+          output_tok_s: 12.5,
+          thinking_tok_s: 4,
+        },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('Prompt processing')).toBeInTheDocument()
+    expect(screen.getByText('2400.0 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Output')).toBeInTheDocument()
+    expect(screen.getByText('12.5 tok/s')).toBeInTheDocument()
+    expect(screen.getByText('Thinking')).toBeInTheDocument()
+    expect(screen.getByText('4.0 tok/s')).toBeInTheDocument()
+  })
+
+  it('shows measuring placeholders when prompt processing speed is not yet available', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({
+      cpu_pct: 25, mem: {}, gpus: [],
+      active_requests: {
+        'live-model': { connections: 1, pp_tok_s: null, output_tok_s: 0, thinking_tok_s: 0 },
+      },
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getAllByText('Measuring…')).toHaveLength(3)
   })
 
   it('prefers fresh local stats over retained local node telemetry', () => {

@@ -8,6 +8,7 @@ import server
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     RequestBodyTooLarge,
+    is_inference_request_path,
     read_limited_json,
     read_limited_request_body,
 )
@@ -25,6 +26,23 @@ class FakeRequest:
         self.streamed = True
         for chunk in self.chunks:
             yield chunk
+
+
+class InferenceRequestPathTests(unittest.TestCase):
+    def test_inference_routes_match_with_and_without_trailing_slash(self):
+        # Joined workers accept these routes through the framework's
+        # trailing-slash redirect, so the limit must apply to both forms.
+        for path in ("/v1/responses", "/v1/responses/",
+                     "/v1/chat/completions", "/v1/chat/completions/",
+                     "/v1/completions", "/v1/completions/"):
+            with self.subTest(path=path):
+                self.assertTrue(is_inference_request_path(path))
+        for path in ("/api/agent/inference/foo", "/api/agent/inference/foo/"):
+            with self.subTest(path=path):
+                self.assertTrue(is_inference_request_path(path))
+        for path in ("/v1/models", "/v1/responses/extra", "/api/agent/"):
+            with self.subTest(path=path):
+                self.assertFalse(is_inference_request_path(path))
 
 
 class InferenceRequestLimitTests(unittest.IsolatedAsyncioTestCase):

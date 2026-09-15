@@ -187,6 +187,9 @@ export interface DeploymentLaunchControls {
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null
+  sg_speculative_num_draft_tokens?: number | null
+  sg_cuda_graph_max_bs?: number | null
+  sg_chunked_prefill_size?: number | null
 }
 
 // One KEY=VALUE line of a hook-backed deployment's settings env file.
@@ -650,6 +653,10 @@ export interface ImagePullResult {
 export interface AppSettings {
   max_concurrent_prompt_processing?: number
   theme?: 'system' | 'light' | 'dark'
+  /** Record trailing throughput history for the History panel. */
+  history_enabled?: boolean
+  /** History sampling cadence in seconds, between 1 and 30. */
+  history_sample_seconds?: number
   // Retained for backward compatibility with settings saved before these
   // controls were removed from the Settings page.
   default_runtime?: RuntimeKind
@@ -801,6 +808,14 @@ export interface ActiveRequestStats {
   output_tok_s?: number
   pp_tok_s?: number | null
   admission_limit?: number
+  /** Live sessions whose trailing window shows generated output tokens. */
+  output_sessions?: number
+  /** Live sessions currently emitting reasoning tokens only. */
+  thinking_sessions?: number
+  /** Live sessions held with no token emitted yet, i.e. still prefilling. */
+  prefill_sessions?: number
+  /** Longest time any of those prefilling sessions has been held, in seconds. */
+  prefill_seconds?: number | null
 }
 
 export interface ActiveRequestGroupStats extends ActiveRequestStats {
@@ -1011,6 +1026,9 @@ export interface LaunchControls {
   dspark_num_speculative_tokens?: number | null
   max_cudagraph_capture_size?: number | null
   max_num_batched_tokens?: number | null
+  sg_speculative_num_draft_tokens?: number | null
+  sg_cuda_graph_max_bs?: number | null
+  sg_chunked_prefill_size?: number | null
 }
 
 export interface SavedConfigurationDetail extends SavedConfiguration {
@@ -1216,4 +1234,68 @@ export interface BenchmarkRunnerRunDetail extends BenchmarkRunnerRunSummary {
     latency_ms?: number | null
     prefix_caching_enabled?: boolean | null
   } | null
+}
+
+/** One five-second bucket of a serving unit's trailing live throughput. */
+export interface LiveHistoryBucket {
+  /** When the bucket closed, in Unix epoch seconds. */
+  at: number
+  output_tok_s: number
+  thinking_tok_s: number
+  /** Aggregate prompt-processing rate. Measured once a prefill completes. */
+  prefill_tok_s: number | null
+  /** True when the engine measured the rate; false for a live estimate. */
+  prefill_measured: boolean
+  /**
+   * Prompt tokens `prefill_tok_s` was computed from, and the seconds it was
+   * divided by. Both are 0 unless a prefill completed inside this bucket, which
+   * is the only moment the engine reports a prompt token count.
+   */
+  prefill_tokens: number
+  prefill_seconds: number
+  /** Mean concurrent sessions over the bucket. */
+  concurrent: number
+  concurrent_peak: number
+  output_sessions: number
+  thinking_sessions: number
+  prefill_sessions: number
+  output_active: boolean
+  thinking_active: boolean
+  output_peak_tok_s: number
+  thinking_peak_tok_s: number
+  prefill_peak_tok_s: number | null
+}
+
+export interface LiveHistorySessionState {
+  output_sessions: number
+  thinking_sessions: number
+  prefill_sessions: number
+}
+
+/** One graph: a deployment, pair, or sharded serving group. */
+export interface LiveHistorySeries {
+  key: string
+  group_id: string
+  model: string
+  deployment_id?: string | null
+  instance_id?: number | null
+  node_names: string[]
+  live_sessions: number
+  state: LiveHistorySessionState
+  /** When this serving unit was last sampled, in Unix epoch seconds. */
+  last_at: number
+  bucket_seconds: number
+  buckets: LiveHistoryBucket[]
+}
+
+export interface LiveHistorySnapshot {
+  /** When the snapshot was taken, in Unix epoch seconds. */
+  generated_at: number
+  /** False when recording is switched off; the series list is then empty. */
+  enabled: boolean
+  /** Span of one bucket, which equals the sampling interval. */
+  bucket_seconds: number
+  range_seconds: number
+  sample_seconds: number
+  series: LiveHistorySeries[]
 }

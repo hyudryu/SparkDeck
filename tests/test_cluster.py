@@ -3879,6 +3879,140 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             flags, ["--max-total-tokens", "999", "--enable-metrics"],
         )
 
+    def test_sglang_launch_controls_parse_and_round_trip(self) -> None:
+        instance = Manager.__new__(Manager)
+        args = [
+            "--mem-fraction-static", "0.88",
+            "--speculative-algorithm", "NEXTN",
+            "--speculative-num-draft-tokens", "6",
+            "--cuda-graph-max-bs", "160",
+            "--chunked-prefill-size", "8192",
+            "--image-specific-flag", "kept",
+        ]
+
+        parsed = instance._deployment_launch_controls({
+            "engine": "sglang", "extra_args": args,
+        })
+
+        self.assertEqual(parsed["sg_speculative_num_draft_tokens"], 6)
+        self.assertEqual(parsed["sg_cuda_graph_max_bs"], 160)
+        self.assertEqual(parsed["sg_chunked_prefill_size"], 8192)
+        # vLLM-only controls do not map onto SGLang flags.
+        self.assertIsNone(parsed["dspark_num_speculative_tokens"])
+        self.assertIsNone(parsed["max_cudagraph_capture_size"])
+        self.assertIsNone(parsed["max_num_batched_tokens"])
+
+        updated = instance._apply_deployment_launch_controls(
+            args,
+            "sglang",
+            {
+                "sg_speculative_num_draft_tokens": 4,
+                "sg_cuda_graph_max_bs": 96,
+                "sg_chunked_prefill_size": 4096,
+            },
+        )
+
+        self.assertEqual(
+            instance._cli_option(updated, {"--speculative-num-draft-tokens"}, int), 4
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--cuda-graph-max-bs"}, int), 96
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--chunked-prefill-size"}, int), 4096
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--speculative-algorithm"}), "NEXTN"
+        )
+        self.assertEqual(
+            instance._cli_option(updated, {"--image-specific-flag"}), "kept"
+        )
+
+        cleared = instance._apply_deployment_launch_controls(
+            updated,
+            "sglang",
+            {
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
+            },
+        )
+        self.assertNotIn("--speculative-num-draft-tokens", cleared)
+        self.assertNotIn("--cuda-graph-max-bs", cleared)
+        self.assertNotIn("--chunked-prefill-size", cleared)
+
+        # An absent key leaves the current flag untouched.
+        untouched = instance._apply_deployment_launch_controls(
+            args, "sglang", {},
+        )
+        self.assertEqual(
+            instance._cli_option(untouched, {"--cuda-graph-max-bs"}, int), 160
+        )
+
+    def test_sglang_launch_controls_stay_out_of_other_engines(self) -> None:
+        instance = Manager.__new__(Manager)
+        args = [
+            "--speculative-num-draft-tokens", "6",
+            "--cuda-graph-max-bs", "160",
+            "--chunked-prefill-size", "8192",
+        ]
+
+        # The SGLang controls are not parsed for vLLM or llama.cpp settings.
+        for engine in ("vllm", "llama.cpp"):
+            parsed = instance._deployment_launch_controls({
+                "engine": engine, "extra_args": args,
+            })
+            self.assertIsNone(parsed["sg_speculative_num_draft_tokens"])
+            self.assertIsNone(parsed["sg_cuda_graph_max_bs"])
+            self.assertIsNone(parsed["sg_chunked_prefill_size"])
+
+        # Applying the SGLang controls to a vLLM argv leaves it untouched.
+        unchanged = instance._apply_deployment_launch_controls(
+            args,
+            "vllm",
+            {
+                "sg_speculative_num_draft_tokens": 4,
+                "sg_cuda_graph_max_bs": 96,
+                "sg_chunked_prefill_size": 4096,
+            },
+        )
+        self.assertEqual(unchanged, args)
+
+        # Invalid values are rejected with the shared positive-int message.
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            instance._apply_deployment_launch_controls(
+                args, "sglang", {"sg_chunked_prefill_size": 0},
+            )
+
+    def test_sglang_launch_controls_flow_into_runtime_flags_preview(self) -> None:
+        instance = Manager.__new__(Manager)
+
+        preview = instance.preview_runtime_flags(
+            ["--enable-metrics"],
+            "sglang",
+            {
+                "sg_speculative_num_draft_tokens": 6,
+                "sg_cuda_graph_max_bs": 160,
+                "sg_chunked_prefill_size": 8192,
+            },
+            {},
+        )
+
+        self.assertEqual(
+            instance._cli_option(
+                preview["flags"], {"--speculative-num-draft-tokens"}, int
+            ),
+            6,
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--cuda-graph-max-bs"}, int), 160
+        )
+        self.assertEqual(
+            instance._cli_option(preview["flags"], {"--chunked-prefill-size"}, int),
+            8192,
+        )
+        self.assertIn("--enable-metrics", preview["flags"])
+
     def test_managed_vllm_preview_includes_launch_defaults_and_identity(self) -> None:
         instance = Manager.__new__(Manager)
         instance.settings = {"default_gpu_memory_utilization": 0.91}

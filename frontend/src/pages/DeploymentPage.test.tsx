@@ -81,6 +81,21 @@ const groupedDetail = {
   ],
 }
 
+const sglangDetail = {
+  ...detail,
+  runtime: 'sglang', deployment_mode: 'single', node_ids: ['local'],
+  extra_args: [
+    '--speculative-algorithm', 'NEXTN', '--speculative-num-draft-tokens', '6',
+    '--cuda-graph-max-bs', '160', '--chunked-prefill-size', '8192',
+  ],
+  launch_controls: {
+    context_window: 32768, max_concurrency: 8, thinking_mode: 'default',
+    sg_speculative_num_draft_tokens: 6, sg_cuda_graph_max_bs: 160,
+    sg_chunked_prefill_size: 8192,
+  },
+  gpu_memory_utilization: null, sg_tp_size: 2, sg_mem_fraction: 0.88,
+}
+
 describe('deployment object page', () => {
   it('shows occupied nodes disabled in Run while allowing the inactive peer group nodes', async () => {
     const user = userEvent.setup()
@@ -412,6 +427,61 @@ describe('deployment object page', () => {
     renderPage()
     await screen.findByRole('heading', { name: 'Reasoning server' })
     expect(screen.queryByLabelText('KV cache dtype')).not.toBeInTheDocument()
+  })
+  it('shows SGLang-compatible launch fields and hides the vLLM-only ones', async () => {
+    const user = userEvent.setup()
+    let saved: Record<string, unknown> | undefined
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
+      const path = String(input)
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/runtime-flags/preview' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body))
+        return new Response(JSON.stringify({
+          flags: body.extra_args,
+          command_flags: body.extra_args.map(quoteArgForTest).join(' '),
+          environment: body.environment,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments/dep-1/settings' && init?.method === 'PUT') {
+        saved = JSON.parse(String(init.body))
+        return new Response(JSON.stringify(sglangDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(sglangDetail), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    // SGLang-native fields replace the vLLM-only structured controls.
+    expect(await screen.findByLabelText('Speculative draft tokens')).toHaveValue(6)
+    expect(screen.getByLabelText('CUDA graph max batch size')).toHaveValue(160)
+    expect(screen.getByLabelText('Chunked prefill size')).toHaveValue(8192)
+    expect(screen.getByLabelText('TP size')).toHaveValue(2)
+    expect(screen.queryByLabelText('Speculative tokens')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CUDA graph capture size')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Max batched tokens')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Tensor parallel size')).not.toBeInTheDocument()
+
+    // The new controls flow into the backend flag preview.
+    await waitFor(() => {
+      const previewCall = fetchMock.mock.calls.find(([input]) => String(input) === '/api/v1/runtime-flags/preview')
+      expect(previewCall).toBeDefined()
+      const previewBody = JSON.parse(String(previewCall?.[1]?.body))
+      expect(previewBody.launch_controls.sg_speculative_num_draft_tokens).toBe(6)
+      expect(previewBody.launch_controls.sg_cuda_graph_max_bs).toBe(160)
+      expect(previewBody.launch_controls.sg_chunked_prefill_size).toBe(8192)
+    })
+
+    const draftTokens = screen.getByLabelText('Speculative draft tokens')
+    await user.clear(draftTokens)
+    await user.type(draftTokens, '4')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(saved).toBeDefined())
+    const controls = (saved as { launch_controls: Record<string, unknown> }).launch_controls
+    expect(controls.sg_speculative_num_draft_tokens).toBe(4)
+    expect(controls.sg_cuda_graph_max_bs).toBe(160)
+    expect(controls.sg_chunked_prefill_size).toBe(8192)
   })
 
   it('shows saved flags and saves before running, then returns to Models', async () => {

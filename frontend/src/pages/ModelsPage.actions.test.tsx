@@ -392,6 +392,23 @@ describe('models page running actions', () => {
     expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeEnabled()
   })
 
+  it('keeps nodes free when a stopped duplicate only carries a failed-launch error marker', async () => {
+    const original = fetchMock.getMockImplementation()!
+    const stale = { ...runningDeployment, id: 'stale', alias: 'Old name', status: 'error', desired_state: 'stopped' }
+    const target = { ...runningDeployment, id: 'target', alias: 'Edited name', status: 'stopped', desired_state: 'stopped' }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [stale, target] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    const targetRow = (await screen.findByText('Edited name')).closest('[role="row"]') as HTMLElement
+    await user.click(within(targetRow).getByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Edited name' })
+    expect(within(dialog).getByRole('radio', { name: /Node 4/ })).toBeEnabled()
+    expect(within(dialog).queryByText(/Already used by deployment/)).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Launch on 1 node' })).toBeEnabled()
+  })
+
   it('rechecks occupancy before launching when another deployment claimed a selected node', async () => {
     const original = fetchMock.getMockImplementation()!
     let claimed = false

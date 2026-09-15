@@ -92,22 +92,22 @@ describe('StoragePage', () => {
     vi.stubGlobal('fetch', fetchMock)
     render(<StoragePage />)
 
-    expect(await screen.findByText('400 GB used')).toBeInTheDocument()
-    expect(screen.getByText('100 GB free')).toBeInTheDocument()
-    expect(screen.getByText('500 GB total')).toBeInTheDocument()
-    expect(screen.queryByText('200 GB in ComfyUI')).not.toBeInTheDocument()
-    expect(screen.queryByText('900 GB total')).not.toBeInTheDocument()
+    expect(await screen.findByText('429 GB used')).toBeInTheDocument()
+    expect(screen.getByText('107 GB free')).toBeInTheDocument()
+    expect(screen.getByText('537 GB total')).toBeInTheDocument()
+    expect(screen.queryByText('215 GB in ComfyUI')).not.toBeInTheDocument()
+    expect(screen.queryByText('966 GB total')).not.toBeInTheDocument()
     const track = screen.getByLabelText('Tight Spark used model storage')
     expect(track.firstElementChild).toHaveStyle({ width: '80%' })
     // A zero free reading is a genuinely full disk, not missing telemetry.
     expect(screen.getByText('0 B free')).toBeInTheDocument()
-    expect(screen.getByText('100 GB total')).toBeInTheDocument()
+    expect(screen.getByText('107 GB total')).toBeInTheDocument()
     const fullTrack = screen.getByLabelText('Full Spark used model storage')
     expect(fullTrack.firstElementChild).toHaveStyle({ width: '100%' })
     // Offline nodes keep the raw disk total because their model inventory
     // cannot be validated.
-    expect(screen.getByText('2.8 GB total')).toBeInTheDocument()
-    expect(screen.queryByText('50 GB free')).not.toBeInTheDocument()
+    expect(screen.getByText('3.0 GB total')).toBeInTheDocument()
+    expect(screen.queryByText('54 GB free')).not.toBeInTheDocument()
   })
 
   it('sorts Virtual NAS models by size in descending order', async () => {
@@ -236,7 +236,7 @@ describe('StoragePage', () => {
     render(<StoragePage />)
 
     await user.click(await screen.findByRole('checkbox', { name: /Backup Spark/ }))
-    expect(screen.getAllByText('954 MB used').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('1.0 GB used').length).toBeGreaterThan(0)
     expect(screen.queryByText(/cataloged/i)).not.toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: /Archive Spark/ })).toBeDisabled()
     expect(screen.getByText('Model already available')).toBeInTheDocument()
@@ -527,6 +527,33 @@ describe('StoragePage', () => {
     expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
   })
 
+  it('marks a running job as measuring its speed until the cluster reports one', async () => {
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [
+        {
+          id: 'measuring-download', model_id: 'org/measuring', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
+          bytes_total: 1000, bytes_transferred: 400, progress: 0.4, created_at: '2026-08-26T12:00:00Z',
+        },
+        {
+          id: 'queued-copy', model_id: 'org/queued', source_node_id: 'node-a', source_node_name: 'Studio Spark',
+          target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'queued', kind: 'transfer',
+          bytes_total: 1000, bytes_transferred: 0, progress: 0, created_at: '2026-08-26T11:00:00Z',
+        },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const download = within(nodePanel).getByLabelText('Downloading from Hugging Face org/measuring on Backup Spark')
+    expect(within(download).getByText(/Measuring speed…/)).toBeInTheDocument()
+    // A job that has not started moving bytes has no speed to measure yet.
+    const queued = within(nodePanel).getByLabelText('Transfer queued org/queued on Backup Spark')
+    expect(queued).not.toHaveTextContent('Measuring speed…')
+  })
+
   it('keeps completed bytes visible while the receiver syncs and registers the cache', async () => {
     const storage: StorageState = {
       ...enabledStorage,
@@ -712,9 +739,9 @@ describe('StoragePage', () => {
     render(<StoragePage />)
 
     const partial = await screen.findByLabelText('Partial cache org/partial-model on Studio Spark')
-    expect(partial).toHaveTextContent('12 GB of 40 GB')
+    expect(partial).toHaveTextContent('13 GB of 43 GB')
     const plain = screen.getByLabelText('Partial cache org/plain-partial on Studio Spark')
-    expect(plain).toHaveTextContent('1.0 GB')
+    expect(plain).toHaveTextContent('1.1 GB')
     expect(plain).not.toHaveTextContent(' of ')
 
     expect(within(partial).getByText('org/partial-model')).toHaveAttribute('title', 'org/partial-model')
@@ -722,7 +749,7 @@ describe('StoragePage', () => {
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     const row = within(inventory).getByText('org/partial-model').closest('.table-row') as HTMLElement
-    expect(within(row).getByText('12 GB of 40 GB')).toBeInTheDocument()
+    expect(within(row).getByText('13 GB of 43 GB')).toBeInTheDocument()
     expect(within(row).getByText('org/partial-model')).toHaveAttribute('title', 'org/partial-model')
   })
 })

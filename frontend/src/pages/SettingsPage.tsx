@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
-import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
+import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, SystemUpdateNode } from '../api/types'
@@ -10,6 +10,7 @@ import { RequestRoutingPanel } from '../components/RequestRoutingPanel'
 import { LegalDialog } from '../components/LegalDialog'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
+import { DEFAULT_HISTORY_SAMPLE_SECONDS } from '../utils/historySettings'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
 
@@ -121,6 +122,8 @@ function editableSettingsFingerprint(settings: AppSettings) {
   return JSON.stringify({
     theme: settings.theme ?? 'system',
     max_concurrent_prompt_processing: settings.max_concurrent_prompt_processing ?? 1,
+    history_enabled: settings.history_enabled !== false,
+    history_sample_seconds: settings.history_sample_seconds ?? DEFAULT_HISTORY_SAMPLE_SECONDS,
   })
 }
 
@@ -518,6 +521,13 @@ export function SettingsPage() {
           <div className="settings-heading"><span><MonitorCog size={18} /></span><div><h2>Interface</h2><p>Choose how SparkDeck looks on this browser.</p></div></div>
           <div className="settings-fields">
             <label className="field"><span>Appearance</span><select value={form.theme} onChange={(event) => setForm({ ...form, theme: event.target.value as AppSettings['theme'] })}><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+          </div>
+        </Panel>
+        <Panel className="settings-section" aria-labelledby="history-title">
+          <div className="settings-heading"><span><History size={18} /></span><div><h2 id="history-title">History</h2><p>Record trailing throughput for the History panel. Turn it off to stop the sampling work entirely.</p></div></div>
+          <div className="settings-fields">
+            <label className="field"><span>Record history</span><select aria-label="Record history" value={form.history_enabled === false ? 'off' : 'on'} onChange={(event) => setForm({ ...form, history_enabled: event.target.value === 'on' })}><option value="on">On</option><option value="off">Off</option></select><small>While off, no samples are taken and nothing is kept in memory.</small></label>
+            <label className="field"><span>Sampling interval</span><input aria-label="History sampling interval in seconds" type="number" min="1" max="30" step="1" required inputMode="numeric" value={Number.isNaN(form.history_sample_seconds) ? '' : form.history_sample_seconds ?? DEFAULT_HISTORY_SAMPLE_SECONDS} onChange={(event) => setForm({ ...form, history_sample_seconds: event.target.valueAsNumber })} aria-describedby="history-interval-help" /><small id="history-interval-help">Seconds between samples, from 1 to 30. One graph point covers one interval, so a longer interval means a coarser graph across the same trailing hour.</small></label>
           </div>
         </Panel>
         <Panel className="settings-section" aria-labelledby="load-balancer-title">

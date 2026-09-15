@@ -23,10 +23,11 @@ from starlette.responses import JSONResponse
 
 
 ROOT = Path(__file__).resolve().parent
+# Stamped onto deployments this server creates so the app can show where a
+# deployment came from. It is informational only and never gates an action:
+# this MCP server controls any deployment in the catalog, including ones
+# created by the app, by a recipe, or by an earlier release.
 OWNER = "sparkdeck-mcp"
-# Keep recognizing deployments created before the SparkDeck rename so users can
-# safely stop or remove them through the same ownership guard.
-LEGACY_OWNERS = frozenset({"vllm-controller-mcp"})
 DEFAULT_CONTROLLER_URL = "http://127.0.0.1:7878"
 MAX_INFERENCE_ERROR_BYTES = 500
 DEFAULT_PROMPTS = [
@@ -184,9 +185,7 @@ class ControllerClient:
             raise ControllerError(f"deployment not found: {deployment_id}")
         return deployment
 
-    async def _deployment_record_id(
-        self, deployment_id: str, *, require_owned: bool,
-    ) -> str:
+    async def _deployment_record_id(self, deployment_id: str) -> str:
         """Resolve either a Manager ID or stable SparkDeck record ID."""
         state = await self.state()
         manager_deployment = next(
@@ -201,8 +200,8 @@ class ControllerClient:
         )
         # Listing is intentional: it performs SparkDeck's Manager/catalog
         # reconciliation and gives pre-stable-ID deployments a record ID on
-        # their first MCP request. The catalog also retains durable ownership
-        # when Manager replaces a deployment during a configuration relaunch.
+        # their first MCP request. The catalog also stays authoritative when
+        # Manager replaces a deployment during a configuration relaunch.
         catalog = await self._request("GET", "/api/v1/deployments")
         records = catalog.get("items") if isinstance(catalog, dict) else None
         if not isinstance(records, list):
@@ -232,23 +231,12 @@ class ControllerClient:
         ), None)
         if record is None or not record.get("id"):
             raise ControllerError(f"deployment not found: {deployment_id}")
-        owner = record.get("managed_by") or (
-            manager_deployment.get("managed_by")
-            if isinstance(manager_deployment, dict) else None
-        )
-        if require_owned and owner not in {OWNER, *LEGACY_OWNERS}:
-            raise ControllerError(
-                f"refusing to modify deployment {deployment_id}: "
-                "it was not created by this MCP server"
-            )
         return str(record["id"])
 
     async def deployment_configuration(
         self, deployment_id: str,
     ) -> dict[str, Any]:
-        record_id = await self._deployment_record_id(
-            deployment_id, require_owned=False,
-        )
+        record_id = await self._deployment_record_id(deployment_id)
         return await self._request(
             "GET", f"/api/v1/deployments/{quote(record_id, safe='')}",
         )
@@ -257,14 +245,10 @@ class ControllerClient:
         self,
         deployment_id: str,
         changes: dict[str, Any],
-        *,
-        require_owned: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise ControllerError("changes must be an object")
-        record_id = await self._deployment_record_id(
-            deployment_id, require_owned=require_owned,
-        )
+        record_id = await self._deployment_record_id(deployment_id)
         return await self._request(
             "PUT", f"/api/v1/deployments/{quote(record_id, safe='')}/settings",
             json_body=changes,
@@ -349,16 +333,13 @@ class ControllerClient:
         deployment_id: str,
         action: str,
         *,
-        require_owned: bool = True,
         node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if action == "remove":
             # Preserve the legacy Manager removal contract used by A/B cleanup
             # and delete_cluster_deployment. v1 record deletion has a distinct
             # DELETE route and must not be conflated with start/stop actions.
-            await self._deployment_record_id(
-                deployment_id, require_owned=require_owned,
-            )
+            await self._deployment_record_id(deployment_id)
             deployment = await self.deployment(deployment_id)
             return await self._request(
                 "POST",
@@ -378,9 +359,7 @@ class ControllerClient:
             ):
                 raise ControllerError("node_ids must contain non-empty node IDs")
             body = {"node_ids": [item.strip() for item in node_ids]}
-        record_id = await self._deployment_record_id(
-            deployment_id, require_owned=require_owned,
-        )
+        record_id = await self._deployment_record_id(deployment_id)
         return await self._request(
             "POST", f"/api/v1/deployments/{quote(record_id, safe='')}/{action}",
             json_body=body,
@@ -859,8 +838,9 @@ def build_server(
         ),
         instructions=(
             "Prefer recipe IDs and deployment IDs. Run A/B variants sequentially unless the "
-            "selected nodes have enough independent GPUs. Destructive tools protect deployments "
-            "not created through this MCP server unless allow_unowned is explicitly set. "
+            "selected nodes have enough independent GPUs. Lifecycle and configuration tools "
+            "act on any deployment in the catalog, including deployments created outside "
+            "this MCP server, so confirm the target ID before stopping or removing one. "
             "For vLLM image-specific runtime variables, use environment as an object of "
             "non-secret string NAME/value pairs; never place credentials in environment."
             " Stop a running deployment before changing its saved configuration, then "
@@ -1019,7 +999,6 @@ def build_server(
     async def update_cluster_deployment_configuration(
         deployment_id: str,
         changes: dict[str, Any],
-        allow_unowned: bool = False,
     ) -> dict[str, Any]:
         """Modify a stopped deployment's saved runtime configuration.
 
@@ -1033,11 +1012,11 @@ def build_server(
         ``extra_args`` when switching repositories). Stop a running
         deployment first, update it, then start it to apply the new
         settings. Unknown fields, secrets, and unsafe flags are rejected by
-        SparkDeck. Deployments not created by this MCP server require
-        ``allow_unowned=true``.
+        SparkDeck. Any deployment in the catalog can be updated, including
+        deployments created outside this MCP server.
         """
         return await client.update_deployment_configuration(
-            deployment_id, changes, require_owned=not allow_unowned,
+            deployment_id, changes,
         )
 
     @server.tool()
@@ -1133,18 +1112,13 @@ def build_server(
         )
 
     @server.tool()
-    async def stop_cluster_deployment(
-        deployment_id: str, allow_unowned: bool = False
-    ) -> dict[str, Any]:
-        """Stop a deployment by ID. Non-MCP deployments require allow_unowned=true."""
-        return await client.action(
-            deployment_id, "stop", require_owned=not allow_unowned
-        )
+    async def stop_cluster_deployment(deployment_id: str) -> dict[str, Any]:
+        """Stop a deployment by ID, whether or not this MCP server created it."""
+        return await client.action(deployment_id, "stop")
 
     @server.tool()
     async def start_cluster_deployment(
         deployment_id: str,
-        allow_unowned: bool = False,
         node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Start a deployment by Manager or stable ID.
@@ -1153,21 +1127,16 @@ def build_server(
         relocate a sharded deployment whose parallel layout was resized (for
         example TP 4 to 2): the selection must contain exactly the
         tensor×pipeline parallel node count required by the saved layout.
-        Non-MCP deployments require ``allow_unowned=true``.
+        Any deployment in the catalog can be started.
         """
         return await client.action(
-            deployment_id, "start",
-            require_owned=not allow_unowned, node_ids=node_ids,
+            deployment_id, "start", node_ids=node_ids,
         )
 
     @server.tool()
-    async def delete_cluster_deployment(
-        deployment_id: str, allow_unowned: bool = False
-    ) -> dict[str, Any]:
-        """Remove a deployment by ID. Non-MCP deployments require allow_unowned=true."""
-        return await client.action(
-            deployment_id, "remove", require_owned=not allow_unowned
-        )
+    async def delete_cluster_deployment(deployment_id: str) -> dict[str, Any]:
+        """Remove a deployment by ID, whether or not this MCP server created it."""
+        return await client.action(deployment_id, "remove")
 
     @server.tool()
     async def run_cluster_ab_test(
@@ -1252,7 +1221,7 @@ def build_server(
                         f"{lifecycle_action.title()}ing variant {label}",
                     )
                     cleanup_result = await client.action(
-                        deployment["id"], lifecycle_action, require_owned=True
+                        deployment["id"], lifecycle_action
                     )
                     if label in outcomes:
                         outcomes[label]["lifecycle"] = cleanup_result

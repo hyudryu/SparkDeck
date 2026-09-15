@@ -13,6 +13,7 @@ from sparkdeck.virtual_nas import (
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VirtualNAS,
+    holds_requested_revision,
 )
 
 
@@ -614,6 +615,83 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(job["status"], "failed")
             self.assertIn("complete requested revision", job["error"])
+
+    async def test_transfer_completes_without_recorded_revision_refs(self):
+        # Neither side records a revision ref: the source often received the
+        # weights by a plain copy, and the export only ships refs that already
+        # match the resolved commit. The resolved snapshot is what matters.
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Registry()
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", registry,
+                lambda: True,
+            )
+            job = queued_job(target_node_id="local")
+            nas.jobs = [job]
+            ref_less = {
+                "model_id": MODEL_ID, "partial": False,
+                "revisions": [RESOLVED_REVISION], "revision_refs": {},
+                "size_bytes": MODEL_BYTES,
+            }
+            nas._node_storage = AsyncMock(side_effect=[
+                {"models": [ref_less], "free_size": AMPLE_BYTES},
+                {"models": [], "free_size": AMPLE_BYTES},
+                {"models": [ref_less], "free_size": AMPLE_BYTES},
+            ])
+
+            async def source_bytes(chunk_size=None):
+                yield b"archive"
+
+            source_response = Mock(status_code=200)
+            source_response.aiter_bytes = source_bytes
+            source_response.aclose = AsyncMock()
+            registry.open_stream.return_value = source_response
+            nas.import_model = AsyncMock(return_value={"ok": True})
+
+            await nas._run_transfer(job)
+
+            # The mocked import never drains the stream, so the assertions
+            # cover source validation, the target's post-import verification,
+            # and the job outcome rather than transferred byte counts.
+            self.assertEqual(job["status"], "completed")
+            self.assertIsNone(job["error"])
+            registry.open_stream.assert_awaited_once()
+            nas.import_model.assert_awaited_once()
+
+    async def test_download_path_still_requires_a_recorded_revision_ref(self):
+        # A Hub download is how a missing alias gets written, so the download
+        # short-circuit must stay stricter than weight presence.
+        ref_less = {
+            "model_id": MODEL_ID, "partial": False,
+            "revisions": [RESOLVED_REVISION], "revision_refs": {},
+        }
+        self.assertTrue(
+            holds_requested_revision(ref_less, RESOLVED_REVISION, REVISION)
+        )
+        self.assertFalse(
+            VirtualNAS._has_revision(ref_less, RESOLVED_REVISION, REVISION)
+        )
+        aliased = {
+            **ref_less,
+            "revisions": [RESOLVED_REVISION, REVISION],
+            "revision_refs": {REVISION: RESOLVED_REVISION},
+        }
+        self.assertTrue(
+            VirtualNAS._has_revision(aliased, RESOLVED_REVISION, REVISION)
+        )
+        conflicting = {
+            **ref_less,
+            "revisions": [RESOLVED_REVISION, "b" * 40],
+            "revision_refs": {REVISION: "b" * 40},
+        }
+        self.assertFalse(
+            holds_requested_revision(conflicting, RESOLVED_REVISION, REVISION)
+        )
+        self.assertFalse(
+            holds_requested_revision(
+                {**ref_less, "partial": True}, RESOLVED_REVISION, REVISION,
+            )
+        )
 
     async def test_transfer_revalidates_capacity_against_actual_source_size(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -41,7 +41,13 @@ from sparkdeck.service import (
     _public_community_aggregates,
 )
 from sparkdeck.stream_cleanup import close_async_stream
+from sparkdeck.responses import to_chat_request, from_chat_response, stream_chat_response
 from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
+from sparkdeck.live_metrics import (
+    DEFAULT_HISTORY_ENABLED,
+    DEFAULT_HISTORY_SAMPLE_SECONDS,
+    clamp_sample_seconds,
+)
 from sparkdeck.request_limits import (
     MAX_CLUSTER_ROUTING_ENVELOPE_BYTES,
     MAX_INFERENCE_REQUEST_BYTES,
@@ -494,6 +500,7 @@ _STORAGE_INSTRUCTIONS = [
     "Partial Hugging Face caches are marked with a warning; only complete caches are transferable.",
     "ComfyUI weights can be deleted in place; recognized complete bundles can also be transferred.",
     "Choose an online source and one or more online targets with enough free space.",
+    "Independent node pairs copy at the same time; a node that is already reading or receiving a model waits for that copy to finish.",
 ]
 
 
@@ -803,6 +810,49 @@ async def rename_temperature_run(run_id: str, req: Request):
 async def get_active_request_rates():
     """Small endpoint polled by the token widget at a fixed cadence."""
     return manager.active_requests()
+
+
+@app.get("/api/v1/live-history")
+async def get_live_history():
+    """Trailing per-serving-unit throughput history for the History panel.
+
+    The sampler is started on the first request and then runs for the life of
+    the process, at whatever cadence the history settings currently say.  While
+    recording is switched off it idles and returns no series.
+    """
+    sparkdeck.history.ensure_sampler()
+    return sparkdeck.history.snapshot()
+
+
+@app.put("/api/v1/live-history/settings")
+async def update_live_history_settings(req: Request):
+    """Turn history recording on or off and set its sampling cadence.
+
+    Kept separate from the full settings update so the panel can flip its own
+    switch without round-tripping every unrelated app setting.
+    """
+    body = await req.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "history settings must be an object")
+    if "enabled" in body:
+        if not isinstance(body["enabled"], bool):
+            raise HTTPException(400, "enabled must be a boolean")
+        sparkdeck.store.set_setting("history_enabled", body["enabled"])
+    if "sample_seconds" in body:
+        raw_seconds = body["sample_seconds"]
+        if isinstance(raw_seconds, bool) or not isinstance(raw_seconds, (int, float, str)):
+            raise HTTPException(400, "sample_seconds must be a number of seconds")
+        try:
+            # Reject junk instead of silently recording the default cadence.
+            float(raw_seconds)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "sample_seconds must be a number of seconds") from exc
+        sparkdeck.store.set_setting("history_sample_seconds", clamp_sample_seconds(raw_seconds))
+    if "enabled" in body and not body["enabled"]:
+        # A disabled panel should not keep a trailing hour in memory.
+        sparkdeck.history.forget()
+    sparkdeck.history.ensure_sampler()
+    return sparkdeck.history.snapshot()
 
 
 # ---------- cluster nodes / node agent ----------
@@ -2879,6 +2929,8 @@ _APP_SETTING_DEFAULTS = {
     "theme": "system",
     "default_runtime": "vllm",
     "default_context_length": 8192,
+    "history_enabled": DEFAULT_HISTORY_ENABLED,
+    "history_sample_seconds": DEFAULT_HISTORY_SAMPLE_SECONDS,
 }
 
 
@@ -2923,11 +2975,27 @@ async def v1_update_settings(req: Request):
     )
     if type(prompt_limit) is not int or prompt_limit < 1:
         raise HTTPException(400, "max_concurrent_prompt_processing must be a positive integer")
+    raw_history_enabled = body.get(
+        "history_enabled",
+        sparkdeck.store.get_setting("history_enabled", DEFAULT_HISTORY_ENABLED),
+    )
+    if not isinstance(raw_history_enabled, bool):
+        raise HTTPException(400, "history_enabled must be a boolean")
+    # An out-of-range interval is clamped rather than rejected, so a stale saved
+    # value or a slightly different client bound can never break recording.
+    history_sample_seconds = clamp_sample_seconds(body.get(
+        "history_sample_seconds",
+        sparkdeck.store.get_setting(
+            "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
+        ),
+    ))
     values = {
         "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
         "default_runtime": default_runtime,
         "default_context_length": default_context_length,
+        "history_enabled": raw_history_enabled,
+        "history_sample_seconds": history_sample_seconds,
     }
     credential = body.get("hf_token")
     if credential is not None:
@@ -4372,6 +4440,49 @@ async def v1_chat_completions(req: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     return result
+
+
+@app.post("/v1/responses")
+async def v1_responses(req: Request):
+    body = await _inference_json(req)
+    try:
+        chat_body = to_chat_request(body)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(exc), "type": "invalid_request_error", "code": None,
+        }})
+    cancel = asyncio.Event()
+    watcher = _watch_disconnect(req, cancel)
+    streaming = False
+    try:
+        result = await sparkdeck.proxy(
+            chat_body, "chat/completions", cancel,
+            caller_ip=_inference_caller_ip(req),
+        )
+        if hasattr(result, "__aiter__"):
+            streaming = True
+            return StreamingResponse(
+                _guard_stream(stream_chat_response(result, body), watcher),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        try:
+            return from_chat_response(result, body)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(502, "invalid upstream chat response") from exc
+    except ClientAbort:
+        return Response(status_code=499)
+    except SourceRoutingUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(exc.response.status_code, exc.response.text[:500]) from exc
+    finally:
+        if not streaming:
+            watcher.cancel()
 
 
 @app.post("/v1/completions")

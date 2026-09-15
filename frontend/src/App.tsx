@@ -22,6 +22,7 @@ import { StoragePage } from './pages/StoragePage'
 import { UsagePage } from './pages/UsagePage'
 import { SwitchPage } from './pages/SwitchPage'
 import { FanControlPage } from './pages/FanControlPage'
+import { HistoryPage } from './pages/HistoryPage'
 
 export default function App() {
   const [onboarding, setOnboarding] = useState<OnboardingStatus>()
@@ -132,6 +133,7 @@ export default function App() {
           <Route path="/compare" element={<ComparePage />} />
           <Route path="/benchmarks" element={<BenchmarksPage />} />
           <Route path="/usage" element={<UsagePage />} />
+          <Route path="/history" element={<HistoryPage />} />
           <Route path="/images" element={<ImagesPage />} />
           <Route path="/storage" element={<StoragePage />} />
           <Route path="/settings" element={<SettingsPage />} />

@@ -59,6 +59,7 @@ from sparkdeck.virtual_nas import (
     VirtualNAS,
     cached_download_bytes,
     download_required_free_bytes,
+    holds_requested_revision,
     partial_download_size_bytes,
     transfer_required_free_bytes,
     validate_model_id,
@@ -152,6 +153,13 @@ MEMBER_LOG_TIMEOUT_SECONDS = 5.0
 # Member-label modes that run one rank of a distributed engine: host
 # networking, fabric environment, and per-rank VRAM fitting all apply.
 _SHARDED_MEMBER_MODES = frozenset({"sharded", "grouped_sharded"})
+# Agent/Docker replies that prove a member container does not exist. For
+# stop and remove that absence is the desired end state, not a failure.
+_MEMBER_ABSENT_ERROR_MARKERS = (
+    "cluster member not found",
+    "managed container not found",
+    "no such container",
+)
 
 
 def _grouped_sharded_topology(body: dict, node_count: int) -> tuple[int, int]:
@@ -432,6 +440,19 @@ TEMPERATURE_RUN_MAX_TELEMETRY_FAILURES = 5
 # EarlyOom is the safety net, but this avoids triggering it in the common case.
 GPU_VRAM_BUFFER_GB = 10.0
 
+# Maximum time an inference request may wait in the controller admission
+# queue before it is rejected instead of lingering as a stale entry.
+INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS = 120.0
+
+# A model transfer reports its live rate from two consecutive cluster
+# inventory samples. The inventory is cached for ten seconds and every node
+# then has to answer, so consecutive samples are routinely further apart than
+# the ten second cache alone suggests. Measure the interval that actually
+# elapsed, and only forget a sample pair once it is too old to describe the
+# current rate.
+VIRTUAL_NAS_RATE_MIN_SAMPLE_GAP_SECONDS = 0.5
+VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS = 300.0
+
 FAN_MODE_DEFAULTS = {
     "curve": {
         "curve_points": [[40.0, 0.0], [60.0, 30.0], [75.0, 60.0], [90.0, 100.0]],
@@ -678,6 +699,19 @@ def _community_consent_fanout(nodes: list[dict], results: list) -> dict:
         else:
             errors.append(f"{name}: consent update was not applied")
     return {"applied": applied, "conflicts": [], "errors": errors}
+
+
+def notify_live_history(manager: Any, event: str, group: Any = None, rec: Any = None) -> None:
+    """Report one inference lifecycle event to the live-history collector.
+
+    Recording is optional and the manager is not always a ``Manager``:
+    several callers drive the tracking methods on a stub object that only
+    carries the attributes they need, so the hook is looked up defensively and
+    an ordinary request never depends on the observer existing.
+    """
+    hook = getattr(manager, "_live_history_hook", None)
+    if hook is not None:
+        hook(event, group, rec)
 
 
 class Manager:
@@ -1954,7 +1988,7 @@ class Manager:
     async def virtual_nas_inventory(self) -> dict:
         instructions = [
             "Enable Virtual NAS to copy complete Hugging Face model caches between paired nodes.",
-            "Transfers are serialized and remain local to your authenticated SparkDeck cluster.",
+            "Transfers between independent node pairs run concurrently and remain local to your authenticated SparkDeck cluster.",
             "ComfyUI weights can be deleted in place; only recognized complete bundles can be transferred between nodes.",
         ]
         if not self.virtual_nas_enabled():
@@ -2061,7 +2095,14 @@ class Manager:
     def _sample_virtual_nas_transfer_rate(
         self, job: dict, sampled_at: float,
     ) -> float | None:
-        """Measure current transfer throughput between inventory samples."""
+        """Measure current transfer throughput between inventory samples.
+
+        The byte count behind ``bytes_transferred`` only advances when the
+        cluster inventory is refreshed, so a sample pair can legitimately span
+        far more than the inventory cache lifetime. Divide by the interval that
+        really elapsed instead of discarding slow samples, which left live
+        transfers without any reported rate.
+        """
         samples = getattr(self, "_virtual_nas_rate_samples", None)
         if samples is None:
             samples = {}
@@ -2077,9 +2118,11 @@ class Manager:
             return None
         previous_at, previous_bytes, previous_rate = previous
         elapsed = sampled_at - previous_at
-        if elapsed < 0.5:
+        if elapsed < VIRTUAL_NAS_RATE_MIN_SAMPLE_GAP_SECONDS:
+            # Repeat requests serve the same cached inventory snapshot, so the
+            # rate measured for that snapshot still describes the job.
             return previous_rate
-        if elapsed > 15:
+        if elapsed > VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS:
             samples[job_id] = (sampled_at, transferred, None)
             return None
         if transferred < previous_bytes:
@@ -2102,17 +2145,14 @@ class Manager:
     def _model_has_pinned_revision(
         model: dict, requested_revision: str, resolved_revision: str | None,
     ) -> bool:
-        if (
-            not resolved_revision
-            or model.get("partial")
-            or resolved_revision not in (model.get("revisions") or [])
-        ):
-            return False
-        if requested_revision == resolved_revision:
-            return True
-        return (
-            (model.get("revision_refs") or {}).get(requested_revision)
-            == resolved_revision
+        """Return whether a node's cache holds the requested revision's weights.
+
+        A cache that never recorded the requested ref still holds the weights
+        when it carries a complete snapshot of the commit the Hub resolved the
+        ref to; see :func:`holds_requested_revision`.
+        """
+        return holds_requested_revision(
+            model, resolved_revision, requested_revision,
         )
 
     async def model_cache_inventory(
@@ -4392,6 +4432,9 @@ class Manager:
                 "dspark_num_speculative_tokens": None,
                 "max_cudagraph_capture_size": None,
                 "max_num_batched_tokens": None,
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
             }
         return {
             "context_window": context_window,
@@ -4424,6 +4467,18 @@ class Manager:
             ),
             "max_num_batched_tokens": cls._cli_option(
                 args, {"--max-num-batched-tokens"}, int
+            ),
+            "sg_speculative_num_draft_tokens": (
+                cls._cli_option(args, {"--speculative-num-draft-tokens"}, int)
+                if engine == "sglang" else None
+            ),
+            "sg_cuda_graph_max_bs": (
+                cls._cli_option(args, {"--cuda-graph-max-bs"}, int)
+                if engine == "sglang" else None
+            ),
+            "sg_chunked_prefill_size": (
+                cls._cli_option(args, {"--chunked-prefill-size"}, int)
+                if engine == "sglang" else None
             ),
         }
 
@@ -4613,6 +4668,21 @@ class Manager:
                 flags = self._replace_command_option(
                     flags, {"--speculative-config"}, speculative_value
                 )
+
+        if engine == "sglang":
+            # SGLang-native equivalents of the vLLM-only structured controls.
+            # As with the gated vLLM keys above, an absent key means the caller
+            # did not submit the control (leave the flag untouched); only an
+            # explicit null clears it.
+            for control_key, flag in (
+                ("sg_speculative_num_draft_tokens", "--speculative-num-draft-tokens"),
+                ("sg_cuda_graph_max_bs", "--cuda-graph-max-bs"),
+                ("sg_chunked_prefill_size", "--chunked-prefill-size"),
+            ):
+                if control_key in controls:
+                    flags = self._replace_command_option(
+                        flags, {flag}, positive_int(control_key),
+                    )
 
         try:
             return shlex.split(flags)
@@ -6083,14 +6153,17 @@ class Manager:
         return tied[index]
 
     def _grouped_coordinators(self, deployment: dict) -> list[dict]:
-        """Rank-0 coordinator of each started engine group, group order."""
+        """Rank-0 coordinator of each running engine group, group order."""
         by_instance: dict[int, dict] = {}
         for member in self._cluster_members_sorted(deployment):
             if int(member.get("rank") or 0) != 0:
                 continue
             if str(member.get("desired_state") or "") == "stopped":
                 continue
-            if str(member.get("status") or "") in {"stopped", "error"}:
+            # Only a group whose engine is actually running may take traffic;
+            # starting/queued/creating groups cannot serve yet, and unknown
+            # or unreachable ones are just as unable.
+            if str(member.get("status") or "") != "running":
                 continue
             instance = int(member.get("instance_id") or 0)
             by_instance.setdefault(instance, member)
@@ -6104,14 +6177,18 @@ class Manager:
         the least busy replicas first. Sharded ranks form a single engine,
         so only the rank-0 coordinator may serve a request. Grouped-sharded
         deployments balance across the running engine groups: each group's
-        rank-0 coordinator carries the group's requests, and stopped or
-        failed groups drop out of the candidate set.
+        rank-0 coordinator carries the group's requests, and stopped, failed,
+        or still-starting groups drop out of the candidate set. When no group
+        is running, the empty route order rejects the request rather than
+        sending it to a group that cannot serve yet.
         """
         members = self._cluster_members_sorted(deployment)
         if deployment.get("mode") == "grouped_sharded":
             coordinators = self._grouped_coordinators(deployment)
             if not coordinators:
-                return members[:1]
+                # No engine group is running. Reject the request instead of
+                # falling back to a still-starting group that cannot serve.
+                return []
             chosen = self._balanced_cluster_member(deployment, coordinators)
             rest = [m for m in coordinators if m is not chosen]
             rest.sort(key=lambda m: self._cluster_member_active(
@@ -7663,39 +7740,34 @@ class Manager:
         return lock
 
     @staticmethod
-    def _member_already_absent(result: Any) -> bool:
-        """True when a lifecycle error only proves the container is gone."""
-        message = str(result).lower()
+    def _member_action_already_absent(message: str) -> bool:
+        lowered = message.lower()
         return any(
-            marker in message
-            for marker in (
-                "cluster member not found",
-                "managed container not found",
-                "no such container",
-            )
+            marker in lowered for marker in _MEMBER_ABSENT_ERROR_MARKERS
         )
 
     @staticmethod
     def _member_action_errors(results: list[Any], action: str) -> list[str]:
-        """Return actionable member errors, keeping remove and stop idempotent.
+        """Return actionable member errors, keeping absence idempotent.
 
         Older node agents return 404 after a cluster member has already been
         removed. That is the desired end state for a remove action, so it must
-        not leave an undeletable deployment card behind.
-
-        A stop has the same end state: a rank whose container vanished before
-        the stop was issued cannot be stopped, and reporting that as a failure
-        would strand the deployment. A recorded per-rank stop failure blocks
-        the node reservation from ever being released, so the ranks would stay
-        pinned by a deployment that has nothing left running.
+        not leave an undeletable deployment card behind. The same applies to
+        stop: a rank whose container was never created (for example a launch
+        that failed at image pull) is already stopped, and Docker's 404 must
+        not persist as the deployment's error.
         """
         errors = []
         for result in results:
             if not isinstance(result, Exception):
                 continue
-            if action in {"remove", "stop"} and Manager._member_already_absent(result):
-                continue
-            errors.append(str(result))
+            message = str(result)
+            already_absent = (
+                action in {"stop", "remove"}
+                and Manager._member_action_already_absent(message)
+            )
+            if not already_absent:
+                errors.append(message)
         return errors
 
     async def remove_orphaned_deployment_members(
@@ -7817,6 +7889,49 @@ class Manager:
                 f"instance must be between 0 and {instances - 1}"
             )
         return requested
+
+    @staticmethod
+    def _fold_headless_member_phases(members: list[dict]) -> None:
+        """Fold headless sharded workers into their group's readiness.
+
+        A rank > 0 TP worker runs headless: it exposes no HTTP API and never
+        logs the rank-0 uvicorn startup marker, so log scraping leaves it at
+        "starting…" forever. Once the group's rank-0 coordinator reports
+        ready and the worker's own container is running, the worker is
+        serving as part of that group and should display ready. Honest
+        failure signals (error/dead/missing/…) are never overwritten.
+        """
+        ready_groups = {
+            int(member.get("instance_id") or 0)
+            for member in members
+            if isinstance(member, dict)
+            and int(member.get("rank") or 0) == 0
+            and str(member.get("status") or "") == "running"
+            and isinstance(member.get("phase"), dict)
+            and member["phase"].get("phase") == "ready"
+        }
+        if not ready_groups:
+            return
+        for member in members:
+            if (
+                not isinstance(member, dict)
+                or int(member.get("rank") or 0) == 0
+                or int(member.get("instance_id") or 0) not in ready_groups
+                or str(member.get("status") or "") != "running"
+            ):
+                continue
+            phase = member.get("phase")
+            phase_name = phase.get("phase") if isinstance(phase, dict) else phase
+            if str(phase_name or "").casefold() in {
+                "ready", "error", "dead", "unreachable", "missing",
+                "unknown", "failed",
+            }:
+                continue
+            member["phase"] = {
+                "phase": "ready",
+                "progress": 1.0,
+                "message": "Group engine is ready (headless rank)",
+            }
 
     @staticmethod
     def _grouped_deployment_status(deployment: dict) -> str:
@@ -8293,6 +8408,14 @@ class Manager:
             for member, result in zip(targeted_members, results):
                 if isinstance(result, Exception):
                     if action == "stop":
+                        if self._member_action_already_absent(str(result)):
+                            # Stopping a rank whose container was never created
+                            # (e.g. its launch failed at image pull) has reached
+                            # the desired end state; the 404 is not a stop
+                            # failure and must not pin the deployment as errored.
+                            member.pop("failed_stop_error", None)
+                            member["status"] = "stopped"
+                            continue
                         member["failed_stop_error"] = str(result)
                     continue
                 member.pop("failed_stop_error", None)
@@ -11853,7 +11976,21 @@ class Manager:
             # A synthetic startup probe must not refresh the deployment's
             # "last used" timestamps or skew ordinary usage metrics.
             self._mark_deployment_used(deployment_id)
+        notify_live_history(self, "start", self._active_reqs[rid]["group"])
         return rid
+
+    def _live_history_hook(self, event: str, group=None, rec=None) -> None:
+        """Forward one lifecycle event to the collector, if one is attached."""
+        history = getattr(self, "live_history", None)
+        if history is None:
+            return
+        handler = getattr(history, event, None)
+        if handler is None:
+            return
+        if event == "end":
+            handler(group, rec)
+        else:
+            handler(group)
 
     def _track_prompt_processing(
         self, rid: int, prompt_tokens: int, pp_time_s: float,
@@ -11883,6 +12020,7 @@ class Manager:
                 # A synthetic startup probe must not refresh the deployment's
                 # "last used" timestamps at completion either.
                 self._mark_deployment_used(rec.get("deployment_id"))
+            notify_live_history(self, "end", rec.get("group"), rec)
 
     def _transfer_inference_ownership(
         self, admission=None, request_id=None, *,
@@ -12023,6 +12161,17 @@ class Manager:
         """Per-engine sessions and rolling rates for the dashboard."""
         return self.active_requests(_grouped=True)
 
+    @staticmethod
+    def _blank_session_rates() -> dict:
+        """Fresh per-model/per-group counters for one dashboard entry."""
+        return {
+            "connections": 0, "decoded_tokens": 0,
+            "thinking_tok_s": 0.0, "output_tok_s": 0.0,
+            "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
+            "output_sessions": 0, "thinking_sessions": 0,
+            "prefill_sessions": 0, "prefill_seconds": None,
+        }
+
     def active_requests(self, *, _grouped: bool = False) -> dict:
         """Per-model, five-second rolling thinking/output stream rates."""
         now = time.monotonic()
@@ -12036,11 +12185,7 @@ class Manager:
                 continue
             group = rec.get("group") or self._request_group(rec["key"])
             entry_key = group["group_id"] if _grouped else rec["key"]
-            e = out.setdefault(entry_key, {
-                "connections": 0, "decoded_tokens": 0,
-                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
-                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
-            })
+            e = out.setdefault(entry_key, self._blank_session_rates())
             if _grouped:
                 e.update(group)
             e["connections"] += 1
@@ -12066,6 +12211,40 @@ class Manager:
                 if timestamps:
                     observed = min(getattr(self, "_trailing_window", 5.0), max(1.0, now - timestamps[0]))
                     e[field] += len(timestamps) / observed
+            # Classify this live session so the dashboard can report what the
+            # engine is doing with it right now. Two precedence rules matter:
+            #
+            # 1. A session that has generated nothing at all is the only one
+            #    that can be called prompt processing. Once a request has
+            #    decoded, it is never prefilling again even if its tokens have
+            #    drained out of the trailing window.
+            # 2. Within the window, visible output wins over reasoning, so a
+            #    session that moved on from thinking to answering is counted
+            #    once as outputting.
+            #
+            # A decoded request whose tokens aged out of the window matches
+            # neither bucket and is left uncounted, so it cannot be reported as
+            # prefilling on the strength of a stale window.
+            output_tokens = len(rec.get("output") or ())
+            thinking_tokens = len(rec.get("thinking") or ())
+            if not (output_tokens or thinking_tokens or rec.get("total_tokens")):
+                # Tracked, held a slot, and has emitted no token yet: this
+                # request is still being prefilled. Requests waiting for a FIFO
+                # slot are not tracked here at all -- they are reported through
+                # the admission queue instead.
+                e["prefill_sessions"] += 1
+                rec_started = rec.get("started_at")
+                if rec_started is not None:
+                    held_seconds = max(0.0, now - float(rec_started))
+                    current = e["prefill_seconds"]
+                    e["prefill_seconds"] = (
+                        held_seconds if current is None
+                        else max(current, held_seconds)
+                    )
+            elif output_tokens:
+                e["output_sessions"] += 1
+            elif thinking_tokens:
+                e["thinking_sessions"] += 1
         for e in out.values():
             e["thinking_tok_s"] = round(e["thinking_tok_s"], 1)
             e["output_tok_s"] = round(e["output_tok_s"], 1)
@@ -12088,12 +12267,7 @@ class Manager:
                 if key in admission
             } if admission.get("group_id") else self._request_group(model)
             entry_key = group["group_id"] if _grouped else model
-            e = out.setdefault(entry_key, {
-                "connections": 0, "decoded_tokens": 0,
-                "thinking_tok_s": 0.0, "output_tok_s": 0.0,
-                "pp_tokens": 0, "pp_time_s": 0.0, "pp_measuring": 0,
-                "pp_tok_s": None,
-            })
+            e = out.setdefault(entry_key, self._blank_session_rates())
             if _grouped:
                 e.update(group)
             e["queued"] = e.get("queued", 0) + admission["queued"]
@@ -12191,17 +12365,26 @@ class Manager:
 
         cancel_waiter: asyncio.Task | None = None
         try:
-            if cancel is None:
-                await waiter["future"]
-            else:
+            pending_on: set = {waiter["future"]}
+            if cancel is not None:
                 cancel_waiter = asyncio.create_task(cancel.wait())
-                done, _ = await asyncio.wait(
-                    {waiter["future"], cancel_waiter},
-                    return_when=asyncio.FIRST_COMPLETED,
+                pending_on.add(cancel_waiter)
+            done, _ = await asyncio.wait(
+                pending_on,
+                timeout=INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # The slot never freed up (stalled or still-starting target).
+                # Reject the request instead of letting it linger in the
+                # queue forever as a stale entry.
+                raise TimeoutError(
+                    f"inference queue wait for '{stats_key}' exceeded "
+                    f"{int(INFERENCE_QUEUE_WAIT_TIMEOUT_SECONDS)}s"
                 )
-                if cancel_waiter in done:
-                    raise ClientAbort("client disconnected while queued")
-                await waiter["future"]
+            if cancel_waiter is not None and cancel_waiter in done:
+                raise ClientAbort("client disconnected while queued")
+            await waiter["future"]
             return waiter["lease"]
         except BaseException:
             if waiter["granted"]:
@@ -15175,6 +15358,10 @@ class Manager:
     )
     _RE_LOAD_PCT = re.compile(r"Loading.*?(\d{1,3})\s*%")
     _RE_ERROR = re.compile(r"\b(Error|Traceback|OutOfMemoryError|CUDA out of memory|RuntimeError)\b")
+    # Backtrace frames ("frame #0: c10::Error::Error(...) + 0xc8") mention
+    # error symbols without reporting an error. A real Python traceback ends
+    # with its exception line, which is not a frame line.
+    _RE_STACK_FRAME = re.compile(r"^\s*(?:frame\s+)?#\d+\b")
 
     def _parse_phase(self, logs: str) -> dict:
         if not logs:
@@ -15220,17 +15407,33 @@ class Manager:
                 "message": f"loading {pct}%",
             }
 
-        # Error detection
-        if self._RE_ERROR.search(tail):
-            err_line = next(
-                (l for l in reversed(lines) if self._RE_ERROR.search(l)),
-                "",
+        # Error detection. A running engine logs handled faults (rejected
+        # requests, transient NCCL/c10 backtraces) and keeps serving, so any
+        # single matching line is not proof of failure — the caller already
+        # reports exited/dead containers from Docker status, and a real
+        # startup crash ends the log with its exception. Only treat log text
+        # as a failure while the error is the container's latest output or
+        # distinct error lines repeat in the recent tail.
+        error_lines = [
+            l for l in lines
+            if self._RE_ERROR.search(l) and not self._RE_STACK_FRAME.search(l)
+        ]
+        if error_lines:
+            last_is_error = bool(
+                self._RE_ERROR.search(lines[-1])
+                and not self._RE_STACK_FRAME.search(lines[-1])
             )
-            return {
-                "phase": "error",
-                "progress": None,
-                "message": err_line.strip()[:240] or "error in startup logs",
-            }
+            recent = lines[-10:]
+            repeated = len({
+                l.strip()[:120] for l in error_lines if l in recent
+            }) >= 2
+            if last_is_error or repeated:
+                return {
+                    "phase": "error",
+                    "progress": None,
+                    "message": error_lines[-1].strip()[:240]
+                    or "error in startup logs",
+                }
 
         # Pre-load init signals
         if "Initializing" in tail or "Starting vLLM" in tail or "engine" in tail.lower():
@@ -20151,6 +20354,10 @@ class Manager:
                 member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
+            if saved.get("mode") in _SHARDED_MEMBER_MODES:
+                # Headless ranks have no readiness endpoint of their own;
+                # derive their phase from the group coordinator's readiness.
+                self._fold_headless_member_phases(deployment["members"])
             if saved.get("status") != "error":
                 # A completed Stop is durable even when a node subsequently
                 # disconnects. Keep the member's offline node observation, but

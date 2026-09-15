@@ -37,6 +37,23 @@ describe('deployment node occupancy', () => {
       expect(Object.keys(occupiedNodeReasons([{ ...split, instances: [{ ...split.instances![0], status, desired_state: 'stopped' }] }]))).toEqual(['n1', 'n2'])
     }
   })
+  it('frees stopped profiles that only carry a failed-launch error marker', () => {
+    const stale = { ...split, id: 'stale', alias: 'Old name', status: 'error' as const, desired_state: 'stopped' as const, instances: undefined }
+    const edited = { ...split, id: 'edited', alias: 'New name', status: 'stopped' as const, desired_state: 'stopped' as const, instances: undefined }
+    expect(occupiedNodeReasons([stale, edited])).toEqual({})
+    expect(occupiedNodeReasons([stale, edited], 'edited')).toEqual({})
+    expect(occupiedNodeReasons([stale, edited], 'stale')).toEqual({})
+  })
+  it('still treats error groups without stopped intent as occupying their nodes', () => {
+    for (const desired_state of [undefined, 'running'] as const) {
+      const crashing = { ...split, status: 'error' as const, desired_state, instances: undefined }
+      expect(Object.keys(occupiedNodeReasons([crashing]))).toEqual(['n1', 'n2', 'n3', 'n4'])
+    }
+  })
+  it('still reserves nodes for a group that is mid-stop', () => {
+    const stopping = { ...split, status: 'stopping' as const, desired_state: 'stopped' as const, instances: undefined }
+    expect(Object.keys(occupiedNodeReasons([stopping]))).toEqual(['n1', 'n2', 'n3', 'n4'])
+  })
   it('reserves stopped groups awaiting recovery but frees explicitly stopped groups', () => {
     for (const status of ['degraded', 'stopped'] as const) {
       const recovering = { ...split, status, desired_state: 'running' as const, instances: [

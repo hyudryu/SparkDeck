@@ -22,6 +22,7 @@ SPA_PATHS = (
     "/storage",
     "/benchmarks",
     "/usage",
+    "/history",
     "/images",
     "/settings",
     "/logs",

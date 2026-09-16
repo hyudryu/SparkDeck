@@ -12,17 +12,21 @@ directly so no cluster lifespan and no real settings database are needed:
 """
 
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import server
 from sparkdeck.live_metrics import (
+    DEFAULT_HISTORY_SAMPLE_SECONDS,
     KEEP_SECONDS,
     MAX_SAMPLE_SECONDS,
     MIN_SAMPLE_SECONDS,
     LiveHistory,
 )
+from sparkdeck.service import SparkDeckService
 
 
 class _Store:
@@ -200,3 +204,51 @@ class LiveHistorySettingsTests(unittest.TestCase):
                     payload = _settings({"sample_seconds": seconds})
                     self.assertEqual(payload["sample_seconds"], float(seconds))
             asyncio.run(harness.history.stop())
+
+
+class LiveHistoryServiceWiringTests(unittest.IsolatedAsyncioTestCase):
+    """The collector has to exist on a real service, not only in the harness.
+
+    ``_Harness`` swaps in its own collector, so every other test in this module
+    would still pass if the service stopped constructing one -- and the routes
+    would answer 500 on a live controller.  These tests read the object the
+    service really builds, against its own settings store.
+    """
+
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.service = SparkDeckService(SimpleNamespace(http=None), Path(directory.name))
+        self._original = server.sparkdeck
+        server.sparkdeck = self.service
+
+    async def asyncTearDown(self) -> None:
+        server.sparkdeck = self._original
+        # The route starts a background sampler; leaving it running would keep
+        # this test's event loop busy after the assertions finish.
+        await self.service.close()
+
+    async def test_a_real_service_constructs_the_collector_the_routes_call(self) -> None:
+        self.assertIsInstance(self.service.history, LiveHistory)
+        # The manager pushes admission and completion events through this
+        # attribute, so the collector has to be reachable from both sides.
+        self.assertIs(self.service.manager.live_history, self.service.history)
+
+    async def test_the_routes_read_the_collector_the_service_built(self) -> None:
+        payload = await server.get_live_history()
+
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["series"], [])
+        self.assertEqual(payload["sample_seconds"], float(DEFAULT_HISTORY_SAMPLE_SECONDS))
+
+    async def test_the_collector_follows_the_service_settings(self) -> None:
+        off = await server.update_live_history_settings(_Request({"enabled": False}))
+        self.assertFalse(off["enabled"])
+        self.assertEqual(off["series"], [])
+
+        paced = await server.update_live_history_settings(
+            _Request({"enabled": True, "sample_seconds": 12})
+        )
+        self.assertEqual(paced["sample_seconds"], 12.0)
+        self.assertEqual(paced["bucket_seconds"], 12.0)
+        self.assertEqual(self.service.store.get_setting("history_sample_seconds"), 12)

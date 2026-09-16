@@ -46,6 +46,11 @@ from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, 
 from .runtime_file_mounts import normalize_runtime_file_mounts
 from .stream_cleanup import close_async_stream
 from .prompt_gate import PromptGates
+from .live_metrics import (
+    DEFAULT_HISTORY_ENABLED,
+    DEFAULT_HISTORY_SAMPLE_SECONDS,
+    LiveHistory,
+)
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     RuntimeRegistry,
@@ -409,6 +414,21 @@ class SparkDeckService:
             lambda: self.store.get_setting("max_concurrent_prompt_processing", 1)
         )
         self.manager.prompt_gate = self.prompt_gate
+        # Trailing throughput history for the History panel.  The manager keeps
+        # owning live request tracking; this observer only reads those records.
+        # Its cadence and its on/off switch are live settings, so the collector
+        # asks for them on every tick rather than caching them at construction:
+        # turning history off has to stop the work immediately.
+        self.history = LiveHistory(
+            self.manager,
+            interval_provider=lambda: self.store.get_setting(
+                "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
+            ),
+            enabled_provider=lambda: bool(
+                self.store.get_setting("history_enabled", DEFAULT_HISTORY_ENABLED)
+            ),
+        )
+        self.manager.live_history = self.history
         self.manager._prompt_observation_dispatch = self._activate_group_observation
         self.registry = RuntimeRegistry()
         self.catalog = HuggingFaceCatalog(
@@ -461,6 +481,7 @@ class SparkDeckService:
                 log.exception("Community consent cancellation callback failed")
 
     async def close(self) -> None:
+        await self.history.stop()
         refreshes = list(getattr(self, "_source_routing_refresh_tasks", {}).values())
         for refresh in refreshes:
             refresh.cancel()

@@ -3,6 +3,7 @@ import copy
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -805,6 +806,98 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployment_action.assert_awaited_once_with(
             "new-manager", "stop",
         )
+
+    async def test_replacement_poll_does_not_adopt_in_flight_bookmark(self):
+        cluster = {
+            "id": "replacement-manager", "sparkdeck_record_id": "record-1",
+            "model": "org/model", "engine": "vllm", "node_ids": ["worker-1"],
+            "members": [{"container_name": "new-rank"}],
+            "launch_settings": {"sparkdeck_record_id": "record-1"},
+        }
+        self.manager.deployments = [cluster]
+        self.service._deployment_launches["record-1"] = asyncio.Event()
+        listed = await self.service._adopt_unlinked_manager_deployments([cluster])
+        self.assertEqual([item["id"] for item in listed], ["record-1"])
+        self.assertEqual(cluster["sparkdeck_record_id"], "record-1")
+        self.assertEqual(cluster["launch_settings"]["sparkdeck_record_id"], "record-1")
+        settings = {**listed[0]["settings"], "manager_deployment_id": cluster["id"]}
+        self.service.store.update_managed_routing("record-1", settings, "new-rank", None)
+        self.service._deployment_launches.pop("record-1")
+        listed = await self.service._adopt_unlinked_manager_deployments([cluster])
+        self.assertEqual([item["id"] for item in listed], ["record-1"])
+
+    async def test_start_poll_during_replacement_keeps_one_public_record(self):
+        replacement = {
+            "id": "replacement-manager", "sparkdeck_record_id": "record-1",
+            "model": "org/model", "engine": "vllm", "node_ids": ["worker-1"],
+            "status": "ready", "api_port": 8020,
+            "members": [{"container_name": "replacement-rank"}],
+            "launch_settings": {"sparkdeck_record_id": "record-1"},
+        }
+
+        async def replace_and_poll(*_args, **_kwargs):
+            self.manager.deployments = [replacement]
+            listed = await self.service.deployments()
+            self.assertEqual([item["id"] for item in listed], ["record-1"])
+            self.assertEqual(replacement["sparkdeck_record_id"], "record-1")
+            return {"ok": True, "errors": [], "replaced_deployment_id": "old-manager",
+                    "deployment": replacement}
+
+        self.manager.deployment_action.side_effect = replace_and_poll
+        await self.service.deployment_action("record-1", "start")
+        listed = await self.service.deployments()
+        self.assertEqual([item["id"] for item in listed], ["record-1"])
+        self.assertEqual(listed[0]["settings"]["manager_deployment_id"], "replacement-manager")
+
+    async def test_existing_synthetic_duplicate_is_repaired_across_restart(self):
+        synthetic_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL, "sparkdeck:manager-deployment:old-manager",
+        ))
+        self.service.store.add_deployment(Deployment(
+            id=synthetic_id, alias="discovered copy", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            container_name="old-rank", settings={"manager_deployment_id": "old-manager"},
+        ), "http://127.0.0.1:8000")
+        # These are distinct launches of the same model: neither is removed.
+        for record_id, manager_id in [("other", "other-manager"), ("bookmark", "")]:
+            self.service.store.add_deployment(Deployment(
+                id=record_id, alias=record_id, runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                settings={"manager_deployment_id": manager_id},
+            ))
+        cluster = {
+            "id": "old-manager", "sparkdeck_record_id": synthetic_id,
+            "model": "org/model", "engine": "vllm", "node_ids": ["worker-1"],
+            "status": "ready", "api_port": 8000,
+            "members": [{"container_name": "old-rank", "node_id": "worker-1"}],
+            "launch_settings": {"sparkdeck_record_id": synthetic_id},
+        }
+        self.manager.deployments = [cluster]
+        self.manager._save_deployments = Mock()
+        await self.service.close()
+        self.service = SparkDeckService(self.manager, Path(self.temp.name))
+        for _ in range(2):
+            listed = await self.service._adopt_unlinked_manager_deployments([cluster])
+            self.assertEqual({item["id"] for item in listed}, {"record-1", "other", "bookmark"})
+            self.assertIsNone(self.service.store.deployment(synthetic_id))
+            self.assertEqual(cluster["sparkdeck_record_id"], "record-1")
+            self.assertEqual(cluster["launch_settings"]["sparkdeck_record_id"], "record-1")
+            self.assertEqual(self.service.store.deployment("record-1")["alias"], "friendly")
+        self.manager._save_deployments.assert_called_once()
+        self.manager.deployment_action.assert_not_awaited()
+
+    async def test_ambiguous_non_synthetic_owners_are_not_deleted(self):
+        synthetic_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL, "sparkdeck:manager-deployment:old-manager",
+        ))
+        for record_id in [synthetic_id, "second-bookmark"]:
+            self.service.store.add_deployment(Deployment(
+                id=record_id, alias=record_id, runtime=RuntimeKind.VLLM,
+                kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                settings={"manager_deployment_id": "old-manager"},
+            ))
+        listed = await self.service._adopt_unlinked_manager_deployments([])
+        self.assertEqual(len(listed), 3)
 
     async def test_remove_manager_registration_is_scoped_and_idempotent(self):
         self.service.store.add_deployment(Deployment(

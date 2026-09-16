@@ -1508,6 +1508,28 @@ class SparkDeckService:
             return self.store.deployments(include_private=True)
         async with self._deployment_reconciliation_lock:
             registered = self.store.deployments(include_private=True)
+            # Older reconciliation could adopt a replacement while its saved
+            # bookmark was still being linked, creating a second UUID5 card.
+            # Only collapse that identifiable synthetic row when exactly one
+            # user-created managed record owns the very same Manager launch.
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for item in registered:
+                manager_id = str(
+                    (item.get("settings") or {}).get("manager_deployment_id") or ""
+                )
+                if manager_id and item.get("kind") == DeploymentKind.MANAGED.value:
+                    groups.setdefault(manager_id, []).append(item)
+            for manager_id, records in groups.items():
+                synthetic_id = str(uuid.uuid5(
+                    uuid.NAMESPACE_URL, f"sparkdeck:manager-deployment:{manager_id}",
+                ))
+                original = [item for item in records if item["id"] != synthetic_id]
+                synthetic = next(
+                    (item for item in records if item["id"] == synthetic_id), None,
+                )
+                if len(original) == 1 and synthetic is not None:
+                    self.store.delete_deployment(synthetic_id)
+                    registered.remove(synthetic)
             by_manager_id = {
                 str((item.get("settings") or {}).get("manager_deployment_id")): item
                 for item in registered
@@ -1537,6 +1559,13 @@ class SparkDeckService:
                     if candidate_manager_id in {"", manager_id}:
                         linked = candidate
                     elif candidate is not None:
+                        if record_id in self._deployment_launches:
+                            # Restart/relocation publishes the new Manager
+                            # launch before updating the bookmark's forward
+                            # link. Leave its reverse link intact until the
+                            # owning operation finishes; polling must not
+                            # manufacture a second card during that window.
+                            continue
                         # Never let a caller-supplied reverse link steal a v1
                         # card from another Manager deployment. Allocate a new
                         # deterministic record for this cluster instead.

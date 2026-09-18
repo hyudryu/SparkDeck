@@ -251,6 +251,7 @@ GET  /v1/models
 POST /v1/chat/completions
 POST /v1/completions
 POST /v1/responses
+POST /v1/embeddings
 ```
 
 For example:
@@ -282,6 +283,23 @@ returned to the client for execution. Text deltas stream as they arrive; tool-ca
 arguments are assembled before their Responses tool events are emitted.
 
 Requests made through SparkDeck can be queued, measured, and used to refresh the deployment idle timer. Calls made directly to a runtime's own port bypass SparkDeck and cannot be included in its benchmark history.
+
+### Embedding models
+
+A Hugging Face cache entry is served through `/v1/embeddings` when it is a SentenceTransformers repository — recognized by the `modules.json` manifest that only SentenceTransformers publishes — and it sits complete on some online node's disk. Nothing is downloaded to make a model available: `/v1/models` lists what the cluster already holds, with `"type": "embedding"`, `"owned_by": "sentence-transformers"`, and the encoder dimension when the repository publishes it. In the example below the model is served by whichever node holds it; a request to a node that lacks the model is routed to one that has it.
+
+```bash
+curl http://localhost:7878/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "input": ["hello world"]
+  }'
+```
+
+The first embedding request installs `sentence-transformers` into a private virtual environment beside SparkDeck's data directory (under `data/embeddings/venv`) and downloads about a gigabyte of dependencies, so it can take minutes; afterwards the environment and a warm worker are reused, and a second request is immediate. Vectors are returned unit-length, matching OpenAI's embedding endpoints, and the worker runs on CPU so it does not contend for the VRAM an inference deployment is using. To install ahead of time, use `POST /api/v1/embeddings/install`; `GET /api/v1/embeddings/status` reports the discovered models and runtime state without installing anything. Set `embeddings_enabled` to `false` to stop serving embedding models entirely.
+
+Embedding models are data, not code: each is loaded from the local snapshot with `trust_remote_code` disabled and Hub access offline, so a missing file fails loudly instead of silently reaching the network.
 
 ## Benchmark privacy and community sync
 

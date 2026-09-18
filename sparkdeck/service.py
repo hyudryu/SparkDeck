@@ -34,6 +34,7 @@ from .catalog import (
     canonical_quantization,
     quantization_from_text,
 )
+from .embeddings import embeddings_response
 from .envfile_settings import (
     EnvFileConflictError,
     apply_env_updates,
@@ -6773,7 +6774,55 @@ class SparkDeckService:
                     "artifact": None, "quantization": None,
                 },
             })
+        for model in await self._cached_embedding_models():
+            model_id = model["model_id"]
+            if model_id in seen:
+                # A chat deployment that happens to serve the same repository
+                # keeps its own entry; the embedding face is not advertised
+                # twice under one id.
+                continue
+            seen.add(model_id)
+            entry: dict[str, Any] = {
+                "id": model_id, "object": "model", "created": 0,
+                "owned_by": "sentence-transformers", "type": "embedding",
+                # The revision is the one revision the cluster serves for this
+                # id, published so a caller can pin the vector space it is
+                # building against.
+                "model": {"repository": model_id, "revision": model.get("revision")},
+                "nodes": list(model.get("node_ids") or []),
+            }
+            if model.get("dimension") is not None:
+                entry["dimension"] = model["dimension"]
+            data.append(entry)
         return {"object": "list", "data": data}
+
+    async def _cached_embedding_models(self) -> list[dict[str, Any]]:
+        """Return embedding models to advertise, never failing the model list.
+
+        ``/v1/models`` is how clients discover chat deployments, so a cache
+        scan that goes wrong — an unreachable node, an unreadable manifest —
+        must drop the embedding entries rather than break the whole listing.
+        """
+        try:
+            return list((await self.manager.embedding_models()).get("models") or [])
+        except Exception:
+            logger.warning("embedding model discovery failed", exc_info=True)
+            return []
+
+    async def embeddings(
+        self, model: str, inputs: list[str], *, normalize: bool = True,
+        encoding_format: str = "float",
+    ) -> dict[str, Any]:
+        """Serve one OpenAI-compatible embedding request from a cached model.
+
+        Embeddings never enter the deployment proxy: they are produced by a
+        local SentenceTransformers worker rather than routed to a registered
+        runtime, so this bypasses deployment resolution entirely.
+        """
+        result = await self.manager.embed(model, inputs, normalize)
+        return embeddings_response(
+            model, result["embeddings"], result["prompt_tokens"], encoding_format,
+        )
 
     def _deployment_public_model_ids(self, deployment: dict[str, Any]) -> list[str]:
         """Return the request ids explicitly served by one deployment.

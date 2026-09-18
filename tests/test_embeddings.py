@@ -808,6 +808,69 @@ class EmbeddingWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(runtime._workers), [str(other)])
         await runtime.stop()
 
+    async def test_concurrent_requests_share_one_worker_process(self):
+        # Two requests for the same model must not each start a process: the
+        # second would orphan the first while it still holds a loaded model.
+        runtime = self.runtime(max_workers=2)
+        self.worker_script(self.stub)
+        started: list[int] = []
+        original = embeddings_module._EmbeddingWorker.start
+
+        async def counting_start(worker):
+            started.append(id(worker))
+            return await original(worker)
+
+        with patch.object(embeddings_module._EmbeddingWorker, "start", counting_start):
+            await asyncio.gather(*(
+                runtime.encode(
+                    model_id=MODEL_ID, snapshot=self.snapshot,
+                    inputs=[f"input-{index}"],
+                )
+                for index in range(5)
+            ))
+
+        self.assertEqual(len(runtime._workers), 1)
+        self.assertEqual(len(started), 1, "a second worker process was started")
+        await runtime.stop()
+
+    async def test_a_busy_worker_is_not_evicted(self):
+        # The memory limit must not fail an in-flight request, so a worker that
+        # is encoding survives even when another model pushes past the limit.
+        runtime = self.runtime(max_workers=1)
+        self.worker_script(self.stub)
+        other = self.root / "other-snapshot"
+        other.mkdir()
+        worker = await runtime._worker(self.snapshot)
+
+        release = asyncio.Event()
+        original_request = worker.request
+
+        async def held_request(inputs, *, normalize):
+            async with worker._lock:
+                await release.wait()
+            return await original_request(inputs, normalize=normalize)
+
+        with patch.object(worker, "request", held_request):
+            task = asyncio.create_task(runtime.encode(
+                model_id=MODEL_ID, snapshot=self.snapshot, inputs=["slow"],
+            ))
+            for _ in range(50):
+                if worker.busy:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(worker.busy, "the encode never started")
+
+            await runtime._worker(other)
+            self.assertIn(str(self.snapshot), runtime._workers)
+
+            release.set()
+            await task
+
+        self.assertEqual(
+            sorted(runtime._workers), sorted([str(self.snapshot), str(other)]),
+        )
+        await runtime.stop()
+
     async def test_idle_workers_are_released(self):
         runtime = self.runtime(idle_seconds=0.05)
         self.worker_script(self.stub)

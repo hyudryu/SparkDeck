@@ -472,6 +472,11 @@ class _EmbeddingWorker:
                 raise EmbeddingError(str(answer["error"]))
             return answer
 
+    @property
+    def busy(self) -> bool:
+        """Whether a request is being encoded right now."""
+        return self._lock.locked()
+
     def failure_detail(self) -> str:
         """Describe why the worker stopped, using its own last output.
 
@@ -624,6 +629,7 @@ class EmbeddingRuntime:
         self.max_workers = max(1, int(max_workers))
         self._base_python = base_python or sys.executable
         self._install_lock = asyncio.Lock()
+        self._worker_lock = asyncio.Lock()
         self._workers: dict[str, _EmbeddingWorker] = {}
         self._monitor: asyncio.Task | None = None
         self.install_error: str | None = None
@@ -785,28 +791,49 @@ class EmbeddingRuntime:
         if worker is not None and worker.process is not None:
             worker.last_used = time.monotonic()
             return worker
-        if worker is not None:
-            # A worker left in place after a timeout is replaced rather than
-            # reused; its reader tasks are already cancelled.
-            await worker.stop()
-        worker = _EmbeddingWorker(
-            self._venv_python(), snapshot,
-            load_timeout=self.load_timeout, encode_timeout=self.encode_timeout,
-        )
-        await worker.start()
-        self._workers[key] = worker
-        self._start_monitor()
-        await self._evict_workers()
-        return worker
-
-    async def _evict_workers(self) -> None:
-        """Stop least-recently-used workers beyond the configured limit."""
-        while len(self._workers) > self.max_workers:
-            oldest = min(
-                self._workers.items(),
-                key=lambda item: (item[1].last_used, item[0]),
+        # Creation is serialized because two concurrent requests for the same
+        # model would otherwise each start a process and one would be orphaned
+        # while still holding a loaded model. A request that arrives while
+        # another model is loading simply waits for that load to finish.
+        async with self._worker_lock:
+            worker = self._workers.get(key)
+            if worker is not None and worker.process is not None:
+                worker.last_used = time.monotonic()
+                return worker
+            if worker is not None:
+                # A worker left in place after a timeout is replaced rather
+                # than reused; its reader tasks are already cancelled.
+                await worker.stop()
+            worker = _EmbeddingWorker(
+                self._venv_python(), snapshot,
+                load_timeout=self.load_timeout, encode_timeout=self.encode_timeout,
             )
-            worker = self._workers.pop(oldest[0])
+            await worker.start()
+            self._workers[key] = worker
+            self._start_monitor()
+            await self._evict_workers(protected=key)
+            return worker
+
+    async def _evict_workers(self, *, protected: str | None = None) -> None:
+        """Stop least-recently-used idle workers beyond the configured limit.
+
+        The worker that was just created is never a candidate — it exists to
+        serve the request that created it — and neither is one that is encoding
+        right now. Failing an in-flight request to satisfy a memory bound would
+        turn a resource limit into a surprising client error, so the limit
+        yields until those requests finish.
+        """
+        while len(self._workers) > self.max_workers:
+            candidates = [
+                (key, worker) for key, worker in self._workers.items()
+                if key != protected and not worker.busy
+            ]
+            if not candidates:
+                return
+            key, worker = min(
+                candidates, key=lambda item: (item[1].last_used, item[0]),
+            )
+            self._workers.pop(key, None)
             await worker.stop()
 
     def _start_monitor(self) -> None:
@@ -820,7 +847,8 @@ class EmbeddingRuntime:
             await asyncio.sleep(interval)
             idle = [
                 key for key, worker in self._workers.items()
-                if time.monotonic() - worker.last_used >= self.idle_seconds
+                if not worker.busy
+                and time.monotonic() - worker.last_used >= self.idle_seconds
             ]
             for key in idle:
                 worker = self._workers.pop(key, None)

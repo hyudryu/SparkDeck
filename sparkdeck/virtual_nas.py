@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
 from .catalog import quantization_from_text
+from .embeddings import CachedEmbedding, embedding_descriptor
 
 
 LOCAL_NODE_ID = "local"
@@ -1481,6 +1482,13 @@ class VirtualNAS:
                 model["selective_files_by_revision"] = selective_files
             if transfer_entry_count > _FILE_STREAM_MAX_ENTRIES:
                 model["transferable"] = False
+            # A SentenceTransformers repository is served through
+            # /v1/embeddings. The marker is evaluated here, on the node that
+            # holds the files, and is path-free so inventory responses keep
+            # cache locations agent-private.
+            embedding = embedding_descriptor(repository, snapshot_revisions)
+            if embedding is not None:
+                model["embedding"] = embedding.public()
             models.append(model)
         external_models = _external_comfyui_inventory(
             self._external_model_roots_provider()
@@ -1520,6 +1528,24 @@ class VirtualNAS:
         if model is None:
             raise LookupError("cached model not found")
         return model
+
+    def embedding_snapshot(
+        self, model_id: str, revision: str | None = None,
+    ) -> CachedEmbedding | None:
+        """Resolve one cached model into the snapshot an embedding worker loads.
+
+        This is the narrow, targeted lookup the serving path needs: it reads one
+        repository instead of scanning the whole cache, and it re-derives the
+        snapshot on the node that will actually run the model, so a revision the
+        controller observed in inventory is never taken on trust here.
+        """
+        repository = self._model_path(validate_model_id(model_id))
+        revisions = _complete_snapshot_revisions(repository)
+        if revision is not None:
+            # A revision that is no longer a complete snapshot is refused
+            # rather than silently replaced with a different one.
+            revisions = {revision} if revision in revisions else set()
+        return embedding_descriptor(repository, revisions)
 
     def export_model(self, model_id: str) -> AsyncIterator[bytes]:
         model_id = validate_model_id(model_id)

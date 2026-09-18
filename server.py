@@ -40,6 +40,11 @@ from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
 )
+from sparkdeck.embeddings import (
+    EmbeddingError,
+    normalize_embedding_inputs,
+    parse_embedding_request,
+)
 from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.responses import to_chat_request, from_chat_response, stream_chat_response
 from sparkdeck.startup_benchmark import StartupBenchmarkMonitor
@@ -1417,6 +1422,39 @@ async def agent_virtual_nas_delete(model_id: str, req: Request):
     try:
         return _public_storage_payload(
             await manager.delete_virtual_nas_model(LOCAL_NODE_ID, model_id)
+        )
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+@app.post("/api/agent/embeddings")
+async def agent_embeddings(req: Request):
+    """Serve one embedding request from this node's own model cache."""
+    _require_agent(req)
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    if not isinstance(body, dict) or set(body) - {
+        "model_id", "revision", "inputs", "normalize",
+    }:
+        raise HTTPException(
+            400,
+            "request may contain only model_id, revision, inputs, and normalize",
+        )
+    revision = body.get("revision")
+    if revision is not None and not isinstance(revision, str):
+        raise HTTPException(400, "revision must be a string")
+    normalize = body.get("normalize", True)
+    if not isinstance(normalize, bool):
+        raise HTTPException(400, "normalize must be a boolean")
+    try:
+        inputs = normalize_embedding_inputs(body.get("inputs"))
+    except EmbeddingError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        return await manager.embed_local(
+            str(body.get("model_id") or ""), revision, inputs, normalize=normalize,
         )
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
@@ -3681,6 +3719,25 @@ async def v1_delete_benchmark(sample_id: str):
     return {"ok": True, "id": sample_id}
 
 
+# ---------- cached embedding models ----------
+
+@app.get("/api/v1/embeddings/status")
+async def v1_embeddings_status():
+    """Report cache-discovered embedding models and the runtime's state."""
+    return await manager.embedding_status()
+
+
+@app.post("/api/v1/embeddings/install")
+async def v1_embeddings_install():
+    """Install the embedding runtime ahead of the first inference request."""
+    try:
+        return await manager.install_embedding_runtime()
+    except EmbeddingError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 # ---------- llama-benchy powered benchmark runner ----------
 
 @app.get("/api/v1/benchmark-runner/status")
@@ -4400,6 +4457,33 @@ async def _inference_json(
 @app.get("/v1/models")
 async def v1_models():
     return await sparkdeck.models()
+
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(req: Request):
+    """Embed text with a SentenceTransformers model cached on a cluster node.
+
+    The first request for a model also installs the embedding runtime, which
+    downloads `torch` and friends, so it can take minutes; later requests reuse
+    the installed environment and a warm worker.
+    """
+    body = await _inference_json(req)
+    try:
+        request = parse_embedding_request(body)
+    except EmbeddingError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        return await sparkdeck.embeddings(
+            request.model, request.inputs,
+            normalize=request.normalize,
+            encoding_format=request.encoding_format,
+        )
+    except TimeoutError as exc:
+        # Caught before the generic mapping, which would report a timeout as a
+        # malformed request rather than an unavailable upstream.
+        raise HTTPException(504, str(exc)) from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
 
 
 @app.post("/v1/chat/completions")

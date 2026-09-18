@@ -66,6 +66,11 @@ from sparkdeck.virtual_nas import (
     validate_storage_model_id,
     validate_revision,
 )
+from sparkdeck.embeddings import (
+    DEFAULT_REQUEST_TIMEOUT,
+    EMBEDDINGS_CAPABILITY,
+    EmbeddingRuntime,
+)
 from sparkdeck.updater import CAPABILITY, current_revision
 from sparkdeck.routeros import ROUTEROS_TIMEOUT_SECONDS, RouterOSService
 from sparkdeck.workload_ownership import ManagedWorkloadLedger
@@ -98,6 +103,11 @@ DEFAULT_SETTINGS = {
     "vllm_auto_adjust_concurrency": True,
     # Opt-in model cache replication across authenticated cluster nodes.
     "virtual_nas_enabled": False,
+    # Serve SentenceTransformers repositories that are already in a node's
+    # model cache through /v1/embeddings. Enabled by default because a cached
+    # model is the only thing that makes the endpoint answer at all; the
+    # runtime is installed on first use, never while listing models.
+    "embeddings_enabled": True,
     # The only SparkDeck node expected to have a direct Ethernet path to the
     # RouterOS management interface. Credentials remain on that selected node.
     "routeros_gateway_node_id": "",
@@ -130,6 +140,9 @@ DEFAULT_SETTINGS = {
 }
 
 logger = logging.getLogger(__name__)
+# Embedding discovery is served on the inference protocol, where a client may
+# poll /v1/models far more often than a cache can meaningfully change.
+_EMBEDDING_DISCOVERY_TTL = 15.0
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
 SENSITIVE_CREDENTIAL_CLI_OPTIONS = HF_CREDENTIAL_CLI_OPTIONS | {
     "--api-key", "--api_key", "--token", "--auth-token", "--auth_token",
@@ -827,12 +840,18 @@ class Manager:
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
             self._resolved_hf_token,
         )
+        # Embedding inference keeps its own virtual environment and worker
+        # processes: the controller's dependency set stays untouched, and a
+        # model that crashes or hangs cannot take the controller with it.
+        self.embedding_runtime = EmbeddingRuntime(self.data_dir)
         # Storage inventory combines remote cache scans with best-effort Hub
         # metadata. Coalesce concurrent page refreshes and retain it briefly;
         # transfer job progress remains live and is merged separately.
         self._virtual_nas_nodes_cache: tuple[float, float, list[dict]] | None = None
         self._virtual_nas_nodes_task: asyncio.Task | None = None
         self._virtual_nas_job_statuses: dict[str, str] = {}
+        self._embedding_inventory_cache: tuple[float, list[dict]] | None = None
+        self._embedding_inventory_task: asyncio.Task | None = None
         self.token_usage_sync_path = self.data_dir / "token_usage_sync.json"
         self.token_usage_sync = self._load_token_usage_sync()
         self._token_usage_sync_status: dict[str, Any] = {
@@ -1037,6 +1056,11 @@ class Manager:
         if routeros is not None:
             await routeros.stop()
         await self.virtual_nas.stop()
+        # Shutdown also runs for a partially constructed Manager, so the
+        # embedding runtime is released the same defensive way as RouterOS.
+        embedding_runtime = getattr(self, "embedding_runtime", None)
+        if embedding_runtime is not None:
+            await embedding_runtime.stop()
         for t in (
             self.worker_task,
             self.idle_task,
@@ -1242,6 +1266,7 @@ class Manager:
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
                 "patched-images-v1",
+                EMBEDDINGS_CAPABILITY,
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -2091,6 +2116,9 @@ class Manager:
 
     def _invalidate_virtual_nas_nodes(self) -> None:
         self._virtual_nas_nodes_cache = None
+        # A download or delete changes what is servable, so embedding
+        # discovery must not keep advertising the old cache contents.
+        self._embedding_inventory_cache = None
 
     def _sample_virtual_nas_transfer_rate(
         self, job: dict, sampled_at: float,
@@ -2153,6 +2181,187 @@ class Manager:
         """
         return holds_requested_revision(
             model, resolved_revision, requested_revision,
+        )
+
+    # ---------- embedding serving ----------
+
+    def embeddings_enabled(self) -> bool:
+        return bool(self.settings.get("embeddings_enabled", True))
+
+    @staticmethod
+    def _node_can_embed(node: dict) -> bool:
+        """Whether a node can be asked to run a cached embedding model."""
+        if node.get("id") == LOCAL_NODE_ID:
+            return True
+        return bool(
+            node.get("online")
+            and EMBEDDINGS_CAPABILITY in (node.get("capabilities") or [])
+        )
+
+    @staticmethod
+    def _node_embedding_models(node: dict) -> list[dict]:
+        """Return one node's servable embedding models, path-free."""
+        models = []
+        for model in node.get("models") or []:
+            descriptor = model.get("embedding")
+            if not isinstance(descriptor, dict) or model.get("partial"):
+                # A partial snapshot has no complete revision to load, so it is
+                # never advertised even when the manifest is already present.
+                continue
+            revision = descriptor.get("revision")
+            if not isinstance(revision, str) or not revision:
+                continue
+            models.append({"model_id": str(model.get("model_id") or ""), **descriptor})
+        return [model for model in models if model["model_id"]]
+
+    async def _embedding_inventory(self) -> list[dict]:
+        """Return a recently sampled model-cache inventory for discovery.
+
+        Discovery deliberately uses the plain inventory rather than the
+        enriched one the Models page requests: ``/v1/models`` is polled by
+        OpenAI clients and must not wait on per-model Hub metadata lookups.
+        Concurrent callers share one fan-out, and the result is held briefly so
+        a polling client cannot turn a cache walk into a per-request cost.
+        """
+        cached = getattr(self, "_embedding_inventory_cache", None)
+        if cached and time.time() - cached[0] < _EMBEDDING_DISCOVERY_TTL:
+            return cached[1]
+        task = getattr(self, "_embedding_inventory_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self.model_cache_inventory())
+            self._embedding_inventory_task = task
+        try:
+            nodes = await asyncio.shield(task)
+        finally:
+            if task.done() and self._embedding_inventory_task is task:
+                self._embedding_inventory_task = None
+        self._embedding_inventory_cache = (time.time(), nodes)
+        return nodes
+
+    async def embedding_models(self) -> dict:
+        """List the embedding models cached anywhere in the cluster."""
+        if not self.embeddings_enabled():
+            return {"enabled": False, "models": []}
+        nodes = await self._embedding_inventory()
+        models: dict[str, dict] = {}
+        for node in nodes:
+            if not node.get("online") or not self._node_can_embed(node):
+                continue
+            node_id = node.get("id")
+            for model in self._node_embedding_models(node):
+                entry = models.setdefault(model["model_id"], {
+                    "model_id": model["model_id"],
+                    "module_count": model.get("module_count"),
+                    "dimension": model.get("dimension"),
+                    "nodes": [],
+                })
+                if entry.get("dimension") is None and model.get("dimension") is not None:
+                    entry["dimension"] = model["dimension"]
+                # Each node carries its own resolved revision: two nodes can
+                # hold the same repository at different revisions, and a
+                # request has to name the snapshot the serving node really has.
+                entry["nodes"].append({
+                    "id": node_id, "revision": model["revision"],
+                })
+        return {
+            "enabled": True,
+            "models": [models[key] for key in sorted(models)],
+        }
+
+    async def embedding_status(self) -> dict:
+        """Report embedding serving state without triggering any install."""
+        discovered = await self.embedding_models()
+        return {
+            "enabled": discovered["enabled"],
+            "models": discovered["models"],
+            "runtime": self.embedding_runtime.state(),
+        }
+
+    async def install_embedding_runtime(self) -> dict:
+        """Install the embedding environment ahead of the first request."""
+        if not self.embeddings_enabled():
+            raise RuntimeError("embedding serving is disabled")
+        await self.embedding_runtime.install()
+        return self.embedding_runtime.state()
+
+    async def embed(
+        self, model_id: str, inputs: list[str], normalize: bool = True,
+    ) -> dict:
+        """Encode ``inputs`` with a cached embedding model on some node."""
+        if not self.embeddings_enabled():
+            raise RuntimeError("embedding serving is disabled")
+        model_id = validate_model_id(model_id)
+        discovered = await self.embedding_models()
+        model = next(
+            (item for item in discovered["models"] if item["model_id"] == model_id),
+            None,
+        )
+        if model is None:
+            raise LookupError(
+                f"no cached embedding model is servable as '{model_id}'"
+            )
+        # The local node is preferred: it needs no agent round trip, and its
+        # worker is the one the controller can observe directly.
+        candidates = sorted(
+            model["nodes"], key=lambda node: node["id"] != LOCAL_NODE_ID,
+        )
+        failures: list[str] = []
+        for candidate in candidates:
+            node_id = candidate["id"]
+            revision = candidate["revision"]
+            try:
+                if node_id == LOCAL_NODE_ID:
+                    return await self.embed_local(
+                        model_id, revision, inputs, normalize=normalize,
+                    )
+                return await self.node_registry.request(
+                    node_id, "POST", "/api/agent/embeddings",
+                    json_body={
+                        "model_id": model_id,
+                        "revision": revision,
+                        "inputs": inputs,
+                        "normalize": normalize,
+                    },
+                    # The first request on a node installs the runtime, so the
+                    # timeout covers a full `pip install sentence-transformers`
+                    # plus the model load that follows it.
+                    timeout=DEFAULT_REQUEST_TIMEOUT,
+                )
+            except Exception as exc:
+                # A node that has the model but cannot serve it (agent mid
+                # update, install failed, out of memory) must not hide another
+                # node that can.
+                logger.warning(
+                    "embedding request for %s failed on node %s: %s",
+                    model_id, node_id, exc,
+                )
+                failures.append(f"{node_id}: {exc}")
+        raise RuntimeError(
+            f"no node could serve '{model_id}' ({'; '.join(failures) or 'no nodes'})"
+        )
+
+    async def embed_local(
+        self, model_id: str, revision: str | None, inputs: list[str],
+        normalize: bool = True,
+    ) -> dict:
+        """Run one embedding request against this node's own cache."""
+        if not self.embeddings_enabled():
+            raise RuntimeError("embedding serving is disabled")
+        # Resolved on the filesystem that will run the model, not from the
+        # inventory the controller just read: a cache that changed in between
+        # must fail rather than load a different snapshot than advertised.
+        snapshot = await asyncio.to_thread(
+            self.virtual_nas.embedding_snapshot, model_id, revision,
+        )
+        if snapshot is None:
+            raise LookupError(
+                f"no cached embedding model is servable as '{model_id}'"
+            )
+        return await self.embedding_runtime.encode(
+            model_id=model_id,
+            snapshot=snapshot.snapshot,
+            inputs=inputs,
+            normalize=normalize,
         )
 
     async def model_cache_inventory(

@@ -19,6 +19,7 @@ with patch("docker.from_env", return_value=Mock()):
     import server
 
 from manager import Manager
+from cluster import NodeAgentResponseError
 from sparkdeck import embedding_worker as worker_module
 from sparkdeck import embeddings as embeddings_module
 from sparkdeck.embeddings import (
@@ -386,6 +387,13 @@ def embedding_node(node_id, *, capabilities=(EMBEDDINGS_CAPABILITY,), online=Tru
     }
 
 
+def _agent_error(node_name: str, status_code: int, detail: str):
+    """Build the error a cluster agent response raises through the registry."""
+    return NodeAgentResponseError(
+        node_name, status_code, json.dumps({"detail": detail}),
+    )
+
+
 def bare_manager(**attributes):
     manager = Manager.__new__(Manager)
     manager.settings = {"embeddings_enabled": True}
@@ -672,7 +680,10 @@ class EmbeddingRoutingTests(unittest.IsolatedAsyncioTestCase):
             (TimeoutError("node-2 timed out"), TimeoutError),
             (EmbeddingError("input exceeds the window"), EmbeddingError),
             (RuntimeError("install failed"), RuntimeError),
-            (LookupError("cached model not found"), RuntimeError),
+            # Every holder reporting the model gone means the advertised
+            # revision vanished, which is a lookup failure rather than an
+            # operational one.
+            (LookupError("cached model not found"), LookupError),
         ):
             with self.subTest(error=error):
                 manager = bare_manager(
@@ -699,6 +710,76 @@ class EmbeddingRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(TimeoutError):
             await manager.embed(MODEL_ID, ["hello"])
+
+    async def test_a_remote_rejection_surfaces_as_a_caller_error(self):
+        # Found by verifying a live deployment: a node answering 400 arrived
+        # wrapped, so it fell through to the operational path and the caller saw
+        # 409 "no node could serve" for what was really its own oversized input.
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[embedding_node("node-2")]),
+        )
+        manager.node_registry.request = AsyncMock(
+            side_effect=_agent_error(
+                "spark-node-4", 400,
+                "ValueError: input 0 has 13161 tokens, beyond this model's "
+                "256-token window; chunk long text before embedding it",
+            ),
+        )
+
+        with self.assertRaises(EmbeddingError) as raised:
+            await manager.embed(MODEL_ID, ["hello"])
+
+        message = str(raised.exception)
+        self.assertIn("13161 tokens", message)
+        self.assertIn("256-token window", message)
+        # The internal envelope must not reach an inference client.
+        self.assertNotIn("spark-node-4", message)
+        self.assertNotIn("agent error", message)
+        self.assertNotIn('{"detail"', message)
+
+    async def test_a_remote_rejection_outranks_a_transient_failure(self):
+        # Every holder serves one revision, so a rejection describes the input;
+        # answering 504 would have the caller retry forever.
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[
+                embedding_node("node-2"), embedding_node("node-3"),
+            ]),
+        )
+        manager.node_registry.request = AsyncMock(side_effect=[
+            _agent_error("spark-node-4", 400, "input is too long"),
+            TimeoutError("slow"),
+        ])
+
+        with self.assertRaises(EmbeddingError):
+            await manager.embed(MODEL_ID, ["hello"])
+
+    async def test_every_holder_losing_the_model_is_a_lookup_failure(self):
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[
+                embedding_node("node-2"), embedding_node("node-3"),
+            ]),
+        )
+        manager.node_registry.request = AsyncMock(side_effect=[
+            _agent_error("spark-node-4", 404, "cached model not found"),
+            _agent_error("spark-node-5", 404, "cached model not found"),
+        ])
+
+        with self.assertRaises(LookupError):
+            await manager.embed(MODEL_ID, ["hello"])
+
+    async def test_an_agent_outage_stays_an_operational_failure(self):
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[embedding_node("node-2")]),
+        )
+        manager.node_registry.request = AsyncMock(
+            side_effect=_agent_error("spark-node-4", 503, "install failed"),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await manager.embed(MODEL_ID, ["hello"])
+
+        self.assertNotIsInstance(raised.exception, EmbeddingError)
+        self.assertIn("install failed", str(raised.exception))
 
     async def test_disabled_serving_refuses_requests(self):
         manager = bare_manager()

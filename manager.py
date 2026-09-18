@@ -2381,17 +2381,70 @@ class Manager:
         # error: the HTTP layer maps a timeout to 504 and an unusable request
         # to 400, and reporting an overloaded cluster as "bad request" would
         # mislead every caller that retries on the difference.
-        detail = "; ".join(f"{node_id}: {exc}" for node_id, exc in failures)
-        message = f"no node could serve '{model_id}' ({detail or 'no nodes'})"
-        for node_id, exc in failures:
+        reasons = [
+            self._embedding_failure_reason(exc, node_id) for node_id, exc in failures
+        ]
+        reason = "; ".join(dict.fromkeys(reasons)) or "no nodes could serve it"
+        message = f"no node could serve '{model_id}': {reason}"
+        for exc in (failure[1] for failure in failures):
+            # A rejection is the most actionable answer: every holder serves
+            # the same revision, so a 4xx describes the caller's input rather
+            # than the cluster's health, and answering with a transient failure
+            # instead would invite endless retries of a request that can never
+            # succeed.
+            if self._embedding_status_code(exc) == 400:
+                raise EmbeddingError(
+                    self._embedding_failure_reason(exc, None)
+                ) from exc
+        for exc in (failure[1] for failure in failures):
             if isinstance(exc, TimeoutError):
                 raise TimeoutError(message) from exc
-        for node_id, exc in failures:
-            # A request every holder rejected outright is the caller's error;
-            # anything else is an operational failure of the cluster.
+        for exc in (failure[1] for failure in failures):
             if isinstance(exc, EmbeddingError):
                 raise EmbeddingError(message) from exc
+        if failures and all(
+            isinstance(exc, LookupError)
+            or self._embedding_status_code(exc) == 404
+            for _node_id, exc in failures
+        ):
+            # Every holder reports the model gone from its cache: the advertised
+            # revision disappeared rather than the request being at fault.
+            raise LookupError(
+                f"no node holds a cached copy of '{model_id}' any more"
+            )
         raise RuntimeError(message)
+
+    @staticmethod
+    def _embedding_status_code(exc: BaseException) -> int | None:
+        """Return the HTTP status an agent reported, when the error carries one."""
+        value = getattr(exc, "status_code", None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _embedding_failure_reason(exc: BaseException, node_id: str | None) -> str:
+        """Describe one candidate's failure without the internal envelope.
+
+        An agent error arrives wrapped as "<node name> agent error: HTTP 400:
+        {"detail": ...}", which names an internal node and nests JSON. The
+        reason a caller needs is the one the agent produced, so it is unwrapped
+        here; the envelope stays in the controller's own log line.
+        """
+        detail = getattr(exc, "detail", None)
+        if isinstance(detail, str) and detail.strip():
+            try:
+                payload = json.loads(detail)
+            except ValueError:
+                payload = None
+            inner = payload.get("detail") if isinstance(payload, dict) else None
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()[:300]
+            return f"node {node_id} rejected the request" if node_id else (
+                "the node rejected the request"
+            )
+        return str(exc)[:300]
 
     async def embed_local(
         self, model_id: str, revision: str | None, inputs: list[str],

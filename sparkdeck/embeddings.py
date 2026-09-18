@@ -52,6 +52,14 @@ _CONFIG_MARKER = "config.json"
 # hostile cache entry cannot be used to read an unbounded file.
 _SENTENCE_TRANSFORMERS_PREFIX = "sentence_transformers."
 _ENCODER_MODULE = "sentence_transformers.models.Transformer"
+# Modules that select or scale the encoder's vectors without changing their
+# width, so the snapshot's published encoder width is the sentence-vector
+# width. Anything else makes the output width unknown to a static check.
+_WIDTH_PRESERVING_MODULES = frozenset({
+    _ENCODER_MODULE,
+    "sentence_transformers.models.Pooling",
+    "sentence_transformers.models.Normalize",
+})
 _MANIFEST_MAX_BYTES = 64 * 1024
 
 DEFAULT_INSTALL_TIMEOUT = 3600.0
@@ -68,7 +76,13 @@ DEFAULT_WORKER_IDLE_SECONDS = 900.0
 # cycling through many cached models must not be able to pin one process per
 # model. Least-recently-used workers beyond this limit are stopped.
 MAX_WORKERS = 2
-_WORKER_SCRIPT = Path(__file__).with_name("embedding_worker.py")
+# The worker answers a whole batch in one newline-delimited record, so the
+# parent's stream limit has to cover the largest response the request bounds
+# allow: 512 inputs of a 4096-wide vector is roughly 25 MB of JSON. The asyncio
+# default is 64 KiB, which even an ordinary 384-wide batch can exceed.
+_PROTOCOL_LINE_LIMIT = 64 * 1024 * 1024
+WORKER_SCRIPT = "embedding_worker.py"
+_WORKER_SCRIPT = Path(__file__).with_name(WORKER_SCRIPT)
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 
 # OpenAI's embeddings contract: one string, or a list of strings, per request.
@@ -145,8 +159,8 @@ def _safe_snapshot_entry(
     return resolved
 
 
-def _load_modules_manifest(path: Path) -> int | None:
-    """Return the module count of a trustworthy SentenceTransformers manifest.
+def _load_modules_manifest(path: Path) -> list | None:
+    """Return a trustworthy SentenceTransformers manifest, or None.
 
     Rejects everything that is not the shape every published repository
     produces: a non-empty list of module entries whose ``type`` lives in the
@@ -174,11 +188,17 @@ def _load_modules_manifest(path: Path) -> int | None:
             return None
         if module_type == _ENCODER_MODULE:
             encoders += 1
-    return len(manifest) if encoders else None
+    return manifest if encoders else None
 
 
 def _hidden_size(repository: Path, snapshot: Path) -> int | None:
-    """Read the encoder width from a snapshot's config, when it is published."""
+    """Read the encoder width from a snapshot's config, when it is published.
+
+    Only the encoder width: a pipeline that projects the sentence vector — a
+    ``Dense`` module, for instance — returns a different final dimension, so
+    :func:`_load_modules_manifest` refuses to treat this as the output width
+    for such a pipeline.
+    """
     config_path = _safe_snapshot_entry(
         repository, snapshot, _CONFIG_MARKER, _MANIFEST_MAX_BYTES,
     )
@@ -194,6 +214,26 @@ def _hidden_size(repository: Path, snapshot: Path) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
     return value
+
+
+def _pipeline_preserves_encoder_width(manifest: Any) -> bool:
+    """Whether every module leaves the encoder's width untouched.
+
+    Discovery reads the repository statically, so it cannot run the pipeline to
+    see what comes out. Pooling and normalizing keep the encoder's width, which
+    is what the snapshot's ``config.json`` publishes; a projection, a
+    concatenation of several encoders, or any module whose effect cannot be
+    established from here means the final width is simply unknown, and an
+    unknown width must not be advertised: a caller that sizes a vector store
+    from it would create columns the worker never fills.
+    """
+    if not isinstance(manifest, list):
+        return False
+    return all(
+        entry.get("type") in _WIDTH_PRESERVING_MODULES
+        for entry in manifest
+        if isinstance(entry, dict)
+    )
 
 
 def _ordered_revisions(repository: Path, revisions: Iterable[str]) -> list[str]:
@@ -225,19 +265,27 @@ def embedding_descriptor(
     """
     for revision in _ordered_revisions(repository, revisions):
         snapshot = repository / "snapshots" / revision
-        manifest = _safe_snapshot_entry(
+        manifest_path = _safe_snapshot_entry(
             repository, snapshot, _MODULES_MARKER, _MANIFEST_MAX_BYTES,
         )
+        if manifest_path is None:
+            continue
+        manifest = _load_modules_manifest(manifest_path)
         if manifest is None:
             continue
-        module_count = _load_modules_manifest(manifest)
-        if module_count is None:
-            continue
+        # Report the sentence-vector width only when the pipeline cannot change
+        # it; otherwise the encoder width would be mistaken for the output
+        # width, and a caller sizing storage from it would be wrong.
+        dimension = (
+            _hidden_size(repository, snapshot)
+            if _pipeline_preserves_encoder_width(manifest)
+            else None
+        )
         return CachedEmbedding(
             revision=revision,
             snapshot=snapshot,
-            dimension=_hidden_size(repository, snapshot),
-            module_count=module_count,
+            dimension=dimension,
+            module_count=len(manifest),
         )
     return None
 
@@ -398,6 +446,7 @@ class _EmbeddingWorker:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(_REPOSITORY_ROOT),
                 env=environment,
+                limit=_PROTOCOL_LINE_LIMIT,
             )
         except OSError as exc:
             raise EmbeddingError(f"could not start the embedding worker: {exc}") from exc
@@ -519,6 +568,11 @@ class _EmbeddingWorker:
                     future.set_result(message)
         except (asyncio.CancelledError, OSError):
             pass
+        except ValueError as exc:
+            # A record beyond the stream limit means this worker can no longer
+            # be read reliably, so it is reported as an error instead of being
+            # left running with a reader that has died.
+            logger.warning("embedding worker protocol line exceeded: %s", exc)
         finally:
             self._fail_pending()
 
@@ -542,13 +596,15 @@ class _EmbeddingWorker:
             self._ready.set_result(message)
 
     def _fail_pending(self) -> None:
-        if not self._pending:
-            return
+        # Readiness is settled even when no request is in flight: a worker that
+        # died before its handshake has to fail the load now, or the first
+        # request would wait out the entire load timeout for a process that is
+        # already known to be gone.
         error = EmbeddingError(self.failure_detail())
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)
-        self._resolve_ready({"ready": False, "error": self.failure_detail()})
+        self._resolve_ready({"ready": False, "error": str(error)})
 
     async def stop(self) -> None:
         """Terminate the worker and settle anything still waiting on it."""

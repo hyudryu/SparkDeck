@@ -39,15 +39,35 @@ def _emit(payload: dict[str, Any]) -> None:
     _PROTOCOL.flush()
 
 
-def _token_count(model: Any, inputs: list[str]) -> int:
-    """Count input tokens when the model publishes a tokenizer."""
+def _input_token_counts(model: Any, inputs: list[str]) -> list[int] | None:
+    """Tokenize every input, or None when the model exposes no tokenizer."""
     try:
-        encoded = model.tokenizer(inputs)["input_ids"]
+        encoded = model.tokenizer(inputs, truncation=False, padding=False)["input_ids"]
     except Exception:
-        return 0
+        return None
     if isinstance(encoded, list) and encoded and isinstance(encoded[0], list):
-        return sum(len(ids) for ids in encoded)
-    return len(encoded) if isinstance(encoded, list) else 0
+        return [len(ids) for ids in encoded]
+    return [len(encoded)] if isinstance(encoded, list) else None
+
+
+def _check_token_window(model: Any, inputs: list[str], counts: list[int] | None) -> None:
+    """Refuse inputs that the model would silently truncate.
+
+    ``SentenceTransformer.encode`` truncates every text to the pipeline's
+    ``max_seq_length`` without saying so, which would answer a long document
+    with the vector of its opening fragment and quietly corrupt whatever
+    retrieval index consumed it. A caller can chunk deliberately; SparkDeck
+    must not decide that on its behalf.
+    """
+    limit = getattr(model, "max_seq_length", None)
+    if not isinstance(limit, int) or limit <= 0 or counts is None:
+        return
+    oversized = [index for index, count in enumerate(counts) if count > limit]
+    if oversized:
+        raise ValueError(
+            f"input {oversized[0]} has {counts[oversized[0]]} tokens, beyond this "
+            f"model's {limit}-token window; chunk long text before embedding it"
+        )
 
 
 def _encode(model: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -59,6 +79,8 @@ def _encode(model: Any, request: dict[str, Any]) -> dict[str, Any]:
     normalize = request.get("normalize", True)
     if not isinstance(normalize, bool):
         raise ValueError("normalize must be a boolean")
+    counts = _input_token_counts(model, inputs)
+    _check_token_window(model, inputs, counts)
     vectors = model.encode(
         inputs,
         normalize_embeddings=normalize,
@@ -68,7 +90,7 @@ def _encode(model: Any, request: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": request.get("id"),
         "embeddings": vectors.tolist(),
-        "prompt_tokens": _token_count(model, inputs),
+        "prompt_tokens": sum(counts) if counts is not None else 0,
     }
 
 

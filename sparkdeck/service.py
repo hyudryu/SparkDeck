@@ -6785,11 +6785,11 @@ class SparkDeckService:
             entry: dict[str, Any] = {
                 "id": model_id, "object": "model", "created": 0,
                 "owned_by": "sentence-transformers", "type": "embedding",
-                # The revision is a per-node cache detail — two nodes can hold
-                # the same repository at different revisions — so it is not
-                # published here; a request only has to name the model.
-                "model": {"repository": model_id},
-                "nodes": [node["id"] for node in model.get("nodes") or []],
+                # The revision is the one revision the cluster serves for this
+                # id, published so a caller can pin the vector space it is
+                # building against.
+                "model": {"repository": model_id, "revision": model.get("revision")},
+                "nodes": list(model.get("node_ids") or []),
             }
             if model.get("dimension") is not None:
                 entry["dimension"] = model["dimension"]

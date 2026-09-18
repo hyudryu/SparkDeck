@@ -69,6 +69,7 @@ from sparkdeck.virtual_nas import (
 from sparkdeck.embeddings import (
     DEFAULT_REQUEST_TIMEOUT,
     EMBEDDINGS_CAPABILITY,
+    EmbeddingError,
     EmbeddingRuntime,
 )
 from sparkdeck.updater import CAPABILITY, current_revision
@@ -2239,34 +2240,74 @@ class Manager:
         return nodes
 
     async def embedding_models(self) -> dict:
-        """List the embedding models cached anywhere in the cluster."""
+        """List the embedding models cached anywhere in the cluster.
+
+        One model id is always served by exactly one revision, chosen across
+        the cluster rather than per node. Vectors from different revisions of
+        the same repository are not comparable, so routing a later request to a
+        node holding another revision would silently mix incompatible vector
+        spaces in whatever store the caller is filling. Nodes holding a
+        different revision are therefore not advertised as serving that model.
+        """
         if not self.embeddings_enabled():
             return {"enabled": False, "models": []}
         nodes = await self._embedding_inventory()
-        models: dict[str, dict] = {}
+        # model id -> revision -> descriptors seen on each node holding it
+        seen: dict[str, dict[str, list[dict]]] = {}
         for node in nodes:
             if not node.get("online") or not self._node_can_embed(node):
                 continue
             node_id = node.get("id")
             for model in self._node_embedding_models(node):
-                entry = models.setdefault(model["model_id"], {
-                    "model_id": model["model_id"],
+                revisions = seen.setdefault(model["model_id"], {})
+                revisions.setdefault(model["revision"], []).append({
+                    "id": node_id,
                     "module_count": model.get("module_count"),
                     "dimension": model.get("dimension"),
-                    "nodes": [],
                 })
-                if entry.get("dimension") is None and model.get("dimension") is not None:
-                    entry["dimension"] = model["dimension"]
-                # Each node carries its own resolved revision: two nodes can
-                # hold the same repository at different revisions, and a
-                # request has to name the snapshot the serving node really has.
-                entry["nodes"].append({
-                    "id": node_id, "revision": model["revision"],
-                })
-        return {
-            "enabled": True,
-            "models": [models[key] for key in sorted(models)],
-        }
+        models: list[dict] = []
+        for model_id in sorted(seen):
+            # The revision the most nodes hold wins, so an ordinary cluster
+            # converges on the copy that keeps the most failover options. A tie
+            # prefers the revision this controller holds — it needs no agent
+            # round trip — and the revision itself breaks any remaining tie so
+            # the choice cannot drift between polls.
+            revision = max(
+                seen[model_id],
+                key=lambda value: (
+                    len(seen[model_id][value]),
+                    any(
+                        holder["id"] == LOCAL_NODE_ID
+                        for holder in seen[model_id][value]
+                    ),
+                    value,
+                ),
+            )
+            holders = seen[model_id][revision]
+            entry: dict[str, Any] = {
+                "model_id": model_id,
+                "revision": revision,
+                "node_ids": [holder["id"] for holder in holders],
+            }
+            module_count = next(
+                (holder["module_count"] for holder in holders
+                 if holder["module_count"] is not None),
+                None,
+            )
+            if module_count is not None:
+                entry["module_count"] = module_count
+            # A holder that could not establish the output width omits it, and
+            # so does the merged entry: an advertised dimension a client sizes
+            # its storage with must not be a guess.
+            dimension = next(
+                (holder["dimension"] for holder in holders
+                 if holder["dimension"] is not None),
+                None,
+            )
+            if dimension is not None:
+                entry["dimension"] = dimension
+            models.append(entry)
+        return {"enabled": True, "models": models}
 
     async def embedding_status(self) -> dict:
         """Report embedding serving state without triggering any install."""
@@ -2301,24 +2342,24 @@ class Manager:
                 f"no cached embedding model is servable as '{model_id}'"
             )
         # The local node is preferred: it needs no agent round trip, and its
-        # worker is the one the controller can observe directly.
-        candidates = sorted(
-            model["nodes"], key=lambda node: node["id"] != LOCAL_NODE_ID,
+        # worker is the one the controller can observe directly. Every
+        # candidate holds the same revision, so a failover cannot change the
+        # vector space a caller is building against.
+        node_ids = sorted(
+            model["node_ids"], key=lambda node_id: node_id != LOCAL_NODE_ID,
         )
-        failures: list[str] = []
-        for candidate in candidates:
-            node_id = candidate["id"]
-            revision = candidate["revision"]
+        failures: list[tuple[str, Exception]] = []
+        for node_id in node_ids:
             try:
                 if node_id == LOCAL_NODE_ID:
                     return await self.embed_local(
-                        model_id, revision, inputs, normalize=normalize,
+                        model_id, model["revision"], inputs, normalize=normalize,
                     )
                 return await self.node_registry.request(
                     node_id, "POST", "/api/agent/embeddings",
                     json_body={
                         "model_id": model_id,
-                        "revision": revision,
+                        "revision": model["revision"],
                         "inputs": inputs,
                         "normalize": normalize,
                     },
@@ -2335,10 +2376,22 @@ class Manager:
                     "embedding request for %s failed on node %s: %s",
                     model_id, node_id, exc,
                 )
-                failures.append(f"{node_id}: {exc}")
-        raise RuntimeError(
-            f"no node could serve '{model_id}' ({'; '.join(failures) or 'no nodes'})"
-        )
+                failures.append((node_id, exc))
+        # The failure class is preserved instead of collapsed into one generic
+        # error: the HTTP layer maps a timeout to 504 and an unusable request
+        # to 400, and reporting an overloaded cluster as "bad request" would
+        # mislead every caller that retries on the difference.
+        detail = "; ".join(f"{node_id}: {exc}" for node_id, exc in failures)
+        message = f"no node could serve '{model_id}' ({detail or 'no nodes'})"
+        for node_id, exc in failures:
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError(message) from exc
+        for node_id, exc in failures:
+            # A request every holder rejected outright is the caller's error;
+            # anything else is an operational failure of the cluster.
+            if isinstance(exc, EmbeddingError):
+                raise EmbeddingError(message) from exc
+        raise RuntimeError(message)
 
     async def embed_local(
         self, model_id: str, revision: str | None, inputs: list[str],
@@ -2409,6 +2462,11 @@ class Manager:
                 "id": node.get("id"), "name": node.get("name"),
                 "online": online,
                 "hidden_from_dashboard": bool(node.get("hidden_from_dashboard")),
+                # Capabilities are carried through rather than summarized into
+                # the one flag below: a caller deciding what a node can be
+                # asked to do needs the node's own advertisement, not a
+                # re-derivation that silently drops every other capability.
+                "capabilities": list(node.get("capabilities") or []),
                 "virtual_nas_download_capable": bool(
                     node.get("id") == LOCAL_NODE_ID
                     or VIRTUAL_NAS_DOWNLOAD_CAPABILITY

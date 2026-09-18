@@ -47,6 +47,12 @@ JOIN_CODE_TTL_SECONDS = 600.0
 JOIN_RATE_LIMIT = 5
 JOIN_RATE_WINDOW_SECONDS = 60.0
 PROXY_TIMEOUT_SECONDS = 600.0
+# An embeddings request may be the one that installs the embedding runtime on
+# the controller, which downloads roughly a gigabyte of dependencies before the
+# model even loads. A worker URL is a supported entry point, so it must not
+# abort an installation that the same call would complete against the
+# controller directly.
+EMBEDDINGS_PROXY_TIMEOUT_SECONDS = 4200.0
 PROXY_DISCONNECT_POLL_SECONDS = 0.1
 CONTROL_DNS_TIMEOUT_SECONDS = 3.0
 CONTROL_REACHABILITY_TIMEOUT_SECONDS = 8.0
@@ -851,7 +857,11 @@ async def forward_management_request(
                 query=request.url.query,
                 headers=headers,
                 content=body,
-                timeout=PROXY_TIMEOUT_SECONDS,
+                timeout=(
+                    EMBEDDINGS_PROXY_TIMEOUT_SECONDS
+                    if request.url.path.rstrip("/") == "/v1/embeddings"
+                    else PROXY_TIMEOUT_SECONDS
+                ),
                 stream=True,
                 disconnect_task=disconnect_task,
             )

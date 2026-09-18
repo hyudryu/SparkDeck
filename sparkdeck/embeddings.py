@@ -30,7 +30,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
@@ -51,15 +51,30 @@ _CONFIG_MARKER = "config.json"
 # :func:`_load_modules_manifest`; config and manifest reads are capped so a
 # hostile cache entry cannot be used to read an unbounded file.
 _SENTENCE_TRANSFORMERS_PREFIX = "sentence_transformers."
-_ENCODER_MODULE = "sentence_transformers.models.Transformer"
-# Modules that select or scale the encoder's vectors without changing their
-# width, so the snapshot's published encoder width is the sentence-vector
-# width. Anything else makes the output width unknown to a static check.
-_WIDTH_PRESERVING_MODULES = frozenset({
-    _ENCODER_MODULE,
-    "sentence_transformers.models.Pooling",
-    "sentence_transformers.models.Normalize",
+_TRANSFORMER_MODULE = "sentence_transformers.models.Transformer"
+_POOLING_MODULE = "sentence_transformers.models.Pooling"
+_NORMALIZE_MODULE = "sentence_transformers.models.Normalize"
+# Modules that hold no state on disk, so a published repository may name a
+# directory that does not exist without breaking loading.
+_STATELESS_MODULES = frozenset({_NORMALIZE_MODULE})
+# Built-in modules that turn text into vectors. Sentences are embedded through
+# any of them, so discovery must not insist on the transformer one.
+_ENCODER_MODULES = frozenset({
+    _TRANSFORMER_MODULE,
+    "sentence_transformers.models.StaticEmbedding",
+    "sentence_transformers.models.WordEmbeddings",
+    "sentence_transformers.models.BoW",
 })
+# Pooling config keys whose enabled combination is concatenated into the
+# sentence vector, which is what makes pooling able to widen it.
+_POOLING_MODE_KEYS = (
+    "pooling_mode_cls_token",
+    "pooling_mode_mean_tokens",
+    "pooling_mode_max_tokens",
+    "pooling_mode_mean_sqrt_len_tokens",
+    "pooling_mode_weightedmean_tokens",
+    "pooling_mode_lasttoken",
+)
 _MANIFEST_MAX_BYTES = 64 * 1024
 
 DEFAULT_INSTALL_TIMEOUT = 3600.0
@@ -77,10 +92,15 @@ DEFAULT_WORKER_IDLE_SECONDS = 900.0
 # model. Least-recently-used workers beyond this limit are stopped.
 MAX_WORKERS = 2
 # The worker answers a whole batch in one newline-delimited record, so the
-# parent's stream limit has to cover the largest response the request bounds
-# allow: 512 inputs of a 4096-wide vector is roughly 25 MB of JSON. The asyncio
-# default is 64 KiB, which even an ordinary 384-wide batch can exceed.
-_PROTOCOL_LINE_LIMIT = 64 * 1024 * 1024
+# parent's stream limit has to cover the largest record a request can produce.
+# A batch is split to stay inside it (see `EmbeddingRuntime._batch_size_for`),
+# which matters because a pipeline may return vectors wider than 4096 and the
+# dimension is only known once the worker has loaded.
+_PROTOCOL_LINE_LIMIT = 512 * 1024 * 1024
+MAX_PROTOCOL_VALUES = 8_000_000
+# Used before a worker reports its width: wide enough for any common embedding
+# model, small enough to keep one record far inside the stream limit.
+MAX_ASSUMED_DIMENSION = 4096
 WORKER_SCRIPT = "embedding_worker.py"
 _WORKER_SCRIPT = Path(__file__).with_name(WORKER_SCRIPT)
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
@@ -92,8 +112,18 @@ MAX_EMBEDDING_INPUT_CHARS = 200_000
 MAX_EMBEDDING_TOTAL_CHARS = 1_000_000
 
 
-class EmbeddingError(ValueError):
-    """Raised for an unusable embedding request; maps to HTTP 400."""
+class EmbeddingError(Exception):
+    """Base class for every embedding failure."""
+
+
+class EmbeddingRequestError(EmbeddingError):
+    """The request itself cannot be served; maps to HTTP 400.
+
+    Kept apart from the runtime failures that share this base — a failed
+    install, a worker that died, an encode that timed out — because telling a
+    caller its input was invalid when the cluster merely failed would send it
+    to fix the one thing that is not wrong.
+    """
 
 
 @dataclass(frozen=True)
@@ -164,9 +194,12 @@ def _load_modules_manifest(path: Path) -> list | None:
 
     Rejects everything that is not the shape every published repository
     produces: a non-empty list of module entries whose ``type`` lives in the
-    ``sentence_transformers.`` namespace and that includes the encoder module.
-    A repository failing this check is simply not advertised as an embedding
-    model rather than being loaded on faith.
+    ``sentence_transformers.`` namespace and that includes at least one module
+    able to turn text into vectors. ``Transformer`` is the common encoder, but
+    ``StaticEmbedding``, ``WordEmbeddings`` and ``BoW`` are built-in encoders
+    that satisfy the same contract, so requiring the transformer one would
+    hide working repositories. A repository failing this check is simply not
+    advertised as an embedding model rather than being loaded on faith.
     """
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -186,29 +219,86 @@ def _load_modules_manifest(path: Path) -> list | None:
         module_path = entry.get("path", "")
         if not isinstance(module_path, str):
             return None
-        if module_type == _ENCODER_MODULE:
+        if module_type in _ENCODER_MODULES:
             encoders += 1
     return manifest if encoders else None
 
 
-def _hidden_size(repository: Path, snapshot: Path) -> int | None:
-    """Read the encoder width from a snapshot's config, when it is published.
+def _module_directory(snapshot: Path, module_path: str) -> Path | None:
+    """Resolve a module's directory inside the snapshot, or None.
 
-    Only the encoder width: a pipeline that projects the sentence vector — a
-    ``Dense`` module, for instance — returns a different final dimension, so
-    :func:`_load_modules_manifest` refuses to treat this as the output width
-    for such a pipeline.
+    An empty path means the module lives at the snapshot root. Anything else
+    must stay inside the snapshot: the manifest is cached content, so a path
+    that climbs out of it is refused rather than joined.
     """
+    if module_path == "":
+        return snapshot
+    parts = PurePosixPath(module_path).parts
+    if not parts or any(part in {".", ".."} or "\\" in part for part in parts):
+        return None
+    candidate = snapshot.joinpath(*parts)
+    try:
+        if not candidate.is_dir() or candidate.is_symlink():
+            return None
+        if not candidate.resolve(strict=True).is_relative_to(
+            snapshot.resolve(strict=True)
+        ):
+            return None
+    except OSError:
+        return None
+    return candidate
+
+
+def _module_files_present(directory: Path) -> bool:
+    """Whether a module directory actually holds loadable files."""
+    try:
+        return any(
+            item.is_file() for item in directory.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _manifest_modules_are_loadable(snapshot: Path, manifest: list) -> bool:
+    """Whether every module the manifest names can actually be loaded.
+
+    A snapshot can satisfy the generic completeness check — root weights,
+    config, tokenizer — while a submodule directory such as ``1_Pooling`` is
+    still missing, and the model would then be advertised as servable only to
+    fail in the worker on every request. Only modules that persist
+    configuration are required to be on disk: ``Normalize`` is stateless, and
+    its directory is legitimately absent from published repositories because
+    it holds no files to publish.
+    """
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            return False
+        module_path = str(entry.get("path", ""))
+        if module_path == "":
+            # The root module is the snapshot itself; the completeness check
+            # upstream already validated the files it needs.
+            continue
+        directory = _module_directory(snapshot, module_path)
+        if directory is None:
+            if entry.get("type") in _STATELESS_MODULES:
+                continue
+            return False
+        if directory == snapshot:
+            continue
+        if not _module_files_present(directory):
+            return False
+    return True
+
+
+def _hidden_size(repository: Path, snapshot: Path) -> int | None:
+    """Read the encoder width from a snapshot's config, when it is published."""
     config_path = _safe_snapshot_entry(
         repository, snapshot, _CONFIG_MARKER, _MANIFEST_MAX_BYTES,
     )
     if config_path is None:
         return None
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(config, dict):
+    config = _read_json_object(config_path)
+    if config is None:
         return None
     value = config.get("hidden_size")
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -216,24 +306,78 @@ def _hidden_size(repository: Path, snapshot: Path) -> int | None:
     return value
 
 
-def _pipeline_preserves_encoder_width(manifest: Any) -> bool:
-    """Whether every module leaves the encoder's width untouched.
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
-    Discovery reads the repository statically, so it cannot run the pipeline to
-    see what comes out. Pooling and normalizing keep the encoder's width, which
-    is what the snapshot's ``config.json`` publishes; a projection, a
-    concatenation of several encoders, or any module whose effect cannot be
-    established from here means the final width is simply unknown, and an
-    unknown width must not be advertised: a caller that sizes a vector store
-    from it would create columns the worker never fills.
+
+def _pooling_width_factor(module_directory: Path) -> int | None:
+    """Return how many encoder widths one pooling module concatenates.
+
+    Polling several modes at once (CLS plus mean, for instance) concatenates
+    their outputs, so the sentence vector is a multiple of the encoder's width.
+    Reading the module's own configuration is the only way to know; an
+    unreadable or unrecognized configuration means the factor is unknown.
     """
-    if not isinstance(manifest, list):
-        return False
-    return all(
-        entry.get("type") in _WIDTH_PRESERVING_MODULES
-        for entry in manifest
-        if isinstance(entry, dict)
+    config = _read_json_object(module_directory / "config.json")
+    if config is None:
+        return None
+    enabled = sum(
+        1 for key in _POOLING_MODE_KEYS if config.get(key) is True
     )
+    # Weighted-mean and last-token pooling concatenate with the others too, and
+    # a config that enables none of the known modes is not understood here.
+    return enabled or None
+
+
+def _pipeline_output_dimension(
+    repository: Path, snapshot: Path, manifest: list,
+) -> int | None:
+    """Compute the sentence-vector width, or None when it cannot be known.
+
+    Discovery reads the repository statically and cannot run the pipeline, so
+    the width is reported only when every module's effect on it is understood:
+    an encoder whose width the snapshot publishes, pooling modules whose
+    concatenation factor is readable, and nothing else that reshapes the
+    vector — a projection such as ``Dense`` returns a width this cannot
+    predict, so it is omitted rather than guessed at. A caller sizes its
+    storage with this number, so a wrong value is worse than none.
+    """
+    width: int | None = None
+    for entry in manifest:
+        module_type = entry.get("type")
+        if module_type not in _ENCODER_MODULES:
+            continue
+        if module_type != _TRANSFORMER_MODULE:
+            # A non-transformer encoder stores its width elsewhere; only the
+            # published transformer config is read here.
+            return None
+        width = _hidden_size(repository, snapshot)
+        if width is None:
+            return None
+    if width is None:
+        return None
+    for entry in manifest:
+        module_type = entry.get("type")
+        if module_type in _ENCODER_MODULES:
+            continue
+        if module_type == _POOLING_MODULE:
+            directory = _module_directory(snapshot, str(entry.get("path", "")))
+            if directory is None:
+                return None
+            factor = _pooling_width_factor(directory)
+            if factor is None:
+                return None
+            width *= factor
+            continue
+        if module_type == _NORMALIZE_MODULE:
+            continue
+        # Any other module may reshape the vector in a way this cannot see.
+        return None
+    return width
 
 
 def _ordered_revisions(repository: Path, revisions: Iterable[str]) -> list[str]:
@@ -261,7 +405,7 @@ def embedding_descriptor(
     @param repository - hub cache directory for a single repository.
     @param revisions - complete snapshot revisions the caller already resolved.
     @returns the descriptor, or None when no complete snapshot publishes a
-        SentenceTransformers manifest.
+        loadable SentenceTransformers pipeline.
     """
     for revision in _ordered_revisions(repository, revisions):
         snapshot = repository / "snapshots" / revision
@@ -273,14 +417,9 @@ def embedding_descriptor(
         manifest = _load_modules_manifest(manifest_path)
         if manifest is None:
             continue
-        # Report the sentence-vector width only when the pipeline cannot change
-        # it; otherwise the encoder width would be mistaken for the output
-        # width, and a caller sizing storage from it would be wrong.
-        dimension = (
-            _hidden_size(repository, snapshot)
-            if _pipeline_preserves_encoder_width(manifest)
-            else None
-        )
+        if not _manifest_modules_are_loadable(snapshot, manifest):
+            continue
+        dimension = _pipeline_output_dimension(repository, snapshot, manifest)
         return CachedEmbedding(
             revision=revision,
             snapshot=snapshot,
@@ -317,23 +456,23 @@ def normalize_embedding_inputs(value: Any) -> list[str]:
     ):
         inputs = list(value)
     else:
-        raise EmbeddingError("input must be a string or a non-empty array of strings")
+        raise EmbeddingRequestError("input must be a string or a non-empty array of strings")
     if any(item == "" for item in inputs):
         # An empty string tokenizes to nothing, and pooling over an empty
         # sequence yields NaN — a vector no caller can use. Refuse it here
         # rather than returning a poisoned embedding.
-        raise EmbeddingError("input strings must not be empty")
+        raise EmbeddingRequestError("input strings must not be empty")
     if len(inputs) > MAX_EMBEDDING_INPUTS:
-        raise EmbeddingError(
+        raise EmbeddingRequestError(
             f"input must contain at most {MAX_EMBEDDING_INPUTS} strings"
         )
     for item in inputs:
         if len(item) > MAX_EMBEDDING_INPUT_CHARS:
-            raise EmbeddingError(
+            raise EmbeddingRequestError(
                 f"each input must be at most {MAX_EMBEDDING_INPUT_CHARS} characters"
             )
     if sum(len(item) for item in inputs) > MAX_EMBEDDING_TOTAL_CHARS:
-        raise EmbeddingError(
+        raise EmbeddingRequestError(
             f"input must total at most {MAX_EMBEDDING_TOTAL_CHARS} characters"
         )
     return inputs
@@ -342,21 +481,21 @@ def normalize_embedding_inputs(value: Any) -> list[str]:
 def parse_embedding_request(body: Any) -> EmbeddingRequest:
     """Validate an OpenAI-compatible embeddings body."""
     if not isinstance(body, dict):
-        raise EmbeddingError("request body must be a JSON object")
+        raise EmbeddingRequestError("request body must be a JSON object")
     model = body.get("model")
     if not isinstance(model, str) or not model.strip():
-        raise EmbeddingError("model is required")
+        raise EmbeddingRequestError("model is required")
     inputs = normalize_embedding_inputs(body.get("input"))
     encoding_format = body.get("encoding_format", "float")
     if encoding_format not in {"float", "base64"}:
-        raise EmbeddingError("encoding_format must be 'float' or 'base64'")
+        raise EmbeddingRequestError("encoding_format must be 'float' or 'base64'")
     if body.get("dimensions") is not None:
         # Silently truncating would hand a caller vectors that no longer match
         # the model's similarity space, so this is refused rather than ignored.
-        raise EmbeddingError("dimensions is not supported by cached embedding models")
+        raise EmbeddingRequestError("dimensions is not supported by cached embedding models")
     normalize = body.get("normalize", True)
     if not isinstance(normalize, bool):
-        raise EmbeddingError("normalize must be a boolean")
+        raise EmbeddingRequestError("normalize must be a boolean")
     return EmbeddingRequest(
         model=model.strip(),
         inputs=inputs,
@@ -370,6 +509,16 @@ def _encoded_vector(vector: list[float], encoding_format: str) -> Any:
         return list(vector)
     packed = struct.pack(f"<{len(vector)}f", *vector)
     return base64.b64encode(packed).decode("ascii")
+
+
+def _validate_vectors(vectors: Any, expected: int) -> None:
+    """Refuse a worker answer that does not describe the inputs it was given."""
+    if (
+        not isinstance(vectors, list)
+        or len(vectors) != expected
+        or any(not isinstance(vector, list) or not vector for vector in vectors)
+    ):
+        raise EmbeddingError("the embedding worker returned an unusable result")
 
 
 def embeddings_response(
@@ -518,7 +667,10 @@ class _EmbeddingWorker:
                 self._pending.pop(request_id, None)
             self.last_used = time.monotonic()
             if answer.get("error"):
-                raise EmbeddingError(str(answer["error"]))
+                message = str(answer["error"])
+                if answer.get("kind") == "input":
+                    raise EmbeddingRequestError(message)
+                raise EmbeddingError(message)
             return answer
 
     @property
@@ -877,7 +1029,8 @@ class EmbeddingRuntime:
         serve the request that created it — and neither is one that is encoding
         right now. Failing an in-flight request to satisfy a memory bound would
         turn a resource limit into a surprising client error, so the limit
-        yields until those requests finish.
+        yields until those requests finish, and enforcement is retried when one
+        does (:meth:`_release_worker`).
         """
         while len(self._workers) > self.max_workers:
             candidates = [
@@ -891,6 +1044,17 @@ class EmbeddingRuntime:
             )
             self._workers.pop(key, None)
             await worker.stop()
+
+    async def _release_worker(self) -> None:
+        """Re-apply the worker cap now that a request has finished.
+
+        Without this, workers left over the limit while every candidate was
+        busy would stay resident until the idle timeout, so overlapping
+        requests for many models could hold far more than ``max_workers``
+        processes.
+        """
+        async with self._worker_lock:
+            await self._evict_workers()
 
     def _start_monitor(self) -> None:
         if self._monitor is None or self._monitor.done():
@@ -910,6 +1074,23 @@ class EmbeddingRuntime:
                 worker = self._workers.pop(key, None)
                 if worker is not None:
                     await worker.stop()
+            if len(self._workers) > self.max_workers:
+                # The cap is enforced on every tick too, in case a completion
+                # raced with shutdown code that skipped its own release.
+                await self._release_worker()
+
+    def _batch_size_for(self, worker: _EmbeddingWorker) -> int:
+        """Return how many inputs may be sent to one worker request.
+
+        A whole batch arrives as a single protocol record, so the batch is
+        split to keep that record inside the stream limit whatever width the
+        model returns. The width is known once the worker has loaded, which is
+        why this cannot be decided by request validation alone.
+        """
+        dimension = worker.dimension or MAX_ASSUMED_DIMENSION
+        if dimension <= 0:
+            dimension = MAX_ASSUMED_DIMENSION
+        return max(1, MAX_PROTOCOL_VALUES // dimension)
 
     async def encode(
         self,
@@ -923,22 +1104,28 @@ class EmbeddingRuntime:
         if self._installed() is None:
             await self.install()
         worker = await self._worker(snapshot)
-        answer = await worker.request(inputs, normalize=normalize)
-        vectors = answer.get("embeddings")
-        if (
-            not isinstance(vectors, list)
-            or len(vectors) != len(inputs)
-            or any(not isinstance(vector, list) or not vector for vector in vectors)
-        ):
-            raise EmbeddingError("the embedding worker returned an unusable result")
-        prompt_tokens = answer.get("prompt_tokens")
+        batch_size = self._batch_size_for(worker)
+        vectors: list[list[float]] = []
+        prompt_tokens = 0
+        try:
+            for offset in range(0, len(inputs), batch_size):
+                answer = await worker.request(
+                    inputs[offset:offset + batch_size], normalize=normalize,
+                )
+                chunk = answer.get("embeddings")
+                _validate_vectors(chunk, len(inputs[offset:offset + batch_size]))
+                vectors.extend(chunk)
+                tokens = answer.get("prompt_tokens")
+                if isinstance(tokens, int) and tokens > 0:
+                    prompt_tokens += tokens
+        finally:
+            # The cap is re-applied once this request stops occupying a worker,
+            # whether it succeeded or failed.
+            await self._release_worker()
         return {
             "model": model_id,
             "embeddings": vectors,
-            "prompt_tokens": (
-                prompt_tokens if isinstance(prompt_tokens, int) and prompt_tokens >= 0
-                else 0
-            ),
+            "prompt_tokens": prompt_tokens,
             "dimension": len(vectors[0]),
         }
 

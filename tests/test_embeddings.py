@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -25,6 +26,7 @@ from sparkdeck import embeddings as embeddings_module
 from sparkdeck.embeddings import (
     EMBEDDINGS_CAPABILITY,
     EmbeddingError,
+    EmbeddingRequestError,
     EmbeddingRuntime,
     embedding_descriptor,
     embeddings_response,
@@ -32,6 +34,7 @@ from sparkdeck.embeddings import (
     parse_embedding_request,
 )
 from sparkdeck.virtual_nas import VirtualNAS
+from sparkdeck.request_limits import is_inference_request_path
 
 
 REVISION = "a" * 40
@@ -54,6 +57,26 @@ def write_manifest(snapshot: Path, modules=_ST_MODULES) -> None:
         ]),
         encoding="utf-8",
     )
+    # Create each module's directory the way a published repository does, so
+    # discovery's loadability check sees a real layout. `2_Normalize` is
+    # deliberately absent in the real world because Normalize is stateless.
+    for module_type, path in modules:
+        if not path or module_type == "sentence_transformers.models.Normalize":
+            continue
+        directory = snapshot / path
+        directory.mkdir(parents=True, exist_ok=True)
+        if module_type == "sentence_transformers.models.Pooling":
+            # One enabled pooling mode keeps the encoder's width.
+            directory.joinpath("config.json").write_text(
+                json.dumps({
+                    "word_embedding_dimension": 384,
+                    "pooling_mode_cls_token": True,
+                    "pooling_mode_mean_tokens": False,
+                }),
+                encoding="utf-8",
+            )
+        else:
+            directory.joinpath("config.json").write_text("{}", encoding="utf-8")
 
 
 def create_cached_embedding(
@@ -66,8 +89,6 @@ def create_cached_embedding(
     (root / "blobs").mkdir(parents=True, exist_ok=True)
     snapshot = root / "snapshots" / revision
     snapshot.mkdir(parents=True, exist_ok=True)
-    snapshot.joinpath("1_Pooling").mkdir(exist_ok=True)
-    snapshot.joinpath("1_Pooling", "config.json").write_text("{}", encoding="utf-8")
     snapshot.joinpath("model.safetensors").write_bytes(b"encoder-weights")
     snapshot.joinpath("tokenizer.json").write_text("{}", encoding="utf-8")
     snapshot.joinpath("config.json").write_text(
@@ -236,6 +257,102 @@ class EmbeddingDescriptorTests(unittest.TestCase):
         )
         again = embedding_descriptor(descriptor.snapshot.parent.parent, {REVISION})
         self.assertEqual(again.dimension, 384)
+
+    def test_several_pooling_modes_report_the_concatenated_width(self):
+        # Pooling concatenates every enabled mode, so the sentence vector is a
+        # multiple of the encoder width rather than the encoder width itself.
+        repository = create_cached_embedding(self.hub, dimension=384)
+        write_manifest(
+            repository / "snapshots" / REVISION,
+            (
+                ("sentence_transformers.models.Transformer", ""),
+                ("sentence_transformers.models.Pooling", "1_Pooling"),
+            ),
+        )
+        (repository / "snapshots" / REVISION / "1_Pooling" / "config.json").write_text(
+            json.dumps({
+                "word_embedding_dimension": 384,
+                "pooling_mode_cls_token": True,
+                "pooling_mode_mean_tokens": True,
+                "pooling_mode_max_tokens": False,
+            }),
+            encoding="utf-8",
+        )
+
+        descriptor = embedding_descriptor(repository, {REVISION})
+
+        self.assertEqual(descriptor.dimension, 768)
+
+    def test_an_unreadable_pooling_config_omits_the_dimension(self):
+        repository = create_cached_embedding(self.hub)
+        (repository / "snapshots" / REVISION / "1_Pooling" / "config.json").write_text(
+            "not json", encoding="utf-8",
+        )
+
+        descriptor = embedding_descriptor(repository, {REVISION})
+
+        self.assertIsNotNone(descriptor)
+        self.assertIsNone(descriptor.dimension)
+
+    def test_a_module_missing_from_the_snapshot_is_not_advertised(self):
+        # A cache can hold root weights, config and tokenizer while a submodule
+        # directory is still absent; advertising it would fail every request.
+        repository = create_cached_embedding(self.hub)
+        shutil.rmtree(repository / "snapshots" / REVISION / "1_Pooling")
+
+        self.assertIsNone(embedding_descriptor(repository, {REVISION}))
+
+    def test_a_stateless_module_may_be_absent(self):
+        # Real published repositories omit 2_Normalize entirely because it
+        # holds no files, and their models load fine.
+        repository = create_cached_embedding(self.hub)
+
+        descriptor = embedding_descriptor(repository, {REVISION})
+
+        self.assertIsNotNone(descriptor)
+        self.assertFalse((repository / "snapshots" / REVISION / "2_Normalize").exists())
+
+    def test_a_module_path_cannot_escape_the_snapshot(self):
+        repository = create_cached_embedding(self.hub)
+        write_manifest(
+            repository / "snapshots" / REVISION,
+            (
+                ("sentence_transformers.models.Transformer", ""),
+                ("sentence_transformers.models.Pooling", "../outside"),
+            ),
+        )
+
+        self.assertIsNone(embedding_descriptor(repository, {REVISION}))
+
+    def test_a_non_transformer_encoder_is_recognized(self):
+        # StaticEmbedding and WordEmbeddings satisfy the same text-in,
+        # vector-out contract, so requiring Transformer would hide them.
+        repository = create_cached_embedding(self.hub)
+        write_manifest(
+            repository / "snapshots" / REVISION,
+            (
+                ("sentence_transformers.models.StaticEmbedding", ""),
+                ("sentence_transformers.models.Pooling", "1_Pooling"),
+            ),
+        )
+
+        descriptor = embedding_descriptor(repository, {REVISION})
+
+        self.assertIsNotNone(descriptor)
+        # These encoders publish their width elsewhere, so it is not guessed at.
+        self.assertIsNone(descriptor.dimension)
+
+    def test_a_pipeline_without_any_encoder_is_not_advertised(self):
+        repository = create_cached_embedding(self.hub)
+        write_manifest(
+            repository / "snapshots" / REVISION,
+            (
+                ("sentence_transformers.models.Pooling", "1_Pooling"),
+                ("sentence_transformers.models.Normalize", "2_Normalize"),
+            ),
+        )
+
+        self.assertIsNone(embedding_descriptor(repository, {REVISION}))
 
     @unittest.skipIf(os.name == "nt", "creating cache symlinks requires privileges")
     def test_manifest_symlinked_outside_the_cache_is_refused(self):
@@ -819,6 +936,93 @@ class EmbeddingRoutingTests(unittest.IsolatedAsyncioTestCase):
             EMBEDDINGS_CAPABILITY, manager.agent_health()["capabilities"],
         )
 
+    async def test_a_node_that_does_not_serve_embeddings_hides_the_capability(self):
+        # Advertising it would have the controller route a model held only here
+        # to a node that refuses every request.
+        manager = Manager.__new__(Manager)
+        manager.agent_credentials = Mock(node_id="local")
+        manager.settings = {
+            "cluster_node_name": "spark-one", "embeddings_enabled": False,
+        }
+
+        self.assertNotIn(
+            EMBEDDINGS_CAPABILITY, manager.agent_health()["capabilities"],
+        )
+
+    async def test_a_wrapped_agent_timeout_is_reported_as_a_timeout(self):
+        # The registry converts an httpx timeout into a plain RuntimeError, so
+        # the class has to be recovered from the exception chain or a slow node
+        # answers 409 instead of the 504 a caller should retry.
+        wrapped = RuntimeError("could not contact spark-node-4: timed out")
+        wrapped.__cause__ = httpx.ReadTimeout("timed out")
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[embedding_node("node-2")]),
+        )
+        manager.node_registry.request = AsyncMock(side_effect=wrapped)
+
+        with self.assertRaises(TimeoutError):
+            await manager.embed(MODEL_ID, ["hello"])
+
+    async def test_a_503_from_a_node_is_not_a_timeout(self):
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[embedding_node("node-2")]),
+        )
+        manager.node_registry.request = AsyncMock(
+            side_effect=_agent_error("spark-node-4", 503, "install failed"),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await manager.embed(MODEL_ID, ["hello"])
+
+        self.assertNotIsInstance(raised.exception, TimeoutError)
+
+    async def test_a_pinned_revision_survives_a_holder_change(self):
+        # A public model id must keep naming one vector space: recomputing the
+        # revision from the current holder majority would flip it when nodes
+        # come and go, and indexed documents would no longer be comparable.
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[
+                embedding_node("local"), embedding_node("node-2"),
+            ]),
+        )
+
+        first = await manager.embedding_models()
+        self.assertEqual(first["models"][0]["revision"], REVISION)
+
+        # Another node now holds the other revision, so it would win a fresh
+        # majority vote — but the pinned revision is still held, so it stands.
+        newer = embedding_node("node-3")
+        newer["models"][0]["embedding"] = {
+            "revision": NEWER_REVISION, "module_count": 3, "dimension": 384,
+        }
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            embedding_node("local"), newer, newer | {"id": "node-4"},
+        ])
+        manager._embedding_inventory_cache = None
+
+        second = await manager.embedding_models()
+
+        self.assertEqual(second["models"][0]["revision"], REVISION)
+        self.assertEqual(second["models"][0]["node_ids"], ["local"])
+
+    async def test_a_pin_is_replaced_once_no_node_holds_that_revision(self):
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(return_value=[embedding_node("local")]),
+        )
+        await manager.embedding_models()
+
+        other = embedding_node("node-2")
+        other["models"][0]["embedding"] = {
+            "revision": NEWER_REVISION, "module_count": 3, "dimension": 384,
+        }
+        manager.model_cache_inventory = AsyncMock(return_value=[other])
+        manager._embedding_inventory_cache = None
+
+        discovered = await manager.embedding_models()
+
+        self.assertEqual(discovered["models"][0]["revision"], NEWER_REVISION)
+        self.assertEqual(discovered["models"][0]["node_ids"], ["node-2"])
+
 
 class EmbeddingRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def runtime(self, **kwargs) -> EmbeddingRuntime:
@@ -1039,6 +1243,55 @@ class EmbeddingWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
             )
         await runtime.stop()
 
+    async def test_an_input_rejection_is_a_request_error(self):
+        # The worker labels a rejection so the caller is told to change its
+        # request, while a runtime failure stays retryable.
+        runtime = self.runtime()
+        self.worker_script(self.stub)
+        rejecting = self.root / "rejecting.py"
+        rejecting.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'ready': True, 'dimension': 2}), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    request = json.loads(line)\n"
+            "    print(json.dumps({'id': request['id'], 'kind': 'input',\n"
+            "                      'error': 'InputRejected: too long'}), flush=True)\n",
+            encoding="utf-8",
+        )
+        self.worker_script(rejecting)
+
+        with self.assertRaises(EmbeddingRequestError):
+            await runtime.encode(
+                model_id=MODEL_ID, snapshot=self.snapshot, inputs=["a"],
+            )
+        await runtime.stop()
+
+    async def test_a_batch_is_split_to_fit_the_protocol_record(self):
+        # One record carries a whole batch, so a wide model must not be asked
+        # for more values than the stream limit can deliver at once.
+        runtime = self.runtime()
+        self.worker_script(self.stub)
+        worker = await runtime._worker(self.snapshot)
+        calls: list[list[str]] = []
+        original = worker.request
+
+        async def counting_request(inputs, *, normalize):
+            calls.append(list(inputs))
+            return await original(inputs, normalize=normalize)
+
+        with patch.object(worker, "request", counting_request), patch.object(
+            embeddings_module.EmbeddingRuntime, "_batch_size_for", return_value=2,
+        ):
+            result = await runtime.encode(
+                model_id=MODEL_ID, snapshot=self.snapshot,
+                inputs=["a", "b", "c", "d", "e"],
+            )
+
+        self.assertEqual([len(call) for call in calls], [2, 2, 1])
+        self.assertEqual(len(result["embeddings"]), 5)
+        self.assertEqual(result["prompt_tokens"], 10)
+        await runtime.stop()
+
     async def test_a_worker_that_cannot_load_reports_its_reason(self):
         runtime = self.runtime()
         failing = self.root / "failing.py"
@@ -1088,8 +1341,8 @@ class EmbeddingWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["dimension"], 20000)
         self.assertGreater(
             len(json.dumps(result["embeddings"])),
-            embeddings_module._PROTOCOL_LINE_LIMIT // 512,
-            "the response was not large enough to exercise the stream limit",
+            64 * 1024,
+            "the response was not large enough to exceed the asyncio default",
         )
 
         # The worker must still be usable afterwards, not left with a dead
@@ -1137,9 +1390,11 @@ class EmbeddingWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(started), 1, "a second worker process was started")
         await runtime.stop()
 
-    async def test_a_busy_worker_is_not_evicted(self):
+    async def test_a_busy_worker_is_not_evicted_and_the_cap_resumes_after(self):
         # The memory limit must not fail an in-flight request, so a worker that
-        # is encoding survives even when another model pushes past the limit.
+        # is encoding survives another model pushing past the limit — but the
+        # cap has to be enforced again once that request finishes, or the extra
+        # heavyweight processes stay resident until the idle timeout.
         runtime = self.runtime(max_workers=1)
         self.worker_script(self.stub)
         other = self.root / "other-snapshot"
@@ -1164,14 +1419,17 @@ class EmbeddingWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertTrue(worker.busy, "the encode never started")
 
+            # Over the limit, but the busy worker is spared.
             await runtime._worker(other)
             self.assertIn(str(self.snapshot), runtime._workers)
+            self.assertEqual(len(runtime._workers), 2)
 
             release.set()
             await task
 
         self.assertEqual(
-            sorted(runtime._workers), sorted([str(self.snapshot), str(other)]),
+            len(runtime._workers), 1,
+            "the worker cap was not re-applied once the request finished",
         )
         await runtime.stop()
 
@@ -1268,8 +1526,11 @@ class EmbeddingHttpTests(unittest.IsolatedAsyncioTestCase):
         for error, expected in (
             (LookupError("no cached embedding model"), 404),
             (RuntimeError("embedding serving is disabled"), 409),
-            (EmbeddingError("unusable result"), 400),
+            (EmbeddingRequestError("unusable result"), 400),
             (ValueError("model_id must be a safe Hugging Face owner/repository ID"), 400),
+            # Runtime trouble is retryable and must not be reported as bad input.
+            (EmbeddingError("pip install failed"), 502),
+            (EmbeddingError("the embedding worker stopped"), 502),
         ):
             with self.subTest(error=error):
                 with patch.object(
@@ -1373,27 +1634,49 @@ class EmbeddingHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 502)
 
+    async def test_embeddings_is_bounded_like_every_other_inference_route(self):
+        # A joined worker forwards before the local handler runs, so the shared
+        # predicate is what stops an unauthenticated caller making a worker
+        # buffer an unbounded embeddings body.
+        self.assertTrue(is_inference_request_path("/v1/embeddings"))
+        self.assertTrue(is_inference_request_path("/v1/embeddings/"))
+        self.assertFalse(is_inference_request_path("/v1/embeddings/extra"))
+        self.assertFalse(is_inference_request_path("/api/v1/embeddings/install"))
+
 
 class FakeTokenizerModel:
     """The bits of a SentenceTransformer the worker's input checks use."""
 
     def __init__(
         self, token_counts: list[int], max_seq_length: int = 256,
-        tokenizer: bool = True,
+        tokenizer: bool = True, prompt: str | None = None,
+        prompt_tokens: int = 0,
     ):
         self.max_seq_length = max_seq_length
         self._token_counts = token_counts
         self._has_tokenizer = tokenizer
         self.embedded: list[list[str]] = []
+        if prompt is not None:
+            self.default_prompt_name = "query"
+            self.prompts = {"query": prompt}
+        # Tokens the prompt itself contributes, added when it is prepended.
+        self._prompt_tokens = prompt_tokens
 
     @property
     def tokenizer(self):
         if not self._has_tokenizer:
             raise AttributeError("this model publishes no tokenizer")
         counts = list(self._token_counts)
+        # A prompted pipeline tokenizes the prepended prompt along with every
+        # text, which is exactly the token cost the window check must see.
+        extra = self._prompt_tokens if getattr(self, "prompts", None) else 0
 
         def tokenize(texts, **_kwargs):
-            return {"input_ids": [[0] * n for n in counts[:len(texts)]]}
+            return {
+                "input_ids": [
+                    [0] * (count + extra) for count in counts[:len(texts)]
+                ],
+            }
 
         return tokenize
 
@@ -1430,7 +1713,7 @@ class EmbeddingWorkerInputTests(unittest.TestCase):
         # index would be filled with a document's opening fragment.
         model = FakeTokenizerModel([3, 900], max_seq_length=256)
 
-        with self.assertRaises(ValueError) as raised:
+        with self.assertRaises(worker_module.InputRejected) as raised:
             worker_module._encode(model, {
                 "id": 1, "inputs": ["short", "a long document"], "normalize": True,
             })
@@ -1438,6 +1721,35 @@ class EmbeddingWorkerInputTests(unittest.TestCase):
         self.assertIn("256", str(raised.exception))
         self.assertIn("input 1 has 900 tokens", str(raised.exception))
         self.assertEqual(model.embedded, [], "a truncated encode was attempted")
+
+    def test_a_default_prompt_counts_toward_the_window(self):
+        # encode() prepends a pipeline's default prompt before tokenizing, so
+        # raw input that fits on paper can still be truncated once it is added.
+        # 250 raw tokens fit a 256-token window; 250 plus a 20-token prompt
+        # does not, and the reported usage must include the prompt's tokens.
+        model = FakeTokenizerModel(
+            [250], max_seq_length=256, prompt="Represent this: ", prompt_tokens=20,
+        )
+
+        with self.assertRaises(worker_module.InputRejected) as raised:
+            worker_module._encode(model, {
+                "id": 1, "inputs": ["a document"], "normalize": True,
+            })
+
+        self.assertIn("270 tokens", str(raised.exception))
+        self.assertEqual(model.embedded, [], "a truncated encode was attempted")
+
+    def test_a_prompted_input_inside_the_window_reports_prompt_tokens(self):
+        model = FakeTokenizerModel(
+            [10], max_seq_length=256, prompt="Represent this: ", prompt_tokens=20,
+        )
+
+        result = worker_module._encode(model, {
+            "id": 1, "inputs": ["a document"], "normalize": True,
+        })
+
+        self.assertEqual(result["prompt_tokens"], 30)
+        self.assertEqual(len(result["embeddings"]), 1)
 
     def test_an_unknown_window_does_not_block_the_request(self):
         model = FakeTokenizerModel([900], max_seq_length=0)
@@ -1462,5 +1774,5 @@ class EmbeddingWorkerInputTests(unittest.TestCase):
         model = FakeTokenizerModel([1])
         for inputs in (None, [], [1], "a string"):
             with self.subTest(inputs=inputs):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(worker_module.InputRejected):
                     worker_module._encode(model, {"id": 1, "inputs": inputs})

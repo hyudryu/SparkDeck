@@ -42,6 +42,7 @@ from sparkdeck.service import (
 )
 from sparkdeck.embeddings import (
     EmbeddingError,
+    EmbeddingRequestError,
     normalize_embedding_inputs,
     parse_embedding_request,
 )
@@ -1450,12 +1451,19 @@ async def agent_embeddings(req: Request):
         raise HTTPException(400, "normalize must be a boolean")
     try:
         inputs = normalize_embedding_inputs(body.get("inputs"))
-    except EmbeddingError as exc:
+    except EmbeddingRequestError as exc:
         raise HTTPException(400, str(exc)) from exc
     try:
         return await manager.embed_local(
             str(body.get("model_id") or ""), revision, inputs, normalize=normalize,
         )
+    except EmbeddingRequestError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except EmbeddingError as exc:
+        # The node could not serve it — a failed install, a dead worker, a
+        # timeout — which is the controller's problem to retry elsewhere, not
+        # the requesting node's input to fix.
+        raise HTTPException(502, str(exc)) from exc
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 
@@ -4470,7 +4478,7 @@ async def v1_embeddings(req: Request):
     body = await _inference_json(req)
     try:
         request = parse_embedding_request(body)
-    except EmbeddingError as exc:
+    except EmbeddingRequestError as exc:
         raise HTTPException(400, str(exc)) from exc
     try:
         return await sparkdeck.embeddings(
@@ -4482,6 +4490,14 @@ async def v1_embeddings(req: Request):
         # Caught before the generic mapping, which would report a timeout as a
         # malformed request rather than an unavailable upstream.
         raise HTTPException(504, str(exc)) from exc
+    except EmbeddingRequestError as exc:
+        # The caller's own request cannot be encoded: too long for the model's
+        # window, or rejected outright by every holder.
+        raise HTTPException(400, str(exc)) from exc
+    except EmbeddingError as exc:
+        # A failed install, a worker that died, an unusable answer: retryable
+        # server-side trouble, which must not be reported as bad input.
+        raise HTTPException(502, str(exc)) from exc
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 

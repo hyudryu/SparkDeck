@@ -39,10 +39,32 @@ def _emit(payload: dict[str, Any]) -> None:
     _PROTOCOL.flush()
 
 
+class InputRejected(ValueError):
+    """The request cannot be encoded as asked; the caller must change it."""
+
+
+def _prompted_texts(model: Any, inputs: list[str]) -> list[str]:
+    """Reproduce the text the model will actually tokenize.
+
+    A pipeline can carry a default prompt, and ``encode`` prepends it before
+    tokenizing. Counting the raw inputs would then undercount by the prompt's
+    length, so an input that fits on paper can still be truncated in practice.
+    """
+    name = getattr(model, "default_prompt_name", None)
+    prompts = getattr(model, "prompts", None)
+    if name and isinstance(prompts, dict):
+        prompt = prompts.get(name)
+        if isinstance(prompt, str) and prompt:
+            return [prompt + text for text in inputs]
+    return list(inputs)
+
+
 def _input_token_counts(model: Any, inputs: list[str]) -> list[int] | None:
-    """Tokenize every input, or None when the model exposes no tokenizer."""
+    """Tokenize every input as it will be encoded, or None without a tokenizer."""
     try:
-        encoded = model.tokenizer(inputs, truncation=False, padding=False)["input_ids"]
+        encoded = model.tokenizer(
+            _prompted_texts(model, inputs), truncation=False, padding=False,
+        )["input_ids"]
     except Exception:
         return None
     if isinstance(encoded, list) and encoded and isinstance(encoded[0], list):
@@ -50,7 +72,7 @@ def _input_token_counts(model: Any, inputs: list[str]) -> list[int] | None:
     return [len(encoded)] if isinstance(encoded, list) else None
 
 
-def _check_token_window(model: Any, inputs: list[str], counts: list[int] | None) -> None:
+def _check_token_window(model: Any, counts: list[int] | None) -> None:
     """Refuse inputs that the model would silently truncate.
 
     ``SentenceTransformer.encode`` truncates every text to the pipeline's
@@ -64,7 +86,7 @@ def _check_token_window(model: Any, inputs: list[str], counts: list[int] | None)
         return
     oversized = [index for index, count in enumerate(counts) if count > limit]
     if oversized:
-        raise ValueError(
+        raise InputRejected(
             f"input {oversized[0]} has {counts[oversized[0]]} tokens, beyond this "
             f"model's {limit}-token window; chunk long text before embedding it"
         )
@@ -75,12 +97,12 @@ def _encode(model: Any, request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(inputs, list) or not inputs or any(
         not isinstance(item, str) for item in inputs
     ):
-        raise ValueError("inputs must be a non-empty array of strings")
+        raise InputRejected("inputs must be a non-empty array of strings")
     normalize = request.get("normalize", True)
     if not isinstance(normalize, bool):
-        raise ValueError("normalize must be a boolean")
+        raise InputRejected("normalize must be a boolean")
     counts = _input_token_counts(model, inputs)
-    _check_token_window(model, inputs, counts)
+    _check_token_window(model, counts)
     vectors = model.encode(
         inputs,
         normalize_embeddings=normalize,
@@ -128,11 +150,16 @@ def main() -> int:
         try:
             request = json.loads(text)
             if not isinstance(request, dict):
-                raise ValueError("request must be a JSON object")
+                raise InputRejected("request must be a JSON object")
             _emit(_encode(model, request))
         except Exception as exc:  # noqa: BLE001 - one bad request must not kill the worker
+            # The kind tells the parent whether the caller must change its
+            # request or the cluster merely failed, which is the difference
+            # between a 400 and a retryable server error.
+            kind = "input" if isinstance(exc, InputRejected) else "runtime"
             _emit({
                 "id": request.get("id") if isinstance(request, dict) else None,
+                "kind": kind,
                 "error": f"{type(exc).__name__}: {exc}"[:800],
             })
     return 0

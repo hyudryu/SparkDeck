@@ -1267,7 +1267,10 @@ class Manager:
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
                 "patched-images-v1",
-                EMBEDDINGS_CAPABILITY,
+                # Only advertised while this node would actually answer: a node
+                # with embedding serving switched off must not be chosen as the
+                # holder of a model the controller then advertises.
+                *([EMBEDDINGS_CAPABILITY] if self.embeddings_enabled() else []),
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
@@ -2266,23 +2269,9 @@ class Manager:
                     "dimension": model.get("dimension"),
                 })
         models: list[dict] = []
+        pins = self._embedding_revision_pins()
         for model_id in sorted(seen):
-            # The revision the most nodes hold wins, so an ordinary cluster
-            # converges on the copy that keeps the most failover options. A tie
-            # prefers the revision this controller holds — it needs no agent
-            # round trip — and the revision itself breaks any remaining tie so
-            # the choice cannot drift between polls.
-            revision = max(
-                seen[model_id],
-                key=lambda value: (
-                    len(seen[model_id][value]),
-                    any(
-                        holder["id"] == LOCAL_NODE_ID
-                        for holder in seen[model_id][value]
-                    ),
-                    value,
-                ),
-            )
+            revision = self._pinned_embedding_revision(model_id, seen[model_id], pins)
             holders = seen[model_id][revision]
             entry: dict[str, Any] = {
                 "model_id": model_id,
@@ -2308,6 +2297,90 @@ class Manager:
                 entry["dimension"] = dimension
             models.append(entry)
         return {"enabled": True, "models": models}
+
+    def _embedding_revision_pins(self) -> dict[str, str]:
+        """Return the revision pinned to each public embedding model id.
+
+        The revision is remembered rather than recomputed from the current
+        holder majority: a node going offline, a cache copy being added or
+        deleted, or the local tie-break changing would otherwise flip the
+        revision behind an unchanged model id, and a caller that indexed
+        documents before the change would query them with vectors from a
+        different vector space.
+        """
+        pins = getattr(self, "_embedding_pins", None)
+        if isinstance(pins, dict):
+            return pins
+        pins = {}
+        path = self._embedding_pins_path()
+        if path is not None:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw = None
+            if isinstance(raw, dict):
+                pins = {
+                    str(key): str(value)
+                    for key, value in raw.items()
+                    if isinstance(value, str) and value
+                }
+        self._embedding_pins = pins
+        return pins
+
+    def _embedding_pins_path(self) -> Path | None:
+        """Where pinned revisions are recorded, when there is a data directory."""
+        data_dir = getattr(self, "data_dir", None)
+        return None if data_dir is None else Path(data_dir) / "embedding_revisions.json"
+
+    def _save_embedding_pins(self, pins: dict[str, str]) -> None:
+        path = self._embedding_pins_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as exc:
+            # Pinning is a stability improvement, not a prerequisite: the
+            # majority choice still stands in for it until it can be recorded.
+            logger.warning("could not record embedding revisions: %s", exc)
+
+    def _pinned_embedding_revision(
+        self, model_id: str, holders: dict[str, list[dict]], pins: dict[str, str],
+    ) -> str:
+        """Choose the revision to keep serving for one model id.
+
+        A pinned revision is kept while any node still holds it, so the vector
+        space behind a public model id stays stable across inventory changes.
+        Otherwise the revision the most nodes hold wins — an ordinary cluster
+        converges on the copy that keeps the most failover options — with a tie
+        preferring the revision this controller holds, since it needs no agent
+        round trip, and the revision itself breaking any remaining tie so the
+        choice cannot drift between polls.
+        """
+        pinned = pins.get(model_id)
+        if pinned in holders:
+            return pinned
+        revision = max(
+            holders,
+            key=lambda value: (
+                len(holders[value]),
+                any(
+                    holder["id"] == LOCAL_NODE_ID for holder in holders[value]
+                ),
+                value,
+            ),
+        )
+        if pinned != revision:
+            updated = {**pins, model_id: revision}
+            if isinstance(getattr(self, "_embedding_pins", None), dict):
+                # Mutate the loaded mapping so later polls see the new pin even
+                # when it cannot be written to disk.
+                self._embedding_pins = updated
+            pins[model_id] = revision
+            self._save_embedding_pins(updated)
+        return revision
 
     async def embedding_status(self) -> dict:
         """Report embedding serving state without triggering any install."""
@@ -2397,7 +2470,7 @@ class Manager:
                     self._embedding_failure_reason(exc, None)
                 ) from exc
         for exc in (failure[1] for failure in failures):
-            if isinstance(exc, TimeoutError):
+            if self._embedding_is_timeout(exc):
                 raise TimeoutError(message) from exc
         for exc in (failure[1] for failure in failures):
             if isinstance(exc, EmbeddingError):
@@ -2422,6 +2495,28 @@ class Manager:
             return int(value) if value is not None else None
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _embedding_is_timeout(exc: BaseException) -> bool:
+        """Whether a failure was a timeout, including a wrapped one.
+
+        The node registry converts an httpx timeout into a plain RuntimeError,
+        so the original class is only reachable through the exception chain;
+        without this, a remote timeout would be reported as an operational
+        conflict instead of the 504 a caller should retry.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, (
+                TimeoutError, asyncio.TimeoutError, httpx.TimeoutException,
+            )):
+                return True
+            if Manager._embedding_status_code(current) in {408, 504}:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     @staticmethod
     def _embedding_failure_reason(exc: BaseException, node_id: str | None) -> str:

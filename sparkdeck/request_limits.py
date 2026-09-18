@@ -19,7 +19,13 @@ def is_inference_request_path(path: str) -> bool:
     # redirect as well, so a joined worker must bound the same payloads on the
     # `/v1/responses/` form too. Normalize only the exact-match set so the
     # `/api/agent/inference/` prefix still matches its own trailing slash.
-    if path.rstrip("/") in {"/v1/chat/completions", "/v1/completions", "/v1/responses"}:
+    # `/v1/embeddings` is an inference route like any other: it carries caller
+    # text, so a joined worker must bound it before forwarding rather than
+    # buffering an arbitrarily large body for the controller to reject.
+    if path.rstrip("/") in {
+        "/v1/chat/completions", "/v1/completions", "/v1/responses",
+        "/v1/embeddings",
+    }:
         return True
     return path.startswith("/api/agent/inference/")
 

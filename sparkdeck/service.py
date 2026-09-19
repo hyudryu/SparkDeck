@@ -1192,7 +1192,25 @@ class SparkDeckService:
                 public_settings["max_concurrency"] = launch_controls["max_concurrency"]
             stored["settings"] = public_settings
             if cluster.get("error"):
-                stored["last_error"] = str(cluster["error"])
+                cluster_error = str(cluster["error"])
+                if _stale_missing_container_error(cluster, cluster_error):
+                    stored["last_error"] = None
+                    # Manager skips status recalculation while a saved status is
+                    # "error", so clearing only the message would leave this
+                    # legacy record displayed as an error forever, now with no
+                    # explanation. It is stopped and owns nothing, so report
+                    # that instead of the stale failure.
+                    if stored.get("status") == "error":
+                        stored["status"] = "stopped"
+                    # ``_deployment_launch_progress`` already copied the same
+                    # Manager error into the launch phase above, and the card
+                    # shows launch details for a stopped deployment, so the
+                    # suppressed failure has to be cleared there too.
+                    if stored.get("launch_phase") == "error":
+                        stored["launch_phase"] = "stopped"
+                        stored["launch_message"] = "Stopped"
+                else:
+                    stored["last_error"] = cluster_error
             stored.update(self._layout_contract(cluster.get("launch_settings")))
             if cluster.get("mode") == "grouped_sharded":
                 stored["instances"] = _grouped_instance_summary(cluster)
@@ -8462,6 +8480,70 @@ def _observed_absent_ranks(cluster: dict[str, Any]) -> bool:
     )
 
 
+_MISSING_CONTAINER_ERROR_MARKERS = (
+    "no such container",
+    "managed container not found",
+    "cluster member not found",
+)
+
+
+def _missing_container_error(error: Any) -> bool:
+    """Whether a Docker or node-agent reply reports an absent container.
+
+    For stop and remove that absence is the desired end state, not a failure,
+    so the marker test is deliberately narrow: a manifest or image-pull error
+    must not be mistaken for a missing container.
+    """
+    text = str(error or "").casefold()
+    return any(marker in text for marker in _MISSING_CONTAINER_ERROR_MARKERS)
+
+
+_ABSENCE_FRAGMENT = re.compile(
+    r"\bno such container\b|\bmanaged container not found\b|\bcluster member not found\b",
+    re.IGNORECASE,
+)
+# Fragments are joined on ";" by the aggregation that builds these messages.
+_ERROR_FRAGMENT_SEPARATOR = re.compile(r"[;\n]+")
+
+
+def _only_missing_container_errors(error: Any) -> bool:
+    """Whether every reported cause in an aggregated error is an absence.
+
+    Manager assembles a deployment error from its member failures, so one string
+    can carry both an expected missing-container response and an actionable
+    fault such as an unreachable node. Testing the whole message for a marker
+    would match the first fragment and discard the real diagnostic with the
+    expected one, so each fragment must positively name an absence.
+    """
+    text = str(error or "").strip()
+    if not text:
+        return False
+    fragments = [
+        fragment.strip()
+        for fragment in _ERROR_FRAGMENT_SEPARATOR.split(text)
+        if fragment.strip()
+    ]
+    return bool(fragments) and all(
+        _ABSENCE_FRAGMENT.search(fragment) for fragment in fragments
+    )
+
+
+def _stale_missing_container_error(cluster: dict[str, Any], error: str) -> bool:
+    """Whether a recorded error only reports absent containers for a stopped
+    deployment that never successfully launched.
+
+    Such a deployment owns no containers, so a Docker/agent 404 from probing or
+    stopping one is the expected state, not a persistent error worth surfacing
+    on the card. Any other cause in the same message is still a real failure and
+    keeps the error.
+    """
+    return (
+        _only_missing_container_errors(error)
+        and cluster.get("desired_state") == "stopped"
+        and not cluster.get("last_deployed_at")
+    )
+
+
 def _reconcile_stale_running_intent(
     cluster: dict[str, Any], stored_desired: str | None,
 ) -> bool:
@@ -8510,6 +8592,51 @@ def _live_manager_cluster(
     )
 
 
+def _member_occupies_no_node(member: dict[str, Any]) -> bool:
+    """Whether a rank provably holds no container on its node.
+
+    A node is only released when every rank on it satisfies this, and only for a
+    record whose intent is already stopped, so absence is never inferred from
+    stopped intent alone. This predicate answers only "is this rank itself
+    holding a node?".
+
+    ``error`` counts as absent because Manager records a launch that failed
+    before any container existed that way, and a cluster whose launches never
+    succeeded cannot be holding its nodes.
+
+    The one deliberate nuance is ``failed_stop_error``. It normally keeps the
+    node reserved, because a stop that could not be carried out may leave a
+    container running. It is ignored only when the recorded failure is itself a
+    missing-container 404, which proves the rank it failed to stop does not
+    exist — stale bookkeeping from a stop attempted before the container was
+    ever created.
+    """
+    failed_stop_error = member.get("failed_stop_error")
+    if failed_stop_error and not _only_missing_container_errors(failed_stop_error):
+        # Manager stores "; "-joined stop failures here, so one string can carry
+        # an absence and a real fault. A stop that may not have been carried out
+        # leaves the node reserved.
+        return False
+    if member.get("status") in _ABSENT_MEMBER_STATUSES:
+        return True
+    # ``error`` is a launch failure, not a crash: a cluster whose launches never
+    # produced a container cannot be holding its nodes, which is what lets a
+    # sibling profile claim them. It stays separate from
+    # ``_ABSENT_MEMBER_STATUSES`` because converging a durable stop must require
+    # a positive absence observation rather than a failed one.
+    #
+    # That reasoning only holds when the absence was actually observed. Manager
+    # keeps a saved ``error`` status when a node answers with Docker
+    # unavailable, and an older agent can synthesize an empty inventory after
+    # enumeration fails; releasing a node then could schedule another deployment
+    # onto hardware that still holds a partially created workload. Manager marks
+    # those nodes with ``docker_ready`` false, so require that confirmation.
+    return (
+        member.get("status") == "error"
+        and member.get("node_docker_ready") is not False
+    )
+
+
 def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
     """Reserve online live ranks without claiming stopped or offline peers.
 
@@ -8536,16 +8663,25 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
     for member in members:
         if member.get("node_id"):
             by_node.setdefault(member["node_id"], []).append(member)
+    cluster_stopped = (
+        (cluster.get("desired_state") or "running") == "stopped"
+        or cluster.get("status") == "stopped"
+    )
     for node_id, ranks in by_node.items():
-        idle = all(
-            member.get("status") in {"exited", "stopped", "dead", "missing"}
-            and not member.get("recreate_pending")
-            and not member.get("failed_stop_error")
-            and (
-                (member.get("desired_state") or cluster.get("desired_state")) == "stopped"
-                or cluster.get("status") == "stopped"
-            )
-            for member in ranks
+        # A node is released when every rank on it is absent, AND that absence
+        # reflects stopped intent somewhere: either the whole record is stopped,
+        # or every rank on this node explicitly stopped. The per-rank case
+        # matters for grouped deployments, where one engine group can be stopped
+        # while the record as a whole still intends to run — its nodes must be
+        # selectable again even though the record reports "running".
+        ranks_stopped = all(
+            (rank.get("desired_state") or "running") == "stopped"
+            for rank in ranks
+        )
+        idle = (cluster_stopped or ranks_stopped) and all(
+            not rank.get("recreate_pending")
+            and _member_occupies_no_node(rank)
+            for rank in ranks
         )
         if idle:
             occupied.discard(node_id)

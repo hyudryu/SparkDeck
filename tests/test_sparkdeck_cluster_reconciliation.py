@@ -541,6 +541,59 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(listed[0]["occupied_node_ids"], ["local"])
 
+    async def test_stopped_group_releases_its_nodes_while_the_record_runs(self):
+        """A stopped group must free its nodes even though the record still runs.
+
+        In a grouped deployment one engine group can be stopped while the record
+        as a whole keeps running. Gating on the aggregate intent alone would
+        leave the stopped group's nodes reserved forever, blocking another
+        deployment from claiming them.
+        """
+        deployment = {
+            "id": "grouped", "sparkdeck_record_id": "record-1",
+            "status": "running", "desired_state": "running",
+            "mode": "grouped_sharded", "node_ids": ["local", "worker-1"],
+            "members": [
+                {
+                    "node_id": "local", "instance_id": 0, "status": "running",
+                    "desired_state": "running",
+                },
+                {
+                    "node_id": "worker-1", "instance_id": 1, "status": "stopped",
+                    "desired_state": "stopped",
+                },
+            ],
+        }
+        self.manager.deployments = [deployment]
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], ["local"])
+
+    async def test_running_group_keeps_its_nodes(self):
+        deployment = {
+            "id": "grouped", "sparkdeck_record_id": "record-1",
+            "status": "running", "desired_state": "running",
+            "mode": "grouped_sharded", "node_ids": ["local", "worker-1"],
+            "members": [
+                {
+                    "node_id": "local", "instance_id": 0, "status": "running",
+                    "desired_state": "running",
+                },
+                {
+                    "node_id": "worker-1", "instance_id": 1, "status": "running",
+                    "desired_state": "running",
+                },
+            ],
+        }
+        self.manager.deployments = [deployment]
+        self.manager.get_state = AsyncMock(return_value={"deployments": [deployment]})
+
+        listed = await self.service.deployments()
+
+        self.assertEqual(listed[0]["occupied_node_ids"], ["local", "worker-1"])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.manager = FakeManager()

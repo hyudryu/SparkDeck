@@ -64,7 +64,13 @@ describe('settings page', () => {
     expect(field).toHaveValue(1)
     expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
     await user.clear(field)
+    // Assert the clear took effect before typing. Without this, a late settings
+    // response that re-renders the field back to its loaded value makes typing
+    // append, so the test silently saves "13" and fails on a timing race rather
+    // than on a real regression.
+    await waitFor(() => expect(field).toHaveValue(null))
     await user.type(field, '3')
+    await waitFor(() => expect(field).toHaveValue(3))
     await user.click(screen.getByRole('button', { name: 'Save settings' }))
     await waitFor(() => expect(limit).toBe(3))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())

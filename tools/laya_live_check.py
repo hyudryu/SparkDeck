@@ -135,6 +135,50 @@ def main() -> int:
         })
         assert bad.status_code == 400, bad.status_code
 
+    # Opt-in routing: the English checkpoint collapses on non-Latin text while
+    # staying confident, so a routed deployment must pick the multilingual one.
+    import laya
+
+    router = laya.Router(max_loaded=1)
+    print("\n-- router --")
+    for label, state in (
+        ("English", {"body": "I was charged twice, please refund."}),
+        ("Japanese", {"body": "二重に請求されました。返金してください。"}),
+        ("German", {"body": "Mir wurde der Betrag zweimal in Rechnung gestellt."}),
+    ):
+        decision = router.route(state, QUESTIONS)
+        print(f"  {label:9} -> {decision['model']:13} ({decision['reason']})")
+
+    japanese = router.route({"body": "二重に請求されました"}, QUESTIONS)
+    assert japanese["model"] == "multilingual", japanese
+    english = router.route({"body": "I was charged twice"}, QUESTIONS)
+    assert english["model"] == "english", english
+
+    # Script detection is exact; the Latin-script language guess is a
+    # documented best-effort heuristic. A caller who knows the language can
+    # always override it, which is what the `routing` request field exposes.
+    german = {"body": "Mir wurde der Betrag zweimal in Rechnung gestellt."}
+    forced = router.route(german, QUESTIONS, lang="de")
+    print(f"  German+lang=de -> {forced['model']:13} ({forced['reason']})")
+    assert forced["model"] == "multilingual", forced
+
+    # And the routed endpoint answers with the decision that produced it.
+    server.ROUTER_ENABLED = True
+    server.set_agent(laya.Router(max_loaded=1))
+    with TestClient(server.app) as routed_client:
+        routed = routed_client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID,
+            "state": {"body": "二重に請求されました。返金してください。"},
+            "questions": QUESTIONS,
+        })
+        routed.raise_for_status()
+        routing = routed.json()["laya"]["routing"]
+        print("\n-- routed completion --")
+        print(json.dumps(routing, indent=2))
+        assert routing["model"] == "multilingual", routing
+        assert routing["repo"] == "convaiinnovations/laya-multilingual"
+        assert routed.json()["laya"]["answers"]["department"]["choice"]
+
     print("\nALL LIVE CHECKS PASSED")
     return 0
 

@@ -51,6 +51,23 @@ MODEL_DEVICE = (os.environ.get("LAYA_DEVICE") or "").strip() or None
 MODEL_REVISION = (os.environ.get("LAYA_REVISION") or "").strip() or None
 SERVE_PORT = int(os.environ.get("LAYA_PORT") or 8080)
 
+# Opt-in multilingual routing. Off by default: a single checkpoint has a much
+# smaller footprint, and the English checkpoint is the strongest on English.
+ROUTER_ENABLED = (os.environ.get("LAYA_ROUTER") or "").strip().casefold() in {
+    "1", "true", "yes", "on",
+}
+ROUTER_DEFAULT = (os.environ.get("LAYA_ROUTER_DEFAULT") or "english").strip()
+
+
+def _router_max_loaded() -> int:
+    try:
+        return max(1, int(os.environ.get("LAYA_ROUTER_MAX_LOADED") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+ROUTER_MAX_LOADED = _router_max_loaded()
+
 
 class DecisionRequestError(ValueError):
     """A caller-supplied decision payload could not be evaluated."""
@@ -133,6 +150,21 @@ def _load_agent() -> Any:
     source = _resolve_weights()
     logger.info("loading Laya model from %s", source)
     started = time.monotonic()
+    if ROUTER_ENABLED:
+        # The English checkpoint does not degrade off English, it collapses and
+        # stays confident while doing so, so an operator serving mixed-language
+        # traffic should route before the forward pass. The shipped English
+        # checkpoint stays the default because it is the strongest on English.
+        agent = laya.Router(
+            device=MODEL_DEVICE,
+            max_loaded=ROUTER_MAX_LOADED,
+            default=ROUTER_DEFAULT,
+        )
+        logger.info(
+            "Laya router ready (max_loaded=%d, default=%s) in %.1fs",
+            ROUTER_MAX_LOADED, ROUTER_DEFAULT, time.monotonic() - started,
+        )
+        return agent
     agent = laya.load(source, device=MODEL_DEVICE)
     logger.info(
         "Laya model %s ready on %s in %.1fs",
@@ -297,6 +329,43 @@ def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, An
     return state, _validated_questions(questions)
 
 
+def _routing_overrides(body: dict[str, Any]) -> dict[str, Any]:
+    """Per-request routing overrides, honoured only when the router is enabled.
+
+    Milestone: an operator who pinned one checkpoint asked for that checkpoint,
+    so an override must never quietly load a different one. Rejecting it is
+    better than ignoring it.
+    """
+    routing = body.get("routing")
+    if routing is None:
+        return {}
+    if not isinstance(routing, dict):
+        raise DecisionRequestError("routing must be an object")
+    unknown = sorted(set(routing) - {"model", "task", "lang"})
+    if unknown:
+        raise DecisionRequestError(
+            f"unsupported routing field(s): {', '.join(unknown)}; "
+            "expected model, task, or lang"
+        )
+    if not ROUTER_ENABLED:
+        raise DecisionRequestError(
+            "this deployment serves a single checkpoint, so routing overrides "
+            "are unavailable; start it with --router to enable multilingual "
+            "routing"
+        )
+    return routing
+
+
+def _decide(
+    agent: Any, state: Any, questions: dict[str, dict[str, Any]],
+    routing: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one decision, routing first when the deployment asked for it."""
+    if ROUTER_ENABLED:
+        return agent.predict(state, questions, **routing)
+    return agent.predict(state, questions)
+
+
 def _render_content(result: dict[str, Any], include_state: bool) -> str:
     payload = {
         "answers": result.get("answers") or {},
@@ -304,6 +373,10 @@ def _render_content(result: dict[str, Any], include_state: bool) -> str:
     }
     if include_state:
         payload["model"] = result.get("model") or MODEL_ID
+    # A routed deployment reports which checkpoint answered, and why, so a
+    # caller can see that a non-English state did not go to the English model.
+    if result.get("routing"):
+        payload["routing"] = result["routing"]
     return json.dumps(payload, separators=(",", ":"), sort_keys=False)
 
 
@@ -314,6 +387,12 @@ def _completion(
     prompt_tokens = int(usage.get("input_tokens") or 0)
     completion_tokens = int(usage.get("output_tokens") or 0)
     answer_text = _render_content(result, include_state=True)
+    extension = {
+        "model": result.get("model") or MODEL_ID,
+        "answers": result.get("answers") or {},
+    }
+    if result.get("routing"):
+        extension["routing"] = result["routing"]
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -327,10 +406,7 @@ def _completion(
                 # Laya returns structure, not prose. This extension keeps the
                 # probabilities and confidences typed for callers that can use
                 # them, while `content` stays valid OpenAI text.
-                "laya": {
-                    "model": result.get("model") or MODEL_ID,
-                    "answers": result.get("answers") or {},
-                },
+                "laya": extension,
             },
             "finish_reason": "stop",
         }],
@@ -339,10 +415,7 @@ def _completion(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-        "laya": {
-            "model": result.get("model") or MODEL_ID,
-            "answers": result.get("answers") or {},
-        },
+        "laya": extension,
     }
 
 
@@ -408,6 +481,7 @@ async def chat_completions(request: Request):
 
     try:
         state, questions = _decision_payload(body)
+        routing = _routing_overrides(body)
     except DecisionRequestError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -415,7 +489,7 @@ async def chat_completions(request: Request):
     gate = _inference_gate
 
     def decide() -> dict[str, Any]:
-        result = agent.predict(state, questions)
+        result = _decide(agent, state, questions, routing)
         if not isinstance(result, dict) or "answers" not in result:
             raise HTTPException(500, "Laya returned an unexpected result")
         return result
@@ -455,13 +529,14 @@ async def predict(request: Request):
         raise HTTPException(400, "request body must be a JSON object")
     try:
         state, questions = _decision_payload({**body, "messages": []})
+        routing = _routing_overrides(body)
     except DecisionRequestError as exc:
         raise HTTPException(400, str(exc)) from exc
     agent = get_agent()
     gate = _inference_gate
 
     def decide() -> dict[str, Any]:
-        return agent.predict(state, questions)
+        return _decide(agent, state, questions, routing)
 
     try:
         if gate is None:

@@ -402,5 +402,106 @@ class EntrypointTests(unittest.TestCase):
         self.assertIn("unsupported argument", result.stderr)
 
 
+class StubRouter:
+    """Stand-in for ``laya.Router``: records the routing kwargs it received."""
+
+    def __init__(self, result=None):
+        self.calls: list[dict] = []
+        self._result = result or {
+            "model": "laya-rl-agent",
+            "answers": {"department": {"type": "choice", "choice": "billing"}},
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "routing": {
+                "model": "multilingual",
+                "repo": "convaiinnovations/laya-multilingual",
+                "reason": "non-Latin script (kana, 100% of letters)",
+            },
+        }
+
+    def predict(self, state, questions, **kwargs):
+        self.calls.append(kwargs)
+        return self._result
+
+
+class LayaRouterTests(unittest.TestCase):
+    """An opt-in router deployment must route and report its decision."""
+
+    def setUp(self):
+        self.enabled = server.ROUTER_ENABLED
+        server.ROUTER_ENABLED = True
+        self.router = StubRouter()
+        server.set_agent(self.router)
+        self.client = TestClient(server.app)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        server.ROUTER_ENABLED = self.enabled
+        server.set_agent(None)
+
+    def _post(self, **extra):
+        return self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": STATE,
+            "questions": QUESTIONS, **extra,
+        })
+
+    def test_routed_decision_reports_which_checkpoint_answered(self):
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["laya"]["routing"]["model"], "multilingual",
+        )
+        self.assertEqual(
+            body["choices"][0]["message"]["laya"]["routing"]["repo"],
+            "convaiinnovations/laya-multilingual",
+        )
+        # The reason is what tells a caller the English checkpoint was skipped.
+        self.assertIn("non-Latin", body["laya"]["routing"]["reason"])
+        content = json.loads(body["choices"][0]["message"]["content"])
+        self.assertEqual(content["routing"], body["laya"]["routing"])
+
+    def test_routing_overrides_are_forwarded(self):
+        response = self._post(routing={"lang": "de"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.router.calls, [{"lang": "de"}])
+
+    def test_unknown_routing_field_is_rejected(self):
+        response = self._post(routing={"colour": "blue"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported routing field", response.json()["detail"])
+        self.assertEqual(self.router.calls, [])
+
+    def test_single_checkpoint_deployment_rejects_overrides(self):
+        """A pinned checkpoint must not be silently replaced by a routing hint."""
+        server.ROUTER_ENABLED = False
+        server.set_agent(StubAgent())
+
+        response = self._post(routing={"lang": "de"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("--router", response.json()["detail"])
+
+    def test_single_checkpoint_deployment_omits_routing_output(self):
+        server.ROUTER_ENABLED = False
+        server.set_agent(StubAgent())
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("routing", response.json()["laya"])
+
+    def test_predict_route_also_routes(self):
+        response = self.client.post("/laya/predict", json={
+            "state": STATE, "questions": QUESTIONS,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("routing", response.json())
+        self.assertEqual(self.router.calls, [{}])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -134,6 +134,81 @@ valid SSE sequence any OpenAI client can consume.
 Laya's native result without the OpenAI envelope. Useful for direct calls and
 for debugging what the model actually produced.
 
+## Laya checkpoints
+
+Laya publishes three checkpoints, and which one you load decides which languages
+the deployment can actually read:
+
+| Checkpoint | Encoder | Params | Context | Use it for |
+| --- | --- | --- | --- | --- |
+| `convaiinnovations/laya` | ModernBERT-large | 421M | 512 | English |
+| `convaiinnovations/laya-multilingual` | mmBERT-base | 322M | 1024 | 100+ languages, 2x faster |
+| `convaiinnovations/laya-typed-decisions` | ModernBERT-large | 421M | 1024 | The typed-decisions workflows |
+
+**The English checkpoint does not degrade gracefully outside English — it
+collapses, and stays confident while doing so.** On the publisher's shared
+benchmark it scores 0.306 on non-English intent against 0.451 for the
+multilingual checkpoint, and on 20-option intent it lands near random (Hindi
+0.100, Korean 0.103 against 0.050 for guessing) at an expected calibration error
+of 0.855. A confident wrong answer is the worst possible output for anything
+branching on `confidence`, so this matters more here than for a chat model.
+
+Deploy the checkpoint you want by deploying that repository as the model:
+
+```text
+convaiinnovations/laya                # English (default)
+convaiinnovations/laya-multilingual   # 100+ languages
+```
+
+### Multilingual routing (opt-in)
+
+Loading one checkpoint per deployment is the default. To have a single
+deployment pick the right checkpoint per request, launch it with `--router`:
+
+```text
+--router --router-max-loaded 3
+```
+
+The router detects the script of the state before the forward pass and chooses
+the checkpoint: non-Latin script goes to `laya-multilingual`, English Latin text
+to `laya`, and `laya-typed-decisions` only when explicitly requested. Every
+response then names the checkpoint that answered, and why:
+
+```json
+{
+  "laya": {
+    "answers": { "...": "..." },
+    "routing": {
+      "model": "multilingual",
+      "repo": "convaiinnovations/laya-multilingual",
+      "reason": "non-Latin script (kana, 100% of letters); the English checkpoint cannot read it",
+      "detection": { "script": "kana", "is_english": false, "non_latin_fraction": 1.0 },
+      "workflow": null
+    }
+  }
+}
+```
+
+Two things to know before enabling it:
+
+- **`--router-max-loaded` defaults to `1`**, matching Laya's own default and
+  keeping the footprint at one checkpoint — but switching language then evicts
+  the previous checkpoint, so a mixed-language workload pays a reload. Set `3`
+  to keep all three resident (~1.16B parameters total, comfortable in a Spark's
+  unified memory) and keep latency flat.
+- **Script detection is exact; the Latin-script language guess is best-effort.**
+  Laya's documentation says so explicitly, and it is honest about the limit: a
+  German sentence can be classified as English. Pass the language explicitly when
+  you already know it, using the `routing` request field:
+
+  ```json
+  { "state": { "...": "..." }, "questions": { "...": "..." }, "routing": { "lang": "de" } }
+  ```
+
+  `routing` accepts `model`, `task`, or `lang`, and is rejected with a clear error
+  when the deployment was not started with `--router`, so a pinned checkpoint is
+  never silently replaced by a routing hint.
+
 ## Running the server outside a container
 
 ```bash
@@ -157,6 +232,10 @@ deployment with a `base_url` instead of a managed one.
 | `--device DEV` | auto | `cuda`, `cuda:1`, `mps`, or `cpu` |
 | `--max-concurrency N` | `1` | Parallel decision requests; the model is tiny, so one GPU request at a time is the safe default |
 | `--served-model-name N` | repo id | Alias reported by `/v1/models` in place of the repo id |
+| `--revision REV` | default branch | Load this exact Hub revision (SparkDeck appends this for a cached bookmark launch) |
+| `--router` | off | Route each request to the checkpoint suited to its language |
+| `--router-max-loaded N` | `1` | Checkpoints the router keeps resident |
+| `--router-default NAME` | `english` | Checkpoint used when nothing is detected |
 
 An unrecognized flag fails the launch instead of starting a server that silently
 ignores the operator's intent.

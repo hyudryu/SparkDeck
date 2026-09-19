@@ -11,7 +11,8 @@ usage() {
     cat >&2 <<'EOF'
 usage: entrypoint.sh [--model ID] [--host ADDR] [--port N] [--device DEV]
                      [--max-concurrency N] [--served-model-name NAME]
-                     [--revision REV]
+                     [--revision REV] [--router] [--router-max-loaded N]
+                     [--router-default NAME]
                      [-- <extra args for uvicorn>]
 
   --model ID             Hugging Face repo id or local path to load
@@ -26,6 +27,14 @@ usage: entrypoint.sh [--model ID] [--host ADDR] [--port N] [--device DEV]
                          (env: LAYA_REVISION). SparkDeck appends this for a
                          cached bookmark launch, so it must be honoured rather
                          than rejected.
+  --router               route each request to the Laya checkpoint suited to its
+                         language, instead of serving one checkpoint
+                         (env: LAYA_ROUTER). The English checkpoint collapses on
+                         non-English text while staying confident, so enable
+                         this when serving mixed-language traffic.
+  --router-max-loaded N  checkpoints kept resident by the router (default 1;
+                         each extra one costs its own weights in memory)
+  --router-default NAME  checkpoint used when nothing is detected (default english)
 EOF
     exit 2
 }
@@ -56,6 +65,14 @@ while [ "$#" -gt 0 ]; do
         --revision)
             [ "$#" -ge 2 ] || usage
             export LAYA_REVISION="$2"; shift 2 ;;
+        --router)
+            export LAYA_ROUTER=1; shift ;;
+        --router-max-loaded)
+            [ "$#" -ge 2 ] || usage
+            export LAYA_ROUTER_MAX_LOADED="$2"; shift 2 ;;
+        --router-default)
+            [ "$#" -ge 2 ] || usage
+            export LAYA_ROUTER_DEFAULT="$2"; shift 2 ;;
         --)
             shift; break ;;
         -h|--help)

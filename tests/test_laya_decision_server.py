@@ -309,6 +309,101 @@ class LayaDecisionServerTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 200)
 
+    def test_oversized_question_payload_is_rejected(self):
+        """Questions are tokenized with the state, so the question-count limit
+        alone does not bound the work a single request can ask for."""
+        huge = {
+            "q": {
+                "type": "choice",
+                "instructions": "x" * (server.MAX_QUESTIONS_CHARS + 1),
+                "criteria": {"a": "first", "b": "second"},
+            },
+        }
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": "small state", "questions": huge,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("questions is too large", response.json()["detail"])
+        self.assertEqual(self.agent.calls, [])
+
+    def test_oversized_choice_description_is_rejected(self):
+        huge = {
+            "q": {
+                "type": "choice",
+                "instructions": "Which?",
+                "criteria": {"a": "y" * (server.MAX_QUESTIONS_CHARS + 1), "b": "other"},
+            },
+        }
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": "small state", "questions": huge,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("questions is too large", response.json()["detail"])
+
+    def test_deeply_nested_question_is_rejected(self):
+        deep: Any = "leaf"
+        for _ in range(server.MAX_STATE_DEPTH + 5):
+            deep = {"nested": deep}
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": "small",
+            "questions": {"q": {"type": "noul", "instructions": deep}},
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("nested too deeply", response.json()["detail"])
+
+    def test_a_realistic_question_set_still_passes(self):
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": STATE, "questions": QUESTIONS,
+        })
+        self.assertEqual(response.status_code, 200)
+
+
+class MessageFallbackTests(unittest.TestCase):
+    """The message fallback must read the caller's newest decision request."""
+
+    def _embedded(self, messages):
+        return server._embedded_payload(messages)
+
+    def test_newest_user_payload_wins_over_earlier_turns(self):
+        older = {"state": {"body": "first"}, "questions": QUESTIONS}
+        newer = {"state": {"body": "second"}, "questions": QUESTIONS}
+
+        payload = self._embedded([
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": json.dumps(older)},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": json.dumps(newer)},
+        ])
+
+        self.assertEqual(payload["state"], {"body": "second"})
+
+    def test_a_system_payload_still_takes_precedence(self):
+        system = {"state": {"body": "from system"}, "questions": QUESTIONS}
+        user = {"state": {"body": "from user"}, "questions": QUESTIONS}
+
+        payload = self._embedded([
+            {"role": "system", "content": json.dumps(system)},
+            {"role": "user", "content": json.dumps(user)},
+        ])
+
+        self.assertEqual(payload["state"], {"body": "from system"})
+
+    def test_plain_prose_messages_yield_no_payload(self):
+        self.assertEqual(
+            self._embedded([{"role": "user", "content": "just a question"}]),
+            {},
+        )
+
+    def test_malformed_json_does_not_hide_a_later_valid_turn(self):
+        valid = {"state": {"body": "valid"}, "questions": QUESTIONS}
+
+        payload = self._embedded([
+            {"role": "user", "content": "{not json"},
+            {"role": "user", "content": json.dumps(valid)},
+        ])
+
+        self.assertEqual(payload["state"], {"body": "valid"})
+
 
 class WeightResolutionTests(unittest.TestCase):
     """A pinned launch must load the pinned snapshot, not the default one.

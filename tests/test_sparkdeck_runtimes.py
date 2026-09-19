@@ -257,6 +257,38 @@ class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_laya_bridge_resolves_the_controller_credential(self):
+        """This bridge is the controller-local path, and ``create_container``
+        forwards the credential rather than resolving it. Without resolving it
+        here, a gated or private checkpoint cannot load on this supported
+        standalone path even though the clustered path injects credentials."""
+        manager = Mock()
+        manager.create_container = AsyncMock(
+            return_value={"name": "sparkdeck-laya-dep-1", "port": 8110}
+        )
+        manager._resolved_hf_token = Mock(return_value="hf_from_settings")
+
+        await launch_managed_container(
+            manager, LayaAdapter(), "dep-1", "laya", "convaiinnovations/laya", {},
+        )
+
+        self.assertEqual(
+            manager.create_container.await_args.kwargs["hf_token"], "hf_from_settings",
+        )
+
+    async def test_laya_bridge_tolerates_a_manager_without_token_resolution(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(
+            return_value={"name": "sparkdeck-laya-dep-1", "port": 8110}
+        )
+        del manager._resolved_hf_token
+
+        await launch_managed_container(
+            manager, LayaAdapter(), "dep-1", "laya", "convaiinnovations/laya", {},
+        )
+
+        self.assertIsNone(manager.create_container.await_args.kwargs["hf_token"])
+
     async def test_vllm_bridge_keeps_pipeline_parallelism(self):
         manager = Mock()
         manager.create_container = AsyncMock(return_value={"name": "sparkdeck-model", "port": 8000})

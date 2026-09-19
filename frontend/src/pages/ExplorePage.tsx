@@ -21,6 +21,17 @@ const COMMUNITY_PAGE_SIZE = 50
 const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
 const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
+// Runtimes that always run one complete copy on a single node, so a fit is
+// decided by the largest eligible node's memory rather than the cluster pool.
+// llama.cpp runs on the controller; Laya is a single-engine decision model with
+// no tensor or pipeline parallelism, so its replicas each need a full copy.
+const SINGLE_NODE_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp', 'laya'])
+// `activeRuntime` is '' when the filter means "all runtimes", which is not a
+// single-node runtime and keeps the pooled-capacity behavior.
+const isSingleNodeRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && SINGLE_NODE_RUNTIMES.has(runtime)
+const singleNodeRuntimeLabel = (runtime: RuntimeKind | ''): string =>
+  runtime === '' ? 'This runtime' : RUNTIME_LABELS[runtime]
 // One label source for every runtime picker and summary on this page.
 const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   vllm: 'vLLM',
@@ -364,12 +375,12 @@ function ModelRow({
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
-  const fitWeightSize = deploymentRuntime === 'llama.cpp'
+  const fitWeightSize = isSingleNodeRuntime(deploymentRuntime)
     ? selectedArtifact?.weightSize ?? weightSize
     : weightSize
-  const fitCapacity = deploymentRuntime === 'llama.cpp' ? localCapacity : capacity
-  const fitAggregate = deploymentRuntime !== 'llama.cpp' && aggregate
-  const fitMeasuredNodes = deploymentRuntime === 'llama.cpp'
+  const fitCapacity = isSingleNodeRuntime(deploymentRuntime) ? localCapacity : capacity
+  const fitAggregate = !isSingleNodeRuntime(deploymentRuntime) && aggregate
+  const fitMeasuredNodes = isSingleNodeRuntime(deploymentRuntime)
     ? localCapacity > 0 ? 1 : 0
     : measuredNodes
   // Sharded deployments always include the controller, then pool the largest
@@ -406,11 +417,13 @@ function ModelRow({
     {expanded && <div className="catalog-model-details" id={panelId}>
       <div className="catalog-model-detail-grid">
         <div>
-          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : 'Cluster fit'}</span>
+          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : isSingleNodeRuntime(deploymentRuntime) ? 'Single-node fit' : 'Cluster fit'}</span>
           <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}{minFitLabel ? ` · ${minFitLabel}` : ''}</strong>
           <p>{fitCapacity > 0
             ? deploymentRuntime === 'llama.cpp'
               ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
+              : isSingleNodeRuntime(deploymentRuntime)
+              ? `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. ${singleNodeRuntimeLabel(deploymentRuntime)} runs a complete copy on one node and does not pool cluster memory. `
               : fitAggregate
               ? `${formatBytes(capacity)} aggregate memory across ${measuredNodes} measured nodes. Fit assumes a sharded deployment that can divide model weights across those nodes; replicated deployments still require the full model weights on every replica. `
               : `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights. `
@@ -490,7 +503,9 @@ export function ExplorePage() {
   }, [aggregates.data?.items, fitsOnly, query, tab])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
-  const catalogFitCapacity = activeRuntime === 'llama.cpp' ? memory.localCapacity : memory.capacity
+  const catalogFitCapacity = isSingleNodeRuntime(activeRuntime)
+    ? memory.localCapacity
+    : memory.capacity
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate>()
@@ -541,7 +556,7 @@ export function ExplorePage() {
     }
     if (tab === 'community') visible = visible.filter((model) => Boolean(model.community))
     if (fitsOnly) visible = visible.flatMap((model) => {
-      const usesControllerCapacity = activeRuntime === 'llama.cpp'
+      const usesControllerCapacity = isSingleNodeRuntime(activeRuntime)
         || (activeRuntime === '' && requiresControllerCapacity(model))
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
@@ -659,7 +674,7 @@ export function ExplorePage() {
           <button className="button button-primary" type="submit">Search</button>
         </form>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? activeRuntime === 'llama.cpp' ? `${formatBytes(catalogFitCapacity)} controller memory for Llama server` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : activeRuntime === 'llama.cpp' ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isSingleNodeRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isSingleNodeRuntime(activeRuntime) ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>

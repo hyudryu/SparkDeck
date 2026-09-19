@@ -253,11 +253,19 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
         # parallelism, so the launcher owns image, port, and volume handling on
         # the node Manager placed it on.
         spec = adapter.launch_spec(model, settings)
+        # This bridge is the controller-local path (no node_ids), and
+        # ``create_container`` forwards the credential rather than resolving it.
+        # Without resolving it here a gated or private checkpoint fails to load
+        # on this supported standalone path, even though the clustered path
+        # injects credentials.
+        resolve_token = getattr(manager, "_resolved_hf_token", None)
+        hf_token = resolve_token() if callable(resolve_token) else None
         return await manager.create_container(
             model=model, engine="laya", image=spec.image,
             environment=settings.get("environment"),
             extra_args=list(spec.command),
             name=safe_container_name(alias, deployment_id),
+            hf_token=hf_token,
             sparkdeck_deployment_id=deployment_id,
         )
     if adapter.kind in (RuntimeKind.VLLM, RuntimeKind.SGLANG):

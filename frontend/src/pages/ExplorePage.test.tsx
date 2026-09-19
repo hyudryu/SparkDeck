@@ -215,6 +215,38 @@ describe('ExplorePage model rows', () => {
     )
   })
 
+  it('measures Laya fit against one node and not the cluster pool', async () => {
+    const user = userEvent.setup()
+    // 6 GB per node over two nodes: ample if pooled, but a Laya deployment runs
+    // a complete copy on one node, so a 10 GB checkpoint must not read as fitting.
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({ items: [{
+        id: 'convaiinnovations/laya', name: 'laya', weight_size_bytes: 10 * gib,
+        downloads: 0, likes: 154, runtime_compatibility: [
+          { runtime: 'laya', supported: true },
+        ],
+      }], total: 1 })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'convaiinnovations/laya', name: 'laya',
+        runtime_compatibility: [{ runtime: 'laya', supported: true }],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 6 * 1024 }] } },
+        { id: 'worker-1', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 6 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'Runtime' }), 'laya')
+    await user.click(await screen.findByRole('button', { name: 'Expand convaiinnovations/laya' }))
+
+    // Pooled memory would say "fit"; a single-node copy does not.
+    expect(screen.getByText(/Laya decisions runs a complete copy on one node and does not pool cluster memory/)).toBeInTheDocument()
+    expect(screen.getByText(/^Single-node fit$/)).toBeInTheDocument()
+  })
+
   it('preserves a compatible row runtime selection when model details arrive', async () => {
     const user = userEvent.setup()
     let resolveDetails: ((response: Response) => void) | undefined

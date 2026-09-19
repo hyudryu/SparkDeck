@@ -39,6 +39,10 @@ QUESTION_TYPES = frozenset({"choice", "score", "noul"})
 PRESET_NAMES = ("router", "guard", "moderation", "triage")
 MAX_QUESTIONS = 256
 MAX_STATE_CHARS = 4_000_000
+# Questions are tokenized with the state, so they need their own bound: a single
+# question can carry a very large instruction or rubric without exceeding the
+# question-count limit.
+MAX_QUESTIONS_CHARS = 1_000_000
 MAX_STATE_DEPTH = 64
 
 # Set by the container entrypoint. ``WEIGHTS`` is the repository or local path
@@ -219,16 +223,20 @@ def _embedded_payload(messages: Any) -> dict[str, Any]:
     """Read the decision payload from a JSON chat message if one is present."""
     if not isinstance(messages, list):
         return {}
-    ordered: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] = []
+    users: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
-        if message.get("role") in ("system", "user"):
-            ordered.append(message)
-    # A system message is the documented carrier; fall back to the last user
-    # turn so a plain OpenAI client can send the payload as its prompt.
-    ordered.sort(key=lambda message: message.get("role") != "system")
-    for message in ordered:
+        if message.get("role") == "system":
+            selected.append(message)
+        elif message.get("role") == "user":
+            users.append(message)
+    # A system message is the documented carrier and always wins. Within the
+    # fallback, the newest user turn is the caller's current request, so earlier
+    # turns of the same conversation must not supply stale state or questions.
+    selected.extend(reversed(users))
+    for message in selected:
         text = _message_text(message.get("content")).strip()
         if not text.startswith("{"):
             continue
@@ -317,45 +325,54 @@ def _validated_questions(questions: Any) -> dict[str, dict[str, Any]]:
     return normalized
 
 
-def _state_size(state: Any) -> int:
-    """Measure an accepted state without trusting its shape.
+def _payload_size(value: Any, *, label: str, budget: int) -> int:
+    """Measure a request payload without trusting its shape.
 
-    A JSON object or array is the documented ticket/JSON use case, so the size
-    bound has to apply to it too: measuring only strings would let a caller
-    hand an arbitrarily large nested value to the tokenizer. The walk is bounded
-    by depth and by the running total, so a pathological structure cannot make
-    the check itself expensive.
+    A JSON object or array is the documented ticket/JSON use case, so the bound
+    has to apply to it too: measuring only strings would let a caller hand an
+    arbitrarily large nested value to the tokenizer. The same walk bounds the
+    questions, because a single question can carry a huge instruction, option
+    description, or rubric while staying well inside the question-count limit.
+    The walk is bounded by depth and by the running total, so a pathological
+    structure cannot make the check itself expensive.
     """
-    budget = MAX_STATE_CHARS
-    stack: list[tuple[Any, int]] = [(state, 0)]
+    stack: list[tuple[Any, int]] = [(value, 0)]
     total = 0
     while stack:
-        value, depth = stack.pop()
+        item, depth = stack.pop()
         if depth > MAX_STATE_DEPTH:
-            raise DecisionRequestError("state is nested too deeply")
-        if isinstance(value, str):
-            total += len(value)
-        elif isinstance(value, dict):
-            if not all(isinstance(key, str) for key in value):
-                raise DecisionRequestError("state object keys must be strings")
-            for key, item in value.items():
+            raise DecisionRequestError(f"{label} is nested too deeply")
+        if isinstance(item, str):
+            total += len(item)
+        elif isinstance(item, dict):
+            if not all(isinstance(key, str) for key in item):
+                raise DecisionRequestError(f"{label} object keys must be strings")
+            for key, nested in item.items():
                 total += len(key)
-                stack.append((item, depth + 1))
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                stack.append((item, depth + 1))
-        elif isinstance(value, bool) or value is None:
+                stack.append((nested, depth + 1))
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                stack.append((nested, depth + 1))
+        elif isinstance(item, bool) or item is None:
             total += 4
-        elif isinstance(value, (int, float)):
+        elif isinstance(item, (int, float)):
             total += 24
         else:
             raise DecisionRequestError(
-                "state may only contain strings, numbers, booleans, null, "
+                f"{label} may only contain strings, numbers, booleans, null, "
                 "objects, and arrays"
             )
         if total > budget:
-            raise DecisionRequestError("state is too large")
+            raise DecisionRequestError(f"{label} is too large")
     return total
+
+
+def _state_size(state: Any) -> int:
+    return _payload_size(state, label="state", budget=MAX_STATE_CHARS)
+
+
+def _questions_size(questions: dict[str, dict[str, Any]]) -> int:
+    return _payload_size(questions, label="questions", budget=MAX_QUESTIONS_CHARS)
 
 
 def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, Any]]]:
@@ -380,7 +397,12 @@ def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, An
     if not isinstance(state, (str, dict, list)):
         raise DecisionRequestError("state must be a string, object, or array")
     _state_size(state)
-    return state, _validated_questions(questions)
+    validated = _validated_questions(questions)
+    # A question's instruction, option descriptions, and rubric are tokenized
+    # alongside the state, so the question-count limit alone does not bound the
+    # work one request can ask for.
+    _questions_size(validated)
+    return state, validated
 
 
 def _routing_overrides(body: dict[str, Any]) -> dict[str, Any]:

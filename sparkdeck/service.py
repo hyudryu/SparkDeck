@@ -1202,6 +1202,13 @@ class SparkDeckService:
                     # that instead of the stale failure.
                     if stored.get("status") == "error":
                         stored["status"] = "stopped"
+                    # ``_deployment_launch_progress`` already copied the same
+                    # Manager error into the launch phase above, and the card
+                    # shows launch details for a stopped deployment, so the
+                    # suppressed failure has to be cleared there too.
+                    if stored.get("launch_phase") == "error":
+                        stored["launch_phase"] = "stopped"
+                        stored["launch_message"] = "Stopped"
                 else:
                     stored["last_error"] = cluster_error
             stored.update(self._layout_contract(cluster.get("launch_settings")))
@@ -8605,7 +8612,10 @@ def _member_occupies_no_node(member: dict[str, Any]) -> bool:
     ever created.
     """
     failed_stop_error = member.get("failed_stop_error")
-    if failed_stop_error and not _missing_container_error(failed_stop_error):
+    if failed_stop_error and not _only_missing_container_errors(failed_stop_error):
+        # Manager stores "; "-joined stop failures here, so one string can carry
+        # an absence and a real fault. A stop that may not have been carried out
+        # leaves the node reserved.
         return False
     if member.get("status") in _ABSENT_MEMBER_STATUSES:
         return True
@@ -8614,7 +8624,17 @@ def _member_occupies_no_node(member: dict[str, Any]) -> bool:
     # sibling profile claim them. It stays separate from
     # ``_ABSENT_MEMBER_STATUSES`` because converging a durable stop must require
     # a positive absence observation rather than a failed one.
-    return member.get("status") == "error"
+    #
+    # That reasoning only holds when the absence was actually observed. Manager
+    # keeps a saved ``error`` status when a node answers with Docker
+    # unavailable, and an older agent can synthesize an empty inventory after
+    # enumeration fails; releasing a node then could schedule another deployment
+    # onto hardware that still holds a partially created workload. Manager marks
+    # those nodes with ``docker_ready`` false, so require that confirmation.
+    return (
+        member.get("status") == "error"
+        and member.get("node_docker_ready") is not False
+    )
 
 
 def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:

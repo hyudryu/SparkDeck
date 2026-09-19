@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 
 from manager import Manager
 from sparkdeck.service import (
+    _member_occupies_no_node,
     _missing_container_error,
     _only_missing_container_errors,
     _stale_missing_container_error,
@@ -263,4 +264,40 @@ def test_aggregated_mixed_error_is_never_suppressed():
     }
 
     assert not _stale_missing_container_error(cluster, cluster["error"])
+
+
+def test_error_rank_keeps_its_node_without_confirmed_inventory():
+    """An unconfirmed absence must not release the node.
+
+    Manager keeps a saved ``error`` status when a node answers with Docker
+    unavailable, and an older agent can synthesize an empty inventory after
+    enumeration fails. Releasing the node then could schedule another
+    deployment onto hardware that still holds a partially created workload.
+    """
+    unconfirmed = {"node_id": "worker", "status": "error", "node_docker_ready": False}
+    assert not _member_occupies_no_node(unconfirmed)
+
+    confirmed = {"node_id": "worker", "status": "error", "node_docker_ready": True}
+    assert _member_occupies_no_node(confirmed)
+
+    # A node that simply did not report the flag keeps today's behavior.
+    assert _member_occupies_no_node({"node_id": "worker", "status": "error"})
+
+
+def test_mixed_failed_stop_error_keeps_its_node():
+    """Manager stores "; "-joined stop failures, so one string can carry an
+    absence and a real fault; a stop that may not have been carried out leaves
+    the node reserved."""
+    mixed = {
+        "node_id": "worker", "status": "stopped",
+        "failed_stop_error": f"{DOCKER_404}; node unreachable",
+    }
+    assert not _member_occupies_no_node(mixed)
+
+    absent_only = {
+        "node_id": "worker", "status": "stopped",
+        "failed_stop_error": DOCKER_404,
+    }
+    assert _member_occupies_no_node(absent_only)
+
 

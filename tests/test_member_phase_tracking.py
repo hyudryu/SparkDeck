@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 from manager import Manager
 from sparkdeck.service import (
     _missing_container_error,
+    _only_missing_container_errors,
     _stale_missing_container_error,
 )
 
@@ -224,3 +225,42 @@ def test_stale_missing_container_error_is_suppressed_only_when_never_launched():
     assert not _stale_missing_container_error(running, DOCKER_404)
 
     assert not _stale_missing_container_error(cluster, "image pull failed")
+
+
+def test_aggregated_error_keeps_actionable_causes():
+    """One string can carry an expected absence and a real fault.
+
+    Manager assembles a deployment error from its member failures, so matching
+    only the first fragment would discard the actionable diagnostic with the
+    expected one.
+    """
+    mixed = (
+        f"worker-a: {DOCKER_404}; "
+        "worker-b: node unreachable"
+    )
+
+    assert not _only_missing_container_errors(mixed)
+    # Every reported cause being an absence is still suppressible.
+    assert _only_missing_container_errors(
+        f"worker-a: {DOCKER_404}; worker-b: managed container not found"
+    )
+    assert _only_missing_container_errors(DOCKER_404)
+
+
+def test_aggregated_absence_error_is_suppressed_for_a_stale_record():
+    cluster = {
+        "desired_state": "stopped", "last_deployed_at": None,
+        "error": "worker-a: No such container: rank-0; worker-b: cluster member not found",
+    }
+
+    assert _stale_missing_container_error(cluster, cluster["error"])
+
+
+def test_aggregated_mixed_error_is_never_suppressed():
+    cluster = {
+        "desired_state": "stopped", "last_deployed_at": None,
+        "error": f"worker-a: {DOCKER_404}; worker-b: node unreachable",
+    }
+
+    assert not _stale_missing_container_error(cluster, cluster["error"])
+

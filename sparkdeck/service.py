@@ -1195,6 +1195,13 @@ class SparkDeckService:
                 cluster_error = str(cluster["error"])
                 if _stale_missing_container_error(cluster, cluster_error):
                     stored["last_error"] = None
+                    # Manager skips status recalculation while a saved status is
+                    # "error", so clearing only the message would leave this
+                    # legacy record displayed as an error forever, now with no
+                    # explanation. It is stopped and owns nothing, so report
+                    # that instead of the stale failure.
+                    if stored.get("status") == "error":
+                        stored["status"] = "stopped"
                 else:
                     stored["last_error"] = cluster_error
             stored.update(self._layout_contract(cluster.get("launch_settings")))
@@ -8484,16 +8491,47 @@ def _missing_container_error(error: Any) -> bool:
     return any(marker in text for marker in _MISSING_CONTAINER_ERROR_MARKERS)
 
 
-def _stale_missing_container_error(cluster: dict[str, Any], error: str) -> bool:
-    """Whether a recorded error only reports an absent container for a
-    stopped deployment that never successfully launched.
+_ABSENCE_FRAGMENT = re.compile(
+    r"\bno such container\b|\bmanaged container not found\b|\bcluster member not found\b",
+    re.IGNORECASE,
+)
+# Fragments are joined on ";" by the aggregation that builds these messages.
+_ERROR_FRAGMENT_SEPARATOR = re.compile(r"[;\n]+")
 
-    Such a deployment owns no containers, so a Docker/agent 404 from probing
-    or stopping one is the expected state, not a persistent error worth
-    surfacing on the card.
+
+def _only_missing_container_errors(error: Any) -> bool:
+    """Whether every reported cause in an aggregated error is an absence.
+
+    Manager assembles a deployment error from its member failures, so one string
+    can carry both an expected missing-container response and an actionable
+    fault such as an unreachable node. Testing the whole message for a marker
+    would match the first fragment and discard the real diagnostic with the
+    expected one, so each fragment must positively name an absence.
+    """
+    text = str(error or "").strip()
+    if not text:
+        return False
+    fragments = [
+        fragment.strip()
+        for fragment in _ERROR_FRAGMENT_SEPARATOR.split(text)
+        if fragment.strip()
+    ]
+    return bool(fragments) and all(
+        _ABSENCE_FRAGMENT.search(fragment) for fragment in fragments
+    )
+
+
+def _stale_missing_container_error(cluster: dict[str, Any], error: str) -> bool:
+    """Whether a recorded error only reports absent containers for a stopped
+    deployment that never successfully launched.
+
+    Such a deployment owns no containers, so a Docker/agent 404 from probing or
+    stopping one is the expected state, not a persistent error worth surfacing
+    on the card. Any other cause in the same message is still a real failure and
+    keeps the error.
     """
     return (
-        _missing_container_error(error)
+        _only_missing_container_errors(error)
         and cluster.get("desired_state") == "stopped"
         and not cluster.get("last_deployed_at")
     )
@@ -8610,7 +8648,17 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
         or cluster.get("status") == "stopped"
     )
     for node_id, ranks in by_node.items():
-        idle = cluster_stopped and all(
+        # A node is released when every rank on it is absent, AND that absence
+        # reflects stopped intent somewhere: either the whole record is stopped,
+        # or every rank on this node explicitly stopped. The per-rank case
+        # matters for grouped deployments, where one engine group can be stopped
+        # while the record as a whole still intends to run — its nodes must be
+        # selectable again even though the record reports "running".
+        ranks_stopped = all(
+            (rank.get("desired_state") or "running") == "stopped"
+            for rank in ranks
+        )
+        idle = (cluster_stopped or ranks_stopped) and all(
             not rank.get("recreate_pending")
             and _member_occupies_no_node(rank)
             for rank in ranks

@@ -239,8 +239,11 @@ Open `http://localhost:7878`. Application state is written beneath `data/`, whic
 | vLLM | Hugging Face model repositories | High-throughput OpenAI-compatible serving and multi-GPU deployments |
 | llama.cpp `llama-server` | GGUF | Efficient local inference and flexible CPU/GPU offload |
 | SGLang | Hugging Face model repositories | High-performance serving, structured generation, and distributed deployments |
+| Laya decisions | Laya System 1 decision checkpoints | Calibrated, non-generative decisions: routing, triage, moderation, guardrails |
 
-Runtime-specific settings remain explicit. For example, SparkDeck reports tensor parallelism for vLLM and SGLang, while llama.cpp deployments expose their actual parallel-slot, GPU-layer, RPC, and split configuration.
+Runtime-specific settings remain explicit. For example, SparkDeck reports tensor parallelism for vLLM and SGLang, while llama.cpp deployments expose their actual parallel-slot, GPU-layer, RPC, and split configuration. Laya deployments are single-engine — they support single and replicated layouts and reject sharded ones, because the decision model has no tensor or pipeline parallelism to divide.
+
+Laya is a **non-autoregressive decision model**, not a text generator: it scores typed questions over a state and returns calibrated probabilities instead of generating tokens. SparkDeck serves it through a small OpenAI-compatible wrapper so it reaches `/v1` like every other runtime, but requests carry `state` and `questions` rather than `messages`. See **[laya-decide/README.md](laya-decide/README.md)** for the request contract, the container image, and the launch options.
 
 ## OpenAI-compatible API
 

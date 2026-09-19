@@ -1,4 +1,4 @@
-"""Runtime adapters for the three inference servers supported by SparkDeck."""
+"""Runtime adapters for the inference servers supported by SparkDeck."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ _GGUF_SHARD_PATTERN = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
     re.IGNORECASE,
 )
+# The decision server's own bind port. It is fixed like llama.cpp's because the
+# published host port is allocated per deployment by Manager.
+LAYA_SERVE_PORT = 8080
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -183,9 +186,45 @@ class SglangAdapter(RuntimeAdapter):
                           entrypoint=["python3"])
 
 
+class LayaAdapter(RuntimeAdapter):
+    """Serve a Laya System 1 decision model behind SparkDeck's /v1 surface.
+
+    Laya does not generate text. The ``laya-decide`` server wraps the decision
+    engine in an OpenAI-compatible API, so the controller proxy, load
+    balancing, token accounting, and health checks all work unchanged.
+    """
+
+    kind = RuntimeKind.LAYA
+    default_image = "sparkdeck/laya-decide:latest"
+
+    def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
+        command = [
+            "--model", model,
+            "--host", "0.0.0.0",
+            "--port", str(LAYA_SERVE_PORT),
+        ]
+        device = str(settings.get("device") or "").strip()
+        if device:
+            command += ["--device", device]
+        if settings.get("max_concurrency") is not None:
+            command += ["--max-concurrency", str(settings["max_concurrency"])]
+        served_model = str(settings.get("served_model") or "").strip()
+        if served_model:
+            command += ["--served-model-name", served_model]
+        revision = str(settings.get("revision") or "").strip()
+        if revision:
+            command += ["--revision", revision]
+        command.extend(str(item) for item in settings.get("extra_args", []))
+        return LaunchSpec(
+            settings.get("image") or self.default_image, command, LAYA_SERVE_PORT,
+        )
+
+
 class RuntimeRegistry:
     def __init__(self):
-        adapters = (VllmAdapter(), LlamaCppAdapter(), SglangAdapter())
+        adapters = (
+            VllmAdapter(), LlamaCppAdapter(), SglangAdapter(), LayaAdapter(),
+        )
         self._adapters = {adapter.kind: adapter for adapter in adapters}
 
     @property
@@ -209,6 +248,26 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
                                    deployment_id: str, alias: str, model: str,
                                    settings: dict[str, Any]) -> dict[str, Any]:
     """Launch a managed runtime while retaining Manager's mature vLLM/SGLang paths."""
+    if adapter.kind is RuntimeKind.LAYA:
+        # Laya is a single-engine decision model: it has no tensor or pipeline
+        # parallelism, so the launcher owns image, port, and volume handling on
+        # the node Manager placed it on.
+        spec = adapter.launch_spec(model, settings)
+        # This bridge is the controller-local path (no node_ids), and
+        # ``create_container`` forwards the credential rather than resolving it.
+        # Without resolving it here a gated or private checkpoint fails to load
+        # on this supported standalone path, even though the clustered path
+        # injects credentials.
+        resolve_token = getattr(manager, "_resolved_hf_token", None)
+        hf_token = resolve_token() if callable(resolve_token) else None
+        return await manager.create_container(
+            model=model, engine="laya", image=spec.image,
+            environment=settings.get("environment"),
+            extra_args=list(spec.command),
+            name=safe_container_name(alias, deployment_id),
+            hf_token=hf_token,
+            sparkdeck_deployment_id=deployment_id,
+        )
     if adapter.kind in (RuntimeKind.VLLM, RuntimeKind.SGLANG):
         if adapter.kind is RuntimeKind.VLLM:
             extra: list[str] = []

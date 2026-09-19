@@ -1,4 +1,4 @@
-export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang'
+export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang' | 'laya'
 export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopping' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
@@ -81,6 +81,10 @@ export interface DeploymentSettings {
   parallel_slots?: number
   max_concurrency?: number
   max_running_requests?: number
+  // Laya decision runtime: the torch device to load on (cuda, cuda:1, mps, cpu)
+  // and the alias reported by /v1/models in place of the repository id.
+  device?: string
+  served_model?: string
   gpu_split?: string
   quantization?: string
   artifact?: string

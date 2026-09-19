@@ -21,6 +21,24 @@ const COMMUNITY_PAGE_SIZE = 50
 const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
 const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
+// Runtimes that always run one complete copy on a single node, so a fit is
+// decided by the largest eligible node's memory rather than the cluster pool.
+// llama.cpp runs on the controller; Laya is a single-engine decision model with
+// no tensor or pipeline parallelism, so its replicas each need a full copy.
+const SINGLE_NODE_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp', 'laya'])
+// `activeRuntime` is '' when the filter means "all runtimes", which is not a
+// single-node runtime and keeps the pooled-capacity behavior.
+const isSingleNodeRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && SINGLE_NODE_RUNTIMES.has(runtime)
+const singleNodeRuntimeLabel = (runtime: RuntimeKind | ''): string =>
+  runtime === '' ? 'This runtime' : RUNTIME_LABELS[runtime]
+// One label source for every runtime picker and summary on this page.
+const RUNTIME_LABELS: Record<RuntimeKind, string> = {
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  'llama.cpp': 'Llama server',
+  laya: 'Laya decisions',
+}
 
 function formatParameters(value?: number | null) {
   if (!Number.isFinite(value) || Number(value) <= 0) return '—'
@@ -231,7 +249,9 @@ function deployHref(
     : communityMode && model.community ? aggregateQuantization(model.community) : undefined
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
   if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
-  else if (runtime !== 'llama.cpp' && sharded) params.set('layout', 'sharded')
+  // Laya reports fit as an aggregate only for display; its decision engine is
+  // single-engine, so it is never launched as a sharded layout.
+  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
@@ -355,12 +375,12 @@ function ModelRow({
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
-  const fitWeightSize = deploymentRuntime === 'llama.cpp'
+  const fitWeightSize = isSingleNodeRuntime(deploymentRuntime)
     ? selectedArtifact?.weightSize ?? weightSize
     : weightSize
-  const fitCapacity = deploymentRuntime === 'llama.cpp' ? localCapacity : capacity
-  const fitAggregate = deploymentRuntime !== 'llama.cpp' && aggregate
-  const fitMeasuredNodes = deploymentRuntime === 'llama.cpp'
+  const fitCapacity = isSingleNodeRuntime(deploymentRuntime) ? localCapacity : capacity
+  const fitAggregate = !isSingleNodeRuntime(deploymentRuntime) && aggregate
+  const fitMeasuredNodes = isSingleNodeRuntime(deploymentRuntime)
     ? localCapacity > 0 ? 1 : 0
     : measuredNodes
   // Sharded deployments always include the controller, then pool the largest
@@ -397,11 +417,13 @@ function ModelRow({
     {expanded && <div className="catalog-model-details" id={panelId}>
       <div className="catalog-model-detail-grid">
         <div>
-          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : 'Cluster fit'}</span>
+          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : isSingleNodeRuntime(deploymentRuntime) ? 'Single-node fit' : 'Cluster fit'}</span>
           <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}{minFitLabel ? ` · ${minFitLabel}` : ''}</strong>
           <p>{fitCapacity > 0
             ? deploymentRuntime === 'llama.cpp'
               ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
+              : isSingleNodeRuntime(deploymentRuntime)
+              ? `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. ${singleNodeRuntimeLabel(deploymentRuntime)} runs a complete copy on one node and does not pool cluster memory. `
               : fitAggregate
               ? `${formatBytes(capacity)} aggregate memory across ${measuredNodes} measured nodes. Fit assumes a sharded deployment that can divide model weights across those nodes; replicated deployments still require the full model weights on every replica. `
               : `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. Fit assumes a single-node or replicated deployment, where every replica must hold the full model weights. `
@@ -431,12 +453,13 @@ function ModelRow({
           <option value="vllm" disabled={compatibilityByRuntime.get('vllm') === false}>vLLM</option>
           <option value="sglang" disabled={compatibilityByRuntime.get('sglang') === false}>SGLang</option>
           <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
+          <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
         </select></label>}
         {deploymentReady
-          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${deploymentRuntime === 'llama.cpp' ? 'Llama server' : deploymentRuntime === 'vllm' ? 'vLLM' : 'SGLang'}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>
+          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${RUNTIME_LABELS[deploymentRuntime] ?? deploymentRuntime}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>
           : <button className="button button-primary" type="button" disabled title={details.loading ? 'Loading GGUF artifacts' : 'No deployable GGUF artifact was found'}>Deploy</button>}
       </div>
     </div>}
@@ -480,7 +503,9 @@ export function ExplorePage() {
   }, [aggregates.data?.items, fitsOnly, query, tab])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
-  const catalogFitCapacity = activeRuntime === 'llama.cpp' ? memory.localCapacity : memory.capacity
+  const catalogFitCapacity = isSingleNodeRuntime(activeRuntime)
+    ? memory.localCapacity
+    : memory.capacity
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate>()
@@ -531,7 +556,7 @@ export function ExplorePage() {
     }
     if (tab === 'community') visible = visible.filter((model) => Boolean(model.community))
     if (fitsOnly) visible = visible.flatMap((model) => {
-      const usesControllerCapacity = activeRuntime === 'llama.cpp'
+      const usesControllerCapacity = isSingleNodeRuntime(activeRuntime)
         || (activeRuntime === '' && requiresControllerCapacity(model))
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
@@ -643,12 +668,13 @@ export function ExplorePage() {
               <option value="vllm">vLLM</option>
               <option value="llama.cpp">Llama server</option>
               <option value="sglang">SGLang</option>
+              <option value="laya">Laya decisions</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>
         </form>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? activeRuntime === 'llama.cpp' ? `${formatBytes(catalogFitCapacity)} controller memory for Llama server` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : activeRuntime === 'llama.cpp' ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isSingleNodeRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isSingleNodeRuntime(activeRuntime) ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>

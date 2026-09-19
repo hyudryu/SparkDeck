@@ -92,6 +92,8 @@ _SAFE_CONFIGURATION_KEYS = {
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "kv_cache_dtype",
     "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
+    # Laya launch inputs carried through a durable SparkDeck record.
+    "device", "served_model",
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {
@@ -1997,7 +1999,10 @@ class SparkDeckService:
             )
         )
         saved_only = bool(saved_only)
-        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp"}
+        # Runtimes whose saved launch settings an operator may repair or tune
+        # once the deployment is stopped. Laya belongs here because its device,
+        # concurrency, image, and extra flags are all persisted launch inputs.
+        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp", "laya"}
         discovered_editable = bool(
             discovered_settings is not None
             and discovered_settings.get("editable")
@@ -3613,6 +3618,19 @@ class SparkDeckService:
             context_length = settings.get("max_model_len") or settings.get("context_length")
             if context_length is not None:
                 extra_args += ["--max-model-len", str(context_length)]
+        if runtime is RuntimeKind.LAYA:
+            # The cluster path carries a launch as argv, so Laya's typed
+            # settings have to become flags here. Without this they are saved
+            # and then silently dropped: a deployment asking for ``cpu`` would
+            # still let the server select CUDA on its own.
+            for key, flag in (
+                ("device", "--device"),
+                ("max_concurrency", "--max-concurrency"),
+                ("served_model", "--served-model-name"),
+            ):
+                value = settings.get(key)
+                if value is not None and str(value).strip():
+                    extra_args += [flag, str(value)]
         if identity.revision and runtime is not RuntimeKind.LLAMA_CPP:
             # Llama.cpp pins its revision inside the cache-relative artifact
             # reference; an unknown --revision flag would break llama-server.
@@ -7648,10 +7666,17 @@ class SparkDeckService:
             startup_benchmark=startup_benchmark, source_route=source_route,
         )
         if (deployment.get("settings") or {}).get("manager_deployment_id") and (
-            deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            deployment.get("runtime") in (
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+                RuntimeKind.LAYA.value,
+            )
             and deployment.get("kind") == DeploymentKind.MANAGED.value
         ):
             # Manager acquires the selected group's slot, including failover.
+            # Laya belongs here for the same reason vLLM and SGLang do: a
+            # managed record's stored endpoint is the controller's own port
+            # mapping, so a deployment placed on a remote node is only
+            # reachable through Manager's member-aware routing.
             return await factory(deployment)
         return await self._run_service_prompt_gate(
             ("deployment", deployment["id"]), factory, cancel=cancel,
@@ -7700,6 +7725,7 @@ class SparkDeckService:
             )
             and deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+                RuntimeKind.LAYA.value,
             )
         ):
             route_kwargs = (
@@ -7758,7 +7784,12 @@ class SparkDeckService:
                              startup_benchmark: bool = False,
                              source_route: dict | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
-        """Keep managed vLLM/SGLang requests on Manager's admission path."""
+        """Keep managed single- and multi-node requests on Manager's admission path.
+
+        Covers vLLM, SGLang, and Laya: all three run as managed members whose
+        real endpoint is discovered per member, so Manager must own member
+        selection, admission, load balancing, and failover.
+        """
         requested_model = str(body.get("model") or deployment["alias"])
         model = deployment["model"]["repository"]
         upstream_body = {**body, "model": model}

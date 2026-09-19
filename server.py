@@ -2996,8 +2996,8 @@ async def v1_update_settings(req: Request):
     if theme not in ("system", "light", "dark"):
         raise HTTPException(400, "theme must be system, light, or dark")
     default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
-    if default_runtime not in ("vllm", "llama.cpp", "sglang"):
-        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, or sglang")
+    if default_runtime not in ("vllm", "llama.cpp", "sglang", "laya"):
+        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, sglang, or laya")
     raw_context_length = body.get(
         "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
     )

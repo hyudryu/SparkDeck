@@ -20,6 +20,11 @@ log = logging.getLogger(__name__)
 _POLL_INITIAL_INTERVAL = 2.0
 _POLL_MAX_INTERVAL = 30.0
 
+# Runtimes that do not generate tokens. The startup benchmark measures a
+# decode, so these deployments are skipped rather than probed until their
+# retry budget runs out.
+_NON_GENERATIVE_RUNTIMES = frozenset({"laya"})
+
 # A probe that completes without recording an eligible sample (e.g. an older
 # llama.cpp/SGLang endpoint that cannot stream terminal usage, a short output,
 # or a timeout) must not be re-attempted every poll. Back off exponentially
@@ -171,6 +176,12 @@ class StartupBenchmarkMonitor:
         targets = []
         for public in deployments:
             if public.get("kind") != "managed" or public.get("desired_state") == "stopped":
+                continue
+            if public.get("runtime") in _NON_GENERATIVE_RUNTIMES:
+                # Laya answers typed questions in one forward pass and generates
+                # no tokens, so the synthetic generation probe cannot produce a
+                # measurement. It also exposes no /v1/completions route, so
+                # probing would fail on every boot and restart the retry loop.
                 continue
             stored = self.service.store.deployment(public["id"], include_private=True) or {}
             deployment = {**stored, **public}

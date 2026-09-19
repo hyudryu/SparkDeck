@@ -29,7 +29,8 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
-const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
+const isRuntimeKind = (value: unknown): value is RuntimeKind =>
+  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya'
 
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
 const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
@@ -670,25 +671,46 @@ export function ModelsPage() {
     const ggufArtifact = Boolean(artifact?.toLocaleLowerCase().endsWith('.gguf'))
     catalogShardedLayout.current = sharded
     if (ggufArtifact || requestedRuntime) runtimeTouched.current = true
-    setForm((current) => ({
-      ...current,
-      model_id: modelId,
-      alias: current.alias || modelId.split('/').at(-1) || modelId,
-      runtime: ggufArtifact ? 'llama.cpp' : requestedRuntime ?? current.runtime,
-      deployment_mode: ggufArtifact ? 'single' : sharded ? 'sharded' : current.deployment_mode,
-      settings: ggufArtifact
-        ? {
-          context_length: current.settings.context_length,
-          parallel_slots: current.settings.parallel_slots ?? 1,
-          gpu_layers: current.settings.gpu_layers ?? 99,
-          quantization: quantization || undefined,
-          artifact,
-        }
-        : {
-          ...current.settings,
-          quantization: quantization || current.settings.quantization,
-        },
-    }))
+    setForm((current) => {
+      // Resolved from the updater's own state so this effect needs no extra
+      // dependency on a value the form already owns.
+      const linkedRuntime: RuntimeKind = ggufArtifact
+        ? 'llama.cpp'
+        : requestedRuntime ?? current.runtime
+      return {
+        ...current,
+        model_id: modelId,
+        alias: current.alias || modelId.split('/').at(-1) || modelId,
+        runtime: ggufArtifact ? 'llama.cpp' : requestedRuntime ?? current.runtime,
+        // A deep link cannot ask for tensor parallelism on a runtime that has
+        // none, and this path bypasses updateRuntime — so it applies the same
+        // normalization. Without it a linked Laya runtime keeps the form's
+        // initial vLLM image, which then launches a vLLM container with Laya
+        // arguments.
+        deployment_mode: ggufArtifact
+          ? 'single'
+          : sharded && linkedRuntime !== 'laya' ? 'sharded' : current.deployment_mode,
+        settings: ggufArtifact
+          ? {
+            context_length: current.settings.context_length,
+            parallel_slots: current.settings.parallel_slots ?? 1,
+            gpu_layers: current.settings.gpu_layers ?? 99,
+            quantization: quantization || undefined,
+            artifact,
+          }
+          : linkedRuntime === 'laya'
+            ? {
+              device: current.runtime === 'laya' ? current.settings.device : undefined,
+              max_concurrency: current.settings.max_concurrency,
+              served_model: current.settings.served_model,
+              image: current.runtime === 'laya' ? current.settings.image : undefined,
+            }
+            : {
+              ...current.settings,
+              quantization: quantization || current.settings.quantization,
+            },
+      }
+    })
     // A deep link names repository artifacts, so record them as
     // listing-derived for the stale-selection cleanup above, and treat the
     // model id as already observed so the linked picks are not wiped.
@@ -2076,9 +2098,12 @@ export function ModelsPage() {
     setForm((current) => {
       const contextLength = current.settings.context_length ?? 8192
       const nodeIds = current.node_ids?.length ? current.node_ids : (localNodeId ? [localNodeId] : [])
-      // Sharded layouts keep their vLLM/SGLang-only constraints; Llama server
-      // always runs complete replicas.
+      // Sharded layouts need tensor parallelism, which only vLLM and SGLang
+      // provide. Llama server and Laya always run complete replicas; Manager
+      // rejects a sharded Laya deployment outright, so offering one here would
+      // save a form that cannot launch.
       const sharded = runtime !== 'llama.cpp'
+        && runtime !== 'laya'
         && current.deployment_mode === 'sharded'
         && (nodeIds?.length ?? 0) > 1
       const deploymentMode = sharded ? 'sharded' : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
@@ -2095,14 +2120,27 @@ export function ModelsPage() {
             quantization: current.settings.quantization,
             artifact: current.settings.artifact,
           }
-          : {
-            context_length: contextLength,
-            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
-            quantization: current.settings.quantization,
-            image: runtime === 'vllm'
-              ? current.settings.image ?? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image
-              : undefined,
-          },
+          : runtime === 'laya'
+            ? {
+              // A decision model is single-engine: no tensor parallelism, and
+              // no context window to size.
+              device: current.settings.device,
+              max_concurrency: current.settings.max_concurrency,
+              served_model: current.settings.served_model,
+              // The form's defaults carry a vLLM image. Keeping it would save
+              // a Laya deployment that launches a vLLM container with
+              // Laya-specific arguments, so the runtime's own default image
+              // applies unless the operator set one for Laya deliberately.
+              image: current.runtime === 'laya' ? current.settings.image : undefined,
+            }
+            : {
+              context_length: contextLength,
+              tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
+              quantization: current.settings.quantization,
+              image: runtime === 'vllm'
+                ? current.settings.image ?? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image
+                : undefined,
+            },
       }
     })
   }
@@ -2721,9 +2759,10 @@ export function ModelsPage() {
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select

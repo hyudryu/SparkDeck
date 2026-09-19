@@ -370,10 +370,19 @@ class HuggingFaceCatalog:
         ):
             formats.append("gguf")
         transformer_model = bool(folded_tags & {"transformers", "safetensors"})
+        # A Laya-compatible checkpoint loads through the ``laya`` package, which
+        # requires a decision head that only the publisher's System 1
+        # checkpoints ship, so tag it explicitly instead of guessing.
+        laya_model = "laya" in folded_tags
         runtime_compatibility = [
             {"runtime": "vllm", "supported": transformer_model},
             {"runtime": "llama.cpp", "supported": "gguf" in formats},
             {"runtime": "sglang", "supported": transformer_model},
+            # Laya is not a general Transformers model: it needs a decision head
+            # and typed-question metadata that only its own checkpoint family
+            # ships, so this stays opt-in by tag rather than following
+            # transformer_model.
+            {"runtime": "laya", "supported": laya_model},
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
         return {

@@ -1,0 +1,466 @@
+"""OpenAI-compatible decision server for Laya System 1 models.
+
+Laya is not a text generator: it scores typed questions over a state in one
+forward pass and returns calibrated probabilities. This module puts that
+decision engine behind the same ``/v1`` surface SparkDeck already proxies, so
+``POST http://<node>:7878/v1/chat/completions`` reaches Laya through the normal
+cluster router with no special-case code in the router itself.
+
+Request contract (several accepted spellings, checked in this order):
+
+1. ``{"state": ..., "questions": {...}}`` as top-level body fields.
+2. A ``system`` (or single ``user``) message whose text is a JSON object
+   containing ``state`` and ``questions``.
+3. ``presets`` naming built-in Laya question sets, layered over any state.
+
+The assistant message carries the Laya result as compact JSON. ``usage``
+reports Laya's real input-token count, which keeps SparkDeck's token
+accounting and benchmark history meaningful for a non-generating model.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+logger = logging.getLogger("laya-decide")
+
+OBJECT_NAME = "laya-decide"
+QUESTION_TYPES = frozenset({"choice", "score", "noul"})
+PRESET_NAMES = ("router", "guard", "moderation", "triage")
+MAX_QUESTIONS = 256
+MAX_STATE_CHARS = 4_000_000
+
+# Set by the container entrypoint. ``WEIGHTS`` is the repository or local path
+# Laya loads; ``MODEL_ID`` is the OpenAI model id published by ``/v1/models``.
+# SparkDeck discovers the served name from that response, so an operator who
+# sets ``--served-model-name`` gets the alias they deployed under and everyone
+# else keeps the Hugging Face repository as the request id.
+WEIGHTS = os.environ.get("LAYA_MODEL") or "convaiinnovations/laya"
+MODEL_ID = (os.environ.get("LAYA_SERVED_MODEL_NAME") or "").strip() or WEIGHTS
+MODEL_DEVICE = (os.environ.get("LAYA_DEVICE") or "").strip() or None
+SERVE_PORT = int(os.environ.get("LAYA_PORT") or 8080)
+
+
+class DecisionRequestError(ValueError):
+    """A caller-supplied decision payload could not be evaluated."""
+
+
+def _max_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("LAYA_MAX_CONCURRENCY") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+_agent: Any = None
+_agent_lock = asyncio.Lock()
+_inference_gate: asyncio.Semaphore | None = None
+# Resolved once from the ``laya`` package so preset validation stays eager and
+# a caller can install its own factories (tests, or a future preset source)
+# without importing torch.
+_preset_factories: dict[str, Any] | None = None
+
+
+def set_agent(agent: Any) -> None:
+    """Install a decision agent. Tests use this to avoid loading torch."""
+    global _agent
+    _agent = agent
+
+
+def _preset_factory(name: str) -> Any:
+    """Return the question factory for a built-in preset name."""
+    global _preset_factories
+    if _preset_factories is None:
+        import laya
+
+        _preset_factories = {
+            "router": laya.router_questions,
+            "guard": laya.guard_questions,
+            "moderation": laya.moderation_questions,
+            "triage": laya.triage_questions,
+        }
+    return _preset_factories.get(name)
+
+
+def get_agent() -> Any:
+    # Read the module global directly so a test or embedder that replaces
+    # ``_agent`` after import is honoured without re-importing the module.
+    agent = globals()["_agent"]
+    if agent is None:
+        raise HTTPException(503, "Laya model is still loading")
+    return agent
+
+
+def _load_agent() -> Any:
+    """Import Laya lazily so the HTTP surface is usable without torch."""
+    import laya
+
+    logger.info("loading Laya model %s", WEIGHTS)
+    started = time.monotonic()
+    agent = laya.load(WEIGHTS, device=MODEL_DEVICE)
+    logger.info(
+        "Laya model %s ready on %s in %.1fs",
+        WEIGHTS, getattr(agent, "device", "unknown"), time.monotonic() - started,
+    )
+    return agent
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _inference_gate
+    _inference_gate = asyncio.Semaphore(_max_concurrency())
+    set_agent(await asyncio.to_thread(_load_agent))
+    yield
+    set_agent(None)
+
+
+app = FastAPI(title=OBJECT_NAME, version="1.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------- request parsing
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # OpenAI content parts: keep only text segments.
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text")
+        )
+    return ""
+
+
+def _embedded_payload(messages: Any) -> dict[str, Any]:
+    """Read the decision payload from a JSON chat message if one is present."""
+    if not isinstance(messages, list):
+        return {}
+    ordered: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in ("system", "user"):
+            ordered.append(message)
+    # A system message is the documented carrier; fall back to the last user
+    # turn so a plain OpenAI client can send the payload as its prompt.
+    ordered.sort(key=lambda message: message.get("role") != "system")
+    for message in ordered:
+        text = _message_text(message.get("content")).strip()
+        if not text.startswith("{"):
+            continue
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, dict) and (
+            "questions" in decoded or "presets" in decoded
+        ):
+            return decoded
+    return {}
+
+
+def _preset_questions(presets: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(presets, list) or not presets:
+        raise DecisionRequestError("presets must be a non-empty array of names")
+    combined: dict[str, dict[str, Any]] = {}
+    for raw in presets:
+        name = str(raw or "").strip().lower()
+        if name not in PRESET_NAMES:
+            raise DecisionRequestError(
+                f"unknown preset {name!r}; expected one of {', '.join(PRESET_NAMES)}"
+            )
+        factory = _preset_factory(name)
+        if factory is None:
+            raise DecisionRequestError(f"preset {name!r} is unavailable")
+        generated = factory()
+        if not isinstance(generated, dict):
+            raise DecisionRequestError(f"preset {name!r} produced no questions")
+        for question_id, definition in generated.items():
+            # Namespace preset ids so two presets can be combined in one call
+            # without silently overwriting each other.
+            key = question_id if question_id not in combined else f"{name}_{question_id}"
+            combined[key] = definition
+    return combined
+
+
+def _validated_questions(questions: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(questions, dict) or not questions:
+        raise DecisionRequestError(
+            "questions must be a non-empty object of typed question definitions"
+        )
+    if len(questions) > MAX_QUESTIONS:
+        raise DecisionRequestError(f"questions cannot exceed {MAX_QUESTIONS} entries")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_id, definition in questions.items():
+        question_id = str(raw_id or "").strip()
+        if not question_id:
+            raise DecisionRequestError("question ids must be non-empty strings")
+        if not isinstance(definition, dict):
+            raise DecisionRequestError(f"question {question_id!r} must be an object")
+        question_type = str(definition.get("type") or "").strip().lower()
+        if question_type not in QUESTION_TYPES:
+            raise DecisionRequestError(
+                f"question {question_id!r} has unsupported type {question_type!r}; "
+                f"expected one of {', '.join(sorted(QUESTION_TYPES))}"
+            )
+        instructions = definition.get("instructions")
+        if not isinstance(instructions, (str, dict, list)) or instructions == "":
+            raise DecisionRequestError(
+                f"question {question_id!r} requires instructions"
+            )
+        criteria = definition.get("criteria")
+        if question_type == "choice":
+            if not isinstance(criteria, dict) or not criteria:
+                raise DecisionRequestError(
+                    f"choice question {question_id!r} requires a criteria object "
+                    "mapping option -> description"
+                )
+        elif question_type == "score":
+            if not isinstance(criteria, list) or len(criteria) < 2:
+                raise DecisionRequestError(
+                    f"score question {question_id!r} requires an ordered criteria "
+                    "array of at least two levels"
+                )
+        elif criteria is not None:
+            raise DecisionRequestError(
+                f"noul question {question_id!r} does not take criteria"
+            )
+        normalized[question_id] = {
+            "type": question_type,
+            "instructions": instructions,
+            "criteria": criteria,
+        }
+    return normalized
+
+
+def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, Any]]]:
+    """Resolve the state and typed questions for one decision request."""
+    embedded = _embedded_payload(body.get("messages"))
+    state = body.get("state", embedded.get("state"))
+    questions = body.get("questions", embedded.get("questions"))
+    presets = body.get("presets", embedded.get("presets"))
+
+    if questions is None and presets is not None:
+        questions = _preset_questions(presets)
+    elif questions is not None and presets is not None:
+        merged = _preset_questions(presets)
+        merged.update(_validated_questions(questions))
+        questions = merged
+
+    if state is None:
+        raise DecisionRequestError(
+            "state is required: pass the text, email, ticket, or JSON document "
+            "to decide over"
+        )
+    if not isinstance(state, (str, dict, list)):
+        raise DecisionRequestError("state must be a string, object, or array")
+    if isinstance(state, str) and len(state) > MAX_STATE_CHARS:
+        raise DecisionRequestError("state is too large")
+    return state, _validated_questions(questions)
+
+
+def _render_content(result: dict[str, Any], include_state: bool) -> str:
+    payload = {
+        "answers": result.get("answers") or {},
+        "usage": result.get("usage") or {},
+    }
+    if include_state:
+        payload["model"] = result.get("model") or MODEL_ID
+    return json.dumps(payload, separators=(",", ":"), sort_keys=False)
+
+
+def _completion(
+    body: dict[str, Any], result: dict[str, Any],
+) -> dict[str, Any]:
+    usage = result.get("usage") or {}
+    prompt_tokens = int(usage.get("input_tokens") or 0)
+    completion_tokens = int(usage.get("output_tokens") or 0)
+    answer_text = _render_content(result, include_state=True)
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": str(body.get("model") or MODEL_ID),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": answer_text,
+                # Laya returns structure, not prose. This extension keeps the
+                # probabilities and confidences typed for callers that can use
+                # them, while `content` stays valid OpenAI text.
+                "laya": {
+                    "model": result.get("model") or MODEL_ID,
+                    "answers": result.get("answers") or {},
+                },
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "laya": {
+            "model": result.get("model") or MODEL_ID,
+            "answers": result.get("answers") or {},
+        },
+    }
+
+
+def _stream_chunks(body: dict[str, Any], completion: dict[str, Any]):
+    """Replay a finished decision as OpenAI SSE data-only chunks."""
+    chunk_id = completion["id"]
+    created = completion["created"]
+    model = completion["model"]
+    usage = completion["usage"]
+
+    def frame(delta: dict[str, Any], finish: str | None) -> str:
+        payload = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    message = completion["choices"][0]["message"]
+    yield frame({"role": "assistant"}, None)
+    yield frame({"content": message["content"], "laya": message["laya"]}, "stop")
+    # A final usage-only frame matches the include_usage convention SparkDeck
+    # already enables for streaming requests.
+    tail = {
+        "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+        "model": model, "choices": [], "usage": usage,
+    }
+    yield f"data: {json.dumps(tail)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+# ------------------------------------------------------------------- HTTP surface
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> dict[str, Any]:
+    return {"status": "ok" if _agent is not None else "loading", "model": MODEL_ID}
+
+
+@app.get("/v1/models")
+async def list_models() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [{
+            "id": MODEL_ID,
+            "object": "model",
+            "created": 0,
+            "owned_by": OBJECT_NAME,
+        }],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+
+    try:
+        state, questions = _decision_payload(body)
+    except DecisionRequestError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    agent = get_agent()
+    gate = _inference_gate
+
+    def decide() -> dict[str, Any]:
+        result = agent.predict(state, questions)
+        if not isinstance(result, dict) or "answers" not in result:
+            raise HTTPException(500, "Laya returned an unexpected result")
+        return result
+
+    try:
+        if gate is None:
+            result = await asyncio.to_thread(decide)
+        else:
+            async with gate:
+                result = await asyncio.to_thread(decide)
+    except DecisionRequestError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Laya decision failed")
+        raise HTTPException(500, f"Laya decision failed: {exc}") from exc
+
+    completion = _completion(body, result)
+    if body.get("stream"):
+        return StreamingResponse(
+            _stream_chunks(body, completion),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return JSONResponse(completion)
+
+
+@app.post("/laya/predict")
+async def predict(request: Request):
+    """Laya-native decision endpoint: typed answers without the OpenAI envelope."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "request body is not valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+    try:
+        state, questions = _decision_payload({**body, "messages": []})
+    except DecisionRequestError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    agent = get_agent()
+    gate = _inference_gate
+
+    def decide() -> dict[str, Any]:
+        return agent.predict(state, questions)
+
+    try:
+        if gate is None:
+            return await asyncio.to_thread(decide)
+        async with gate:
+            return await asyncio.to_thread(decide)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Laya decision failed")
+        raise HTTPException(500, f"Laya decision failed: {exc}") from exc
+
+
+def main() -> None:
+    import uvicorn
+
+    logging.basicConfig(
+        level=os.environ.get("LAYA_LOG_LEVEL") or "info",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    uvicorn.run(
+        app, host="0.0.0.0", port=SERVE_PORT,
+        log_level=(os.environ.get("LAYA_LOG_LEVEL") or "info").lower(),
+    )
+
+
+if __name__ == "__main__":
+    main()

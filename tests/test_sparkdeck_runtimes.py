@@ -5,14 +5,17 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock
 
 from sparkdeck.runtimes import (
-    LlamaCppAdapter, RuntimeRegistry, SglangAdapter, VllmAdapter,
-    launch_managed_container, normalize_openai_base_url,
+    LAYA_SERVE_PORT, LayaAdapter, LlamaCppAdapter, RuntimeRegistry, SglangAdapter,
+    VllmAdapter, launch_managed_container, normalize_openai_base_url,
 )
 
 
 class RuntimeAdapterTests(unittest.TestCase):
-    def test_registry_supports_exactly_three_runtimes(self):
-        self.assertEqual(set(RuntimeRegistry().kinds), {"vllm", "llama.cpp", "sglang"})
+    def test_registry_supports_every_shipped_runtime(self):
+        self.assertEqual(
+            set(RuntimeRegistry().kinds),
+            {"vllm", "llama.cpp", "sglang", "laya"},
+        )
 
     def test_vllm_launch_settings(self):
         command = VllmAdapter().launch_spec("org/model", {
@@ -155,6 +158,49 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertIn("--dp-size", command)
         self.assertIn("--context-length", command)
 
+    def test_laya_launch_settings_reach_the_decision_server(self):
+        spec = LayaAdapter().launch_spec("convaiinnovations/laya", {
+            "device": "cuda:0", "max_concurrency": 4,
+            "served_model": "laya-decide",
+        })
+        self.assertEqual(spec.internal_port, LAYA_SERVE_PORT)
+        self.assertEqual(
+            spec.command,
+            [
+                "--model", "convaiinnovations/laya",
+                "--host", "0.0.0.0",
+                "--port", str(LAYA_SERVE_PORT),
+                "--device", "cuda:0",
+                "--max-concurrency", "4",
+                "--served-model-name", "laya-decide",
+            ],
+        )
+
+    def test_laya_launch_settings_omit_unset_options(self):
+        spec = LayaAdapter().launch_spec("convaiinnovations/laya", {})
+        self.assertEqual(
+            spec.command,
+            [
+                "--model", "convaiinnovations/laya",
+                "--host", "0.0.0.0",
+                "--port", str(LAYA_SERVE_PORT),
+            ],
+        )
+        self.assertNotIn("--device", spec.command)
+
+    def test_laya_has_no_tensor_or_pipeline_parallelism(self):
+        # Laya is a single-engine decision model: parallel flags on the
+        # settings must never reach its argv.
+        command = LayaAdapter().launch_spec("org/laya", {
+            "tensor_parallel_size": 2, "pipeline_parallel_size": 4,
+            "data_parallel_size": 3, "context_length": 32768,
+        }).command
+        for flag in (
+            "--tensor-parallel-size", "--pipeline-parallel-size",
+            "--tp-size", "--dp-size", "--max-model-len", "--context-length",
+        ):
+            self.assertNotIn(flag, command)
+
     def test_openai_base_url_normalizes_one_v1_prefix(self):
         self.assertEqual(
             normalize_openai_base_url("https://example.test/openai/v1/"),
@@ -187,6 +233,29 @@ class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         extra = manager.create_container.await_args.kwargs["extra_args"]
         self.assertEqual(extra, ["--dp-size", "2", "--quantization", "fp8"])
+
+    async def test_laya_bridge_uses_durable_managed_create(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(
+            return_value={"name": "sparkdeck-laya-dep-1", "port": 8110}
+        )
+
+        await launch_managed_container(
+            manager, LayaAdapter(), "dep-1", "laya", "convaiinnovations/laya",
+            {"served_model": "laya-decide"},
+        )
+
+        kwargs = manager.create_container.await_args.kwargs
+        self.assertEqual(kwargs["engine"], "laya")
+        self.assertEqual(kwargs["model"], "convaiinnovations/laya")
+        self.assertEqual(
+            kwargs["extra_args"],
+            [
+                "--model", "convaiinnovations/laya",
+                "--host", "0.0.0.0", "--port", str(LAYA_SERVE_PORT),
+                "--served-model-name", "laya-decide",
+            ],
+        )
 
     async def test_vllm_bridge_keeps_pipeline_parallelism(self):
         manager = Mock()

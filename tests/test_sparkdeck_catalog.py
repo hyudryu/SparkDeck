@@ -12,6 +12,39 @@ from sparkdeck.service import SparkDeckService
 
 
 class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_laya_compatibility_follows_the_publisher_tag(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[
+                {
+                    "id": "convaiinnovations/laya",
+                    "tags": ["transformers", "safetensors", "laya", "rl-agent"],
+                    "siblings": [{"rfilename": "model.safetensors", "size": 843_843_266}],
+                },
+                {
+                    # An ordinary Transformers checkpoint must not advertise a
+                    # decision runtime it cannot load.
+                    "id": "org/chat-model",
+                    "tags": ["transformers", "safetensors"],
+                    "siblings": [{"rfilename": "model.safetensors", "size": 1}],
+                },
+            ])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("model", 10)
+        await http.aclose()
+
+        support = {
+            item["id"]: {
+                entry["runtime"]: entry["supported"]
+                for entry in item["runtime_compatibility"]
+            }
+            for item in items
+        }
+        self.assertTrue(support["convaiinnovations/laya"]["laya"])
+        self.assertFalse(support["org/chat-model"]["laya"])
+        # vLLM and SGLang remain available for the general case.
+        self.assertTrue(support["org/chat-model"]["vllm"])
+
     async def test_search_forwards_query_limit_sort_and_private_token(self):
         captured = []
 

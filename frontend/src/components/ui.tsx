@@ -50,6 +50,7 @@ export function RuntimeMark({ runtime }: { runtime: string }) {
     vllm: 'vLLM',
     'llama.cpp': 'Llama server',
     sglang: 'SGLang',
+    laya: 'Laya decisions',
   }
   return <span className="runtime-mark">{labels[runtime] ?? runtime}</span>
 }

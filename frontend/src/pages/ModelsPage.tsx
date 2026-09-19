@@ -29,7 +29,8 @@ const initialForm: CreateDeploymentInput = {
   deployment_mode: 'single',
 }
 
-const isRuntimeKind = (value: unknown): value is RuntimeKind => value === 'vllm' || value === 'llama.cpp' || value === 'sglang'
+const isRuntimeKind = (value: unknown): value is RuntimeKind =>
+  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya'
 
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
 const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
@@ -2721,9 +2722,10 @@ export function ModelsPage() {
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
+              {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select

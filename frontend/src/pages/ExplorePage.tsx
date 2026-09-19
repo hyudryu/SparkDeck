@@ -21,6 +21,13 @@ const COMMUNITY_PAGE_SIZE = 50
 const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
 const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
+// One label source for every runtime picker and summary on this page.
+const RUNTIME_LABELS: Record<RuntimeKind, string> = {
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  'llama.cpp': 'Llama server',
+  laya: 'Laya decisions',
+}
 
 function formatParameters(value?: number | null) {
   if (!Number.isFinite(value) || Number(value) <= 0) return '—'
@@ -231,7 +238,9 @@ function deployHref(
     : communityMode && model.community ? aggregateQuantization(model.community) : undefined
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
   if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
-  else if (runtime !== 'llama.cpp' && sharded) params.set('layout', 'sharded')
+  // Laya reports fit as an aggregate only for display; its decision engine is
+  // single-engine, so it is never launched as a sharded layout.
+  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
@@ -431,12 +440,13 @@ function ModelRow({
           <option value="vllm" disabled={compatibilityByRuntime.get('vllm') === false}>vLLM</option>
           <option value="sglang" disabled={compatibilityByRuntime.get('sglang') === false}>SGLang</option>
           <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
+          <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
         </select></label>}
         {deploymentReady
-          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${deploymentRuntime === 'llama.cpp' ? 'Llama server' : deploymentRuntime === 'vllm' ? 'vLLM' : 'SGLang'}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>
+          ? <Link className="button button-primary" aria-label={`Deploy ${model.id}`} title={`Deploy with ${RUNTIME_LABELS[deploymentRuntime] ?? deploymentRuntime}`} to={deployHref(model, deploymentRuntime, selectedArtifact, fitAggregate, communityMode)}>Deploy</Link>
           : <button className="button button-primary" type="button" disabled title={details.loading ? 'Loading GGUF artifacts' : 'No deployable GGUF artifact was found'}>Deploy</button>}
       </div>
     </div>}
@@ -643,6 +653,7 @@ export function ExplorePage() {
               <option value="vllm">vLLM</option>
               <option value="llama.cpp">Llama server</option>
               <option value="sglang">SGLang</option>
+              <option value="laya">Laya decisions</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>

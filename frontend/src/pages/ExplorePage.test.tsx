@@ -122,6 +122,7 @@ describe('ExplorePage model rows', () => {
             { runtime: 'vllm', supported: true },
             { runtime: 'llama.cpp', supported: true },
             { runtime: 'sglang', supported: false },
+            { runtime: 'laya', supported: false },
           ],
           local_deployment_ids: ['existing-vllm'],
         }],
@@ -133,6 +134,7 @@ describe('ExplorePage model rows', () => {
           { runtime: 'vllm', supported: false },
           { runtime: 'llama.cpp', supported: true },
           { runtime: 'sglang', supported: false },
+          { runtime: 'laya', supported: false },
         ],
         quantizations: [{
           name: 'unknown', files: [{ filename: 'model.gguf', size_bytes: 6 * gib }],
@@ -159,9 +161,11 @@ describe('ExplorePage model rows', () => {
 
     const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
     expect(deploymentType).toHaveValue('vllm')
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(4)
     await screen.findByText('model.gguf')
     expect(within(deploymentType).getByRole('option', { name: 'vLLM' })).toBeEnabled()
+    // Laya needs decision-model checkpoints, so a plain GGUF row disables it.
+    expect(within(deploymentType).getByRole('option', { name: 'Laya decisions' })).toBeDisabled()
     await user.selectOptions(deploymentType, 'llama.cpp')
     expect(deploymentType).toHaveValue('llama.cpp')
     const selectedRow = screen.getByRole('button', { name: 'Collapse org/model-GGUF' })
@@ -171,6 +175,43 @@ describe('ExplorePage model rows', () => {
     expect(screen.getByRole('combobox', { name: 'GGUF artifact for org/model-GGUF' })).toHaveValue('unknown\u0000model.gguf')
     expect(screen.getByRole('link', { name: 'Deploy org/model-GGUF' })).toHaveAttribute(
       'href', '/models?model=org%2Fmodel-GGUF&runtime=llama.cpp&artifact=model.gguf',
+    )
+  })
+
+  it('deploys a Laya decision checkpoint without a sharded layout', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/catalog/models?')) return json({ items: [{
+        id: 'convaiinnovations/laya', name: 'laya', weight_size_bytes: 843 * 1024 ** 2,
+        downloads: 0, likes: 154, runtime_compatibility: [
+          { runtime: 'vllm', supported: false },
+          { runtime: 'sglang', supported: false },
+          { runtime: 'llama.cpp', supported: false },
+          { runtime: 'laya', supported: true },
+        ],
+      }], total: 1 })
+      if (path.includes('/api/v1/catalog/models/')) return json({ model: {
+        id: 'convaiinnovations/laya', name: 'laya',
+        runtime_compatibility: [{ runtime: 'laya', supported: true }],
+      }, aggregates: [] })
+      if (path.endsWith('/api/v1/nodes')) return json({ items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{ index: 0, mem_total_mib: 128 * 1024 }] } },
+      ] })
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    }))
+
+    render(<MemoryRouter><ExplorePage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Expand convaiinnovations/laya' }))
+
+    const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for convaiinnovations/laya' })
+    expect(within(deploymentType).getByRole('option', { name: 'Laya decisions' })).toBeEnabled()
+    await user.selectOptions(deploymentType, 'laya')
+
+    // Laya has no tensor parallelism, so it must never carry the sharded hint
+    // even when the checkpoint fits only as an aggregate.
+    expect(screen.getByRole('link', { name: 'Deploy convaiinnovations/laya' })).toHaveAttribute(
+      'href', '/models?model=convaiinnovations%2Flaya&runtime=laya',
     )
   })
 
@@ -769,7 +810,7 @@ describe('ExplorePage model rows', () => {
     )
 
     const deploymentType = within(modelArticle).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(3)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(4)
     await user.selectOptions(deploymentType, 'llama.cpp')
     const artifactSelect = within(modelArticle).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })
     expect(artifactSelect).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')

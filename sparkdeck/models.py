@@ -11,6 +11,11 @@ class RuntimeKind(StrEnum):
     VLLM = "vllm"
     LLAMA_CPP = "llama.cpp"
     SGLANG = "sglang"
+    # Laya is a non-autoregressive System 1 decision model: it scores typed
+    # questions over a state and returns calibrated probabilities instead of
+    # generating tokens. SparkDeck serves it behind the same OpenAI-compatible
+    # /v1 surface through the ``laya-decide`` runtime.
+    LAYA = "laya"
 
 
 class DeploymentKind(StrEnum):

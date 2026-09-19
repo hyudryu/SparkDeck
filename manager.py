@@ -328,6 +328,14 @@ _LLAMA_GGUF_SHARD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Laya is a non-autoregressive System 1 decision model (421M parameters). It
+# has no tensor or pipeline parallelism and needs no engine eviction rules
+# beyond the shared GPU device request, so it follows the llama.cpp shape: one
+# complete decision server per selected node, reading weights from the node's
+# shared Hugging Face cache.
+DEFAULT_LAYA_IMAGE = "sparkdeck/laya-decide:latest"
+_LAYA_SERVE_PORT = 8080
+
 CONTROLLER_LABEL = "io.sparkdeck.managed"
 MODEL_LABEL = "io.sparkdeck.model"
 ENGINE_LABEL = "io.sparkdeck.runtime"
@@ -3822,7 +3830,7 @@ class Manager:
                     "stopped" if deployment.get("status") == "stopped" else "running",
                 )
                 engine = str(deployment.get("engine") or "vllm")
-                if engine not in {"vllm", "sglang", "llama.cpp"}:
+                if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
                     deployment["status"] = "error"
                     deployment["error"] = f"unsupported persisted runtime: {engine}"
             return value
@@ -5157,8 +5165,8 @@ class Manager:
             )
         if not settings["model"]:
             raise ValueError("model is required")
-        if settings["engine"] not in {"vllm", "sglang", "llama.cpp"}:
-            raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        if settings["engine"] not in {"vllm", "sglang", "llama.cpp", "laya"}:
+            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
         mode = settings["deployment_mode"]
         if mode not in _MODE_ALLOWLIST:
             raise ValueError(
@@ -7292,8 +7300,8 @@ class Manager:
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
-        if engine not in {"vllm", "sglang", "llama.cpp"}:
-            raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
+            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
         body["runtime_file_mounts"] = normalize_runtime_file_mounts(
             body.get("runtime_file_mounts"), engine,
         )
@@ -7336,6 +7344,13 @@ class Manager:
             # runs its own complete replica instead.
             raise ValueError(
                 "llama.cpp deployments support single and replicated layouts, "
+                "not sharded"
+            )
+        if engine == "laya" and mode in {"sharded", "grouped_sharded"}:
+            # Laya is a single-engine decision model with no tensor or pipeline
+            # parallelism; replicas are the only way to use more than one node.
+            raise ValueError(
+                "Laya deployments support single and replicated layouts, "
                 "not sharded"
             )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
@@ -8470,7 +8485,7 @@ class Manager:
         if (
             action == "start"
             and str(deployment.get("engine") or "vllm")
-            not in {"vllm", "sglang", "llama.cpp"}
+            not in {"vllm", "sglang", "llama.cpp", "laya"}
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
         if targeted_instance is not None and action == "start" and (
@@ -16153,6 +16168,124 @@ class Manager:
             )
             raise RuntimeError(safe_error) from exc
 
+    async def _create_laya_container(
+        self,
+        model: str,
+        port: int | None,
+        image: str | None,
+        extra_args: list[str] | None,
+        name: str | None,
+        cluster_member: dict | None,
+        sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
+    ) -> dict:
+        """Launch one Laya decision server, mirroring the llama.cpp shape.
+
+        Laya is a complete single-engine runtime, so sharded layouts are
+        rejected rather than silently degraded: its 421M-parameter forward pass
+        cannot be split across hosts, and the model already fits comfortably on
+        one device.
+        """
+        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
+            raise ValueError("Laya deployments cannot run sharded")
+        image = image or DEFAULT_LAYA_IMAGE
+        # Unlike SGLang and llama.cpp, Laya does not evict other engines: it is
+        # small enough to co-exist with a chat model on one node, so taking the
+        # node's GPUs away from a running engine would cost more than it frees.
+        if port is None:
+            port = await self._allocate_port()
+        if name is None:
+            safe = model.replace("/", "-").replace("_", "-").lower()
+            name = f"laya-{safe}-{port}"
+        self._cluster_launch_update(
+            name, "preparing", "Preparing Laya decision server launch",
+            model=model, cluster_member=cluster_member,
+        )
+
+        def _create():
+            try:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+                self.client.images.get(image)
+            except docker.errors.ImageNotFound:
+                self._cluster_launch_update(
+                    name, "pulling_image",
+                    f"Downloading Docker image {image}; this can take several minutes",
+                    model=model, cluster_member=cluster_member,
+                )
+                print(f"[laya] pulling missing image: {image}")
+                self.client.images.pull(image)
+            command = [
+                "--model", model,
+                "--host", "0.0.0.0",
+                "--port", str(_LAYA_SERVE_PORT),
+            ]
+            command.extend(str(item) for item in extra_args or [])
+            self._cluster_launch_update(
+                name, "creating_container", "Creating Docker container",
+                model=model, cluster_member=cluster_member,
+            )
+            labels = {
+                CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                ENGINE_LABEL: "laya",
+            }
+            if sparkdeck_deployment_id:
+                labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
+            if cluster_member:
+                labels.update({
+                    DEPLOYMENT_LABEL: cluster_member["deployment_id"],
+                    NODE_LABEL: cluster_member["node_id"],
+                    RANK_LABEL: str(cluster_member["rank"]),
+                    MODE_LABEL: cluster_member.get("mode", "single"),
+                    NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
+                })
+            run_options = {
+                "image": image,
+                # The image's entrypoint translates this argv into the decision
+                # server's environment, so the command stays a pure flag list.
+                "command": command,
+                "name": name,
+                "detach": True,
+                # Weights come from the node's shared Hugging Face cache, which
+                # the image mounts at its declared HF_HOME target.
+                "volumes": self._build_volumes("", self.settings["hf_cache"], image),
+                "ipc_mode": "host",
+                "shm_size": shm_size or self.settings["shm_size"],
+                "labels": labels,
+                "restart_policy": {"Name": "unless-stopped"},
+                "ports": {f"{_LAYA_SERVE_PORT}/tcp": port},
+            }
+            # A GPU is optional: Laya also runs on CPU, and the decision server
+            # falls back on its own when CUDA is unavailable.
+            try:
+                run_options["device_requests"] = [
+                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                ]
+            except Exception:
+                pass
+            container = self._run_managed_container(run_options)
+            container.reload()
+            self._cluster_launch_update(
+                name, "starting", "Container created; loading the decision model",
+                model=model, cluster_member=cluster_member,
+            )
+            summary = self._container_summary(container)
+            if summary is not None:
+                summary["model_source"] = "public_repository"
+            return summary
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+
     async def _create_container_with_port(
         self,
         model: str,
@@ -16183,8 +16316,8 @@ class Manager:
         runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
-        if engine not in {"vllm", "sglang", "llama.cpp"}:
-            raise ValueError("engine must be vllm, sglang, or llama.cpp")
+        if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
+            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
         runtime_file_mounts = normalize_runtime_file_mounts(runtime_file_mounts, engine)
         # Validate before image pulls, GPU eviction, or any Docker mutation.
@@ -16223,6 +16356,14 @@ class Manager:
                 llama_context_length=llama_context_length,
                 llama_parallel_slots=llama_parallel_slots,
                 llama_gpu_layers=llama_gpu_layers,
+                cluster_member=cluster_member,
+                sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
+            )
+        if engine == "laya":
+            return await self._create_laya_container(
+                model=model, port=port, image=image,
+                extra_args=extra_args, name=name,
                 cluster_member=cluster_member,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
                 shm_size=managed_shm_size,

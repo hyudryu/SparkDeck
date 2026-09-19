@@ -343,8 +343,15 @@ def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
     Returns ``True``/``False`` when ``--device`` states a preference explicitly
     (a ``cpu`` device must leave the node's GPUs alone), and ``None`` when the
     server should be left to pick a device on its own.
+
+    The last occurrence wins, because that is what the entrypoint and any
+    command-line parser resolve to: typed settings can emit ``--device cpu``
+    while a later Extra flag overrides it with ``--device=cuda:1``. Reading the
+    first value there would omit the Docker GPU request while the server picked
+    CUDA, and the model would fail to initialize.
     """
     args = [str(item) for item in extra_args or []]
+    preference: bool | None = None
     for index, token in enumerate(args):
         device = None
         if token == "--device" and index + 1 < len(args):
@@ -353,8 +360,8 @@ def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
             device = token.partition("=")[2]
         if device is None:
             continue
-        return not device.strip().casefold().startswith("cpu")
-    return None
+        preference = not device.strip().casefold().startswith("cpu")
+    return preference
 
 
 def _node_has_nvidia_driver() -> bool:
@@ -8506,13 +8513,13 @@ class Manager:
             raise ValueError("invalid deployment action")
         if model_revision is not None and (
             action != "start" or not node_ids or instance is not None
-            or deployment.get("engine", "vllm") not in {"vllm", "sglang"}
+            or deployment.get("engine", "vllm") not in {"vllm", "sglang", "laya"}
             or not isinstance(model_revision, str)
             or not IMMUTABLE_HF_REVISION.fullmatch(model_revision)
         ):
             raise ValueError(
                 "a cached model revision requires an explicit full-deployment "
-                "start selection for vLLM or SGLang"
+                "start selection for vLLM, SGLang, or Laya"
             )
         targeted_instance = self._grouped_target_instance(
             deployment, action, instance,

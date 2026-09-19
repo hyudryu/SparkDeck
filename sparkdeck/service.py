@@ -1981,7 +1981,10 @@ class SparkDeckService:
             )
         )
         saved_only = bool(saved_only)
-        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp"}
+        # Runtimes whose saved launch settings an operator may repair or tune
+        # once the deployment is stopped. Laya belongs here because its device,
+        # concurrency, image, and extra flags are all persisted launch inputs.
+        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp", "laya"}
         discovered_editable = bool(
             discovered_settings is not None
             and discovered_settings.get("editable")

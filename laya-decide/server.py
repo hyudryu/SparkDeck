@@ -146,10 +146,21 @@ def _resolve_weights() -> str:
 
 def _load_agent() -> Any:
     """Import Laya lazily so the HTTP surface is usable without torch."""
+    if ROUTER_ENABLED and MODEL_REVISION:
+        # The router resolves each of its own checkpoints, so the single
+        # revision this deployment was pinned to cannot apply to all of them,
+        # and passing it as the English repository path would break every routed
+        # request. An explicit failure beats loading a commit the operator did
+        # not ask for. Checked before importing Laya so a misconfigured launch
+        # reports the configuration problem rather than a missing dependency.
+        raise RuntimeError(
+            "a revision pin cannot be combined with router mode: the router "
+            "resolves its own checkpoints. Remove --revision, or pin a revision "
+            "by deploying the specific checkpoint repository without --router."
+        )
+
     import laya
 
-    source = _resolve_weights()
-    logger.info("loading Laya model from %s", source)
     started = time.monotonic()
     if ROUTER_ENABLED:
         # The English checkpoint does not degrade off English, it collapses and
@@ -166,6 +177,8 @@ def _load_agent() -> Any:
             ROUTER_MAX_LOADED, ROUTER_DEFAULT, time.monotonic() - started,
         )
         return agent
+    source = _resolve_weights()
+    logger.info("loading Laya model from %s", source)
     agent = laya.load(source, device=MODEL_DEVICE)
     logger.info(
         "Laya model %s ready on %s in %.1fs",

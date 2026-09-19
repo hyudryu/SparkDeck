@@ -671,25 +671,46 @@ export function ModelsPage() {
     const ggufArtifact = Boolean(artifact?.toLocaleLowerCase().endsWith('.gguf'))
     catalogShardedLayout.current = sharded
     if (ggufArtifact || requestedRuntime) runtimeTouched.current = true
-    setForm((current) => ({
-      ...current,
-      model_id: modelId,
-      alias: current.alias || modelId.split('/').at(-1) || modelId,
-      runtime: ggufArtifact ? 'llama.cpp' : requestedRuntime ?? current.runtime,
-      deployment_mode: ggufArtifact ? 'single' : sharded ? 'sharded' : current.deployment_mode,
-      settings: ggufArtifact
-        ? {
-          context_length: current.settings.context_length,
-          parallel_slots: current.settings.parallel_slots ?? 1,
-          gpu_layers: current.settings.gpu_layers ?? 99,
-          quantization: quantization || undefined,
-          artifact,
-        }
-        : {
-          ...current.settings,
-          quantization: quantization || current.settings.quantization,
-        },
-    }))
+    setForm((current) => {
+      // Resolved from the updater's own state so this effect needs no extra
+      // dependency on a value the form already owns.
+      const linkedRuntime: RuntimeKind = ggufArtifact
+        ? 'llama.cpp'
+        : requestedRuntime ?? current.runtime
+      return {
+        ...current,
+        model_id: modelId,
+        alias: current.alias || modelId.split('/').at(-1) || modelId,
+        runtime: ggufArtifact ? 'llama.cpp' : requestedRuntime ?? current.runtime,
+        // A deep link cannot ask for tensor parallelism on a runtime that has
+        // none, and this path bypasses updateRuntime — so it applies the same
+        // normalization. Without it a linked Laya runtime keeps the form's
+        // initial vLLM image, which then launches a vLLM container with Laya
+        // arguments.
+        deployment_mode: ggufArtifact
+          ? 'single'
+          : sharded && linkedRuntime !== 'laya' ? 'sharded' : current.deployment_mode,
+        settings: ggufArtifact
+          ? {
+            context_length: current.settings.context_length,
+            parallel_slots: current.settings.parallel_slots ?? 1,
+            gpu_layers: current.settings.gpu_layers ?? 99,
+            quantization: quantization || undefined,
+            artifact,
+          }
+          : linkedRuntime === 'laya'
+            ? {
+              device: current.runtime === 'laya' ? current.settings.device : undefined,
+              max_concurrency: current.settings.max_concurrency,
+              served_model: current.settings.served_model,
+              image: current.runtime === 'laya' ? current.settings.image : undefined,
+            }
+            : {
+              ...current.settings,
+              quantization: quantization || current.settings.quantization,
+            },
+      }
+    })
     // A deep link names repository artifacts, so record them as
     // listing-derived for the stale-selection cleanup above, and treat the
     // model id as already observed so the linked picks are not wiped.

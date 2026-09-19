@@ -13,6 +13,9 @@ _SECRET_NAME = re.compile(
 )
 _PROTECTED_NAMES = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
+# Engines whose launcher reads configuration from the container environment.
+_ENVIRONMENT_CAPABLE_ENGINES = frozenset({"vllm", "laya"})
+
 # Docker inspection may expose arbitrary application credentials. Only these
 # known runtime-tuning inputs are safe and useful to carry into a recipe saved
 # from an externally created vLLM container.
@@ -43,11 +46,20 @@ _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES = frozenset({
 def normalize_runtime_environment(
     value: Any, engine: str = "vllm",
 ) -> dict[str, str]:
-    """Return a bounded, credential-free environment map for vLLM."""
+    """Return a bounded, credential-free environment map for a managed runtime.
+
+    Engines that read their launch configuration from the environment (vLLM and
+    the Laya decision server, which takes things like ``LAYA_LOG_LEVEL`` or
+    ``HF_HUB_OFFLINE``) accept operator variables. Everything else has no
+    environment-driven configuration, so a non-empty map is a caller mistake
+    worth reporting rather than silently dropping.
+    """
     if value is None:
         return {}
-    if engine != "vllm" and value:
-        raise ValueError("runtime environment variables are only supported for vLLM")
+    if engine not in _ENVIRONMENT_CAPABLE_ENGINES and value:
+        raise ValueError(
+            "runtime environment variables are only supported for vLLM and Laya"
+        )
     if not isinstance(value, dict):
         raise ValueError("environment must be an object of string values")
     if len(value) > 128:

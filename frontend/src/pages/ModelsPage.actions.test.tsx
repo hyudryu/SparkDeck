@@ -2005,4 +2005,37 @@ describe('deployment group controls', () => {
     await screen.findByRole('menuitem', { name: 'Start group' })
     await waitFor(() => expect(followupProbes).toBeGreaterThan(0), { timeout: 3500 })
   })
+
+  it('a Laya deep link does not inherit the form default vLLM image', async () => {
+    // A deep link sets the runtime without going through the form's runtime
+    // switch, so it must apply the same normalization. Otherwise the saved
+    // deployment carries the vLLM default image and launches a vLLM container
+    // with Laya arguments.
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      const json = (body: unknown) => new Response(
+        JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+      if (path === '/api/v1/deployments') return json({ items: [] })
+      if (path === '/api/v1/nodes') return json({ items: nodes })
+      if (path === '/api/v1/settings') return json({ default_runtime: 'vllm', default_context_length: 8192 })
+      if (path.startsWith('/api/v1/catalog/models/')) {
+        return json({ model: { id: 'convaiinnovations/laya', name: 'laya' }, aggregates: [] })
+      }
+      return json({ items: [], availability: 'not_configured', evidence_policy: {} })
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/models?model=convaiinnovations/laya&runtime=laya']}>
+        <ModelsPage />
+      </MemoryRouter>,
+    )
+
+    const dialog = await screen.findByRole('dialog', { name: 'Create deployment' })
+    expect(await within(dialog).findByLabelText('Runtime')).toHaveValue('laya')
+    // The vLLM image is vLLM-only, and a Laya deployment must not be launched
+    // with a pre-filled image it never asked for.
+    expect(within(dialog).queryByText(/nvcr\.io\/nvidia\/vllm/)).not.toBeInTheDocument()
+    expect(within(dialog).queryAllByLabelText(/image/i)).toHaveLength(0)
+  })
 })

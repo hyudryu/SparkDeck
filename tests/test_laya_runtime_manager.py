@@ -148,6 +148,48 @@ class LayaContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("device_requests", manager._run_managed_container.call_args.args[0])
         probe.assert_not_called()
 
+    async def test_the_last_device_flag_decides_gpu_selection(self):
+        """Typed settings emit `--device cpu` and an Extra flag can override it.
+
+        The entrypoint and any argument parser resolve to the last occurrence, so
+        reading the first would omit the Docker GPU request while the server
+        selected CUDA, and initialization would fail.
+        """
+        from manager import _laya_gpu_preference
+
+        self.assertFalse(_laya_gpu_preference(["--device", "cpu"]))
+        self.assertTrue(_laya_gpu_preference(["--device=cuda:1"]))
+        # Last wins in both directions.
+        self.assertTrue(_laya_gpu_preference(["--device", "cpu", "--device=cuda:1"]))
+        self.assertFalse(_laya_gpu_preference(["--device=cuda:1", "--device", "cpu"]))
+        self.assertIsNone(_laya_gpu_preference(["--served-model-name", "laya"]))
+        self.assertIsNone(_laya_gpu_preference(None))
+
+    async def test_laya_accepts_operator_environment_variables(self):
+        """The decision server reads configuration from the environment, so a
+        validator that rejects every non-vLLM map would fail the launch before
+        the container branch runs."""
+        from sparkdeck.runtime_environment import normalize_runtime_environment
+
+        normalized = normalize_runtime_environment(
+            {"HF_HUB_OFFLINE": "1", "LAYA_LOG_LEVEL": "debug"}, "laya",
+        )
+        self.assertEqual(
+            normalized, {"HF_HUB_OFFLINE": "1", "LAYA_LOG_LEVEL": "debug"},
+        )
+        # The credential guard still applies.
+        with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
+            normalize_runtime_environment({"HF_TOKEN": "x"}, "laya")
+
+    async def test_the_last_device_flag_reaches_the_container_request(self):
+        manager = _manager()
+        with patch("manager._node_has_nvidia_driver", return_value=False):
+            await _launch(
+                manager, extra_args=["--device", "cpu", "--device=cuda:1"],
+            )
+        # The server will select CUDA, so Docker must be given the GPU.
+        self.assertIn("device_requests", manager._run_managed_container.call_args.args[0])
+
     async def test_extra_args_extend_the_served_configuration(self):
         manager = _manager()
 

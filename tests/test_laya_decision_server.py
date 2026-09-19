@@ -321,11 +321,13 @@ class WeightResolutionTests(unittest.TestCase):
     def setUp(self):
         self._weights = server.WEIGHTS
         self._revision = server.MODEL_REVISION
+        self._router = server.ROUTER_ENABLED
         self.addCleanup(self._restore)
 
     def _restore(self):
         server.WEIGHTS = self._weights
         server.MODEL_REVISION = self._revision
+        server.ROUTER_ENABLED = self._router
 
     def test_unpinned_launch_loads_the_repository_untouched(self):
         server.WEIGHTS = "convaiinnovations/laya"
@@ -354,6 +356,18 @@ class WeightResolutionTests(unittest.TestCase):
 
         # A local directory needs no Hub resolution and must not be rewritten.
         self.assertEqual(server._resolve_weights(), str(REPO_ROOT))
+
+    def test_router_mode_rejects_a_revision_pin(self):
+        """The router resolves its own checkpoints, so one pinned revision
+        cannot apply to all of them. Failing is deliberate: the alternatives
+        are silently loading an unpinned commit or breaking routed requests."""
+        server.ROUTER_ENABLED = True
+        server.MODEL_REVISION = "e" * 40
+
+        with self.assertRaises(RuntimeError) as caught:
+            server._load_agent()
+
+        self.assertIn("cannot be combined with router mode", str(caught.exception))
 
 
 class EntrypointTests(unittest.TestCase):

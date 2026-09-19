@@ -120,7 +120,14 @@ function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics
 
 export function ChatPage() {
   const deployments = useResource((signal) => api.deployments.list(signal))
-  const running = useMemo(() => deployments.data?.filter((item) => item.status === 'running') ?? [], [deployments.data])
+  const running = useMemo(() => deployments.data?.filter((item) => (
+    item.status === 'running'
+    // Laya is a non-autoregressive decision model: it takes `state` and typed
+    // `questions` and returns calibrated answers, so a chat turn would fail
+    // with a 400 every time. It is reachable on /v1 for callers that send a
+    // decision payload, but it is not a chat target.
+    && item.runtime !== 'laya'
+  )) ?? [], [deployments.data])
   const [model, setModel] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])

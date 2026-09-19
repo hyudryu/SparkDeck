@@ -343,6 +343,18 @@ class StartupBenchmarkTests(unittest.IsolatedAsyncioTestCase):
         }]
         self.assertEqual(await self.monitor.targets(), [])
 
+    async def test_non_generative_runtime_is_never_probed(self):
+        """Laya generates no tokens, so there is no decode to measure.
+
+        It also exposes no /v1/completions route, so probing it would fail on
+        every boot and re-enter the retry loop instead of settling.
+        """
+        self.deployment["runtime"] = "laya"
+        self.deployment["model"] = {"repository": "convaiinnovations/laya"}
+        self.service.deployments.return_value = [self.deployment]
+
+        self.assertEqual(await self.monitor.targets(), [])
+
     async def test_local_health_probe_is_read_only_and_requires_health_200(self):
         self.manager.inference_target_health = AsyncMock(return_value=False)
         self.assertFalse(await self.monitor._healthy(self.target))

@@ -7630,10 +7630,17 @@ class SparkDeckService:
             startup_benchmark=startup_benchmark, source_route=source_route,
         )
         if (deployment.get("settings") or {}).get("manager_deployment_id") and (
-            deployment.get("runtime") in (RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value)
+            deployment.get("runtime") in (
+                RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+                RuntimeKind.LAYA.value,
+            )
             and deployment.get("kind") == DeploymentKind.MANAGED.value
         ):
             # Manager acquires the selected group's slot, including failover.
+            # Laya belongs here for the same reason vLLM and SGLang do: a
+            # managed record's stored endpoint is the controller's own port
+            # mapping, so a deployment placed on a remote node is only
+            # reachable through Manager's member-aware routing.
             return await factory(deployment)
         return await self._run_service_prompt_gate(
             ("deployment", deployment["id"]), factory, cancel=cancel,
@@ -7682,6 +7689,7 @@ class SparkDeckService:
             )
             and deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+                RuntimeKind.LAYA.value,
             )
         ):
             route_kwargs = (
@@ -7740,7 +7748,12 @@ class SparkDeckService:
                              startup_benchmark: bool = False,
                              source_route: dict | None = None,
                              ) -> dict[str, Any] | AsyncIterator[str]:
-        """Keep managed vLLM/SGLang requests on Manager's admission path."""
+        """Keep managed single- and multi-node requests on Manager's admission path.
+
+        Covers vLLM, SGLang, and Laya: all three run as managed members whose
+        real endpoint is discovered per member, so Manager must own member
+        selection, admission, load balancing, and failover.
+        """
         requested_model = str(body.get("model") or deployment["alias"])
         model = deployment["model"]["repository"]
         upstream_body = {**body, "model": model}

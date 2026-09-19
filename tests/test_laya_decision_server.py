@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
+import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -251,6 +255,151 @@ class LayaDecisionServerTests(unittest.TestCase):
             "model": server.MODEL_ID, "state": STATE, "questions": QUESTIONS,
         })
         self.assertEqual(response.status_code, 503)
+
+
+class WeightResolutionTests(unittest.TestCase):
+    """A pinned launch must load the pinned snapshot, not the default one.
+
+    SparkDeck appends ``--revision`` for a cached bookmark launch, so the
+    decision server has to resolve that exact snapshot instead of silently
+    loading whatever the repository points at today.
+    """
+
+    def setUp(self):
+        self._weights = server.WEIGHTS
+        self._revision = server.MODEL_REVISION
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        server.WEIGHTS = self._weights
+        server.MODEL_REVISION = self._revision
+
+    def test_unpinned_launch_loads_the_repository_untouched(self):
+        server.WEIGHTS = "convaiinnovations/laya"
+        server.MODEL_REVISION = None
+
+        self.assertEqual(server._resolve_weights(), "convaiinnovations/laya")
+
+    def test_pinned_launch_resolves_that_exact_snapshot(self):
+        server.WEIGHTS = "convaiinnovations/laya"
+        server.MODEL_REVISION = "b" * 40
+        import huggingface_hub
+
+        with unittest.mock.patch.object(
+            huggingface_hub, "snapshot_download",
+            return_value="/cache/snapshots/" + "b" * 40,
+        ) as download:
+            resolved = server._resolve_weights()
+
+        self.assertEqual(resolved, "/cache/snapshots/" + "b" * 40)
+        self.assertEqual(download.call_args.kwargs["revision"], "b" * 40)
+        self.assertEqual(download.call_args.args[0], "convaiinnovations/laya")
+
+    def test_local_checkpoint_is_already_an_exact_snapshot(self):
+        server.WEIGHTS = str(REPO_ROOT)
+        server.MODEL_REVISION = "c" * 40
+
+        # A local directory needs no Hub resolution and must not be rewritten.
+        self.assertEqual(server._resolve_weights(), str(REPO_ROOT))
+
+
+class EntrypointTests(unittest.TestCase):
+    """The entrypoint must accept the argv SparkDeck actually builds.
+
+    The container entrypoint is a bash script, so it is exercised as one. The
+    fake ``python`` on PATH records the argv it was exec'd with instead of
+    starting a server, which is what makes the translation observable.
+    """
+
+    ENTRYPOINT = REPO_ROOT / "laya-decide" / "entrypoint.sh"
+
+    @staticmethod
+    def _bash_path(path: Path) -> str:
+        """Express a path the way the available bash can open it.
+
+        A Windows bash (WSL or MSYS) cannot resolve a ``C:\\...`` string, and
+        the two translate drives differently, so both spellings are probed and
+        the first the shell can actually reach is used.
+        """
+        text = str(path)
+        if os.name != "nt":
+            return text
+        drive, _, rest = text.partition(":")
+        tail = rest.lstrip("\\").replace("\\", "/")
+        for candidate in (f"/mnt/{drive.lower()}/{tail}", f"/{drive.lower()}/{tail}"):
+            probe = subprocess.run(
+                ["bash", "-c", f'test -e "{candidate}"'],
+                capture_output=True, text=True,
+            )
+            if probe.returncode == 0:
+                return candidate
+        return text
+
+    def _run_entrypoint(self, args: list[str]):
+        """Run the entrypoint and return (completed process, recorded argv)."""
+        import shutil
+
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is required to exercise the container entrypoint")
+
+        with tempfile.TemporaryDirectory() as work:
+            shim = Path(work) / "shim"
+            shim.mkdir()
+            stub = shim / "python"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf \'%s\\n\' "$@" > "$(dirname "$0")/argv"\n',
+                encoding="utf-8", newline="\n",
+            )
+            stub.chmod(0o755)
+            # A bash on Windows cannot use inherited Windows PATH entries, and
+            # one of them may hold a python.exe that would shadow the stub, so
+            # the harness script sets a shell-native PATH of its own.
+            harness = Path(work) / "harness.sh"
+            harness.write_text(
+                "#!/usr/bin/env bash\n"
+                f'PATH="{self._bash_path(shim)}:/usr/local/bin:/usr/bin:/bin"\n'
+                "export PATH\n"
+                f'exec bash "{self._bash_path(self.ENTRYPOINT)}" "$@"\n',
+                encoding="utf-8", newline="\n",
+            )
+            harness.chmod(0o755)
+            result = subprocess.run(
+                [bash, self._bash_path(harness), *args],
+                capture_output=True, text=True,
+            )
+            recorded = shim / "argv"
+            return result, (
+                recorded.read_text(encoding="utf-8") if recorded.exists() else ""
+            )
+
+    def test_revision_pin_is_consumed_rather_than_rejected(self):
+        result, argv = self._run_entrypoint(
+            ["--model", "convaiinnovations/laya", "--revision", "d" * 40],
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The revision reaches the server as configuration, not as argv.
+        self.assertNotIn("--revision", argv)
+        self.assertNotIn("--model", argv)
+        self.assertIn("uvicorn", argv)
+
+    def test_device_and_served_name_are_consumed(self):
+        result, argv = self._run_entrypoint([
+            "--model", "org/laya", "--device", "cpu",
+            "--served-model-name", "laya-decide",
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--device", argv)
+        self.assertNotIn("--served-model-name", argv)
+
+    def test_unknown_flag_fails_the_launch(self):
+        result, _argv = self._run_entrypoint(["--not-a-real-flag"])
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported argument", result.stderr)
 
 
 if __name__ == "__main__":

@@ -211,6 +211,9 @@ class LayaAdapter(RuntimeAdapter):
         served_model = str(settings.get("served_model") or "").strip()
         if served_model:
             command += ["--served-model-name", served_model]
+        revision = str(settings.get("revision") or "").strip()
+        if revision:
+            command += ["--revision", revision]
         command.extend(str(item) for item in settings.get("extra_args", []))
         return LaunchSpec(
             settings.get("image") or self.default_image, command, LAYA_SERVE_PORT,
@@ -252,6 +255,7 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
         spec = adapter.launch_spec(model, settings)
         return await manager.create_container(
             model=model, engine="laya", image=spec.image,
+            environment=settings.get("environment"),
             extra_args=list(spec.command),
             name=safe_container_name(alias, deployment_id),
             sparkdeck_deployment_id=deployment_id,

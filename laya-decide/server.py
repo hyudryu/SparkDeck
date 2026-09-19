@@ -48,6 +48,7 @@ MAX_STATE_CHARS = 4_000_000
 WEIGHTS = os.environ.get("LAYA_MODEL") or "convaiinnovations/laya"
 MODEL_ID = (os.environ.get("LAYA_SERVED_MODEL_NAME") or "").strip() or WEIGHTS
 MODEL_DEVICE = (os.environ.get("LAYA_DEVICE") or "").strip() or None
+MODEL_REVISION = (os.environ.get("LAYA_REVISION") or "").strip() or None
 SERVE_PORT = int(os.environ.get("LAYA_PORT") or 8080)
 
 
@@ -101,13 +102,38 @@ def get_agent() -> Any:
     return agent
 
 
+def _resolve_weights() -> str:
+    """Return the path or repository id to load, honouring a revision pin.
+
+    Laya's own loader has no revision argument and always takes the current
+    default revision, so a pinned launch resolves the exact snapshot here first
+    and hands Laya the resulting local directory. SparkDeck appends
+    ``--revision`` for a cached bookmark launch, and silently loading a newer
+    snapshot than the operator pinned would be worse than failing.
+    """
+    if not MODEL_REVISION:
+        return WEIGHTS
+    if os.path.exists(WEIGHTS):
+        # A local directory is already an exact, immutable checkout.
+        return WEIGHTS
+    from huggingface_hub import snapshot_download
+
+    logger.info("resolving %s at revision %s", WEIGHTS, MODEL_REVISION)
+    return snapshot_download(
+        WEIGHTS,
+        revision=MODEL_REVISION,
+        token=os.environ.get("HF_TOKEN") or None,
+    )
+
+
 def _load_agent() -> Any:
     """Import Laya lazily so the HTTP surface is usable without torch."""
     import laya
 
-    logger.info("loading Laya model %s", WEIGHTS)
+    source = _resolve_weights()
+    logger.info("loading Laya model from %s", source)
     started = time.monotonic()
-    agent = laya.load(WEIGHTS, device=MODEL_DEVICE)
+    agent = laya.load(source, device=MODEL_DEVICE)
     logger.info(
         "Laya model %s ready on %s in %.1fs",
         WEIGHTS, getattr(agent, "device", "unknown"), time.monotonic() - started,

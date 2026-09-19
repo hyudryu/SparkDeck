@@ -336,6 +336,43 @@ _LLAMA_GGUF_SHARD_PATTERN = re.compile(
 DEFAULT_LAYA_IMAGE = "sparkdeck/laya-decide:latest"
 _LAYA_SERVE_PORT = 8080
 
+
+def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
+    """The operator's GPU intent for the decision server.
+
+    Returns ``True``/``False`` when ``--device`` states a preference explicitly
+    (a ``cpu`` device must leave the node's GPUs alone), and ``None`` when the
+    server should be left to pick a device on its own.
+    """
+    args = [str(item) for item in extra_args or []]
+    for index, token in enumerate(args):
+        device = None
+        if token == "--device" and index + 1 < len(args):
+            device = args[index + 1]
+        elif token.startswith("--device="):
+            device = token.partition("=")[2]
+        if device is None:
+            continue
+        return not device.strip().casefold().startswith("cpu")
+    return None
+
+
+def _node_has_nvidia_driver() -> bool:
+    """Whether this node can actually satisfy a Docker GPU device request.
+
+    ``DeviceRequest`` construction never fails; the daemon rejects the request
+    later when no NVIDIA driver is present. Probing here is what makes the CPU
+    fallback real on a node without one.
+    """
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
 CONTROLLER_LABEL = "io.sparkdeck.managed"
 MODEL_LABEL = "io.sparkdeck.model"
 ENGINE_LABEL = "io.sparkdeck.runtime"
@@ -16173,9 +16210,11 @@ class Manager:
         model: str,
         port: int | None,
         image: str | None,
+        environment: dict[str, str] | None,
         extra_args: list[str] | None,
         name: str | None,
         cluster_member: dict | None,
+        hf_token: str | None,
         sparkdeck_deployment_id: str | None,
         shm_size: Any = None,
     ) -> dict:
@@ -16249,22 +16288,38 @@ class Manager:
                 "name": name,
                 "detach": True,
                 # Weights come from the node's shared Hugging Face cache, which
-                # the image mounts at its declared HF_HOME target.
-                "volumes": self._build_volumes("", self.settings["hf_cache"], image),
+                # the image mounts at its declared HF_HOME target. Passing
+                # ``model`` also mounts a controller-local checkpoint directory,
+                # which the loader would otherwise not find inside the container.
+                "volumes": self._build_volumes(model, self.settings["hf_cache"], image),
                 "ipc_mode": "host",
                 "shm_size": shm_size or self.settings["shm_size"],
                 "labels": labels,
                 "restart_policy": {"Name": "unless-stopped"},
                 "ports": {f"{_LAYA_SERVE_PORT}/tcp": port},
             }
-            # A GPU is optional: Laya also runs on CPU, and the decision server
-            # falls back on its own when CUDA is unavailable.
-            try:
-                run_options["device_requests"] = [
-                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
-                ]
-            except Exception:
-                pass
+            container_environment = dict(environment or {})
+            # A gated or private checkpoint must authenticate when the loader
+            # resolves or downloads it, exactly as the vLLM and SGLang paths do.
+            container_environment.update(self._container_hf_environment(hf_token))
+            if container_environment:
+                run_options["environment"] = container_environment
+            # Laya runs on CPU too, so the GPU request is added only when it can
+            # actually be honoured. Constructing a DeviceRequest always
+            # succeeds, so an unconditional request would only fail later,
+            # inside Docker, on a node with no NVIDIA device driver.
+            gpu_preference = _laya_gpu_preference(extra_args)
+            wants_gpu = (
+                _node_has_nvidia_driver()
+                if gpu_preference is None else gpu_preference
+            )
+            if wants_gpu:
+                try:
+                    run_options["device_requests"] = [
+                        docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                    ]
+                except Exception:
+                    pass
             container = self._run_managed_container(run_options)
             container.reload()
             self._cluster_launch_update(
@@ -16363,8 +16418,10 @@ class Manager:
         if engine == "laya":
             return await self._create_laya_container(
                 model=model, port=port, image=image,
+                environment=runtime_environment,
                 extra_args=extra_args, name=name,
                 cluster_member=cluster_member,
+                hf_token=hf_token,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
                 shm_size=managed_shm_size,
             )

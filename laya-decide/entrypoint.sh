@@ -11,6 +11,7 @@ usage() {
     cat >&2 <<'EOF'
 usage: entrypoint.sh [--model ID] [--host ADDR] [--port N] [--device DEV]
                      [--max-concurrency N] [--served-model-name NAME]
+                     [--revision REV]
                      [-- <extra args for uvicorn>]
 
   --model ID             Hugging Face repo id or local path to load
@@ -21,6 +22,10 @@ usage: entrypoint.sh [--model ID] [--host ADDR] [--port N] [--device DEV]
   --max-concurrency N    parallel decision requests (env: LAYA_MAX_CONCURRENCY, 1)
   --served-model-name N  alias reported by /v1/models in place of the repo id
                          (env: LAYA_SERVED_MODEL_NAME)
+  --revision REV         load this exact Hub revision instead of the default one
+                         (env: LAYA_REVISION). SparkDeck appends this for a
+                         cached bookmark launch, so it must be honoured rather
+                         than rejected.
 EOF
     exit 2
 }
@@ -48,6 +53,9 @@ while [ "$#" -gt 0 ]; do
         --served-model-name)
             [ "$#" -ge 2 ] || usage
             export LAYA_SERVED_MODEL_NAME="$2"; shift 2 ;;
+        --revision)
+            [ "$#" -ge 2 ] || usage
+            export LAYA_REVISION="$2"; shift 2 ;;
         --)
             shift; break ;;
         -h|--help)

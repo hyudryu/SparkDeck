@@ -2077,9 +2077,12 @@ export function ModelsPage() {
     setForm((current) => {
       const contextLength = current.settings.context_length ?? 8192
       const nodeIds = current.node_ids?.length ? current.node_ids : (localNodeId ? [localNodeId] : [])
-      // Sharded layouts keep their vLLM/SGLang-only constraints; Llama server
-      // always runs complete replicas.
+      // Sharded layouts need tensor parallelism, which only vLLM and SGLang
+      // provide. Llama server and Laya always run complete replicas; Manager
+      // rejects a sharded Laya deployment outright, so offering one here would
+      // save a form that cannot launch.
       const sharded = runtime !== 'llama.cpp'
+        && runtime !== 'laya'
         && current.deployment_mode === 'sharded'
         && (nodeIds?.length ?? 0) > 1
       const deploymentMode = sharded ? 'sharded' : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
@@ -2096,14 +2099,23 @@ export function ModelsPage() {
             quantization: current.settings.quantization,
             artifact: current.settings.artifact,
           }
-          : {
-            context_length: contextLength,
-            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
-            quantization: current.settings.quantization,
-            image: runtime === 'vllm'
-              ? current.settings.image ?? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image
-              : undefined,
-          },
+          : runtime === 'laya'
+            ? {
+              // A decision model is single-engine: no tensor parallelism, and
+              // no context window to size.
+              device: current.settings.device,
+              max_concurrency: current.settings.max_concurrency,
+              served_model: current.settings.served_model,
+              image: current.settings.image,
+            }
+            : {
+              context_length: contextLength,
+              tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
+              quantization: current.settings.quantization,
+              image: runtime === 'vllm'
+                ? current.settings.image ?? deploymentDefaults(appSettings.data, localNodeId ?? 'local').settings.image
+                : undefined,
+            },
       }
     })
   }

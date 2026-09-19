@@ -12,8 +12,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 # SparkDeck mounts each node's Hugging Face cache at the HF_HOME path above, so
 # a weight set already staged by Virtual NAS is reused instead of re-downloaded.
+# The version is pinned deliberately: this server is exercised against it, and
+# Laya's own defaults (checkpoint ids, result shape) have changed between
+# releases.
 RUN pip install --no-cache-dir \
-        "laya==0.1.6" \
+        "laya==0.2.1" \
         "fastapi>=0.110" \
         "uvicorn[standard]>=0.27" \
         "pydantic>=2.5"

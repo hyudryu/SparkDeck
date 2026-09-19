@@ -92,6 +92,8 @@ _SAFE_CONFIGURATION_KEYS = {
     "pipeline_parallel_size", "data_parallel_size", "quantization", "dtype",
     "kv_cache_dtype",
     "max_concurrency", "max_running_requests", "mem_fraction_static", "gpu_memory_utilization",
+    # Laya launch inputs carried through a durable SparkDeck record.
+    "device", "served_model",
     "runtime_version",
 }
 _LOCAL_ROUTING_KEYS = {
@@ -3595,6 +3597,19 @@ class SparkDeckService:
             context_length = settings.get("max_model_len") or settings.get("context_length")
             if context_length is not None:
                 extra_args += ["--max-model-len", str(context_length)]
+        if runtime is RuntimeKind.LAYA:
+            # The cluster path carries a launch as argv, so Laya's typed
+            # settings have to become flags here. Without this they are saved
+            # and then silently dropped: a deployment asking for ``cpu`` would
+            # still let the server select CUDA on its own.
+            for key, flag in (
+                ("device", "--device"),
+                ("max_concurrency", "--max-concurrency"),
+                ("served_model", "--served-model-name"),
+            ):
+                value = settings.get(key)
+                if value is not None and str(value).strip():
+                    extra_args += [flag, str(value)]
         if identity.revision and runtime is not RuntimeKind.LLAMA_CPP:
             # Llama.cpp pins its revision inside the cache-relative artifact
             # reference; an unknown --revision flag would break llama-server.

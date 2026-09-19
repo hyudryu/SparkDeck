@@ -43,6 +43,22 @@ host="${LAYA_HOST:-0.0.0.0}"
 port="${LAYA_PORT:-8080}"
 
 while [ "$#" -gt 0 ]; do
+    # Accept both ``--flag value`` and ``--flag=value`` for scalar options.
+    # Operators write the equals form in SparkDeck's Extra flags field, and
+    # Manager's own device handling recognizes it, so rejecting it here would
+    # fail a launch whose GPU policy was already applied upstream. A flag is
+    # normalized into the split form only when everything after ``=`` can
+    # actually be treated as the value.
+    arg="$1"
+    case "$arg" in
+        --*=*)
+            flag="${arg%%=*}"
+            value="${arg#*=}"
+            case "$flag" in
+                --model|--host|--port|--device|--max-concurrency|--served-model-name|--revision|--router-max-loaded|--router-default)
+                    set -- "$flag" "$value" "${@:2}" ;;
+            esac ;;
+    esac
     case "$1" in
         --model)
             [ "$#" -ge 2 ] || usage

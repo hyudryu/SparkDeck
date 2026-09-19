@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -256,6 +257,58 @@ class LayaDecisionServerTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 503)
 
+    def test_oversized_structured_state_is_rejected(self):
+        """The size bound must apply to the documented JSON/ticket state too.
+
+        Measuring only strings would let a caller hand an unbounded nested value
+        to the tokenizer, which is exactly the case the bound exists for.
+        """
+        huge = {"body": "x" * (server.MAX_STATE_CHARS + 1)}
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": huge, "questions": QUESTIONS,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("too large", response.json()["detail"])
+        self.assertEqual(self.agent.calls, [])
+
+    def test_oversized_state_is_rejected_when_nested_in_a_list(self):
+        huge = [{"turn": n, "text": "y" * 100_000} for n in range(50)]
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": huge, "questions": QUESTIONS,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("too large", response.json()["detail"])
+
+    def test_deeply_nested_state_is_rejected(self):
+        deep: Any = "leaf"
+        for _ in range(server.MAX_STATE_DEPTH + 5):
+            deep = {"nested": deep}
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID, "state": deep, "questions": QUESTIONS,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("nested too deeply", response.json()["detail"])
+
+    def test_unsupported_state_value_type_is_rejected(self):
+        # Not reachable over HTTP (the value could not be JSON), so the guard is
+        # exercised directly: a future non-JSON caller must not slip past it.
+        with self.assertRaises(server.DecisionRequestError) as caught:
+            server._state_size({"when": object()})
+        self.assertIn("may only contain", str(caught.exception))
+
+    def test_non_string_object_keys_are_rejected(self):
+        with self.assertRaises(server.DecisionRequestError) as caught:
+            server._state_size({1: "value"})
+        self.assertIn("keys must be strings", str(caught.exception))
+
+    def test_a_normal_structured_state_still_passes(self):
+        response = self.client.post("/v1/chat/completions", json={
+            "model": server.MODEL_ID,
+            "state": {"subject": "Refund", "turns": ["hello", {"body": "again"}]},
+            "questions": QUESTIONS,
+        })
+        self.assertEqual(response.status_code, 200)
+
 
 class WeightResolutionTests(unittest.TestCase):
     """A pinned launch must load the pinned snapshot, not the default one.
@@ -394,6 +447,20 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--device", argv)
         self.assertNotIn("--served-model-name", argv)
+
+    def test_equals_form_flags_are_accepted(self):
+        """Operators write `--flag=value` in Extra flags, and Manager's own GPU
+        preference parsing recognizes that form. Rejecting it in the container
+        would fail a launch whose GPU policy was already applied."""
+        result, argv = self._run_entrypoint([
+            "--model=org/laya", "--device=cpu", "--max-concurrency=4",
+            "--router", "--router-max-loaded=3",
+        ])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for flag in ("--device", "--max-concurrency", "--router-max-loaded", "--model"):
+            self.assertNotIn(flag, argv)
+        self.assertIn("uvicorn", argv)
 
     def test_unknown_flag_fails_the_launch(self):
         result, _argv = self._run_entrypoint(["--not-a-real-flag"])

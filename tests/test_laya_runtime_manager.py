@@ -426,5 +426,78 @@ class LayaProxyTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
 
+class LayaLaunchSettingsTests(unittest.TestCase):
+    """Typed Laya settings must survive both launch paths and persistence."""
+
+    def _service(self):
+        return SparkDeckService.__new__(SparkDeckService)
+
+    def _body(self, settings):
+        return self._service()._cluster_launch_body(
+            RuntimeKind.LAYA, "convaiinnovations/laya", "laya-decide", "record-1",
+            ModelIdentity("convaiinnovations/laya"), settings,
+            ["spark-2"], "single", None,
+        )
+
+    def test_cluster_launch_translates_typed_laya_settings_to_flags(self):
+        """The cluster path builds argv from extra_args, so a setting that is
+        not translated here is saved and then silently dropped — a deployment
+        asking for `cpu` would still let the server select CUDA."""
+        body = self._body({
+            "device": "cpu", "max_concurrency": 4, "served_model": "laya-decide",
+        })
+
+        extra = body["extra_args"]
+        self.assertEqual(extra[extra.index("--device") + 1], "cpu")
+        self.assertEqual(extra[extra.index("--max-concurrency") + 1], "4")
+        self.assertEqual(extra[extra.index("--served-model-name") + 1], "laya-decide")
+        self.assertEqual(body["engine"], "laya")
+
+    def test_unset_laya_settings_do_not_emit_flags(self):
+        body = self._body({"device": None, "max_concurrency": None, "served_model": ""})
+
+        self.assertNotIn("--device", body["extra_args"])
+        self.assertNotIn("--max-concurrency", body["extra_args"])
+        self.assertNotIn("--served-model-name", body["extra_args"])
+
+    def test_revision_is_still_forwarded_for_laya(self):
+        service = self._service()
+        body = service._cluster_launch_body(
+            RuntimeKind.LAYA, "convaiinnovations/laya", "laya-decide", "record-1",
+            ModelIdentity("convaiinnovations/laya", revision="a" * 40),
+            {}, ["spark-2"], "single", None,
+        )
+
+        extra = body["extra_args"]
+        self.assertEqual(extra[extra.index("--revision") + 1], "a" * 40)
+
+    def test_durable_launch_settings_keep_laya_inputs(self):
+        """Manager rebuilds argv from these, so dropping them relaunches a
+        deployment without the device the operator pinned."""
+        from manager import Manager
+
+        durable = Manager._deployment_launch_settings({
+            "engine": "laya", "model": "convaiinnovations/laya",
+            "node_ids": ["spark-2"], "device": "cpu",
+            "max_concurrency": 3, "served_model": "laya-decide",
+        })
+
+        self.assertEqual(durable["device"], "cpu")
+        self.assertEqual(durable["max_concurrency"], 3)
+        self.assertEqual(durable["served_model"], "laya-decide")
+
+    def test_service_configuration_keeps_laya_inputs(self):
+        """_safe_configuration runs on every persisted record."""
+        configuration = SparkDeckService._safe_configuration({
+            "device": "cuda:1", "served_model": "laya-decide",
+            "max_concurrency": 2, "secrets": "must not survive",
+        })
+
+        self.assertEqual(configuration.get("device"), "cuda:1")
+        self.assertEqual(configuration.get("served_model"), "laya-decide")
+        self.assertEqual(configuration.get("max_concurrency"), 2)
+        self.assertNotIn("secrets", configuration)
+
+
 if __name__ == "__main__":
     unittest.main()

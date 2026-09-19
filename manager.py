@@ -4592,6 +4592,12 @@ class Manager:
             "llama_context_length": body.get("llama_context_length"),
             "llama_parallel_slots": body.get("llama_parallel_slots"),
             "llama_gpu_layers": body.get("llama_gpu_layers"),
+            # Laya launch inputs. The cluster path rebuilds a member's argv from
+            # these durable settings, so dropping them would relaunch a
+            # deployment without the device the operator pinned.
+            "device": body.get("device") or None,
+            "served_model": body.get("served_model") or None,
+            "max_concurrency": body.get("max_concurrency"),
             "deployment_mode": body.get("deployment_mode") or body.get("mode") or "single",
             "node_ids": list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID])),
             "port": body.get("port"),

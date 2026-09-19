@@ -2106,7 +2106,11 @@ export function ModelsPage() {
               device: current.settings.device,
               max_concurrency: current.settings.max_concurrency,
               served_model: current.settings.served_model,
-              image: current.settings.image,
+              // The form's defaults carry a vLLM image. Keeping it would save
+              // a Laya deployment that launches a vLLM container with
+              // Laya-specific arguments, so the runtime's own default image
+              // applies unless the operator set one for Laya deliberately.
+              image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
             : {
               context_length: contextLength,

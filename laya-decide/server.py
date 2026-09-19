@@ -39,6 +39,7 @@ QUESTION_TYPES = frozenset({"choice", "score", "noul"})
 PRESET_NAMES = ("router", "guard", "moderation", "triage")
 MAX_QUESTIONS = 256
 MAX_STATE_CHARS = 4_000_000
+MAX_STATE_DEPTH = 64
 
 # Set by the container entrypoint. ``WEIGHTS`` is the repository or local path
 # Laya loads; ``MODEL_ID`` is the OpenAI model id published by ``/v1/models``.
@@ -303,6 +304,47 @@ def _validated_questions(questions: Any) -> dict[str, dict[str, Any]]:
     return normalized
 
 
+def _state_size(state: Any) -> int:
+    """Measure an accepted state without trusting its shape.
+
+    A JSON object or array is the documented ticket/JSON use case, so the size
+    bound has to apply to it too: measuring only strings would let a caller
+    hand an arbitrarily large nested value to the tokenizer. The walk is bounded
+    by depth and by the running total, so a pathological structure cannot make
+    the check itself expensive.
+    """
+    budget = MAX_STATE_CHARS
+    stack: list[tuple[Any, int]] = [(state, 0)]
+    total = 0
+    while stack:
+        value, depth = stack.pop()
+        if depth > MAX_STATE_DEPTH:
+            raise DecisionRequestError("state is nested too deeply")
+        if isinstance(value, str):
+            total += len(value)
+        elif isinstance(value, dict):
+            if not all(isinstance(key, str) for key in value):
+                raise DecisionRequestError("state object keys must be strings")
+            for key, item in value.items():
+                total += len(key)
+                stack.append((item, depth + 1))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                stack.append((item, depth + 1))
+        elif isinstance(value, bool) or value is None:
+            total += 4
+        elif isinstance(value, (int, float)):
+            total += 24
+        else:
+            raise DecisionRequestError(
+                "state may only contain strings, numbers, booleans, null, "
+                "objects, and arrays"
+            )
+        if total > budget:
+            raise DecisionRequestError("state is too large")
+    return total
+
+
 def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, Any]]]:
     """Resolve the state and typed questions for one decision request."""
     embedded = _embedded_payload(body.get("messages"))
@@ -324,8 +366,7 @@ def _decision_payload(body: dict[str, Any]) -> tuple[Any, dict[str, dict[str, An
         )
     if not isinstance(state, (str, dict, list)):
         raise DecisionRequestError("state must be a string, object, or array")
-    if isinstance(state, str) and len(state) > MAX_STATE_CHARS:
-        raise DecisionRequestError("state is too large")
+    _state_size(state)
     return state, _validated_questions(questions)
 
 

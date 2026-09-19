@@ -11,6 +11,7 @@ decision over HTTP in the OpenAI response shape SparkDeck proxies.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import time
@@ -52,11 +53,30 @@ QUESTIONS = {
 
 
 def main() -> int:
+    import unittest.mock as mock
+
     import server
     from fastapi.testclient import TestClient
 
     print(f"model repo: {server.WEIGHTS}")
-    agent = server._load_agent()
+
+    # One load, shared by the direct call and the HTTP surface. The app's
+    # lifespan loads an agent of its own, so without this cache a host sized
+    # for a single Laya instance would hold two during verification. The real
+    # loader is captured first so the patched version cannot recurse into itself.
+    real_load = server._load_agent
+    loaded: list = []
+
+    def load_once():
+        if not loaded:
+            loaded.append(real_load())
+        return loaded[0]
+
+    with mock.patch.object(server, "_load_agent", load_once):
+        return _run(server, TestClient, load_once())
+
+
+def _run(server, TestClient, agent) -> int:
     server.set_agent(agent)
 
     started = time.monotonic()
@@ -137,9 +157,18 @@ def main() -> int:
 
     # Opt-in routing: the English checkpoint collapses on non-Latin text while
     # staying confident, so a routed deployment must pick the multilingual one.
+    import gc
+
     import laya
 
-    router = laya.Router(max_loaded=1)
+    # The English agent above is a separate instance from anything the router
+    # owns, so release it before holding two checkpoints at once. This mirrors
+    # the real deployment, which loads through exactly one code path.
+    server.set_agent(None)
+    del agent
+    gc.collect()
+
+    router = laya.Router(max_loaded=2)
     print("\n-- router --")
     for label, state in (
         ("English", {"body": "I was charged twice, please refund."}),
@@ -162,10 +191,20 @@ def main() -> int:
     print(f"  German+lang=de -> {forced['model']:13} ({forced['reason']})")
     assert forced["model"] == "multilingual", forced
 
-    # And the routed endpoint answers with the decision that produced it.
+    # And the routed endpoint answers with the decision that produced it. The
+    # router installed above is the agent under test, so the app's lifespan is
+    # neutralized for this pass rather than loading a second checkpoint on top.
     server.ROUTER_ENABLED = True
-    server.set_agent(laya.Router(max_loaded=1))
-    with TestClient(server.app) as routed_client:
+    server.set_agent(router)
+
+    @contextlib.asynccontextmanager
+    async def no_load(_app):
+        yield
+
+    original_lifespan = server.app.router.lifespan_context
+    server.app.router.lifespan_context = no_load
+    try:
+        routed_client = TestClient(server.app)
         routed = routed_client.post("/v1/chat/completions", json={
             "model": server.MODEL_ID,
             "state": {"body": "二重に請求されました。返金してください。"},
@@ -178,6 +217,8 @@ def main() -> int:
         assert routing["model"] == "multilingual", routing
         assert routing["repo"] == "convaiinnovations/laya-multilingual"
         assert routed.json()["laya"]["answers"]["department"]["choice"]
+    finally:
+        server.app.router.lifespan_context = original_lifespan
 
     print("\nALL LIVE CHECKS PASSED")
     return 0

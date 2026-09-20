@@ -392,6 +392,30 @@ describe('models page running actions', () => {
     expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeEnabled()
   })
 
+  it.each([['laya', 'vllm'], ['vllm', 'laya']])('launches %s on a healthy node already used by %s', async (targetRuntime, existingRuntime) => {
+    const original = fetchMock.getMockImplementation()!
+    const target = { ...runningDeployment, id: 'target', alias: 'Shared model', runtime: targetRuntime, status: 'stopped', desired_state: 'stopped' }
+    const existing = { ...runningDeployment, runtime: existingRuntime, occupied_node_ids: ['worker-1', 'worker-4'] }
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments'
+      ? new Response(JSON.stringify({ items: [existing, target] }), { headers: { 'Content-Type': 'application/json' } })
+      : original(input, init))
+    const user = userEvent.setup()
+    renderPage()
+    const targetRow = (await screen.findByText('Shared model')).closest('[role="row"]') as HTMLElement
+    await user.click(within(targetRow).getByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Shared model' })
+    expect(within(dialog).getByRole('radio', { name: /Node 4/ })).toBeEnabled()
+    expect(within(dialog).getByRole('radio', { name: /Node 4/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Node 1/ })).toBeDisabled()
+    expect(within(dialog).queryByText(/Already used by deployment/)).not.toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/target/start') && init?.method === 'POST')
+      expect(request).toBeDefined()
+      expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['worker-1'])
+    })
+  })
+
   it('keeps nodes free when a stopped duplicate only carries a failed-launch error marker', async () => {
     const original = fetchMock.getMockImplementation()!
     const stale = { ...runningDeployment, id: 'stale', alias: 'Old name', status: 'error', desired_state: 'stopped' }

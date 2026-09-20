@@ -1,4 +1,4 @@
-import type { Deployment, DeploymentInstance } from '../api/types'
+import type { Deployment, DeploymentInstance, RuntimeKind } from '../api/types'
 
 const ACTIVE = new Set(['running', 'ready', 'starting', 'launching', 'recovering', 'stopping', 'degraded', 'error', 'unknown'])
 // Aggregate states that can still hold live containers under stopped intent.
@@ -18,10 +18,13 @@ export function groupNodeIds(deployment: Deployment, group: DeploymentInstance):
   return requestedNodeIds(deployment).slice(group.instance_id * count, (group.instance_id + 1) * count)
 }
 
-export function occupiedNodeReasons(deployments: Deployment[], exceptId?: string): Record<string, string> {
+export function occupiedNodeReasons(deployments: Deployment[], exceptId?: string, targetRuntime?: RuntimeKind): Record<string, string> {
   const reasons: Record<string, string> = {}
   for (const deployment of deployments) {
     if (deployment.id === exceptId || deployment.status === 'saved') continue
+    // Laya decision models can coexist with any runtime on a healthy node.
+    // Other runtimes retain exclusive scheduling relative to each other.
+    if (targetRuntime === 'laya' || deployment.runtime === 'laya') continue
     // Aggregate health can be degraded solely because unrelated peers are
     // unreachable. Prefer the controller's per-member runtime reservations.
     if (deployment.occupied_node_ids !== undefined) {

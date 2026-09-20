@@ -352,12 +352,12 @@ export function DeploymentPage() {
   const [previewError, setPreviewError] = useState<string>()
 
   useEffect(() => {
-    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId, resource.data?.runtime)
     setRunSelection((current) => {
       const next = current?.filter((id) => !occupied[id])
       return next?.length === current?.length ? current : next
     })
-  }, [deployments.data, deploymentId])
+  }, [deployments.data, deploymentId, resource.data?.runtime])
 
   useEffect(() => {
     if (!runSelection) return
@@ -571,7 +571,7 @@ export function DeploymentPage() {
     }
     const required = requiredRunNodes()
     deployments.reload()
-    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+    const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId, resource.data?.runtime)
     const selectable = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id]).map((node) => node.id)
     const preferred = (resource.data?.node_ids ?? []).filter((id) => selectable.includes(id))
     setError(undefined); setNotice(undefined)
@@ -581,7 +581,7 @@ export function DeploymentPage() {
   const checkOccupancy = async (ids: string[]) => {
     const latest = await api.deployments.list()
     deployments.apply(latest)
-    const occupied = occupiedNodeReasons(latest, deploymentId)
+    const occupied = occupiedNodeReasons(latest, deploymentId, resource.data?.runtime)
     const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
     if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
   }
@@ -769,7 +769,7 @@ export function DeploymentPage() {
             ? `This grouped layout runs ${detail.instances?.length ?? 2} independent engine group(s) on exactly ${required} nodes.`
             : `This single-node layout runs TP${tensor} on one physical node.`
       const exactCount = flexibleParallel ? validParallelSelection(runSelection) : runSelection.length === required
-      const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId)
+      const occupied = occupiedNodeReasons(deployments.data ?? [], deploymentId, resource.data?.runtime)
       const allSelectable = runSelection.every((id) => !occupied[id] && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
       const ready = !deployments.loading && !deployments.error && (directLifecycle || (!nodes.loading && !nodes.error && exactCount && allSelectable))
       return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && setRunSelection(undefined)}>

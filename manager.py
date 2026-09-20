@@ -14721,6 +14721,11 @@ class Manager:
         try:
             for container in await self.list_containers():
                 runtime = container.get("engine") or "vllm"
+                # Laya Decide is a small companion inference runtime. Keep it
+                # alive when a chat engine starts, just as Laya's own launcher
+                # preserves the chat engine in the opposite start order.
+                if runtime == "laya" and protect in {"vllm", "sglang", "llama.cpp"}:
+                    continue
                 if (
                     container.get("managed")
                     and container.get("status") == "running"
@@ -16768,16 +16773,20 @@ class Manager:
             # Estimate VRAM from the container's model label.
             try:
                 c = self.client.containers.get(name)
+                labels = c.labels or {}
                 model = _label_value(c.labels or {}, MODEL_LABEL, "")
                 params_b, bpp = self._estimate_params_and_quant(model)
                 if params_b > 0:
                     need_gb = params_b * 1e9 * bpp * 1.2 / (1024 ** 3)
-                    labels = c.labels or {}
                     if _label_value(labels, MODE_LABEL) in _SHARDED_MEMBER_MODES:
                         need_gb /= max(1, int(_label_value(labels, NNODES_LABEL, "1")))
                 else:
                     need_gb = 30.0  # conservative fallback
-                self._try_fit_new_model(need_gb, protect_name=name)
+                # Laya is a companion runtime, including when restarting an
+                # existing container. Its model name often has no size suffix;
+                # the generic 30 GB estimate must not evict the chat model.
+                if _label_value(labels, ENGINE_LABEL) != "laya":
+                    self._try_fit_new_model(need_gb, protect_name=name)
             except Exception:
                 pass  # best-effort; if we can't read the container, proceed anyway
         def _do():
@@ -17298,9 +17307,24 @@ class Manager:
                 stopped = self._explicitly_stopped_containers = set()
             stopped.add(name)
         stopped_deployment: list[str] = []
+        launches = getattr(self, "cluster_member_launches", {})
+        launch = launches.get(name)
+        launch_updated_at = launch.get("updated_at") if launch else None
 
         def _do():
-            container = self.client.containers.get(name)
+            try:
+                container = self.client.containers.get(name)
+            except docker.errors.NotFound:
+                # Docker image pulls/creation run in worker threads and can
+                # outlive a cancelled request. Absence is not a completed stop
+                # while such a launch can still create this container.
+                current_launch = launches.get(name) or {}
+                if current_launch.get("phase") in {
+                    "queued", "preparing", "checking_image", "pulling_image",
+                    "creating_container",
+                }:
+                    raise RuntimeError("container launch is still in progress; stop must be retried")
+                return
             stopped_deployment.append(
                 _label_value(container.labels or {}, DEPLOYMENT_LABEL)
             )
@@ -17322,6 +17346,13 @@ class Manager:
             await asyncio.wait_for(asyncio.to_thread(_do), timeout=30)
         except asyncio.TimeoutError:
             raise RuntimeError(f"container stop timed out after 30s")
+        # Do not advertise an old launch as a synthetic 'creating' container
+        # after Docker confirmed it stopped or absent. Retain any progress
+        # updated during the stop so reconciliation can inspect it again.
+        if launches.get(name) is launch and (
+            launch is None or launch.get("updated_at") == launch_updated_at
+        ):
+            launches.pop(name, None)
         try:
             await self._reap_container_admission(
                 name, stopped_deployment[0] if stopped_deployment else None,
@@ -19816,7 +19847,9 @@ class Manager:
         """Stop the least-recently-active managed containers until *need_gb*
         fits in the GPU's free memory (total − used − 10 GB buffer).
 
-        Containers whose name matches ``protect_name`` are never evicted.
+        Containers whose name matches ``protect_name`` and Laya companion
+        runtimes are never evicted. A launch that still cannot fit must report
+        its runtime memory failure instead of silently stopping its companion.
         Best-effort — failures are logged but never raised.
         """
         total, used = self._read_gpu_memory_gb()
@@ -19834,7 +19867,10 @@ class Manager:
             ]
             running = []
             for c in containers:
-                if c.status == "running" and c.name != protect_name:
+                if (
+                    c.status == "running" and c.name != protect_name
+                    and _label_value(c.labels or {}, ENGINE_LABEL) != "laya"
+                ):
                     running.append(c)
             running.sort(
                 key=lambda c: self._activity.get(c.name, {}).get(

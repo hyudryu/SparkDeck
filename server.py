@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 import jwt
+import docker
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import (
@@ -1712,7 +1713,20 @@ async def agent_start_container(name: str, req: Request):
 
 @app.post("/api/agent/containers/{name}/stop")
 async def agent_stop_container(name: str, req: Request, explicit: bool = False):
-    await _require_managed_agent_container(name, req)
+    try:
+        await _require_managed_agent_container(name, req)
+    except HTTPException as exc:
+        if exc.status_code != 404 or name not in getattr(manager, "cluster_member_launches", {}):
+            raise
+        # A tracked launch can outlive its Docker container. Permit cleanup
+        # only after Docker confirms absence, never for an existing unmanaged
+        # container with the same name. Authentication above still applies.
+        try:
+            await asyncio.to_thread(manager.client.containers.get, name)
+        except docker.errors.NotFound:
+            pass
+        else:
+            raise exc
     return await manager.stop_container(name, explicit=explicit)
 
 

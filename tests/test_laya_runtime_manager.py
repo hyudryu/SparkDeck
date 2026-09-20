@@ -9,6 +9,7 @@ path the controller uses to reach a running decision server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -18,7 +19,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from manager import (
-    DEFAULT_LAYA_IMAGE, DEPLOYMENT_LABEL, ENGINE_LABEL, Manager, MODE_LABEL,
+    CONTROLLER_LABEL, DEFAULT_LAYA_IMAGE, DEPLOYMENT_LABEL, ENGINE_LABEL, Manager, MODE_LABEL,
     NNODES_LABEL, NODE_LABEL, RANK_LABEL, _LAYA_SERVE_PORT,
 )
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
@@ -278,6 +279,131 @@ class LayaContainerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, r"boom \[REDACTED\]"):
             await _launch(manager, name="laya-fail")
+
+
+class LayaNodeSharingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restarting_laya_does_not_evict_chat_for_generic_memory_estimate(self):
+        manager = _manager()
+        container = Mock()
+        container.labels = {ENGINE_LABEL: "laya"}
+        manager.client.containers.get.return_value = container
+        manager._estimate_params_and_quant = Mock(return_value=(0, 2))
+        manager._try_fit_new_model = Mock()
+
+        await manager.start_container("laya", explicit=True)
+
+        manager._try_fit_new_model.assert_not_called()
+        container.start.assert_called_once()
+
+    async def test_restarting_chat_keeps_memory_fit_behavior(self):
+        manager = _manager()
+        container = Mock()
+        container.labels = {ENGINE_LABEL: "vllm"}
+        manager.client.containers.get.return_value = container
+        manager._estimate_params_and_quant = Mock(return_value=(0, 2))
+        manager._try_fit_new_model = Mock()
+
+        await manager.start_container("chat", explicit=True)
+
+        manager._try_fit_new_model.assert_called_once_with(30.0, protect_name="chat")
+        container.start.assert_called_once()
+
+    async def test_memory_pressure_preserves_laya_and_evicts_only_other_chat(self):
+        manager = _manager()
+        manager._activity = {}
+        manager._read_gpu_memory_gb = Mock(return_value=(128, 120))
+        laya = Mock()
+        laya.name, laya.status = "laya", "running"
+        laya.labels = {CONTROLLER_LABEL: "1", ENGINE_LABEL: "laya"}
+        chat = Mock()
+        chat.name, chat.status = "old-chat", "running"
+        chat.labels = {CONTROLLER_LABEL: "1", ENGINE_LABEL: "vllm"}
+        manager.client.containers.list.return_value = [laya, chat]
+
+        manager._try_fit_new_model(100, protect_name="new-chat")
+
+        laya.stop.assert_not_called()
+        laya.update.assert_not_called()
+        chat.stop.assert_called_once_with(timeout=10)
+
+    async def test_laya_launch_keeps_the_existing_chat_engine(self):
+        manager = _manager()
+        manager.evict_other_backends = AsyncMock()
+        manager.stop_container = AsyncMock()
+
+        await _launch(manager)
+
+        manager.evict_other_backends.assert_not_awaited()
+        manager.stop_container.assert_not_awaited()
+
+    async def test_chat_engine_eviction_preserves_laya_but_stops_other_chat_engines(self):
+        for engine in ("vllm", "sglang", "llama.cpp"):
+            with self.subTest(engine=engine):
+                manager = _manager()
+                containers = [
+                    {"name": runtime, "engine": runtime, "managed": True,
+                     "status": "running"}
+                    for runtime in ("laya", "vllm", "sglang", "llama.cpp")
+                ]
+                manager.list_containers = AsyncMock(return_value=containers)
+                manager.stop_container = AsyncMock()
+                manager._activity = {item["name"]: 1 for item in containers}
+
+                result = await manager.evict_other_backends(protect=engine)
+
+                expected = {"vllm", "sglang", "llama.cpp"} - {engine}
+                self.assertEqual(set(result["stopped"]), expected)
+                self.assertEqual(
+                    {call.args[0] for call in manager.stop_container.await_args_list},
+                    expected,
+                )
+                self.assertIn("laya", manager._activity)
+
+    async def test_training_eviction_still_stops_laya(self):
+        manager = _manager()
+        manager.list_containers = AsyncMock(return_value=[{
+            "name": "laya", "engine": "laya", "managed": True,
+            "status": "running",
+        }])
+        manager.stop_container = AsyncMock()
+        manager._activity = {"laya": 1}
+
+        await manager.evict_other_backends(protect="unsloth")
+
+        manager.stop_container.assert_awaited_once_with("laya")
+
+    async def test_concurrent_laya_and_chat_members_reserve_distinct_host_ports(self):
+        manager = _manager()
+        manager._allocate_port = Manager._allocate_port.__get__(manager)
+        manager.settings.update(port_range_start=8100, port_range_end=8101)
+        manager.client.containers.list.return_value = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        ports = {}
+
+        async def create(**kwargs):
+            ports[kwargs["engine"]] = kwargs["port"]
+            if len(ports) == 2:
+                entered.set()
+            await release.wait()
+            return {"port": kwargs["port"]}
+
+        manager._create_container_with_port = create
+        tasks = [
+            asyncio.create_task(manager.create_container(
+                model=model, engine=engine,
+                cluster_member={"deployment_id": engine, "node_id": "local"},
+            ))
+            for model, engine in (("org/laya", "laya"), ("org/chat", "vllm"))
+        ]
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            self.assertEqual(set(ports.values()), {8100, 8101})
+            self.assertEqual(manager._host_port_reservations, {8100, 8101})
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+        self.assertEqual(manager._host_port_reservations, set())
 
 
 class LayaPreflightTests(unittest.IsolatedAsyncioTestCase):

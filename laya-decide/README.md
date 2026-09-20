@@ -29,6 +29,12 @@ with no special-case code in the router.
 
 ## Build and publish the image
 
+Laya can share a node with a vLLM, SGLang, or llama.cpp deployment. Starting
+either deployment preserves the other, and stopping Laya releases only its
+own container. Other inference runtimes still require exclusive node selection
+relative to each other. Leave enough memory for both models; sharing does not
+partition GPU memory or reduce the larger model's allocation automatically.
+
 SparkDeck launches managed runtimes from a container image. The default Laya
 image is `sparkdeck/laya-decide:latest`; build and publish it once, then point
 deployments at it (or override `image` per deployment for a private registry).

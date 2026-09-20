@@ -11,6 +11,16 @@ const split = {
 } as Deployment
 
 describe('deployment node occupancy', () => {
+  it('allows Laya to share live nodes in either launch order, without weakening other runtime exclusivity', () => {
+    const large = { ...split, runtime: 'vllm' as const, occupied_node_ids: ['n1'] }
+    const laya = { ...large, id: 'laya', alias: 'Laya Decide', runtime: 'laya' as const }
+    expect(occupiedNodeReasons([large], undefined, 'laya')).toEqual({})
+    expect(occupiedNodeReasons([laya], undefined, 'vllm')).toEqual({})
+    expect(occupiedNodeReasons([laya], undefined, 'laya')).toEqual({})
+    expect(occupiedNodeReasons([laya, large], undefined, 'sglang')).toEqual({ n1: 'Already used by deployment Production' })
+    expect(occupiedNodeReasons([{ ...large, runtime: 'llama.cpp' }], undefined, 'vllm')).toEqual({ n1: 'Already used by deployment Production' })
+    expect(occupiedNodeReasons([{ ...laya, occupied_node_ids: undefined }], undefined, 'vllm')).toEqual({})
+  })
   it('uses observed reservations rather than assigning degraded health to every node', () => {
     const offlinePeers = { ...split, status: 'degraded' as const, desired_state: 'stopped' as const, occupied_node_ids: ['n3', 'n4'] }
     expect(Object.keys(occupiedNodeReasons([offlinePeers]))).toEqual(['n3', 'n4'])

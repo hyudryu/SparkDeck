@@ -485,36 +485,36 @@ export function ModelsPage() {
   const [addInstanceLaunch, setAddInstanceLaunch] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [addInstanceError, setAddInstanceError] = useState<string>()
   useEffect(() => {
-    const trim = (ids: string[], exceptId?: string) => {
-      const occupied = occupiedNodeReasons(resource.data ?? [], exceptId)
+    const trim = (ids: string[], exceptId?: string, runtime?: RuntimeKind) => {
+      const occupied = occupiedNodeReasons(resource.data ?? [], exceptId, runtime)
       return ids.filter((id) => !occupied[id])
     }
     setStartSelection((current) => {
       if (!current) return current
-      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      const nodeIds = trim(current.nodeIds, current.deployment.id, current.deployment.runtime)
       return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
     })
     setRecipeDeployment((current) => {
       if (!current) return current
-      const nodeIds = trim(current.nodeIds)
+      const nodeIds = trim(current.nodeIds, undefined, current.recipe.engine)
       return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
     })
     setAddInstanceLaunch((current) => {
       if (!current) return current
-      const nodeIds = trim(current.nodeIds, current.deployment.id)
+      const nodeIds = trim(current.nodeIds, current.deployment.id, current.deployment.runtime)
       return nodeIds.length === current.nodeIds.length ? current : { ...current, nodeIds }
     })
     setAdditionalLaunch((current) => {
       if (!current) return current
-      const additionalIds = trim(current.additionalIds, current.deployment.id)
+      const additionalIds = trim(current.additionalIds, current.deployment.id, current.deployment.runtime)
       return additionalIds.length === current.additionalIds.length ? current : { ...current, additionalIds }
     })
   }, [resource.data])
 
-  const assertNodesUnoccupied = async (ids: string[], exceptId?: string) => {
+  const assertNodesUnoccupied = async (ids: string[], exceptId?: string, runtime?: RuntimeKind) => {
     const latest = await api.deployments.list()
     resource.setData(latest)
-    const occupied = occupiedNodeReasons(latest, exceptId)
+    const occupied = occupiedNodeReasons(latest, exceptId, runtime)
     const conflicts = [...new Set(ids.map((id) => occupied[id]).filter(Boolean))]
     if (conflicts.length) throw new Error(`${conflicts.join('; ')}. Stop that deployment or choose free nodes.`)
   }
@@ -1320,7 +1320,7 @@ export function ModelsPage() {
 
   const openGroupPicker = (deployment: Deployment, action: 'start' | 'stop') => {
     const groups = selectableGroups(deployment, action)
-    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
     const first = groups.find((group) => action === 'stop' || !groupNodeIds(deployment, group).some((id) => occupied[id] || groupNodeUnavailable(id)))
     setGroupError(undefined)
     setGroupSelection({ deployment, action, instance: first?.instance_id ?? 'all' })
@@ -1348,7 +1348,7 @@ export function ModelsPage() {
     try {
       if (action === 'start') await assertNodesUnoccupied((deployment.instances ?? [])
         .filter((group) => instance === 'all' || group.instance_id === instance)
-        .flatMap((group) => groupNodeIds(deployment, group)), deployment.id)
+        .flatMap((group) => groupNodeIds(deployment, group)), deployment.id, deployment.runtime)
       const updated = await api.deployments.action(deployment.id, action, undefined, undefined, false,
         instance === 'all' ? undefined : instance)
       setGroupSelection(undefined)
@@ -1490,7 +1490,7 @@ export function ModelsPage() {
       }
       const promote = canPromoteDiscovered(deployment)
       const adoptingDirect = promote && deployment.direct_start
-      await assertNodesUnoccupied(directLifecycle ? deployment.node_ids ?? [] : nodeIds, deployment.id)
+      await assertNodesUnoccupied(directLifecycle ? deployment.node_ids ?? [] : nodeIds, deployment.id, deployment.runtime)
       await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
       setActionNotice(directLifecycle
         ? `Starting ${deployment.alias} on its existing fixed target.`
@@ -1547,7 +1547,7 @@ export function ModelsPage() {
     const required = deploymentRequiredNodes(deployment)
     // Saved node preferences are the default selection even before weights
     // exist; the launch flow can prepare missing nodes via Virtual NAS.
-    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+    const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
     const selectableNodes = (nodes.data ?? []).filter((node) => isNodeSelectable(node) && !occupied[node.id])
     const selectableIds = selectableNodes.map((node) => node.id)
     const saved = (deployment.node_ids ?? []).filter((id) => selectableIds.includes(id))
@@ -1606,7 +1606,7 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setAdditionalError(undefined)
     try {
-      await assertNodesUnoccupied([...currentIds, ...additionalIds], deployment.id)
+      await assertNodesUnoccupied([...currentIds, ...additionalIds], deployment.id, deployment.runtime)
       await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
       setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
       setAdditionalLaunch(undefined)
@@ -1636,7 +1636,7 @@ export function ModelsPage() {
     const required = deployment.instance_node_count ?? 0
     const occupied = new Set(deployment.node_ids ?? [])
     const free = (nodes.data ?? []).filter(
-      (node) => isNodeSelectable(node) && !occupied.has(node.id) && !occupiedNodeReasons(resource.data ?? [], deployment.id)[node.id],
+      (node) => isNodeSelectable(node) && !occupied.has(node.id) && !occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)[node.id],
     )
     setAddInstanceError(undefined)
     // Preselect the first free nodes so Confirm is one click away; every
@@ -1653,7 +1653,7 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setAddInstanceError(undefined)
     try {
-      await assertNodesUnoccupied(nodeIds, deployment.id)
+      await assertNodesUnoccupied(nodeIds, deployment.id, deployment.runtime)
       await api.deployments.action(deployment.id, 'add_instance', nodeIds)
       setActionNotice(`Starting another deployment of ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}. Requests load-balance across every engine group.`)
       setAddInstanceLaunch(undefined)
@@ -1967,7 +1967,7 @@ export function ModelsPage() {
     setRecipeError(undefined)
     setRecipeTransferNotice(undefined)
     setRecipeSeedNodeId(undefined)
-    setRecipeDeployment({ recipe, nodeIds: nodeIds.filter((id) => !occupiedNodeReasons(resource.data ?? [])[id]) })
+    setRecipeDeployment({ recipe, nodeIds: nodeIds.filter((id) => !occupiedNodeReasons(resource.data ?? [], undefined, recipe.engine)[id]) })
   }
 
   const prepareRecipeWeights = async () => {
@@ -2049,7 +2049,7 @@ export function ModelsPage() {
     setActionNotice(undefined)
     setRecipeError(undefined)
     try {
-      await assertNodesUnoccupied(nodeIds)
+      await assertNodesUnoccupied(nodeIds, undefined, recipe.engine)
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
       setRecipeDeployment(undefined)
@@ -2385,7 +2385,7 @@ export function ModelsPage() {
 
       {recipeDeployment && (() => {
         const { recipe, nodeIds } = recipeDeployment
-        const occupied = occupiedNodeReasons(resource.data ?? [])
+        const occupied = occupiedNodeReasons(resource.data ?? [], undefined, recipe.engine)
         const localPath = isLocalModelPath(recipe.model)
         const preflightTargets = new Map((transferPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
         const weighted = localPath
@@ -2500,7 +2500,7 @@ export function ModelsPage() {
       {groupSelection && (() => {
         const { deployment, action, instance } = groupSelection
         const groups = selectableGroups(deployment, action)
-        const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id) : {}
+        const occupied = action === 'start' ? occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime) : {}
         const groupReason = (group: NonNullable<Deployment['instances']>[number]) => groupNodeIds(deployment, group).map((id) => (action === 'start' ? groupNodeUnavailable(id) : undefined) || occupied[id]).find(Boolean)
         const allBlocked = (deployment.instances ?? []).some((group) => groupReason(group))
         const selectedBlocked = instance === 'all' ? allBlocked : groups.some((group) => group.instance_id === instance && groupReason(group))
@@ -2526,7 +2526,7 @@ export function ModelsPage() {
 
       {startSelection && (() => {
         const { deployment, nodeIds } = startSelection
-        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
         const directLifecycle = isDiscoveredExternal(deployment) && !canPromoteDiscovered(deployment)
         const fixedTargets = deployment.selected_nodes?.length
           ? deployment.selected_nodes.map((node) => node.name)
@@ -2667,7 +2667,7 @@ export function ModelsPage() {
 
       {additionalLaunch && (() => {
         const { deployment, currentIds, additionalIds } = additionalLaunch
-        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
         const weighted = deploymentWeightedNodes(deployment)
         // Gate on the cache predicate only: cached nodes that are offline or
         // Docker-unready stay in allowedIds so the selector reports their
@@ -2708,7 +2708,7 @@ export function ModelsPage() {
 
       {addInstanceLaunch && (() => {
         const { deployment, nodeIds } = addInstanceLaunch
-        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id)
+        const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
         const required = deployment.instance_node_count ?? 0
         const occupiedIds = deployment.node_ids ?? []
         // Occupied nodes stay visible but disabled so the picker shows where
@@ -2762,7 +2762,7 @@ export function ModelsPage() {
                 <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
-              {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism.</p>}
+              {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism. Laya can share nodes with other models; available memory still limits what can run together.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select

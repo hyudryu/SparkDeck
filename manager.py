@@ -11766,9 +11766,12 @@ class Manager:
     def _variant_from_cmd(cmd: list) -> str:
         """Short quant/dtype descriptor from a vLLM or SGLang command line.
         Explicit "auto" values are dropped — they mean "no override" and
-        would otherwise split stats for identical configs."""
+        would otherwise split stats for identical configs. The KV cache
+        dtype is excluded on purpose: the engine often resolves it to the
+        same value on its own, so tagging it split otherwise-identical
+        deployments into differently named stats keys."""
         parts = []
-        for flag in ("--quantization", "--dtype", "--kv-cache-dtype"):
+        for flag in ("--quantization", "--dtype"):
             if flag in cmd:
                 i = cmd.index(flag)
                 if i + 1 < len(cmd) and cmd[i + 1].lower() != "auto":

@@ -4400,6 +4400,29 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["launch_settings"]["cache_cost_per_1m"], 0.1)
             self.assertEqual(saved["launch_settings"]["output_cost_per_1m"], 3.5)
 
+    def test_variant_tag_ignores_kv_cache_dtype(self) -> None:
+        # Two launches of the same model usually agree on the KV cache dtype
+        # (explicitly or via the engine default), so it must not split the
+        # stats key. Weight precision flags still tag the variant.
+        self.assertEqual(
+            Manager._variant_from_cmd(
+                ["--kv-cache-dtype", "fp8", "--max-model-len", "4096"],
+            ),
+            "",
+        )
+        self.assertEqual(
+            Manager._variant_from_cmd(
+                ["--dtype", "float16", "--kv-cache-dtype", "fp8"],
+            ),
+            "float16",
+        )
+        self.assertEqual(
+            Manager._variant_from_cmd(
+                ["--quantization", "awq", "--kv-cache-dtype", "auto"],
+            ),
+            "awq",
+        )
+
     def test_stopped_variant_edit_migrates_pricing_identity_and_rates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)
@@ -4425,7 +4448,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "engine": "vllm",
                     "deployment_mode": "single",
                     "node_ids": ["local"],
-                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "extra_args": ["--dtype", "nvfp4_ds_mla"],
                     "input_cost_per_1m": 1.25,
                     "cache_cost_per_1m": 0.1,
                     "output_cost_per_1m": 3.5,
@@ -4433,7 +4456,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             }]
 
             updated = instance.update_deployment_settings("deployment-1", {
-                "extra_args": ["--kv-cache-dtype", "fp8"],
+                "extra_args": ["--dtype", "fp8"],
             })
 
             self.assertEqual(updated["pricing_model_key"], "org/model [fp8]")
@@ -4485,7 +4508,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "engine": "vllm",
                     "deployment_mode": "single",
                     "node_ids": ["local"],
-                    "extra_args": ["--kv-cache-dtype", "nvfp4_ds_mla"],
+                    "extra_args": ["--dtype", "nvfp4_ds_mla"],
                     "input_cost_per_1m": 1.25,
                     "cache_cost_per_1m": 0.1,
                     "output_cost_per_1m": 3.5,
@@ -4498,7 +4521,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "pricing_model_key": "org/model [fp8]",
                 "launch_settings": {
                     "model": "org/model",
-                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                    "extra_args": ["--dtype", "fp8"],
                     "input_cost_per_1m": 2.0,
                     "cache_cost_per_1m": 0.2,
                     "output_cost_per_1m": 4.0,
@@ -4510,12 +4533,12 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 ValueError, "already owned.*different recorded rates",
             ):
                 instance.update_deployment_settings("moving", {
-                    "extra_args": ["--kv-cache-dtype", "fp8"],
+                    "extra_args": ["--dtype", "fp8"],
                 })
 
             self.assertEqual(moving["pricing_model_key"], "org/model [nvfp4_ds_mla]")
             self.assertEqual(moving["launch_settings"]["extra_args"], [
-                "--kv-cache-dtype", "nvfp4_ds_mla",
+                "--dtype", "nvfp4_ds_mla",
             ])
             self.assertEqual(
                 instance._usage_member_pricing("org/model [fp8]")["deployment_id"],

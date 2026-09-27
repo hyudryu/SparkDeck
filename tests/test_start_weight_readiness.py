@@ -69,6 +69,31 @@ class CachedStartSelectionTests(unittest.IsolatedAsyncioTestCase):
                     await self.select([cached("node-4", [B])], revision=revision, settings=settings)
         self.assertIsNone(await self.select([cached("node-4", [A, "main"], main=A)], revision="main"))
 
+    async def test_tensorfold_selection_never_injects_a_cached_revision(self):
+        """TensorFold has no --revision flag, so a start selection must not
+        hand Manager a cached revision: its relaunch guard rejects revisions
+        for engines that cannot accept them, which failed the launch."""
+        async def select_tensorfold(inventory):
+            return await self.service(inventory)._validate_start_selection(
+                {"runtime": "tensorfold", "model": {"repository": MODEL}},
+                [item["id"] for item in inventory], None,
+            )
+
+        # An unambiguous shared snapshot validates the weights but injects
+        # nothing, where vLLM would receive that snapshot as --revision.
+        self.assertIsNone(await select_tensorfold([cached("node-4", [A])]))
+        self.assertEqual(
+            await self.select([cached("node-4", [A])]), A,
+        )
+        # Ambiguous caches are a TensorFold launch constraint, not an error:
+        # the server resolves its own snapshot either way.
+        self.assertIsNone(await select_tensorfold(
+            [cached("node-4", [A, B]), cached("node-3", [B])],
+        ))
+        # Incomplete weights are still rejected.
+        with self.assertRaisesRegex(ValueError, "not available.*node-4"):
+            await select_tensorfold([cached("node-4", [A], partial=True)])
+
 
 class CachedRevisionRelaunchTests(unittest.IsolatedAsyncioTestCase):
     def manager(self):

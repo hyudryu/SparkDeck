@@ -4243,6 +4243,12 @@ class SparkDeckService:
             (cached[node_id].get("revision_refs") or {}).get("main")
             for node_id in node_ids
         ]
+        if deployment.get("runtime") == RuntimeKind.TENSORFOLD.value:
+            # TensorFold has no --revision flag: the server resolves its own
+            # snapshot. Weights were validated above, but no cached revision
+            # may be injected into the relaunch — Manager rejects revisions
+            # for engines that cannot accept them.
+            return None
         if (
             main_refs and main_refs[0] in common
             and all(value == main_refs[0] for value in main_refs)

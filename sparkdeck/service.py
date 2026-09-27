@@ -3400,10 +3400,16 @@ class SparkDeckService:
                 artifact=artifact,
                 quantization=quantization,
             )
-            if runtime is RuntimeKind.TENSORFOLD and identity.revision:
+            if (
+                runtime is RuntimeKind.TENSORFOLD
+                and kind is DeploymentKind.MANAGED
+                and identity.revision
+            ):
                 # TensorFold resolves its own checkpoint snapshot and has no
                 # --revision flag; persisting a pin it cannot honour would
-                # make the deployment claim a revision it never loads.
+                # make the deployment claim a revision it never loads. An
+                # external endpoint launches nothing here, so its metadata
+                # stays untouched.
                 raise ValueError(
                     "TensorFold deployments cannot pin a model revision"
                 )

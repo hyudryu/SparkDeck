@@ -1269,7 +1269,9 @@ export function ModelsPage() {
           instances: form.deployment_mode === 'grouped_sharded' ? settings.instances ?? null : null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,
-          quantization: settings.quantization ?? null,
+          quantization: form.runtime === 'tensorfold' && form.managed
+            ? null
+            : settings.quantization ?? null,
           artifact: settings.artifact ?? null,
           extra_args: settings.extra_args ?? [],
           environment: settings.environment,
@@ -2788,8 +2790,7 @@ export function ModelsPage() {
               {form.runtime === 'tensorfold' && <p className="field-note">TensorFold is an OpenAI-compatible serving engine with exact speculative decoding for NVIDIA GPUs. Single and replicated layouts are supported; it has no tensor parallelism. Weights resolve from the cluster's Hugging Face cache, and the container image must provide the <code>tensorfold</code> CLI as its entrypoint.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {form.managed && form.runtime === 'tensorfold' && <label className="field"><span>TensorFold image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/tensorfold:latest" /><small>The container image pulled on every selected node. TensorFold has no upstream image; build {`sparkdeck/tensorfold:latest`} from <code>tensorfold/Dockerfile</code> or point this at a registry tag whose entrypoint is the <code>tensorfold</code> CLI.</small></label>}
-              {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
-                <select
+              {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>                <select
                   value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
                   onChange={(event) => {
                     const modelId = event.target.value
@@ -2822,7 +2823,7 @@ export function ModelsPage() {
                   ))}
                 </select>
                 <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
-              </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
+              </label> : form.runtime === 'tensorfold' && form.managed ? null : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
               {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) && !artifactManualEntry ? <label className="field"><span>GGUF artifact</span>
                 <select
                   required

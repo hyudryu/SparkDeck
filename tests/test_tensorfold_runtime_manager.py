@@ -275,6 +275,32 @@ class TensorfoldPreflightTests(unittest.IsolatedAsyncioTestCase):
                 "node_ids": ["local", "spark-2"],
             })
 
+    async def test_preflight_rejects_nodes_without_reported_gpus(self):
+        """A GPU-less node must fail before any replica evicts healthy
+        chat backends, using the same telemetry the launch would rely on."""
+        manager = Manager.__new__(Manager)
+        manager._reject_hf_cli_credentials = Mock()
+        manager._validate_runtime_file_mount_nodes = Mock()
+
+        async def cluster_nodes():
+            return [
+                {"id": "spark-2", "name": "Spark 2", "online": True,
+                 "docker_ready": True,
+                 "stats": {"gpus": [{"name": "HGX", "memory_total_gb": 96}]}},
+                {"id": "cpu-node", "name": "CPU Node", "online": True,
+                 "docker_ready": True, "stats": {"gpus": []}},
+            ]
+
+        manager.cluster_nodes = cluster_nodes
+
+        with self.assertRaisesRegex(ValueError, "none is reported on: CPU Node"):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "tensorfold",
+                "deployment_mode": "replicated",
+                "node_ids": ["spark-2", "cpu-node"],
+            })
+
     async def test_preflight_accepts_a_single_node_tensorfold_deployment(self):
         manager = Manager.__new__(Manager)
         manager._reject_hf_cli_credentials = Mock()
@@ -351,6 +377,39 @@ class FakeClusterManager:
 
 
 class TensorfoldClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revision_pin_is_rejected_at_creation(self):
+        """TensorFold resolves its own snapshot, so a persisted revision pin
+        would claim provenance the server never loads."""
+        import tempfile
+        from pathlib import Path
+
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        service = SparkDeckService(manager, Path(temp.name))
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "cannot pin a model revision",
+            ):
+                await service.create_deployment({
+                    "model": "org/model",
+                    "alias": "tf-pinned",
+                    "runtime": "tensorfold",
+                    "revision": "a" * 40,
+                    "node_ids": ["spark-2"],
+                    "deployment_mode": "single",
+                })
+            # The rejected record must not be persisted under its alias.
+            self.assertIsNone(
+                service.store.deployment("tf-pinned", include_private=True),
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
     async def test_cached_revision_is_not_injected_for_tensorfold(self):
         """A shared cached snapshot must not add the unsupported --revision
         flag to a TensorFold launch: TensorFold resolves checkpoints itself

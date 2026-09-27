@@ -3400,6 +3400,13 @@ class SparkDeckService:
                 artifact=artifact,
                 quantization=quantization,
             )
+            if runtime is RuntimeKind.TENSORFOLD and identity.revision:
+                # TensorFold resolves its own checkpoint snapshot and has no
+                # --revision flag; persisting a pin it cannot honour would
+                # make the deployment claim a revision it never loads.
+                raise ValueError(
+                    "TensorFold deployments cannot pin a model revision"
+                )
             deployment = Deployment(
                 id=deployment_id, alias=alias, runtime=runtime, kind=kind,
                 model=identity, settings=self._local_configuration(settings),
@@ -7286,6 +7293,7 @@ class SparkDeckService:
             deployment.get("kind") != DeploymentKind.MANAGED.value
             or deployment.get("runtime") not in {
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+                RuntimeKind.TENSORFOLD.value,
             }
         ):
             raise error_type(

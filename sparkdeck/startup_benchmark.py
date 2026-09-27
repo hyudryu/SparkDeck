@@ -319,7 +319,14 @@ class StartupBenchmarkMonitor:
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
             seen_key=self._seen_key(target.fingerprint),
-            manager_requests_expected=int(bool(target.cluster) or deployment["runtime"] in {"vllm", "sglang"}),
+            # TensorFold direct launches route through Manager like vLLM and
+            # SGLang, so their synthetic probe is an expected Manager request
+            # rather than contamination.
+            manager_requests_expected=int(
+                bool(target.cluster) or deployment["runtime"] in {
+                    "vllm", "sglang", "tensorfold",
+                }
+            ),
         )
         token = self.service._community_observation.set(observation)
         stream = None

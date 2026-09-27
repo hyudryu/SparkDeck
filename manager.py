@@ -7509,6 +7509,27 @@ class Manager:
         model = body.get("model") or ""
         if not model:
             raise ValueError("model is required")
+        if engine == "tensorfold":
+            # TensorFold cannot start without an NVIDIA GPU, so a node that
+            # explicitly reports none must fail before any replica evicts
+            # healthy chat backends. Nodes without GPU telemetry are not
+            # judged here; the per-node launcher check remains authoritative.
+            gpu_short = []
+            for nid in node_ids:
+                gpus = (available[nid].get("stats") or {}).get("gpus")
+                if gpus is None:
+                    continue
+                usable = [
+                    gpu for gpu in gpus
+                    if not (isinstance(gpu, dict) and gpu.get("error"))
+                ]
+                if not usable:
+                    gpu_short.append(available[nid].get("name", nid))
+            if gpu_short:
+                raise ValueError(
+                    "TensorFold requires an NVIDIA GPU, and none is reported "
+                    "on: " + ", ".join(gpu_short)
+                )
         vllm_parallel_layout: tuple[int, int] | None = None
         if mode in {"single", "sharded"} and engine == "vllm":
             requested_args = list(body.get("extra_args") or [])

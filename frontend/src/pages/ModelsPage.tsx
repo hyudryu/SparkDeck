@@ -1235,7 +1235,7 @@ export function ModelsPage() {
               : undefined)
           : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
-        environment: form.managed && form.runtime === 'vllm'
+        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold')
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
@@ -2785,6 +2785,7 @@ export function ModelsPage() {
               {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism. Laya can share nodes with other models; available memory still limits what can run together.</p>}
               {form.runtime === 'tensorfold' && <p className="field-note">TensorFold is an OpenAI-compatible serving engine with exact speculative decoding for NVIDIA GPUs. Single and replicated layouts are supported; it has no tensor parallelism. Weights resolve from the cluster's Hugging Face cache, and the container image must provide the <code>tensorfold</code> CLI as its entrypoint.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
+              {form.managed && form.runtime === 'tensorfold' && <label className="field"><span>TensorFold image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/tensorfold:latest" /><small>The container image pulled on every selected node. TensorFold has no upstream image; build {`sparkdeck/tensorfold:latest`} from <code>tensorfold/Dockerfile</code> or point this at a registry tag whose entrypoint is the <code>tensorfold</code> CLI.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
                 <select
                   value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
@@ -2900,7 +2901,7 @@ export function ModelsPage() {
                 <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
-                  {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
+                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
                   {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>

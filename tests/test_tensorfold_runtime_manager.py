@@ -18,6 +18,7 @@ from manager import (
     Manager, MODE_LABEL, NNODES_LABEL, NODE_LABEL, RANK_LABEL,
     _SUPPORTED_ENGINES, _TENSORFOLD_SERVE_PORT,
 )
+from cluster import TENSORFOLD_CAPABILITY
 from sparkdeck.runtime_environment import normalize_runtime_environment
 from sparkdeck.service import SparkDeckService
 
@@ -286,9 +287,12 @@ class TensorfoldPreflightTests(unittest.IsolatedAsyncioTestCase):
             return [
                 {"id": "spark-2", "name": "Spark 2", "online": True,
                  "docker_ready": True,
+                 "capabilities": [TENSORFOLD_CAPABILITY],
                  "stats": {"gpus": [{"name": "HGX", "memory_total_gb": 96}]}},
                 {"id": "cpu-node", "name": "CPU Node", "online": True,
-                 "docker_ready": True, "stats": {"gpus": []}},
+                 "docker_ready": True,
+                 "capabilities": [TENSORFOLD_CAPABILITY],
+                 "stats": {"gpus": []}},
             ]
 
         manager.cluster_nodes = cluster_nodes
@@ -301,6 +305,37 @@ class TensorfoldPreflightTests(unittest.IsolatedAsyncioTestCase):
                 "node_ids": ["spark-2", "cpu-node"],
             })
 
+    async def test_preflight_rejects_agents_without_tensorfold_support(self):
+        """Older agents reject the unknown engine at container creation, so a
+        mixed-version selection must fail before any replica launches."""
+        manager = Manager.__new__(Manager)
+        manager._reject_hf_cli_credentials = Mock()
+        manager._validate_runtime_file_mount_nodes = Mock()
+
+        async def cluster_nodes():
+            return [
+                {"id": "local", "name": "Coordinator", "online": True,
+                 "docker_ready": True,
+                 "capabilities": [TENSORFOLD_CAPABILITY],
+                 "stats": {"gpus": [{"name": "HGX", "memory_total_gb": 96}]}},
+                {"id": "old-node", "name": "Old Node", "online": True,
+                 "docker_ready": True,
+                 "capabilities": ["runtime-file-mounts-v1"],
+                 "stats": {"gpus": [{"name": "HGX", "memory_total_gb": 96}]}},
+            ]
+
+        manager.cluster_nodes = cluster_nodes
+
+        with self.assertRaisesRegex(
+            ValueError, "requires updated SparkDeck agents on: Old Node",
+        ):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "tensorfold",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+            })
+
     async def test_preflight_accepts_a_single_node_tensorfold_deployment(self):
         manager = Manager.__new__(Manager)
         manager._reject_hf_cli_credentials = Mock()
@@ -310,6 +345,7 @@ class TensorfoldPreflightTests(unittest.IsolatedAsyncioTestCase):
             return [{
                 "id": "spark-2", "name": "Spark 2", "online": True,
                 "docker_ready": True,
+                "capabilities": [TENSORFOLD_CAPABILITY],
             }]
 
         manager.cluster_nodes = cluster_nodes

@@ -1261,7 +1261,9 @@ export function ModelsPage() {
         // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
           alias: form.alias,
-          image: form.runtime === 'vllm' ? settings.image ?? null : undefined,
+          image: form.runtime === 'vllm' || form.runtime === 'tensorfold'
+            ? settings.image ?? null
+            : undefined,
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
           instances: form.deployment_mode === 'grouped_sharded' ? settings.instances ?? null : null,

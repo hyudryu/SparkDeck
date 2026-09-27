@@ -36,6 +36,7 @@ from cluster import (
     AgentCredentials,
     NodeAgentResponseError,
     NodeRegistry,
+    TENSORFOLD_CAPABILITY,
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.stream_cleanup import close_async_stream
@@ -1328,6 +1329,7 @@ class Manager:
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
+                TENSORFOLD_CAPABILITY,
                 "patched-images-v1",
                 EMBEDDINGS_CAPABILITY,
             ],
@@ -7510,6 +7512,22 @@ class Manager:
         if not model:
             raise ValueError("model is required")
         if engine == "tensorfold":
+            # Agents older than the TensorFold runtime reject the unknown
+            # engine at container creation, which a concurrent replicated
+            # launch would only surface after updated nodes have evicted
+            # their healthy backends.
+            unsupported = [
+                available.get(nid, {}).get("name") or nid for nid in node_ids
+                if nid != LOCAL_NODE_ID and TENSORFOLD_CAPABILITY
+                not in (available.get(nid, {}).get("capabilities") or [])
+            ]
+            if unsupported:
+                raise ValueError(
+                    "TensorFold requires updated SparkDeck agents on: "
+                    + ", ".join(unsupported)
+                    + ". Update these nodes in Settings before starting this "
+                    "deployment."
+                )
             # TensorFold cannot start without an NVIDIA GPU, so a node that
             # explicitly reports none must fail before any replica evicts
             # healthy chat backends. Nodes without GPU telemetry are not

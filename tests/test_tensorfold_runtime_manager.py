@@ -54,6 +54,13 @@ async def _launch(manager, **overrides):
 
 
 class TensorfoldContainerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The launcher refuses to run without an NVIDIA driver, so the default
+        # fixture pretends one is present; individual tests override it.
+        driver = patch("manager._node_has_nvidia_driver", return_value=True)
+        driver.start()
+        self.addCleanup(driver.stop)
+
     async def test_tensorfold_container_runs_the_serve_command(self):
         manager = _manager()
 
@@ -115,19 +122,21 @@ class TensorfoldContainerTests(unittest.IsolatedAsyncioTestCase):
         options = manager._run_managed_container.call_args.args[0]
         self.assertNotIn("environment", options)
 
-    async def test_gpu_request_follows_driver_availability(self):
+    async def test_gpu_request_is_always_attached(self):
         manager = _manager()
         with patch("manager._node_has_nvidia_driver", return_value=True):
             await _launch(manager)
         self.assertIn("device_requests", manager._run_managed_container.call_args.args[0])
 
+    async def test_nodes_without_an_nvidia_driver_are_rejected_before_eviction(self):
         manager = _manager()
-        manager.evict_other_backends = AsyncMock()
         with patch("manager._node_has_nvidia_driver", return_value=False):
-            await _launch(manager)
-        # A node without an NVIDIA driver must not receive a request Docker
-        # would reject; TensorFold's CUDA backend could not start anyway.
-        self.assertNotIn("device_requests", manager._run_managed_container.call_args.args[0])
+            with self.assertRaisesRegex(ValueError, "requires an NVIDIA GPU"):
+                await _launch(manager)
+        # Healthy chat backends must not be evicted for a launch that cannot
+        # start, and no container may be created.
+        manager.evict_other_backends.assert_not_awaited()
+        manager._run_managed_container.assert_not_called()
 
     async def test_extra_args_extend_the_served_configuration(self):
         manager = _manager()
@@ -321,6 +330,132 @@ class TensorfoldLaunchControlsTests(unittest.TestCase):
             {"context_window": 8192, "thinking_mode": "default"},
         )
         self.assertEqual(args, ["--context", "8192"])
+
+
+class FakeClusterManager:
+    """The slice of Manager the cluster-record launch path needs."""
+
+    def __init__(self):
+        import httpx
+
+        self.http = httpx.AsyncClient()
+        self.deployments = []
+        self.selected_cluster_nodes = AsyncMock(
+            return_value=[{"id": "spark-2", "name": "Spark 2"}],
+        )
+        self.create_deployment = AsyncMock(return_value={
+            "id": "cluster-tf", "status": "starting", "api_port": 8123,
+            "members": [], "model_source": "public_repository",
+        })
+        self.public_target_node = Mock(side_effect=lambda node: node)
+
+
+class TensorfoldClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_revision_is_not_injected_for_tensorfold(self):
+        """A shared cached snapshot must not add the unsupported --revision
+        flag to a TensorFold launch: TensorFold resolves checkpoints itself
+        and fails on unknown flags."""
+        import tempfile
+        from pathlib import Path
+
+        from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+        from sparkdeck.service import SparkDeckService
+
+        # The store keeps a SQLite handle open, so the directory must be
+        # cleaned up only after the service is closed (notably on Windows).
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        service = SparkDeckService(manager, Path(temp.name))
+        service._validate_start_selection = AsyncMock(return_value="b" * 40)
+        service._link_cluster_record = Mock()
+        record = Deployment(
+            id="record-tf", alias="tf-model",
+            runtime=RuntimeKind.TENSORFOLD, kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model"), settings={},
+        )
+
+        try:
+            await service._launch_cluster_record(
+                record, {}, "org/model", "", ["spark-2"],
+            )
+
+            service._validate_start_selection.assert_not_awaited()
+            body = manager.create_deployment.await_args.args[0]
+            self.assertEqual(body["engine"], "tensorfold")
+            self.assertNotIn("--revision", body["extra_args"])
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+
+class TensorfoldProxyTests(unittest.IsolatedAsyncioTestCase):
+    """Managed TensorFold traffic must route through Manager's member-aware path."""
+
+    async def test_managed_tensorfold_uses_manager_member_routing(self):
+        import tempfile
+        from pathlib import Path
+
+        import httpx
+
+        from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+        from sparkdeck.service import SparkDeckService
+
+        class FakeProxyManager:
+            def __init__(self, transport):
+                self.http = httpx.AsyncClient(transport=transport)
+                self.deployments = []
+                self.list_containers = AsyncMock(return_value=[])
+                self._prompt_waiting_requests = {}
+                self.proxy_cluster_inference = AsyncMock()
+
+            def source_ip_routing_rule(self, caller_ip, requested_model):
+                return None
+
+            @staticmethod
+            async def _await_or_cancel(coro, cancel):
+                return await coro
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeProxyManager(httpx.MockTransport(
+                lambda request: httpx.Response(200, json={})
+            ))
+            manager.proxy_cluster_inference.return_value = {
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
+                "model": "org/model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+            }
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="record-tf", alias="tf-model",
+                runtime=RuntimeKind.TENSORFOLD, kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/model"),
+                container_name="tensorfold-org-model-8123", status="running",
+                settings={"manager_deployment_id": "cluster-tf"},
+            ))
+            service.store.update_managed_routing(
+                "record-tf", {"manager_deployment_id": "cluster-tf"},
+                "tensorfold-org-model-8123", "http://127.0.0.1:8123",
+            )
+
+            try:
+                await service.proxy(
+                    {"model": "tf-model", "messages": [{"role": "user", "content": "hi"}]},
+                    "chat/completions",
+                )
+
+                manager.proxy_cluster_inference.assert_awaited_once()
+                args = manager.proxy_cluster_inference.await_args.args
+                self.assertEqual(args[0], "cluster-tf")
+                self.assertEqual(args[1], "org/model")
+            finally:
+                await manager.http.aclose()
+                await service.close()
 
 
 class TensorfoldLaunchSettingsTests(unittest.TestCase):

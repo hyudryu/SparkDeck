@@ -16456,6 +16456,15 @@ class Manager:
         """
         if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
             raise ValueError("TensorFold deployments cannot run sharded")
+        # TensorFold's CUDA backend cannot start without an NVIDIA driver, and
+        # its MLX backend needs Apple Silicon, which a Linux container never
+        # has. Reject here — before evicting healthy backends — rather than
+        # leaving an unusable deployment crash-looping on a CPU-only node.
+        if not _node_has_nvidia_driver():
+            raise ValueError(
+                "TensorFold requires an NVIDIA GPU, and no NVIDIA driver is "
+                "available on this node"
+            )
         image = image or DEFAULT_TENSORFOLD_IMAGE
         # TensorFold takes the node's GPUs for its CUDA backend, so other
         # chat engines must be evicted before the CUDA context is created.
@@ -16531,16 +16540,14 @@ class Manager:
             container_environment.update(self._container_hf_environment(hf_token))
             if container_environment:
                 run_options["environment"] = container_environment
-            # TensorFold's CUDA backend needs the GPUs; constructing a
-            # DeviceRequest always succeeds, so the request is gated on the
-            # NVIDIA driver being present rather than failing inside Docker.
-            if _node_has_nvidia_driver():
-                try:
-                    run_options["device_requests"] = [
-                        docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
-                    ]
-                except Exception:
-                    pass
+            # The driver check above guarantees the CUDA backend can start, so
+            # the container always receives the node's GPUs.
+            try:
+                run_options["device_requests"] = [
+                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                ]
+            except Exception:
+                pass
             container = self._run_managed_container(run_options)
             container.reload()
             self._cluster_launch_update(

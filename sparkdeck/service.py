@@ -3838,13 +3838,16 @@ class SparkDeckService:
         )
         if mode == "single" and len(selected_ids) != 1:
             raise ValueError("single deployment requires exactly one node")
-        if mode == "sharded" and record.runtime is RuntimeKind.LLAMA_CPP:
+        if mode == "sharded" and record.runtime in (
+            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+        ):
             raise ValueError(
-                "llama.cpp deployments support single and replicated layouts, not sharded"
+                f"{record.runtime.value} deployments support single and "
+                "replicated layouts, not sharded"
             )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
-        if record.runtime is not RuntimeKind.LLAMA_CPP:
+        if record.runtime not in (RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD):
             # Llama.cpp readiness is per-file inside the resolved snapshot and
             # is verified by each node when its container is created; the
             # whole-repository inventory check would reject selective GGUF
@@ -7687,7 +7690,7 @@ class SparkDeckService:
         if (deployment.get("settings") or {}).get("manager_deployment_id") and (
             deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
-                RuntimeKind.LAYA.value,
+                RuntimeKind.LAYA.value, RuntimeKind.TENSORFOLD.value,
             )
             and deployment.get("kind") == DeploymentKind.MANAGED.value
         ):
@@ -7695,7 +7698,8 @@ class SparkDeckService:
             # Laya belongs here for the same reason vLLM and SGLang do: a
             # managed record's stored endpoint is the controller's own port
             # mapping, so a deployment placed on a remote node is only
-            # reachable through Manager's member-aware routing.
+            # reachable through Manager's member-aware routing. TensorFold
+            # members carry the same stored-endpoint shape.
             return await factory(deployment)
         return await self._run_service_prompt_gate(
             ("deployment", deployment["id"]), factory, cancel=cancel,
@@ -7744,7 +7748,7 @@ class SparkDeckService:
             )
             and deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
-                RuntimeKind.LAYA.value,
+                RuntimeKind.LAYA.value, RuntimeKind.TENSORFOLD.value,
             )
         ):
             route_kwargs = (

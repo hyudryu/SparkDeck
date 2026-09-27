@@ -30,7 +30,7 @@ const initialForm: CreateDeploymentInput = {
 }
 
 const isRuntimeKind = (value: unknown): value is RuntimeKind =>
-  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya'
+  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya' || value === 'tensorfold'
 
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
 const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
@@ -69,11 +69,13 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
     runtime,
     settings: runtime === 'llama.cpp'
       ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-      : {
-        context_length: contextLength,
-        tensor_parallel_size: 1,
-        image: runtime === 'vllm' ? vllmImage : undefined,
-      },
+      : runtime === 'tensorfold'
+        ? { context_length: contextLength }
+        : {
+          context_length: contextLength,
+          tensor_parallel_size: 1,
+          image: runtime === 'vllm' ? vllmImage : undefined,
+        },
     node_ids: [localNodeId],
   }
 }
@@ -689,7 +691,7 @@ export function ModelsPage() {
         // arguments.
         deployment_mode: ggufArtifact
           ? 'single'
-          : sharded && linkedRuntime !== 'laya' ? 'sharded' : current.deployment_mode,
+          : sharded && linkedRuntime !== 'laya' && linkedRuntime !== 'tensorfold' ? 'sharded' : current.deployment_mode,
         settings: ggufArtifact
           ? {
             context_length: current.settings.context_length,
@@ -705,10 +707,18 @@ export function ModelsPage() {
               served_model: current.settings.served_model,
               image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
-            : {
-              ...current.settings,
-              quantization: quantization || current.settings.quantization,
-            },
+            : linkedRuntime === 'tensorfold'
+              ? {
+                // A linked TensorFold runtime keeps the form's initial vLLM
+                // image out of the launch; Manager applies the runtime's own
+                // default image unless the operator set one deliberately.
+                context_length: current.settings.context_length,
+                image: current.runtime === 'tensorfold' ? current.settings.image : undefined,
+              }
+              : {
+                ...current.settings,
+                quantization: quantization || current.settings.quantization,
+              },
       }
     })
     // A deep link names repository artifacts, so record them as
@@ -791,12 +801,14 @@ export function ModelsPage() {
             quantization: current.settings.quantization,
             artifact: current.settings.artifact,
           }
-          : {
-            context_length: contextLength,
-            tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
-            quantization: current.settings.quantization,
-            image: runtime === 'vllm' ? current.settings.image ?? defaults.settings.image : undefined,
-          },
+          : runtime === 'tensorfold'
+            ? { context_length: contextLength }
+            : {
+              context_length: contextLength,
+              tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
+              quantization: current.settings.quantization,
+              image: runtime === 'vllm' ? current.settings.image ?? defaults.settings.image : undefined,
+            },
       }
     })
   }, [appSettings.data, localNodeId])
@@ -1223,7 +1235,7 @@ export function ModelsPage() {
               : undefined)
           : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
-        environment: form.managed && form.runtime === 'vllm'
+        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold')
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
@@ -1234,7 +1246,7 @@ export function ModelsPage() {
         throw new Error('Each runtime file mount needs a host file path and a container file path.')
       }
       const utilization = Number(gpuMemoryUtil)
-      if (form.managed && form.runtime !== 'llama.cpp' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
+      if (form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
         settings.gpu_memory_utilization = utilization
       }
       if (form.deployment_mode === 'grouped_sharded') {
@@ -1249,13 +1261,17 @@ export function ModelsPage() {
         // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
           alias: form.alias,
-          image: form.runtime === 'vllm' ? settings.image ?? null : undefined,
+          image: form.runtime === 'vllm' || form.runtime === 'tensorfold'
+            ? settings.image ?? null
+            : undefined,
           context_length: settings.context_length ?? null,
           tensor_parallel_size: settings.tensor_parallel_size ?? null,
           instances: form.deployment_mode === 'grouped_sharded' ? settings.instances ?? null : null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,
-          quantization: settings.quantization ?? null,
+          quantization: form.runtime === 'tensorfold' && form.managed
+            ? null
+            : settings.quantization ?? null,
           artifact: settings.artifact ?? null,
           extra_args: settings.extra_args ?? [],
           environment: settings.environment,
@@ -2104,6 +2120,7 @@ export function ModelsPage() {
       // save a form that cannot launch.
       const sharded = runtime !== 'llama.cpp'
         && runtime !== 'laya'
+        && runtime !== 'tensorfold'
         && current.deployment_mode === 'sharded'
         && (nodeIds?.length ?? 0) > 1
       const deploymentMode = sharded ? 'sharded' : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
@@ -2133,7 +2150,14 @@ export function ModelsPage() {
               // applies unless the operator set one for Laya deliberately.
               image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
-            : {
+            : runtime === 'tensorfold'
+              ? {
+                // TensorFold is single-engine: no tensor parallelism. The
+                // context cap maps to its --context flag at launch.
+                context_length: current.settings.context_length,
+                image: current.runtime === 'tensorfold' ? current.settings.image : undefined,
+              }
+              : {
               context_length: contextLength,
               tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
               quantization: current.settings.quantization,
@@ -2759,13 +2783,14 @@ export function ModelsPage() {
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option><option value="tensorfold">TensorFold</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism. Laya can share nodes with other models; available memory still limits what can run together.</p>}
+              {form.runtime === 'tensorfold' && <p className="field-note">TensorFold is an OpenAI-compatible serving engine with exact speculative decoding for NVIDIA GPUs. Single and replicated layouts are supported; it has no tensor parallelism. Weights resolve from the cluster's Hugging Face cache, and the container image must provide the <code>tensorfold</code> CLI as its entrypoint.</p>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
-              {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>
-                <select
+              {form.managed && form.runtime === 'tensorfold' && <label className="field"><span>TensorFold image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/tensorfold:latest" /><small>The container image pulled on every selected node. TensorFold has no upstream image; build {`sparkdeck/tensorfold:latest`} from <code>tensorfold/Dockerfile</code> or point this at a registry tag whose entrypoint is the <code>tensorfold</code> CLI.</small></label>}
+              {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>                <select
                   value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
                   onChange={(event) => {
                     const modelId = event.target.value
@@ -2798,7 +2823,7 @@ export function ModelsPage() {
                   ))}
                 </select>
                 <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
-              </label> : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
+              </label> : form.runtime === 'tensorfold' && form.managed ? null : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
               {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) && !artifactManualEntry ? <label className="field"><span>GGUF artifact</span>
                 <select
                   required
@@ -2852,7 +2877,7 @@ export function ModelsPage() {
                 help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
               {form.managed && form.deployment_mode === 'grouped_sharded' && <label className="field"><span>Instances (independent engine groups)</span><input type="number" min="1" value={form.settings.instances ?? 1} onChange={(event) => setForm({ ...form, settings: { ...form.settings, instances: Math.max(1, Number(event.target.value) || 1) } })} />{(form.settings.tensor_parallel_size ?? 1) * (form.settings.instances ?? 1) !== (form.node_ids?.length ?? 0) && <small className="form-error" role="status">{form.node_ids?.length ?? 0} selected nodes cannot split into {form.settings.instances ?? 1} TP{form.settings.tensor_parallel_size ?? 1} group(s); pick {form.settings.instances ?? 1} × {form.settings.tensor_parallel_size ?? 1} nodes or adjust the counts.</small>}<small>Each instance runs on {form.settings.tensor_parallel_size ?? 2} of the selected nodes; the selection must equal instances × tensor parallel size.</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
@@ -2861,7 +2886,7 @@ export function ModelsPage() {
                 }} /></label>
                 {form.runtime === 'llama.cpp' ? (
                   <label className="field"><span>Parallel slots</span><input type="number" min="1" value={form.settings.parallel_slots} onChange={(event) => setForm({ ...form, settings: { ...form.settings, parallel_slots: Number(event.target.value) } })} /></label>
-                ) : (
+                ) : form.runtime === 'tensorfold' ? null : (
                   <label className="field"><span>Tensor parallel size</span><input type="number" min="1" readOnly={form.deployment_mode === 'sharded'} value={form.settings.tensor_parallel_size} onChange={(event) => setForm((current) => {
                     const tensor = Number(event.target.value)
                     return { ...current, settings: {
@@ -2878,8 +2903,8 @@ export function ModelsPage() {
               {form.managed && <>
                 <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
                 {launchArgsOpen && <div className="args-editor">
-                  {form.runtime !== 'llama.cpp' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
-                  {form.runtime === 'vllm' && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder="HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to every vLLM rank; do not enter secrets.</small></label>}
+                  {form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
+                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
                   {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>

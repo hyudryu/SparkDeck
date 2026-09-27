@@ -24,6 +24,10 @@ LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 2
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
 AGENT_FABRIC_PORT = 7878
+# Advertised by agents whose Manager can launch the TensorFold engine. Older
+# agents reject the unknown engine at container creation, so a mixed-version
+# cluster must be caught in preflight rather than mid-launch.
+TENSORFOLD_CAPABILITY = "tensorfold-launch-v1"
 
 
 class NodeAgentResponseError(RuntimeError):

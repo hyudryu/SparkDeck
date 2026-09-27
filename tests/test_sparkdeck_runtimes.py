@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, Mock
 
 from sparkdeck.runtimes import (
     LAYA_SERVE_PORT, LayaAdapter, LlamaCppAdapter, RuntimeRegistry, SglangAdapter,
-    VllmAdapter, launch_managed_container, normalize_openai_base_url,
+    TensorfoldAdapter, TENSORFOLD_SERVE_PORT, VllmAdapter,
+    launch_managed_container, normalize_openai_base_url,
 )
 
 
@@ -14,7 +15,7 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_registry_supports_every_shipped_runtime(self):
         self.assertEqual(
             set(RuntimeRegistry().kinds),
-            {"vllm", "llama.cpp", "sglang", "laya"},
+            {"vllm", "llama.cpp", "sglang", "laya", "tensorfold"},
         )
 
     def test_vllm_launch_settings(self):
@@ -342,3 +343,49 @@ class ManagedLaunchBridgeTests(unittest.IsolatedAsyncioTestCase):
         options = manager._run_managed_container.call_args.args[0]
         self.assertEqual(options["labels"]["io.sparkdeck.managed"], "1")
         self.assertEqual(options["labels"]["io.sparkdeck.deployment"], "dep-1")
+
+
+class TensorfoldAdapterTests(unittest.TestCase):
+    def test_tensorfold_launch_settings(self):
+        spec = TensorfoldAdapter().launch_spec("org/model", {
+            "context_length": 8192, "thinking": False,
+            "extra_args": ["--mtp-drafts", "4"],
+        })
+        self.assertEqual(spec.command[:6], [
+            "serve", "org/model", "--host", "0.0.0.0",
+            "--port", str(TENSORFOLD_SERVE_PORT),
+        ])
+        self.assertEqual(spec.command[spec.command.index("--context") + 1], "8192")
+        self.assertIn("--no-thinking", spec.command)
+        self.assertIn("--mtp-drafts", spec.command)
+        self.assertEqual(spec.entrypoint, ["tensorfold"])
+        self.assertNotIn("--tensor-parallel-size", spec.command)
+
+    def test_tensorfold_defaults_emit_only_the_base_argv(self):
+        spec = TensorfoldAdapter().launch_spec("org/model", {})
+        self.assertEqual(spec.command, [
+            "serve", "org/model", "--host", "0.0.0.0",
+            "--port", str(TENSORFOLD_SERVE_PORT),
+        ])
+
+
+class TensorfoldBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tensorfold_bridge_uses_durable_managed_create(self):
+        manager = Mock()
+        manager._resolved_hf_token = Mock(return_value="secret")
+        manager.create_container = AsyncMock(return_value={"name": "tensorfold-model"})
+
+        result = await launch_managed_container(
+            manager, TensorfoldAdapter(), "dep-1", "tf", "org/model",
+            {"context_length": 4096, "extra_args": ["--mtp-drafts", "4"]},
+        )
+
+        kwargs = manager.create_container.await_args.kwargs
+        self.assertEqual(kwargs["engine"], "tensorfold")
+        self.assertEqual(kwargs["model"], "org/model")
+        self.assertEqual(kwargs["hf_token"], "secret")
+        self.assertEqual(kwargs["sparkdeck_deployment_id"], "dep-1")
+        self.assertEqual(
+            kwargs["extra_args"], ["--context", "4096", "--mtp-drafts", "4"],
+        )
+        self.assertEqual(result["name"], "tensorfold-model")

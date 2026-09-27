@@ -26,6 +26,7 @@ _GGUF_SHARD_PATTERN = re.compile(
 # The decision server's own bind port. It is fixed like llama.cpp's because the
 # published host port is allocated per deployment by Manager.
 LAYA_SERVE_PORT = 8080
+TENSORFOLD_SERVE_PORT = 8080
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -220,10 +221,41 @@ class LayaAdapter(RuntimeAdapter):
         )
 
 
+class TensorfoldAdapter(RuntimeAdapter):
+    """Serve a TensorFold exact-decoding server behind SparkDeck's /v1 surface.
+
+    TensorFold wraps its speculative-decoding engine in an OpenAI-compatible
+    API, so the controller proxy, load balancing, token accounting, and health
+    checks all work unchanged. The image's entrypoint must be the
+    ``tensorfold`` CLI; weights resolve through the Hugging Face cache.
+    """
+
+    kind = RuntimeKind.TENSORFOLD
+    default_image = "sparkdeck/tensorfold:latest"
+
+    def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
+        command = [
+            "serve", model,
+            "--host", "0.0.0.0",
+            "--port", str(TENSORFOLD_SERVE_PORT),
+        ]
+        context = settings.get("context_length") or settings.get("context_window")
+        if context:
+            command += ["--context", str(context)]
+        if settings.get("thinking") is False:
+            command += ["--no-thinking"]
+        command.extend(str(item) for item in settings.get("extra_args", []))
+        return LaunchSpec(
+            settings.get("image") or self.default_image, command,
+            TENSORFOLD_SERVE_PORT, entrypoint=["tensorfold"],
+        )
+
+
 class RuntimeRegistry:
     def __init__(self):
         adapters = (
             VllmAdapter(), LlamaCppAdapter(), SglangAdapter(), LayaAdapter(),
+            TensorfoldAdapter(),
         )
         self._adapters = {adapter.kind: adapter for adapter in adapters}
 
@@ -264,6 +296,35 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             model=model, engine="laya", image=spec.image,
             environment=settings.get("environment"),
             extra_args=list(spec.command),
+            name=safe_container_name(alias, deployment_id),
+            hf_token=hf_token,
+            sparkdeck_deployment_id=deployment_id,
+        )
+    if adapter.kind is RuntimeKind.TENSORFOLD:
+        # TensorFold resolves its checkpoint through the Hugging Face cache,
+        # so it must launch through Manager to get the shared cache mount,
+        # the HF credential, and the port/label handling the Laya bridge uses.
+        spec = adapter.launch_spec(model, settings)
+        # This bridge is the controller-local path (no node_ids), and
+        # ``create_container`` forwards the credential rather than resolving it.
+        # Without resolving it here a gated or private checkpoint fails to load
+        # on this supported standalone path, even though the clustered path
+        # injects credentials.
+        resolve_token = getattr(manager, "_resolved_hf_token", None)
+        hf_token = resolve_token() if callable(resolve_token) else None
+        # Manager builds the serve/model/host/port argv itself, so only the
+        # option flags are forwarded, in the same order launch_spec emits them.
+        extra: list[str] = []
+        context = settings.get("context_length") or settings.get("context_window")
+        if context:
+            extra += ["--context", str(context)]
+        if settings.get("thinking") is False:
+            extra += ["--no-thinking"]
+        extra += [str(item) for item in settings.get("extra_args", [])]
+        return await manager.create_container(
+            model=model, engine="tensorfold", image=spec.image,
+            environment=settings.get("environment"),
+            extra_args=extra,
             name=safe_container_name(alias, deployment_id),
             hf_token=hf_token,
             sparkdeck_deployment_id=deployment_id,

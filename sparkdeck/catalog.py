@@ -383,6 +383,19 @@ class HuggingFaceCatalog:
             # ships, so this stays opt-in by tag rather than following
             # transformer_model.
             {"runtime": "laya", "supported": laya_model},
+            # TensorFold serves a curated set of checkpoint families with
+            # per-family kernel packages and refuses unsupported formats before
+            # download. The Hub listing cannot verify family support, so the
+            # catalog reports it as unsupported here; TensorFold deployments
+            # are created from the Models page instead.
+            {
+                "runtime": "tensorfold",
+                "supported": False,
+                "reason": (
+                    "TensorFold supports a curated set of checkpoint families "
+                    "that this listing cannot verify."
+                ),
+            },
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
         return {

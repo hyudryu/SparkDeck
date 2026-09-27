@@ -336,6 +336,16 @@ _LLAMA_GGUF_SHARD_PATTERN = re.compile(
 DEFAULT_LAYA_IMAGE = "sparkdeck/laya-decide:latest"
 _LAYA_SERVE_PORT = 8080
 
+# TensorFold (https://github.com/ashhart/TensorFold) is an OpenAI-compatible
+# exact-decoding server for Apple Silicon and NVIDIA GPUs. There is no
+# upstream image, so the default expects a locally prepared image with a
+# pip-installed tensorfold whose Docker entrypoint is the ``tensorfold`` CLI.
+# Weights resolve from the node's shared Hugging Face cache; a single server
+# holds the full model, so only single and replicated layouts are supported.
+DEFAULT_TENSORFOLD_IMAGE = "sparkdeck/tensorfold:latest"
+_TENSORFOLD_SERVE_PORT = 8080
+_SUPPORTED_ENGINES = ("vllm", "sglang", "llama.cpp", "laya", "tensorfold")
+
 
 def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
     """The operator's GPU intent for the decision server.
@@ -3874,7 +3884,7 @@ class Manager:
                     "stopped" if deployment.get("status") == "stopped" else "running",
                 )
                 engine = str(deployment.get("engine") or "vllm")
-                if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
+                if engine not in _SUPPORTED_ENGINES:
                     deployment["status"] = "error"
                     deployment["error"] = f"unsupported persisted runtime: {engine}"
             return value
@@ -4761,6 +4771,33 @@ class Manager:
                 "sg_cuda_graph_max_bs": None,
                 "sg_chunked_prefill_size": None,
             }
+        if engine == "tensorfold":
+            # TensorFold caps prompt+reply with --context and has no
+            # vLLM-style concurrency, parallelism, or speculative flags;
+            # map only the shared scalar and the thinking switch, and leave
+            # the rest of the argv untouched.
+            if "--thinking" in args:
+                thinking = "enabled"
+            elif "--no-thinking" in args:
+                thinking = "disabled"
+            else:
+                thinking = None
+            return {
+                "context_window": cls._cli_option(args, {"--context"}, int),
+                "max_concurrency": None,
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
+                "kv_cache_dtype": None,
+                "thinking_mode": thinking,
+                "speculative_method": None,
+                "draft_sample_method": None,
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
+            }
         return {
             "context_window": context_window,
             "max_concurrency": max_concurrency,
@@ -4868,6 +4905,29 @@ class Manager:
                 flags, {"--parallel", "-np"},
                 positive_int("max_concurrency"),
             )
+            try:
+                return shlex.split(flags)
+            except ValueError as exc:
+                raise ValueError("launch arguments have invalid shell quoting") from exc
+
+        if engine == "tensorfold":
+            flags = self._replace_command_option(
+                flags, {"--context"}, positive_int("context_window"),
+            )
+            # TensorFold's thinking switch is a bare flag pair, so strip both
+            # (they take no value) and append the requested one; "default"
+            # removes the override and leaves the server's template-driven
+            # default in place.
+            flags = re.sub(
+                r"(?<!\S)(?:--no-thinking|--thinking)(?:=\S+)?", "", flags,
+            ).strip()
+            thinking = str(controls.get("thinking_mode") or "default")
+            if thinking == "enabled":
+                flags = f"{flags} --thinking".strip()
+            elif thinking == "disabled":
+                flags = f"{flags} --no-thinking".strip()
+            elif thinking != "default":
+                raise ValueError("thinking_mode must be default, enabled, or disabled")
             try:
                 return shlex.split(flags)
             except ValueError as exc:
@@ -5101,7 +5161,10 @@ class Manager:
             str(model_revision).strip()
             if model_revision not in (None, "") else None
         )
-        if revision and engine != "llama.cpp":
+        # llama.cpp pins its revision inside the cache-relative artifact path,
+        # and TensorFold resolves the checkpoint itself with no --revision
+        # flag, so neither can honour a pinned model revision.
+        if revision and engine not in ("llama.cpp", "tensorfold"):
             final_args += ["--revision", revision]
         if engine == "sglang" and quantization not in (None, ""):
             final_args += ["--quantization", str(quantization).strip()]
@@ -5215,8 +5278,10 @@ class Manager:
             )
         if not settings["model"]:
             raise ValueError("model is required")
-        if settings["engine"] not in {"vllm", "sglang", "llama.cpp", "laya"}:
-            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
+        if settings["engine"] not in _SUPPORTED_ENGINES:
+            raise ValueError(
+                "engine must be one of: " + ", ".join(_SUPPORTED_ENGINES)
+            )
         mode = settings["deployment_mode"]
         if mode not in _MODE_ALLOWLIST:
             raise ValueError(
@@ -7350,8 +7415,10 @@ class Manager:
         body = dict(body)
         self._reject_hf_cli_credentials(body.get("extra_args"))
         engine = str(body.get("engine") or "vllm")
-        if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
-            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
+        if engine not in _SUPPORTED_ENGINES:
+            raise ValueError(
+                "engine must be one of: " + ", ".join(_SUPPORTED_ENGINES)
+            )
         body["runtime_file_mounts"] = normalize_runtime_file_mounts(
             body.get("runtime_file_mounts"), engine,
         )
@@ -7401,6 +7468,13 @@ class Manager:
             # parallelism; replicas are the only way to use more than one node.
             raise ValueError(
                 "Laya deployments support single and replicated layouts, "
+                "not sharded"
+            )
+        if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
+            # One TensorFold server holds the whole model; replicas are the
+            # only way to use more than one node.
+            raise ValueError(
+                "TensorFold deployments support single and replicated layouts, "
                 "not sharded"
             )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
@@ -8535,7 +8609,7 @@ class Manager:
         if (
             action == "start"
             and str(deployment.get("engine") or "vllm")
-            not in {"vllm", "sglang", "llama.cpp", "laya"}
+            not in _SUPPORTED_ENGINES
         ):
             raise ValueError("persisted deployment runtime is no longer supported")
         if targeted_instance is not None and action == "start" and (
@@ -14724,7 +14798,9 @@ class Manager:
                 # Laya Decide is a small companion inference runtime. Keep it
                 # alive when a chat engine starts, just as Laya's own launcher
                 # preserves the chat engine in the opposite start order.
-                if runtime == "laya" and protect in {"vllm", "sglang", "llama.cpp"}:
+                if runtime == "laya" and protect in {
+                    "vllm", "sglang", "llama.cpp", "tensorfold",
+                }:
                     continue
                 if (
                     container.get("managed")
@@ -16359,6 +16435,133 @@ class Manager:
             )
             raise RuntimeError(safe_error) from exc
 
+    async def _create_tensorfold_container(
+        self,
+        model: str,
+        port: int | None,
+        image: str | None,
+        environment: dict[str, str] | None,
+        extra_args: list[str] | None,
+        name: str | None,
+        cluster_member: dict | None,
+        hf_token: str | None,
+        sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
+    ) -> dict:
+        """Launch one TensorFold server, mirroring the llama.cpp shape.
+
+        TensorFold resolves the checkpoint itself from the Hugging Face cache
+        (or downloads it), and one server holds the whole model, so sharded
+        layouts are rejected rather than silently degraded.
+        """
+        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
+            raise ValueError("TensorFold deployments cannot run sharded")
+        image = image or DEFAULT_TENSORFOLD_IMAGE
+        # TensorFold takes the node's GPUs for its CUDA backend, so other
+        # chat engines must be evicted before the CUDA context is created.
+        await self.evict_other_backends(protect="tensorfold")
+        if port is None:
+            port = await self._allocate_port()
+        if name is None:
+            safe = model.replace("/", "-").replace("_", "-").lower()
+            name = f"tensorfold-{safe}-{port}"
+        self._cluster_launch_update(
+            name, "preparing", "Preparing TensorFold launch",
+            model=model, cluster_member=cluster_member,
+        )
+
+        def _create():
+            try:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+                self.client.images.get(image)
+            except docker.errors.ImageNotFound:
+                self._cluster_launch_update(
+                    name, "pulling_image",
+                    f"Downloading Docker image {image}; this can take several minutes",
+                    model=model, cluster_member=cluster_member,
+                )
+                print(f"[tensorfold] pulling missing image: {image}")
+                self.client.images.pull(image)
+            command = [
+                "serve", model,
+                "--host", "0.0.0.0",
+                "--port", str(_TENSORFOLD_SERVE_PORT),
+            ]
+            command.extend(str(item) for item in extra_args or [])
+            self._cluster_launch_update(
+                name, "creating_container", "Creating Docker container",
+                model=model, cluster_member=cluster_member,
+            )
+            labels = {
+                CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                ENGINE_LABEL: "tensorfold",
+            }
+            if sparkdeck_deployment_id:
+                labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
+            if cluster_member:
+                labels.update({
+                    DEPLOYMENT_LABEL: cluster_member["deployment_id"],
+                    NODE_LABEL: cluster_member["node_id"],
+                    RANK_LABEL: str(cluster_member["rank"]),
+                    MODE_LABEL: cluster_member.get("mode", "single"),
+                    NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
+                })
+            run_options = {
+                "image": image,
+                # The image's entrypoint must be the ``tensorfold`` CLI, so the
+                # command carries only the serve subcommand and its flags.
+                "command": command,
+                "name": name,
+                "detach": True,
+                # TensorFold resolves the checkpoint through the Hugging Face
+                # cache, which the image mounts at its declared HF_HOME target.
+                "volumes": self._build_volumes(model, self.settings["hf_cache"], image),
+                "ipc_mode": "host",
+                "shm_size": shm_size or self.settings["shm_size"],
+                "labels": labels,
+                "restart_policy": {"Name": "unless-stopped"},
+                "ports": {f"{_TENSORFOLD_SERVE_PORT}/tcp": port},
+            }
+            container_environment = dict(environment or {})
+            # A gated or private checkpoint must authenticate when the server
+            # resolves or downloads it, exactly as the vLLM and SGLang paths do.
+            container_environment.update(self._container_hf_environment(hf_token))
+            if container_environment:
+                run_options["environment"] = container_environment
+            # TensorFold's CUDA backend needs the GPUs; constructing a
+            # DeviceRequest always succeeds, so the request is gated on the
+            # NVIDIA driver being present rather than failing inside Docker.
+            if _node_has_nvidia_driver():
+                try:
+                    run_options["device_requests"] = [
+                        docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                    ]
+                except Exception:
+                    pass
+            container = self._run_managed_container(run_options)
+            container.reload()
+            self._cluster_launch_update(
+                name, "starting", "Container created; loading the model",
+                model=model, cluster_member=cluster_member,
+            )
+            summary = self._container_summary(container)
+            if summary is not None:
+                summary["model_source"] = "public_repository"
+            return summary
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+
     async def _create_container_with_port(
         self,
         model: str,
@@ -16389,8 +16592,10 @@ class Manager:
         runtime_file_mounts: list[dict[str, str]] | None = None,
     ) -> dict:
         self._reject_hf_cli_credentials(extra_args)
-        if engine not in {"vllm", "sglang", "llama.cpp", "laya"}:
-            raise ValueError("engine must be vllm, sglang, llama.cpp, or laya")
+        if engine not in _SUPPORTED_ENGINES:
+            raise ValueError(
+                "engine must be one of: " + ", ".join(_SUPPORTED_ENGINES)
+            )
         runtime_environment = self._normalize_runtime_environment(environment, engine)
         runtime_file_mounts = normalize_runtime_file_mounts(runtime_file_mounts, engine)
         # Validate before image pulls, GPU eviction, or any Docker mutation.
@@ -16435,6 +16640,16 @@ class Manager:
             )
         if engine == "laya":
             return await self._create_laya_container(
+                model=model, port=port, image=image,
+                environment=runtime_environment,
+                extra_args=extra_args, name=name,
+                cluster_member=cluster_member,
+                hf_token=hf_token,
+                sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
+            )
+        if engine == "tensorfold":
+            return await self._create_tensorfold_container(
                 model=model, port=port, image=image,
                 environment=runtime_environment,
                 extra_args=extra_args, name=name,

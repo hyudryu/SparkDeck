@@ -16,6 +16,11 @@ class RuntimeKind(StrEnum):
     # generating tokens. SparkDeck serves it behind the same OpenAI-compatible
     # /v1 surface through the ``laya-decide`` runtime.
     LAYA = "laya"
+    # TensorFold is an OpenAI-compatible exact-decoding server for Apple
+    # Silicon and NVIDIA GPUs with speculative drafting that never changes
+    # output bytes. One server holds the whole model, so it follows the
+    # single-engine shape llama.cpp and Laya use.
+    TENSORFOLD = "tensorfold"
 
 
 class DeploymentKind(StrEnum):

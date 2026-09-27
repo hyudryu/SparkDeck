@@ -1023,7 +1023,9 @@ def build_server(
         token array, non-secret string ``environment`` values, structured
         ``launch_controls`` (for example ``context_window``,
         ``max_concurrency``, tensor/pipeline parallel size, KV cache dtype,
-        thinking mode, or speculative decoding controls), supported vLLM
+        thinking mode, or speculative decoding controls; TensorFold
+        deployments map ``context_window`` to its ``--context`` flag),
+        supported vLLM
         or SGLang memory fields, and the weights repository via ``model``
         (a Hugging Face repo id; drop any pinned ``--revision`` flag from
         ``extra_args`` when switching repositories). Stop a running

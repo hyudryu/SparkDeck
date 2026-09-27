@@ -51,6 +51,7 @@ export function RuntimeMark({ runtime }: { runtime: string }) {
     'llama.cpp': 'Llama server',
     sglang: 'SGLang',
     laya: 'Laya decisions',
+    tensorfold: 'TensorFold',
   }
   return <span className="runtime-mark">{labels[runtime] ?? runtime}</span>
 }

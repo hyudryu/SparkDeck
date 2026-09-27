@@ -161,7 +161,7 @@ describe('ExplorePage model rows', () => {
 
     const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
     expect(deploymentType).toHaveValue('vllm')
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(4)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(5)
     await screen.findByText('model.gguf')
     expect(within(deploymentType).getByRole('option', { name: 'vLLM' })).toBeEnabled()
     // Laya needs decision-model checkpoints, so a plain GGUF row disables it.
@@ -842,7 +842,7 @@ describe('ExplorePage model rows', () => {
     )
 
     const deploymentType = within(modelArticle).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(4)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(5)
     await user.selectOptions(deploymentType, 'llama.cpp')
     const artifactSelect = within(modelArticle).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })
     expect(artifactSelect).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')

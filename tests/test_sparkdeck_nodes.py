@@ -651,7 +651,7 @@ class RemovedOllamaTests(unittest.IsolatedAsyncioTestCase):
     async def test_ollama_container_launch_is_rejected(self):
         manager = Manager.__new__(Manager)
         with self.assertRaisesRegex(
-            ValueError, "engine must be vllm, sglang, llama.cpp, or laya",
+            ValueError, "engine must be one of: vllm, sglang, llama.cpp, laya, tensorfold",
         ):
             await manager.create_container("legacy/model", engine="ollama")
 

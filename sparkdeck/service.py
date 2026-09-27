@@ -2002,7 +2002,7 @@ class SparkDeckService:
         # Runtimes whose saved launch settings an operator may repair or tune
         # once the deployment is stopped. Laya belongs here because its device,
         # concurrency, image, and extra flags are all persisted launch inputs.
-        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp", "laya"}
+        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp", "laya", "tensorfold"}
         discovered_editable = bool(
             discovered_settings is not None
             and discovered_settings.get("editable")
@@ -2817,11 +2817,14 @@ class SparkDeckService:
                     )
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
-        if str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value and (
+        if str(stored.get("runtime")) in (
+            RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
+        ) and (
             settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
         ):
             raise ValueError(
-                "llama.cpp deployments support single and replicated layouts, not sharded"
+                f"{stored.get('runtime')} deployments support single and "
+                "replicated layouts, not sharded"
             )
         contract = self._saved_layout_contract(
             settings, str(stored.get("runtime") or ""),
@@ -3440,10 +3443,11 @@ class SparkDeckService:
                 if mode == "single" and len(requested_node_ids) != 1:
                     raise ValueError("single deployment requires exactly one node")
                 if mode in {"sharded", "grouped_sharded"} and (
-                    runtime is RuntimeKind.LLAMA_CPP
+                    runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD)
                 ):
                     raise ValueError(
-                        "llama.cpp deployments support single and replicated layouts, not sharded"
+                        f"{runtime.value} deployments support single and "
+                        "replicated layouts, not sharded"
                     )
                 if mode == "grouped_sharded":
                     # Reject an unlaunchable topology at save time; Manager's
@@ -3631,9 +3635,24 @@ class SparkDeckService:
                 value = settings.get(key)
                 if value is not None and str(value).strip():
                     extra_args += [flag, str(value)]
-        if identity.revision and runtime is not RuntimeKind.LLAMA_CPP:
+        if runtime is RuntimeKind.TENSORFOLD:
+            # The cluster path carries a launch as argv, so TensorFold's typed
+            # settings have to become flags here too. Without this a saved
+            # context length is silently dropped at launch.
+            context_length = (
+                settings.get("context_length") or settings.get("context_window")
+            )
+            if context_length is not None:
+                extra_args += ["--context", str(context_length)]
+            if settings.get("thinking") is False:
+                extra_args += ["--no-thinking"]
+        if identity.revision and runtime not in (
+            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+        ):
             # Llama.cpp pins its revision inside the cache-relative artifact
             # reference; an unknown --revision flag would break llama-server.
+            # TensorFold resolves the checkpoint itself and has no --revision
+            # flag, so a pinned revision cannot be forwarded either.
             extra_args += ["--revision", identity.revision]
         launch_body = {
             **settings,

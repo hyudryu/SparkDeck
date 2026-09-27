@@ -383,6 +383,10 @@ class HuggingFaceCatalog:
             # ships, so this stays opt-in by tag rather than following
             # transformer_model.
             {"runtime": "laya", "supported": laya_model},
+            # TensorFold serves a curated set of Transformers checkpoints
+            # (safetensors) with per-family kernels; unsupported formats such
+            # as GGUF, GPTQ, or AWQ are refused before download.
+            {"runtime": "tensorfold", "supported": transformer_model},
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
         return {

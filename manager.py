@@ -2483,8 +2483,9 @@ class Manager:
         """Pick an image for the one-shot ownership repair container.
 
         Model runtime images are always present on a serving node and ship a
-        POSIX userland, so they are preferred before a tiny image that Docker
-        would have to pull.
+        POSIX userland, so they are preferred before any other local image
+        with a known runtime userland, and only then a tiny image Docker
+        must pull.
         """
         candidates: list[str] = []
         for raw in (
@@ -2502,6 +2503,18 @@ class Manager:
             except docker.errors.ImageNotFound:
                 continue
             return tag
+        # A node can serve exclusively through custom runtime images, so
+        # prefer any locally present image with a known POSIX userland
+        # before resorting to a pull the node may be unable to make.
+        markers = ("vllm", "sglang", "llama", "laya", "tensorfold")
+        try:
+            for image in self.client.images.list():
+                for tag in (image.tags or []):
+                    lowered = tag.lower()
+                    if any(marker in lowered for marker in markers):
+                        return tag
+        except docker.errors.DockerException:
+            pass
         return "busybox:latest"
 
     def _reclaim_model_cache_ownership(self, repository: Path) -> bool:
@@ -2512,31 +2525,47 @@ class Manager:
         unprivileged agent can neither chmod nor unlink. The agent does hold
         Docker socket access, so a one-shot container restores ownership
         without relying on sudo, which the systemd user service can never
-        elevate. Returns whether the repair ran.
+        elevate. Returns whether a repair was attempted.
+
+        The bind mount is anchored at the repository's parent (the hub)
+        rather than at the repository: a racing container can replace the
+        repository with a symlink, and Docker resolves bind sources on the
+        host. chown therefore only ever acts on the named child inside the
+        real hub, and ``-h`` keeps it from dereferencing even that entry.
+        Each target is skipped when it does not exist, so a repair after the
+        repository was deleted still reaches a remaining lock directory.
         """
         identity = self._posix_identity()
         if identity is None:
             return False
         uid, gid = identity
+        hub = repository.parent
+        if not hub.is_dir():
+            return False
+        lock_dir = hub / ".locks" / repository.name
+        if not repository.exists() and not lock_dir.exists():
+            # Nothing of this model remains; there is nothing to repair.
+            return False
         try:
             image = self._ownership_reclaim_image()
-            mounts = [Mount("/reclaim-hub", str(repository), type="bind")]
-            # Hugging Face keeps per-model download locks in a hub-level
-            # sibling of the repository; root containers leave those
-            # root-owned too, and the next download must create entries there.
-            lock_dir = repository.parent / ".locks" / repository.name
-            targets = "/reclaim-hub"
-            if lock_dir.is_dir() and not lock_dir.is_symlink():
-                mounts.append(Mount("/reclaim-locks", str(lock_dir), type="bind"))
-                targets += " /reclaim-locks"
+            repairs: list[str] = []
+            for child in (
+                f"/reclaim-hub/{repository.name}",
+                f"/reclaim-hub/.locks/{repository.name}",
+            ):
+                quoted = shlex.quote(child)
+                repairs.append(
+                    f"[ -e {quoted} ] && chown -R {uid}:{gid} -h {quoted} "
+                    f"|| [ ! -e {quoted} ]",
+                )
             self.client.containers.run(
                 image,
-                command=[f"chown -R {uid}:{gid} {targets}"],
+                command=["; ".join(repairs)],
                 entrypoint=["/bin/sh", "-c"],
                 # Runtime images may declare a non-root USER; only root can
                 # repair root-owned entries.
                 user="0:0",
-                mounts=mounts,
+                mounts=[Mount("/reclaim-hub", str(hub), type="bind")],
                 detach=False,
                 remove=True,
             )

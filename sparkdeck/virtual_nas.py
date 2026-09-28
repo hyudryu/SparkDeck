@@ -2401,6 +2401,9 @@ class VirtualNAS:
         # outside the configured Hub directory.
         if destination.is_symlink() or not destination.is_dir():
             raise RuntimeError("cached model repository is not a safe directory")
+        # A previously served repository may hold root-written metadata the
+        # unprivileged merge could not replace or extend; repair first.
+        self._reclaim_if_foreign(destination)
         self._merge_model_directory(extracted, destination)
         shutil.rmtree(extracted, ignore_errors=True)
 
@@ -2649,8 +2652,11 @@ class VirtualNAS:
             return False
 
         def foreign(metadata: os.stat_result) -> bool:
-            owner = _metadata_owner_id(metadata)
-            return owner is not None and owner != current_uid
+            # Only the privileged model runtime writes as root; entries owned
+            # by another real user in a deliberately shared cache must not be
+            # re-owned by an automatic repair. A root agent can act on every
+            # entry itself, so nothing counts as foreign to it.
+            return _metadata_owner_id(metadata) == 0 and current_uid != 0
 
         try:
             # The repository itself can be the root-written entry: an empty

@@ -2483,10 +2483,11 @@ class Manager:
         """Ordered images to try for the one-shot ownership repair container.
 
         Model runtime images are always present on a serving node and ship a
-        POSIX userland, so the configured runtime images come first, then any
-        locally present image with a known runtime userland, then any other
-        local image (a custom-tag-only node), and finally a tiny image Docker
-        must pull. Failures fall through to the next candidate.
+        POSIX userland, so locally present configured runtime images come
+        first, then locally present images with a known runtime userland.
+        Only these are executed: an arbitrary local image was never trusted
+        to run as root against the cache. A tiny image Docker can pull is
+        kept as the guaranteed final fallback.
         """
         candidates: list[str] = []
         for raw in (
@@ -2511,13 +2512,15 @@ class Manager:
             tag for tag in local if tag not in ordered
             and any(marker in tag.lower() for marker in markers)
         ]
-        ordered += [tag for tag in local if tag not in ordered]
-        ordered.append("busybox:latest")
         unique: list[str] = []
         for tag in ordered:
             if tag not in unique:
                 unique.append(tag)
-        return unique[:8]
+        # Keep the list bounded but always retain the pullable fallback.
+        trimmed = unique[:7]
+        if "busybox:latest" not in trimmed:
+            trimmed.append("busybox:latest")
+        return trimmed
 
     def _reclaim_model_cache_ownership(self, repository: Path) -> bool:
         """Chown root-written cache entries back to this process via Docker.
@@ -2549,10 +2552,6 @@ class Manager:
         cache = hub.parent
         if not cache.is_dir():
             return False
-        lock_dir = hub / ".locks" / repository.name
-        if not repository.exists() and not lock_dir.exists():
-            # Nothing of this model remains; there is nothing to repair.
-            return False
         chown = f"chown {uid}:{gid} -h"
         repairs: list[str] = []
         for parent in ("/reclaim-cache/hub", "/reclaim-cache/hub/.locks"):
@@ -2575,7 +2574,9 @@ class Manager:
             try:
                 self.client.containers.run(
                     image,
-                    command=["; ".join(repairs)],
+                    # Any failed repair step must fail the container, so a
+                    # usable later image still gets tried.
+                    command=[" && ".join(repairs)],
                     entrypoint=["/bin/sh", "-c"],
                     # Runtime images may declare a non-root USER; only root
                     # can repair root-owned entries.

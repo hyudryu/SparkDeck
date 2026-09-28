@@ -2770,7 +2770,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["user"], "0:0")
             self.assertEqual(
                 kwargs["command"],
-                ["; ".join([
+                [" && ".join([
                     "[ -e /reclaim-cache/hub ]"
                     " && chown 1000:1000 -h /reclaim-cache/hub"
                     " || [ ! -e /reclaim-cache/hub ]",
@@ -2849,26 +2849,31 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(kwargs["mounts"][0]["Source"], str(Path(directory)))
 
-    def test_ownership_reclaimer_skips_when_nothing_remains(self):
+    def test_ownership_reclaimer_repairs_hub_parents_without_model_children(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = Manager(Path(directory))
             hub = Path(directory) / "hub"
             hub.mkdir(parents=True)
             containers = Mock()
             client = Mock(containers=containers)
+            client.images.list.return_value = [
+                Mock(tags=[manager.settings["vllm_image"]]),
+            ]
             manager.client = client
 
             with (
                 patch("os.getuid", return_value=1000, create=True),
                 patch("os.getgid", return_value=1000, create=True),
             ):
-                self.assertFalse(
+                # Parent-only residue must reach the repair container even
+                # though the model itself has no cached entries yet.
+                self.assertTrue(
                     manager._reclaim_model_cache_ownership(
                         hub / "models--org--model",
                     ),
                 )
 
-            containers.run.assert_not_called()
+            containers.run.assert_called_once()
 
     def test_ownership_reclaimer_prefers_a_local_runtime_image(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2906,8 +2911,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             containers = Mock()
             client = Mock(containers=containers)
             client.images.list.return_value = [
-                Mock(tags=["myorg/first:1"]),
-                Mock(tags=["myorg/second:2"]),
+                Mock(tags=["myorg/vllm-worker:1"]),
+                Mock(tags=["myorg/sglang-worker:2"]),
             ]
             manager.client = client
             containers.run.side_effect = [
@@ -3049,8 +3054,11 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
     def test_ownership_reclaimer_reports_failure_without_raising(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = Manager(Path(directory))
+            hub = Path(directory) / "hub"
+            (hub / "models--org--model").mkdir(parents=True)
             client = Mock()
             client.containers.run.side_effect = RuntimeError("docker down")
+            client.images.list.return_value = []
             manager.client = client
 
             with (
@@ -3059,7 +3067,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertFalse(
                     manager._reclaim_model_cache_ownership(
-                        Path(directory) / "models--org--model",
+                        hub / "models--org--model",
                     ),
                 )
 

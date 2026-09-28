@@ -2753,9 +2753,10 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             repository.mkdir(parents=True)
             containers = Mock()
             client = Mock(containers=containers)
-            client.images.get.return_value = Mock()
+            client.images.list.return_value = [
+                Mock(tags=[manager.settings["vllm_image"]]),
+            ]
             manager.client = client
-            manager.settings = {**manager.settings, "vllm_image": "node/vllm:local"}
 
             with (
                 patch("os.getuid", return_value=1000, create=True),
@@ -2769,17 +2770,25 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["user"], "0:0")
             self.assertEqual(
                 kwargs["command"],
-                [
-                    "[ -e /reclaim-hub/models--org--model ]"
-                    " && chown -R 1000:1000 -h /reclaim-hub/models--org--model"
-                    " || [ ! -e /reclaim-hub/models--org--model ]; "
-                    "[ -e /reclaim-hub/.locks/models--org--model ]"
-                    " && chown -R 1000:1000 -h /reclaim-hub/.locks/models--org--model"
-                    " || [ ! -e /reclaim-hub/.locks/models--org--model ]",
-                ],
+                ["; ".join([
+                    "[ -e /reclaim-cache/hub ]"
+                    " && chown 1000:1000 -h /reclaim-cache/hub"
+                    " || [ ! -e /reclaim-cache/hub ]",
+                    "[ -e /reclaim-cache/hub/.locks ]"
+                    " && chown 1000:1000 -h /reclaim-cache/hub/.locks"
+                    " || [ ! -e /reclaim-cache/hub/.locks ]",
+                    "[ -e /reclaim-cache/hub/models--org--model ]"
+                    " && find /reclaim-cache/hub/models--org--model -user 0"
+                    " -exec chown 1000:1000 -h {} +"
+                    " || [ ! -e /reclaim-cache/hub/models--org--model ]",
+                    "[ -e /reclaim-cache/hub/.locks/models--org--model ]"
+                    " && find /reclaim-cache/hub/.locks/models--org--model"
+                    " -user 0 -exec chown 1000:1000 -h {} +"
+                    " || [ ! -e /reclaim-cache/hub/.locks/models--org--model ]",
+                ])],
             )
-            self.assertEqual(kwargs["mounts"][0]["Target"], "/reclaim-hub")
-            self.assertEqual(kwargs["mounts"][0]["Source"], str(hub))
+            self.assertEqual(kwargs["mounts"][0]["Target"], "/reclaim-cache")
+            self.assertEqual(kwargs["mounts"][0]["Source"], str(Path(directory)))
             self.assertEqual(kwargs["remove"], True)
             self.assertEqual(kwargs["detach"], False)
 
@@ -2792,7 +2801,9 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             repository.mkdir(parents=True)
             containers = Mock()
             client = Mock(containers=containers)
-            client.images.get.return_value = Mock()
+            client.images.list.return_value = [
+                Mock(tags=[manager.settings["vllm_image"]]),
+            ]
             manager.client = client
 
             with (
@@ -2802,20 +2813,12 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(manager._reclaim_model_cache_ownership(repository))
 
             _, kwargs = containers.run.call_args
-            repository_child = "/reclaim-hub/models--org--model"
-            locks_child = "/reclaim-hub/.locks/models--org--model"
-            self.assertEqual(
-                kwargs["command"],
-                [
-                    f"[ -e {repository_child} ]"
-                    f" && chown -R 1000:1000 -h {repository_child}"
-                    f" || [ ! -e {repository_child} ]; "
-                    f"[ -e {locks_child} ]"
-                    f" && chown -R 1000:1000 -h {locks_child}"
-                    f" || [ ! -e {locks_child} ]",
-                ],
+            locks_child = "/reclaim-cache/hub/.locks/models--org--model"
+            self.assertIn(
+                f"find {locks_child} -user 0 -exec chown 1000:1000 -h {{}} +",
+                kwargs["command"][0],
             )
-            self.assertEqual(kwargs["mounts"][0]["Source"], str(hub))
+            self.assertEqual(kwargs["mounts"][0]["Source"], str(Path(directory)))
             self.assertEqual(len(kwargs["mounts"]), 1)
 
     def test_ownership_reclaimer_repairs_locks_after_repository_delete(self):
@@ -2826,7 +2829,9 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             (hub / ".locks" / "models--org--model").mkdir(parents=True)
             containers = Mock()
             client = Mock(containers=containers)
-            client.images.get.return_value = Mock()
+            client.images.list.return_value = [
+                Mock(tags=[manager.settings["vllm_image"]]),
+            ]
             manager.client = client
 
             with (
@@ -2838,10 +2843,11 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             _, kwargs = containers.run.call_args
             # Only the lock directory remains; its repair must still run.
             self.assertIn(
-                "chown -R 1000:1000 -h /reclaim-hub/.locks/models--org--model",
+                "find /reclaim-cache/hub/.locks/models--org--model"
+                " -user 0 -exec chown 1000:1000 -h {} +",
                 kwargs["command"][0],
             )
-            self.assertEqual(kwargs["mounts"][0]["Source"], str(hub))
+            self.assertEqual(kwargs["mounts"][0]["Source"], str(Path(directory)))
 
     def test_ownership_reclaimer_skips_when_nothing_remains(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2871,7 +2877,6 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             (hub / "models--org--model").mkdir(parents=True)
             containers = Mock()
             client = Mock(containers=containers)
-            client.images.get.side_effect = docker.errors.ImageNotFound("missing")
             client.images.list.return_value = [
                 Mock(tags=["myorg/whatever:1"]),
                 Mock(tags=["127.0.0.1:5000/custom-sglang:0.4.6"]),
@@ -2891,6 +2896,39 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 containers.run.call_args.args[0],
                 "127.0.0.1:5000/custom-sglang:0.4.6",
+            )
+
+    def test_ownership_reclaimer_tries_next_image_when_one_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            hub = Path(directory) / "hub"
+            (hub / "models--org--model").mkdir(parents=True)
+            containers = Mock()
+            client = Mock(containers=containers)
+            client.images.list.return_value = [
+                Mock(tags=["myorg/first:1"]),
+                Mock(tags=["myorg/second:2"]),
+            ]
+            manager.client = client
+            containers.run.side_effect = [
+                RuntimeError("no shell in image"),
+                Mock(),
+            ]
+
+            with (
+                patch("os.getuid", return_value=1000, create=True),
+                patch("os.getgid", return_value=1000, create=True),
+            ):
+                self.assertTrue(
+                    manager._reclaim_model_cache_ownership(
+                        hub / "models--org--model",
+                    ),
+                )
+
+            self.assertEqual(containers.run.call_count, 2)
+            self.assertNotEqual(
+                containers.run.call_args_list[0].args[0],
+                containers.run.call_args_list[1].args[0],
             )
 
     def test_foreign_owner_scan_includes_the_repository_root(self):
@@ -2977,6 +3015,35 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 nas._reclaim_if_foreign(repository)
 
             self.assertEqual(scanned, [repository, lock_dir, repository, lock_dir])
+            self.assertEqual(reclaimed, [repository, repository])
+
+    def test_reclaim_covers_root_owned_hub_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            reclaimed: list[Path] = []
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=lambda path: reclaimed.append(path) or True,
+            )
+
+            def fake_entry(nas_instance, path):
+                # The hub directory itself is root-written; the model tree
+                # below it is clean.
+                return Path(path) == hub
+
+            def no_foreign_entries(nas_instance, path):
+                return False
+
+            with (
+                patch.object(VirtualNAS, "_entry_is_foreign", fake_entry),
+                patch.object(
+                    VirtualNAS, "_repository_has_foreign_owner", no_foreign_entries,
+                ),
+            ):
+                self.assertTrue(nas.reclaim_cached_model_ownership("org/model"))
+                nas._reclaim_if_foreign(repository)
+
             self.assertEqual(reclaimed, [repository, repository])
 
     def test_ownership_reclaimer_reports_failure_without_raising(self):

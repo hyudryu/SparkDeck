@@ -2479,13 +2479,14 @@ class Manager:
         getgid = getattr(os, "getgid", None)
         return getuid(), getgid() if getgid is not None else getuid()
 
-    def _ownership_reclaim_image(self) -> str:
-        """Pick an image for the one-shot ownership repair container.
+    def _ownership_reclaim_images(self) -> list[str]:
+        """Ordered images to try for the one-shot ownership repair container.
 
         Model runtime images are always present on a serving node and ship a
-        POSIX userland, so they are preferred before any other local image
-        with a known runtime userland, and only then a tiny image Docker
-        must pull.
+        POSIX userland, so the configured runtime images come first, then any
+        locally present image with a known runtime userland, then any other
+        local image (a custom-tag-only node), and finally a tiny image Docker
+        must pull. Failures fall through to the next candidate.
         """
         candidates: list[str] = []
         for raw in (
@@ -2497,28 +2498,29 @@ class Manager:
             tag = str(raw or "").strip()
             if tag and tag not in candidates:
                 candidates.append(tag)
-        for tag in candidates:
-            try:
-                self.client.images.get(tag)
-            except docker.errors.ImageNotFound:
-                continue
-            return tag
-        # A node can serve exclusively through custom runtime images, so
-        # prefer any locally present image with a known POSIX userland
-        # before resorting to a pull the node may be unable to make.
         markers = ("vllm", "sglang", "llama", "laya", "tensorfold")
+        local: list[str] = []
         try:
             for image in self.client.images.list():
-                for tag in (image.tags or []):
-                    lowered = tag.lower()
-                    if any(marker in lowered for marker in markers):
-                        return tag
+                local.extend(image.tags or [])
         except docker.errors.DockerException:
-            pass
-        return "busybox:latest"
+            local = []
+        local_set = set(local)
+        ordered = [tag for tag in candidates if tag in local_set]
+        ordered += [
+            tag for tag in local if tag not in ordered
+            and any(marker in tag.lower() for marker in markers)
+        ]
+        ordered += [tag for tag in local if tag not in ordered]
+        ordered.append("busybox:latest")
+        unique: list[str] = []
+        for tag in ordered:
+            if tag not in unique:
+                unique.append(tag)
+        return unique[:8]
 
     def _reclaim_model_cache_ownership(self, repository: Path) -> bool:
-        """Chown one cached repository back to this process's user via Docker.
+        """Chown root-written cache entries back to this process via Docker.
 
         Model containers run as root with the host Hugging Face cache
         bind-mounted, so serving a model leaves root-owned hub metadata the
@@ -2527,52 +2529,72 @@ class Manager:
         without relying on sudo, which the systemd user service can never
         elevate. Returns whether a repair was attempted.
 
-        The bind mount is anchored at the repository's parent (the hub)
-        rather than at the repository: a racing container can replace the
-        repository with a symlink, and Docker resolves bind sources on the
-        host. chown therefore only ever acts on the named child inside the
-        real hub, and ``-h`` keeps it from dereferencing even that entry.
-        Each target is skipped when it does not exist, so a repair after the
-        repository was deleted still reaches a remaining lock directory.
+        The bind mount is anchored at the configured cache directory rather
+        than the repository or the hub: containers hold that directory
+        read-write, so a racing runtime can rename anything inside it, but
+        it cannot rename the anchor itself, and Docker resolves bind
+        sources on the host. chown therefore only ever addresses entries
+        inside the real cache directory: the hub and its lock root non-
+        recursively (a root-written parent blocks creating any new model),
+        and each model child recursively but selecting only root-owned
+        entries, so a deliberately shared repository keeps its other
+        users. ``-h`` keeps chown from dereferencing a swapped symlink, and
+        every target is skipped when it does not exist.
         """
         identity = self._posix_identity()
         if identity is None:
             return False
         uid, gid = identity
         hub = repository.parent
-        if not hub.is_dir():
+        cache = hub.parent
+        if not cache.is_dir():
             return False
         lock_dir = hub / ".locks" / repository.name
         if not repository.exists() and not lock_dir.exists():
             # Nothing of this model remains; there is nothing to repair.
             return False
-        try:
-            image = self._ownership_reclaim_image()
-            repairs: list[str] = []
-            for child in (
-                f"/reclaim-hub/{repository.name}",
-                f"/reclaim-hub/.locks/{repository.name}",
-            ):
-                quoted = shlex.quote(child)
-                repairs.append(
-                    f"[ -e {quoted} ] && chown -R {uid}:{gid} -h {quoted} "
-                    f"|| [ ! -e {quoted} ]",
-                )
-            self.client.containers.run(
-                image,
-                command=["; ".join(repairs)],
-                entrypoint=["/bin/sh", "-c"],
-                # Runtime images may declare a non-root USER; only root can
-                # repair root-owned entries.
-                user="0:0",
-                mounts=[Mount("/reclaim-hub", str(hub), type="bind")],
-                detach=False,
-                remove=True,
+        chown = f"chown {uid}:{gid} -h"
+        repairs: list[str] = []
+        for parent in ("/reclaim-cache/hub", "/reclaim-cache/hub/.locks"):
+            quoted = shlex.quote(parent)
+            repairs.append(
+                f"[ -e {quoted} ] && {chown} {quoted} || [ ! -e {quoted} ]",
             )
-        except Exception:
-            logger.exception("cache ownership reclaim of %s failed", repository)
-            return False
-        return True
+        for child in (
+            f"/reclaim-cache/hub/{repository.name}",
+            f"/reclaim-cache/hub/.locks/{repository.name}",
+        ):
+            quoted = shlex.quote(child)
+            # Repair only root-owned entries so other cache users keep
+            # their ownership of a deliberately shared repository.
+            repairs.append(
+                f"[ -e {quoted} ] && find {quoted} -user 0 "
+                f"-exec {chown} {{}} + || [ ! -e {quoted} ]",
+            )
+        for image in self._ownership_reclaim_images():
+            try:
+                self.client.containers.run(
+                    image,
+                    command=["; ".join(repairs)],
+                    entrypoint=["/bin/sh", "-c"],
+                    # Runtime images may declare a non-root USER; only root
+                    # can repair root-owned entries.
+                    user="0:0",
+                    mounts=[Mount("/reclaim-cache", str(cache), type="bind")],
+                    detach=False,
+                    remove=True,
+                )
+            except docker.errors.ImageNotFound:
+                # The candidate is not local and the node cannot pull.
+                continue
+            except Exception:
+                logger.exception(
+                    "cache ownership reclaim of %s with %s failed",
+                    repository, image,
+                )
+                continue
+            return True
+        return False
 
     async def model_cache_inventory(
         self, enrich_expected_sizes: bool = False,

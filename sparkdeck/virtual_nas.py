@@ -2625,6 +2625,22 @@ class VirtualNAS:
         """Hugging Face keeps per-model download locks beside the repository."""
         return repository.parent / ".locks" / repository.name
 
+    def _entry_is_foreign(self, path: Path) -> bool:
+        """Whether one directory entry itself is root-written, no traversal.
+
+        A root-created hub or lock root blocks creating any new model entry
+        inside it, so the parents of a model repository need their own check
+        even when the model's repository does not exist yet.
+        """
+        current_uid = _current_user_id()
+        if current_uid is None or current_uid == 0:
+            return False
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return _metadata_owner_id(metadata) == 0
+
     def reclaim_cached_model_ownership(self, model_id: str) -> bool:
         """Repair one cached repository's ownership after container writes.
 
@@ -2639,12 +2655,21 @@ class VirtualNAS:
             return False
         if repository.is_symlink() or not repository.is_dir():
             return False
-        if not self._repository_has_foreign_owner(repository):
-            if not self._repository_has_foreign_owner(
-                self._model_lock_dir(repository),
-            ):
-                return False
+        if not self._needs_ownership_repair(repository):
+            return False
         return self._reclaim_repository_ownership(repository)
+
+    def _needs_ownership_repair(self, repository: Path) -> bool:
+        """Whether root-written entries surround or fill this repository."""
+        if self._entry_is_foreign(repository.parent):
+            return True
+        if self._entry_is_foreign(self._model_lock_dir(repository).parent):
+            return True
+        if self._repository_has_foreign_owner(repository):
+            return True
+        return self._repository_has_foreign_owner(
+            self._model_lock_dir(repository),
+        )
 
     def _repository_has_foreign_owner(self, repository: Path) -> bool:
         current_uid = _current_user_id()
@@ -2688,12 +2713,7 @@ class VirtualNAS:
 
     def _reclaim_if_foreign(self, repository: Path) -> None:
         """Restore ownership before Hub writes into a previously served tree."""
-        if self._repository_has_foreign_owner(repository):
-            self._reclaim_repository_ownership(repository)
-            return
-        # Download locks live in a hub-level sibling; a root-owned lock
-        # directory blocks Hub from creating its lock files just as much.
-        if self._repository_has_foreign_owner(self._model_lock_dir(repository)):
+        if self._needs_ownership_repair(repository):
             self._reclaim_repository_ownership(repository)
 
     def _reclaim_repository_ownership(self, repository: Path) -> bool:

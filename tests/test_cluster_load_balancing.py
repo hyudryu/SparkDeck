@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from fastapi import HTTPException
 
-from manager import ClientAbort, Manager
+from manager import ClientAbort, ClusterReplicaUnavailable, Manager
+
+
+HEALTH_PATH = "/api/agent/inference/health"
 
 
 def status_error(status: int) -> httpx.HTTPStatusError:
@@ -91,8 +94,17 @@ def build_manager(deployment: dict) -> Manager:
     manager = Manager.__new__(Manager)
     manager.deployments = [deployment]
     manager.node_registry = Mock()
-    manager.node_registry.request = AsyncMock(return_value={"choices": []})
+    # The readiness gate probes every candidate through the observational
+    # agent health endpoint before forwarding; serve that by default so
+    # tests exercise balancing and failover against healthy replicas.
+    async def serve(node_id, method, path, *, json_body=None, timeout=30):
+        if path == HEALTH_PATH:
+            return {"ready": True}
+        return {"choices": []}
+
+    manager.node_registry.request = AsyncMock(side_effect=serve)
     manager.node_registry.open_stream = AsyncMock()
+    manager.inference_target_health = AsyncMock(return_value=True)
     manager._acquire_inference_slot = AsyncMock(return_value=None)
     manager._release_inference_slot = Mock()
     return manager
@@ -102,6 +114,7 @@ def proxied_containers(manager: Manager) -> list[str]:
     return [
         call.kwargs["json_body"]["_sparkdeck_container_name"]
         for call in manager.node_registry.request.await_args_list
+        if call.args[2] != HEALTH_PATH
     ]
 
 
@@ -130,7 +143,9 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
             ["repl-1-r0", "repl-1-r1", "repl-1-r0", "repl-1-r1"],
         )
         nodes = [
-            call.args[0] for call in manager.node_registry.request.await_args_list
+            call.args[0]
+            for call in manager.node_registry.request.await_args_list
+            if call.args[2] != HEALTH_PATH
         ]
         self.assertEqual(nodes, ["remote-1", "remote-2", "remote-1", "remote-2"])
 
@@ -140,13 +155,15 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         manager._active_reqs = {}
         manager._trailing_window = 5.0
 
-        async def respond(*args, **kwargs):
+        async def respond(node_id, method, path, *, json_body=None, timeout=30):
+            if path == HEALTH_PATH:
+                return {"ready": True}
             self.assertEqual(
                 manager.active_requests()["org/model"]["caller_ips"],
                 {"192.0.2.45": 1},
             )
             self.assertEqual(
-                kwargs["json_body"]["_sparkdeck_caller_ip"], "192.0.2.45",
+                json_body["_sparkdeck_caller_ip"], "192.0.2.45",
             )
             return {"choices": []}
 
@@ -165,6 +182,8 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         first_started = asyncio.Event()
 
         async def slow_rank_zero(node_id, method, path, *, json_body=None, timeout=30):
+            if path == HEALTH_PATH:
+                return {"ready": True}
             if json_body["_sparkdeck_container_name"] == "repl-1-r0":
                 first_started.set()
                 await asyncio.sleep(0.05)
@@ -242,14 +261,17 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreachable_replica_fails_over_to_next(self):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
+            # Rank 0's readiness probe fails, so it is skipped without a
+            # forward attempt; rank 1 answers its probe and serves.
             RuntimeError("could not contact Node 0: connect failed"),
+            {"ready": True},
             {"choices": [], "ok": True},
         ])
 
         result = await self.proxy(manager)
 
         self.assertEqual(result, {"choices": [], "ok": True})
-        self.assertEqual(manager.node_registry.request.await_count, 2)
+        self.assertEqual(manager.node_registry.request.await_count, 3)
         second = manager.node_registry.request.await_args_list[1]
         self.assertEqual(second.args[0], "remote-2")
         self.assertEqual(
@@ -264,6 +286,7 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
             RuntimeError("could not contact Node 0: connect failed"),
+            {"ready": True},
             {"choices": [], "ok": True},
         ])
         route_observation = {}
@@ -278,14 +301,17 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
             route_observation["member"]["node_id"], "remote-2",
         )
 
-    async def test_exhausted_replicas_raise_last_error(self):
+    async def test_exhausted_replicas_raise_not_ready(self):
+        # A replica whose readiness probe cannot be answered is out of
+        # rotation, so exhausting every candidate reports no ready replica
+        # instead of the last transport error.
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
             RuntimeError("could not contact Node 0"),
             RuntimeError("could not contact Node 1"),
         ])
 
-        with self.assertRaisesRegex(RuntimeError, "Node 1"):
+        with self.assertRaisesRegex(ClusterReplicaUnavailable, "not ready"):
             await self.proxy(manager)
         self.assertEqual(manager.node_registry.request.await_count, 2)
         self.assertEqual(
@@ -305,7 +331,9 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_admission_limits_are_scoped_per_replica(self):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": True},
             RuntimeError("could not contact Node 0: connect failed"),
+            {"ready": True},
             {"choices": [], "ok": True},
         ])
         captured = []
@@ -339,32 +367,37 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ClientAbort):
             await self.proxy(manager)
 
-        manager.node_registry.request.assert_not_awaited()
+        # Only rank 0's readiness probe reaches the registry before the
+        # cancelled admission aborts the forward without failover.
+        manager.node_registry.request.assert_awaited_once()
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
     async def test_remote_upstream_client_error_does_not_fail_over(self):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": True},
             RuntimeError("Node 0 agent error: HTTP 400: invalid parameters"),
         ])
 
         with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
             await self.proxy(manager)
 
-        manager.node_registry.request.assert_awaited_once()
+        self.assertEqual(manager.node_registry.request.await_count, 2)
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
     async def test_remote_upstream_server_error_fails_over(self):
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": True},
             RuntimeError("Node 0 agent error: HTTP 503: model overloaded"),
+            {"ready": True},
             {"choices": [], "ok": True},
         ])
 
         result = await self.proxy(manager)
 
         self.assertEqual(result["ok"], True)
-        self.assertEqual(manager.node_registry.request.await_count, 2)
+        self.assertEqual(manager.node_registry.request.await_count, 4)
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
 
     async def test_remote_missing_container_fails_over_without_stream(self):
@@ -379,17 +412,115 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
         })
         manager = build_manager(replicated_deployment())
         manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": True},
             RuntimeError(f"Node 0 agent error: HTTP 404: {detail}"),
+            {"ready": True},
             {"choices": [], "ok": True},
         ])
 
         result = await self.proxy(manager)
 
         self.assertEqual(result["ok"], True)
-        self.assertEqual(manager.node_registry.request.await_count, 2)
-        second = manager.node_registry.request.await_args_list[1]
-        self.assertEqual(second.args[0], "remote-2")
+        self.assertEqual(manager.node_registry.request.await_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in manager.node_registry.request.await_args_list
+             if call.args[2] != HEALTH_PATH][-1],
+            "remote-2",
+        )
         self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+
+class ReadinessGateTests(unittest.IsolatedAsyncioTestCase):
+    """The balancer routes only to members whose engine answers health."""
+
+    async def proxy(self, manager: Manager, **overrides):
+        body = {"model": "org/model", "messages": [], "stream": False, **overrides}
+        return await manager.proxy_cluster_inference(
+            "repl-1", "org/model", body, "chat/completions",
+        )
+
+    async def test_not_ready_replica_is_skipped_and_ready_one_serves(self):
+        manager = build_manager(replicated_deployment())
+
+        async def serve(node_id, method, path, *, json_body=None, timeout=30):
+            if path == HEALTH_PATH:
+                return {
+                    "ready": json_body["_sparkdeck_container_name"] != "repl-1-r0",
+                }
+            return {"choices": [], "ok": True}
+
+        manager.node_registry.request = AsyncMock(side_effect=serve)
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result, {"choices": [], "ok": True})
+        # Rank 0 is still loading, so the request must land on rank 1.
+        self.assertEqual(proxied_containers(manager), ["repl-1-r1"])
+        self.assertEqual(member_loads(manager, manager.deployments[0]), [0, 0])
+
+    async def test_deployment_without_any_ready_replica_is_rejected(self):
+        manager = build_manager(replicated_deployment())
+        manager.node_registry.request = AsyncMock(return_value={"ready": False})
+
+        with self.assertRaisesRegex(ClusterReplicaUnavailable, "not ready"):
+            await self.proxy(manager)
+
+        # Every candidate was probed; none received a forwarded request.
+        self.assertEqual(proxied_containers(manager), [])
+        self.assertEqual(
+            member_loads(manager, manager.deployments[0]), [0, 0]
+        )
+
+    async def test_failed_readiness_probe_skips_the_replica(self):
+        manager = build_manager(replicated_deployment())
+
+        async def serve(node_id, method, path, *, json_body=None, timeout=30):
+            if path == HEALTH_PATH and node_id == "remote-1":
+                raise RuntimeError("could not contact Node 0")
+            if path == HEALTH_PATH:
+                return {"ready": True}
+            return {"choices": [], "ok": True}
+
+        manager.node_registry.request = AsyncMock(side_effect=serve)
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(proxied_containers(manager), ["repl-1-r1"])
+
+    async def test_local_replica_not_ready_fails_over_to_remote(self):
+        deployment = replicated_deployment()
+        deployment["members"] = [
+            member(0, "local", "repl-1-r0"),
+            member(1, "remote-2", "repl-1-r1"),
+        ]
+        manager = build_manager(deployment)
+        manager._vllm_chat = AsyncMock(return_value={"choices": []})
+        manager._vllm_completions = AsyncMock(return_value={"choices": []})
+        manager.inference_target_health = AsyncMock(return_value=False)
+
+        result = await self.proxy(manager)
+
+        self.assertEqual(result, {"choices": []})
+        manager._vllm_chat.assert_not_awaited()
+        self.assertEqual(proxied_containers(manager), ["repl-1-r1"])
+
+    async def test_startup_benchmark_bypasses_the_readiness_gate(self):
+        deployment = replicated_deployment()
+        deployment["members"] = [member(0, "local", "repl-1-r0")]
+        manager = build_manager(deployment)
+        manager.inference_target_health = AsyncMock(return_value=False)
+        manager._vllm_chat = AsyncMock(return_value={"choices": []})
+        manager._vllm_completions = AsyncMock(return_value={"choices": []})
+
+        await manager._proxy_cluster_member_unlimited(
+            deployment, deployment["members"][0],
+            "org/model", {"model": "org/model", "stream": False},
+            "chat/completions", None, startup_benchmark=True,
+        )
+
+        manager.inference_target_health.assert_not_awaited()
+        manager._vllm_chat.assert_awaited_once()
 
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
@@ -713,7 +844,10 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manager._vllm_chat.await_args.kwargs["container_name"], "repl-1-r0"
         )
-        remote_calls = manager.node_registry.request.await_args_list
+        remote_calls = [
+            call for call in manager.node_registry.request.await_args_list
+            if call.args[2] != HEALTH_PATH
+        ]
         self.assertEqual(len(remote_calls), 1)
         self.assertEqual(remote_calls[0].args[0], "remote-2")
         self.assertEqual(member_loads(manager, deployment), [0, 0])
@@ -723,14 +857,19 @@ class LocalReplicaTests(unittest.IsolatedAsyncioTestCase):
         manager._vllm_chat = AsyncMock(side_effect=LookupError(
             "No managed container found for model 'org/model'"
         ))
-        manager.node_registry.request = AsyncMock(
-            return_value={"choices": [], "ok": True}
-        )
+
+        async def serve(node_id, method, path, *, json_body=None, timeout=30):
+            if path == HEALTH_PATH:
+                return {"ready": True}
+            return {"choices": [], "ok": True}
+
+        manager.node_registry.request = AsyncMock(side_effect=serve)
 
         result = await self.manager_proxy(manager)
 
         self.assertEqual(result["ok"], True)
-        manager.node_registry.request.assert_awaited_once()
+        # The remote replica answers its readiness probe and then serves.
+        self.assertEqual(manager.node_registry.request.await_count, 2)
         self.assertEqual(member_loads(manager, deployment), [0, 0])
 
     async def test_local_stream_releases_load_after_consumption(self):

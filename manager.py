@@ -7152,6 +7152,39 @@ class Manager:
             if waiting:
                 self._release_cluster_member(deployment_id, member)
 
+    async def _cluster_member_serving(
+        self, deployment: dict, member: dict, model: str,
+    ) -> bool:
+        """True only when this member's engine answers a health check now.
+
+        Load-balancer routing must follow the dashboard's green state: a
+        member that is not yet serving HTTP 200 — still loading weights,
+        crashed, or unreachable — cannot take traffic. Persisted member
+        status records launch progress, not engine readiness, so readiness
+        is probed live with the same observational check a local forward
+        uses; it never wakes, restarts, or queues against the engine.
+        """
+        deployment_id = str(deployment.get("id") or "")
+        try:
+            if member.get("node_id") == LOCAL_NODE_ID:
+                return await self.inference_target_health(
+                    model, container_name=member.get("container_name"),
+                    deployment_id=deployment_id,
+                )
+            result = await self.node_registry.request(
+                member.get("node_id"), "POST", "/api/agent/inference/health",
+                json_body={
+                    "model": model,
+                    "_sparkdeck_container_name": member.get("container_name"),
+                    "_sparkdeck_deployment_id": deployment_id,
+                }, timeout=10,
+            )
+        except ClientAbort:
+            raise
+        except Exception:
+            return False
+        return bool((result or {}).get("ready"))
+
     async def _proxy_cluster_member_unlimited(
         self,
         deployment: dict,
@@ -7181,6 +7214,18 @@ class Manager:
             # the member is unavailable rather than broken, so fail over.
             raise ClusterReplicaUnavailable(
                 "engine group is stopped; start it or route to a running group"
+            )
+        if not startup_benchmark and not await self._cluster_member_serving(
+            deployment, member, model,
+        ):
+            # A container can be up for minutes while its weights are still
+            # loading, so Docker status alone proves nothing. Only a member
+            # whose engine answers its health endpoint may take traffic;
+            # everyone else stays out of rotation and the request fails over
+            # (or is rejected when no member is serving yet).
+            raise ClusterReplicaUnavailable(
+                "engine is not ready yet; its health endpoint is not "
+                "answering, so it cannot take traffic"
             )
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)

@@ -347,6 +347,9 @@ _LAYA_SERVE_PORT = 8080
 DEFAULT_TENSORFOLD_IMAGE = "sparkdeck/tensorfold:latest"
 _TENSORFOLD_SERVE_PORT = 8080
 _SUPPORTED_ENGINES = ("vllm", "sglang", "llama.cpp", "laya", "tensorfold")
+# The Laya decision server and TensorFold expose no /health route; their
+# readiness signal is the OpenAI surface itself answering 200.
+_ENGINES_WITHOUT_HEALTH_ROUTE = frozenset({"laya", "tensorfold"})
 
 
 def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
@@ -7280,6 +7283,48 @@ class Manager:
             if waiting:
                 self._release_cluster_member(deployment_id, member)
 
+    async def _cluster_member_serving(
+        self, deployment: dict, member: dict, model: str,
+    ) -> bool:
+        """True only when this member's engine answers its health check now.
+
+        Load-balancer routing must follow the dashboard's green state: a
+        member that is not yet serving 200 — still loading weights,
+        crashed, or unreachable — cannot take traffic. Persisted member
+        status records launch progress, not engine readiness, so readiness
+        is probed live with the same observational check a local forward
+        uses; it never wakes, restarts, or queues against the engine.
+        Engines without a ``/health`` route (the Laya decision server and
+        TensorFold expose only their OpenAI surface) are ready when that
+        surface answers 200, which is also what turns them green.
+        """
+        deployment_id = str(deployment.get("id") or "")
+        strict_health = str(
+            deployment.get("engine") or ""
+        ) not in _ENGINES_WITHOUT_HEALTH_ROUTE
+        try:
+            if member.get("node_id") == LOCAL_NODE_ID:
+                return await self.inference_target_health(
+                    model, container_name=member.get("container_name"),
+                    deployment_id=deployment_id, single_target=True,
+                    **({"strict_health": True} if strict_health else {}),
+                )
+            result = await self.node_registry.request(
+                member.get("node_id"), "POST", "/api/agent/inference/health",
+                json_body={
+                    "model": model,
+                    "_sparkdeck_container_name": member.get("container_name"),
+                    "_sparkdeck_deployment_id": deployment_id,
+                    "single_target": True,
+                    **({"strict_health": True} if strict_health else {}),
+                }, timeout=10,
+            )
+        except ClientAbort:
+            raise
+        except Exception:
+            return False
+        return bool((result or {}).get("ready"))
+
     async def _proxy_cluster_member_unlimited(
         self,
         deployment: dict,
@@ -7309,6 +7354,18 @@ class Manager:
             # the member is unavailable rather than broken, so fail over.
             raise ClusterReplicaUnavailable(
                 "engine group is stopped; start it or route to a running group"
+            )
+        if not startup_benchmark and not await self._cluster_member_serving(
+            deployment, member, model,
+        ):
+            # A container can be up for minutes while its weights are still
+            # loading, so Docker status alone proves nothing. Only a member
+            # whose engine answers its health endpoint may take traffic;
+            # everyone else stays out of rotation and the request fails over
+            # (or is rejected when no member is serving yet).
+            raise ClusterReplicaUnavailable(
+                "engine is not ready yet; its health endpoint is not "
+                "answering, so it cannot take traffic"
             )
         node_id = member.get("node_id")
         self._acquire_cluster_member(deployment_id, member)
@@ -15862,7 +15919,7 @@ class Manager:
         image_labels = image_config.get("Labels") or {}
         return str(image_labels.get(key) or "").strip() != value
 
-    async def list_containers(self) -> list[dict]:
+    async def list_containers(self, *, with_phase: bool = True) -> list[dict]:
         def _run():
             def inventory():
                 out = []
@@ -15884,6 +15941,11 @@ class Manager:
                 })
                 return out
         containers = await asyncio.to_thread(_run)
+        if not with_phase:
+            # An exact-target probe only needs status and port; the full
+            # setup-phase pass health-checks and tails logs for every
+            # running container.
+            return containers
         # Attach setup phase (health/log-derived) in parallel.
         if containers:
             phases = await asyncio.gather(
@@ -19652,13 +19714,21 @@ class Manager:
     async def inference_target_health(
         self, model: str, *, container_name: str | None = None,
         deployment_id: str | None = None, strict_health: bool = False,
+        single_target: bool = False,
     ) -> bool:
-        """Observe an exact inference target without waking a stopped model."""
+        """Observe an exact inference target without waking a stopped model.
+
+        ``single_target`` skips the per-container setup-phase work of a full
+        inventory pass (a health check and log tail for every running
+        container) and probes only the named target, which keeps a hot-path
+        readiness probe cheap.
+        """
         if deployment_id:
             deployment = self._deployment(deployment_id)
             if deployment and deployment.get("desired_state") == "stopped":
                 return False
-        for container in await self.list_containers():
+        containers = await self.list_containers(with_phase=not single_target)
+        for container in containers:
             if container_name and container.get("name") != container_name:
                 continue
             if (

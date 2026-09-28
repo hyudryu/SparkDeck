@@ -26,7 +26,8 @@ import docker
 
 from disk_manager import DiskScanJobs, browse_directories, delete_entries
 from manager import (
-    Manager, ClientAbort, FanSettingsConflict, SourceRoutingUnavailable,
+    Manager, ClientAbort, ClusterReplicaUnavailable, FanSettingsConflict,
+    SourceRoutingUnavailable,
 )
 from cluster import (
     AGENT_PROTOCOL_VERSION,
@@ -1473,10 +1474,12 @@ async def agent_inference_health(req: Request):
     container_name = body.pop("_sparkdeck_container_name", None)
     deployment_id = body.pop("_sparkdeck_deployment_id", None)
     strict_health = body.get("strict_health") is True
+    single_target = body.get("single_target") is True
     try:
         ready = await manager.inference_target_health(
             model, container_name=container_name, deployment_id=deployment_id,
             **({"strict_health": True} if strict_health else {}),
+            **({"single_target": True} if single_target else {}),
         )
         return {
             "ready": ready, "model": model,
@@ -4517,7 +4520,7 @@ async def v1_chat_completions(req: Request):
     except ClientAbort:
         # Client left; upstream request was aborted too. Nothing to send.
         return Response(status_code=499)
-    except SourceRoutingUnavailable as e:
+    except (SourceRoutingUnavailable, ClusterReplicaUnavailable) as e:
         raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
@@ -4570,7 +4573,7 @@ async def v1_responses(req: Request):
             raise HTTPException(502, "invalid upstream chat response") from exc
     except ClientAbort:
         return Response(status_code=499)
-    except SourceRoutingUnavailable as exc:
+    except (SourceRoutingUnavailable, ClusterReplicaUnavailable) as exc:
         raise HTTPException(503, str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -4599,7 +4602,7 @@ async def v1_completions(req: Request):
         stream = hasattr(result, "__aiter__")
     except ClientAbort:
         return Response(status_code=499)
-    except SourceRoutingUnavailable as e:
+    except (SourceRoutingUnavailable, ClusterReplicaUnavailable) as e:
         raise HTTPException(503, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))

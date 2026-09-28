@@ -501,7 +501,11 @@ class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
             }],
         }]
         manager.node_registry = Mock()
-        manager.node_registry.request = AsyncMock(return_value={"choices": [], "usage": {}})
+        async def serve(node_id, method, path, *, json_body=None, timeout=30):
+            if path.endswith("/inference/health"):
+                return {"ready": True}
+            return {"choices": [], "usage": {}}
+        manager.node_registry.request = AsyncMock(side_effect=serve)
         manager._acquire_inference_slot = AsyncMock(return_value="remote-cluster")
         manager._release_inference_slot = Mock()
         return manager
@@ -516,14 +520,21 @@ class RemoteInferenceTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"choices": [], "usage": {}})
         manager._acquire_inference_slot.assert_awaited_once()
-        manager.node_registry.request.assert_awaited_once_with(
-            "remote-1", "POST", "/api/agent/inference/chat/completions",
-            json_body={
-                **body,
-                "_sparkdeck_container_name": "rank-0",
-                "_sparkdeck_deployment_id": "remote-cluster",
-            }, timeout=600,
+        forward_calls = [
+            call for call in manager.node_registry.request.await_args_list
+            if not call.args[2].endswith("/inference/health")
+        ]
+        self.assertEqual(len(forward_calls), 1)
+        self.assertEqual(
+            forward_calls[0].args,
+            ("remote-1", "POST", "/api/agent/inference/chat/completions"),
         )
+        self.assertEqual(forward_calls[0].kwargs["json_body"], {
+            **body,
+            "_sparkdeck_container_name": "rank-0",
+            "_sparkdeck_deployment_id": "remote-cluster",
+        })
+        self.assertEqual(forward_calls[0].kwargs["timeout"], 600)
         manager._release_inference_slot.assert_called_once_with("remote-cluster")
 
     async def test_remote_health_uses_selected_primary_agent(self):

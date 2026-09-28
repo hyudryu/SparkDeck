@@ -17,7 +17,12 @@ class NonstreamCleanupOwnershipTests(unittest.IsolatedAsyncioTestCase):
         opened, closing, finish_close = asyncio.Event(), asyncio.Event(), asyncio.Event()
         cancel = asyncio.Event()
 
-        async def request(*args, **kwargs):
+        async def request(node_id, method, path, *, json_body=None, timeout=30):
+            # The readiness gate probes the observational health endpoint
+            # before forwarding; answer it so the forward itself is the
+            # request that blocks until the transport unwinds.
+            if path.endswith("/inference/health"):
+                return {"ready": True}
             opened.set()
             try:
                 await asyncio.Event().wait()

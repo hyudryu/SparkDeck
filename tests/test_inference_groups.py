@@ -49,10 +49,14 @@ def test_remote_groups_track_unlimited_nonstream_requests_without_caller_ip():
     async def run():
         manager = grouped_manager()
         release = asyncio.Event()
-        async def response(*args, **kwargs):
+        manager.node_registry = Mock()
+        async def response(node_id, method, path, *, json_body=None, timeout=30):
+            # The readiness gate probes the observational health endpoint
+            # before every forward; report the engines ready.
+            if path.endswith("/inference/health"):
+                return {"ready": True}
             await release.wait()
             return {"choices": []}
-        manager.node_registry = Mock()
         manager.node_registry.request = AsyncMock(side_effect=response)
         deployment = manager.deployments[0]
         tasks = [asyncio.create_task(manager._proxy_cluster_member(
@@ -114,6 +118,7 @@ def test_remote_stream_group_sessions_close_independently():
             async def aclose(self):
                 pass
         manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(return_value={"ready": True})
         manager.node_registry.open_stream = AsyncMock(side_effect=lambda *a, **k: Response())
         deployment = manager.deployments[0]
         streams = [await manager._proxy_cluster_member(

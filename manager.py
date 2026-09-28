@@ -2520,11 +2520,23 @@ class Manager:
         uid, gid = identity
         try:
             image = self._ownership_reclaim_image()
+            mounts = [Mount("/reclaim-hub", str(repository), type="bind")]
+            # Hugging Face keeps per-model download locks in a hub-level
+            # sibling of the repository; root containers leave those
+            # root-owned too, and the next download must create entries there.
+            lock_dir = repository.parent / ".locks" / repository.name
+            targets = "/reclaim-hub"
+            if lock_dir.is_dir() and not lock_dir.is_symlink():
+                mounts.append(Mount("/reclaim-locks", str(lock_dir), type="bind"))
+                targets += " /reclaim-locks"
             self.client.containers.run(
                 image,
-                command=[f"chown -R {uid}:{gid} /reclaim-hub"],
+                command=[f"chown -R {uid}:{gid} {targets}"],
                 entrypoint=["/bin/sh", "-c"],
-                mounts=[Mount("/reclaim-hub", str(repository), type="bind")],
+                # Runtime images may declare a non-root USER; only root can
+                # repair root-owned entries.
+                user="0:0",
+                mounts=mounts,
                 detach=False,
                 remove=True,
             )

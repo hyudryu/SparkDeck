@@ -2617,6 +2617,11 @@ class VirtualNAS:
             raise RuntimeError("source node did not report a usable cached size")
         return size
 
+    @staticmethod
+    def _model_lock_dir(repository: Path) -> Path:
+        """Hugging Face keeps per-model download locks beside the repository."""
+        return repository.parent / ".locks" / repository.name
+
     def reclaim_cached_model_ownership(self, model_id: str) -> bool:
         """Repair one cached repository's ownership after container writes.
 
@@ -2632,13 +2637,29 @@ class VirtualNAS:
         if repository.is_symlink() or not repository.is_dir():
             return False
         if not self._repository_has_foreign_owner(repository):
-            return False
+            if not self._repository_has_foreign_owner(
+                self._model_lock_dir(repository),
+            ):
+                return False
         return self._reclaim_repository_ownership(repository)
 
     def _repository_has_foreign_owner(self, repository: Path) -> bool:
         current_uid = _current_user_id()
         if current_uid is None or repository.is_symlink() or not repository.is_dir():
             return False
+
+        def foreign(metadata: os.stat_result) -> bool:
+            owner = _metadata_owner_id(metadata)
+            return owner is not None and owner != current_uid
+
+        try:
+            # The repository itself can be the root-written entry: an empty
+            # or wholly root-owned tree has no child to report it.
+            if foreign(repository.stat(follow_symlinks=False)):
+                return True
+        except OSError:
+            # An unreadable root cannot be proven clean either.
+            return True
         pending = [repository]
         while pending:
             current = pending.pop()
@@ -2648,19 +2669,25 @@ class VirtualNAS:
                         try:
                             metadata = entry.stat(follow_symlinks=False)
                         except OSError:
-                            continue
-                        owner = _metadata_owner_id(metadata)
-                        if owner is not None and owner != current_uid:
+                            return True
+                        if foreign(metadata):
                             return True
                         if stat.S_ISDIR(metadata.st_mode):
                             pending.append(Path(entry.path))
             except OSError:
-                continue
+                # An unsearchable subtree cannot be proven clean; require
+                # repair rather than skipping it.
+                return True
         return False
 
     def _reclaim_if_foreign(self, repository: Path) -> None:
         """Restore ownership before Hub writes into a previously served tree."""
         if self._repository_has_foreign_owner(repository):
+            self._reclaim_repository_ownership(repository)
+            return
+        # Download locks live in a hub-level sibling; a root-owned lock
+        # directory blocks Hub from creating its lock files just as much.
+        if self._repository_has_foreign_owner(self._model_lock_dir(repository)):
             self._reclaim_repository_ownership(repository)
 
     def _reclaim_repository_ownership(self, repository: Path) -> bool:

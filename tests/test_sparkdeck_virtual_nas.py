@@ -2763,11 +2763,98 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             containers.run.assert_called_once()
             _, kwargs = containers.run.call_args
             self.assertEqual(kwargs["entrypoint"], ["/bin/sh", "-c"])
+            self.assertEqual(kwargs["user"], "0:0")
             self.assertEqual(kwargs["command"], ["chown -R 1000:1000 /reclaim-hub"])
             self.assertEqual(kwargs["mounts"][0]["Target"], "/reclaim-hub")
             self.assertEqual(kwargs["mounts"][0]["Source"], str(repository))
             self.assertEqual(kwargs["remove"], True)
             self.assertEqual(kwargs["detach"], False)
+
+    def test_ownership_reclaimer_repairs_hub_lock_sibling_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            lock_dir = hub / ".locks" / "models--org--model"
+            repository.mkdir(parents=True)
+            lock_dir.mkdir(parents=True)
+            containers = Mock()
+            client = Mock(containers=containers)
+            client.images.get.return_value = Mock()
+            manager.client = client
+
+            with (
+                patch("os.getuid", return_value=1000, create=True),
+                patch("os.getgid", return_value=1000, create=True),
+            ):
+                self.assertTrue(manager._reclaim_model_cache_ownership(repository))
+
+            _, kwargs = containers.run.call_args
+            self.assertEqual(
+                kwargs["command"],
+                ["chown -R 1000:1000 /reclaim-hub /reclaim-locks"],
+            )
+            self.assertEqual(
+                [(mount["Target"], mount["Source"]) for mount in kwargs["mounts"]],
+                [
+                    ("/reclaim-hub", str(repository)),
+                    ("/reclaim-locks", str(lock_dir)),
+                ],
+            )
+
+    def test_foreign_owner_scan_includes_the_repository_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = hub / "models--org--model"
+            repository.mkdir(parents=True)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            with (
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+            ):
+                self.assertTrue(nas._repository_has_foreign_owner(repository))
+
+    def test_unsearchable_subtree_requires_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: True)
+
+            with (
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch(
+                    "sparkdeck.virtual_nas.os.scandir",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ),
+            ):
+                self.assertTrue(nas._repository_has_foreign_owner(repository))
+
+    def test_reclaim_covers_root_owned_hub_lock_sibling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            lock_dir = hub / ".locks" / "models--org--model"
+            lock_dir.mkdir(parents=True)
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=lambda path: reclaimed.append(path) or True,
+            )
+            reclaimed: list[Path] = []
+            scanned: list[Path] = []
+
+            def fake_scan(nas_instance, path):
+                scanned.append(Path(path))
+                return Path(path) == lock_dir
+
+            with patch.object(
+                VirtualNAS, "_repository_has_foreign_owner", fake_scan,
+            ):
+                self.assertTrue(nas.reclaim_cached_model_ownership("org/model"))
+                nas._reclaim_if_foreign(repository)
+
+            self.assertEqual(scanned, [repository, lock_dir, repository, lock_dir])
+            self.assertEqual(reclaimed, [repository, repository])
 
     def test_ownership_reclaimer_reports_failure_without_raising(self):
         with tempfile.TemporaryDirectory() as directory:

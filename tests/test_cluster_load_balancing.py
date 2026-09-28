@@ -522,6 +522,69 @@ class ReadinessGateTests(unittest.IsolatedAsyncioTestCase):
         manager.inference_target_health.assert_not_awaited()
         manager._vllm_chat.assert_awaited_once()
 
+    async def test_engines_with_health_route_probe_strict(self):
+        deployment = replicated_deployment()
+        deployment["engine"] = "vllm"
+        deployment["members"] = [member(0, "local", "repl-1-r0")]
+        manager = build_manager(deployment)
+        manager._vllm_chat = AsyncMock(return_value={"choices": []})
+        manager._vllm_completions = AsyncMock(return_value={"choices": []})
+
+        await self.proxy(manager)
+
+        # /health must answer 200 itself; the /v1/models fallback must not
+        # let a broken engine take traffic.
+        manager.inference_target_health.assert_awaited_once_with(
+            "org/model", container_name="repl-1-r0",
+            deployment_id="repl-1", single_target=True, strict_health=True,
+        )
+
+    async def test_laya_probe_falls_back_to_openai_surface(self):
+        # The Laya decision server exposes /healthz but no /health route, so
+        # its readiness signal is /v1/models answering 200 — the same signal
+        # that turns the dashboard green for it.
+        deployment = replicated_deployment()
+        deployment["engine"] = "laya"
+        deployment["members"] = [member(0, "local", "repl-1-r0")]
+        manager = build_manager(deployment)
+        manager._vllm_chat = AsyncMock(return_value={"choices": []})
+        manager._vllm_completions = AsyncMock(return_value={"choices": []})
+
+        await self.proxy(manager)
+
+        manager.inference_target_health.assert_awaited_once_with(
+            "org/model", container_name="repl-1-r0",
+            deployment_id="repl-1", single_target=True,
+        )
+
+
+class HttpStatusMappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_not_ready_cluster_is_reported_as_503(self):
+        import server
+
+        async def _body(req, *args, **kwargs):
+            return {"model": "org/model", "messages": [], "stream": False}
+
+        with (
+            patch.object(server, "_inference_json", _body),
+            patch.object(
+                server.sparkdeck, "proxy",
+                AsyncMock(side_effect=ClusterReplicaUnavailable(
+                    "engine is not ready yet",
+                )),
+            ),
+            patch.object(server, "_inference_caller_ip", lambda req: None),
+            patch.object(
+                server, "_watch_disconnect",
+                lambda req, cancel: Mock(cancel=Mock()),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await server.v1_chat_completions(None)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("not ready", raised.exception.detail)
+
 
 class ReplicaStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_unconsumed_remote_stream_closes_and_releases_slots(self):

@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from manager import (
     DEFAULT_SETTINGS,
+    DEPLOYMENT_LABEL,
+    MODEL_LABEL,
     VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS,
     Manager,
 )
@@ -2565,6 +2567,257 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                     virtual_nas._remove_repository_with_privilege(outside, hub)
 
             self.assertTrue((outside / "keep").exists())
+
+    def test_delete_reclaims_ownership_through_docker_without_privilege(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            refs = repository / "refs"
+            refs.mkdir()
+            (refs / "main").write_text("revision-1")
+            real_rmtree = shutil.rmtree
+            state = {"reclaimed": False}
+            reclaimed_paths: list[Path] = []
+
+            def simulated_rmtree(path, *, onerror):
+                if not state["reclaimed"]:
+                    error = PermissionError("simulated root-owned cache entry")
+                    onerror(os.unlink, refs / "main", (PermissionError, error, None))
+                    return
+                real_rmtree(path)
+
+            def fake_reclaimer(path):
+                reclaimed_paths.append(path)
+                state["reclaimed"] = True
+                return True
+
+            def owner_id(metadata):
+                return 1000 if state["reclaimed"] else 0
+
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=fake_reclaimer,
+            )
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", simulated_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", side_effect=owner_id),
+                patch(
+                    "sparkdeck.virtual_nas._remove_repository_with_privilege",
+                    side_effect=AssertionError(
+                        "docker reclaim must remove the tree without sudo",
+                    ),
+                ),
+            ):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(reclaimed_paths, [repository])
+            self.assertFalse(repository.exists())
+
+    def test_delete_falls_back_to_privilege_when_the_reclaimer_cannot_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository, failing_rmtree = self._foreign_owned_cache_tree(
+                directory, hub,
+            )
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=lambda path: False,
+            )
+            privileged: list[Path] = []
+            real_rmtree = shutil.rmtree
+
+            def remove_with_privilege(path, hub_path):
+                privileged.append((path, hub_path))
+                real_rmtree(path)
+
+            with (
+                patch("sparkdeck.virtual_nas.shutil.rmtree", failing_rmtree),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+                patch(
+                    "sparkdeck.virtual_nas._remove_repository_with_privilege",
+                    remove_with_privilege,
+                ),
+            ):
+                result = nas.delete_model("org/model")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(privileged, [(repository, hub)])
+            self.assertFalse(repository.exists())
+
+    def test_reclaim_repository_ownership_swallows_reclaimer_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=Mock(side_effect=RuntimeError("docker down")),
+            )
+
+            self.assertFalse(nas._reclaim_repository_ownership(repository))
+
+    def test_download_reclaims_foreign_owned_repository_before_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            residue = hub / "models--org--model"
+            (residue / "refs").mkdir(parents=True)
+            (residue / "refs" / "main").write_text("stale")
+            state = {"reclaimed": False}
+            reclaimed_paths: list[Path] = []
+
+            def fake_reclaimer(path):
+                reclaimed_paths.append(path)
+                state["reclaimed"] = True
+                return True
+
+            def owner_id(metadata):
+                return 1000 if state["reclaimed"] else 0
+
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=fake_reclaimer,
+            )
+
+            def download_into_cache(**kwargs):
+                # The reclaim must happen before Hub writes touch the tree.
+                self.assertTrue(state["reclaimed"])
+                create_cached_model(Path(kwargs["cache_dir"]))
+                return str(
+                    Path(kwargs["cache_dir"]) / "models--org--model"
+                    / "snapshots" / "revision-1"
+                )
+
+            snapshot_download = Mock(side_effect=download_into_cache)
+            huggingface_hub = Mock(snapshot_download=snapshot_download)
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}),
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", side_effect=owner_id),
+            ):
+                result = nas.download_model("org/model", "revision-1")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(reclaimed_paths, [residue])
+
+    def test_reclaim_cached_model_ownership_repairs_served_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            repository = create_cached_model(hub)
+            (repository / "refs").mkdir()
+            (repository / "refs" / "main").write_text("revision-1")
+            reclaimed_paths: list[Path] = []
+
+            def fake_reclaimer(path):
+                reclaimed_paths.append(path)
+                return True
+
+            nas = VirtualNAS(
+                Path(directory), lambda: hub, FakeRegistry(), lambda: True,
+                ownership_reclaimer=fake_reclaimer,
+            )
+
+            with (
+                patch("sparkdeck.virtual_nas._current_user_id", return_value=1000),
+                patch("sparkdeck.virtual_nas._metadata_owner_id", return_value=0),
+            ):
+                self.assertTrue(nas.reclaim_cached_model_ownership("org/model"))
+                # A tree this process owns needs no repair.
+                with patch(
+                    "sparkdeck.virtual_nas._metadata_owner_id",
+                    return_value=1000,
+                ):
+                    self.assertFalse(
+                        nas.reclaim_cached_model_ownership("org/model"),
+                    )
+            self.assertEqual(reclaimed_paths, [repository])
+            self.assertFalse(nas.reclaim_cached_model_ownership("org/absent"))
+
+    def test_manager_wires_docker_ownership_reclaimer_into_virtual_nas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+
+            self.assertEqual(
+                manager.virtual_nas._ownership_reclaimer,
+                manager._reclaim_model_cache_ownership,
+            )
+
+    def test_ownership_reclaimer_runs_chown_container_with_process_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            repository = Path(directory) / "hub" / "models--org--model"
+            containers = Mock()
+            client = Mock(containers=containers)
+            client.images.get.return_value = Mock()
+            manager.client = client
+            manager.settings = {**manager.settings, "vllm_image": "node/vllm:local"}
+
+            with (
+                patch("os.getuid", return_value=1000, create=True),
+                patch("os.getgid", return_value=1000, create=True),
+            ):
+                self.assertTrue(manager._reclaim_model_cache_ownership(repository))
+
+            containers.run.assert_called_once()
+            _, kwargs = containers.run.call_args
+            self.assertEqual(kwargs["entrypoint"], ["/bin/sh", "-c"])
+            self.assertEqual(kwargs["command"], ["chown -R 1000:1000 /reclaim-hub"])
+            self.assertEqual(kwargs["mounts"][0]["Target"], "/reclaim-hub")
+            self.assertEqual(kwargs["mounts"][0]["Source"], str(repository))
+            self.assertEqual(kwargs["remove"], True)
+            self.assertEqual(kwargs["detach"], False)
+
+    def test_ownership_reclaimer_reports_failure_without_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            client = Mock()
+            client.containers.run.side_effect = RuntimeError("docker down")
+            manager.client = client
+
+            with (
+                patch("os.getuid", return_value=1000, create=True),
+                patch("os.getgid", return_value=1000, create=True),
+            ):
+                self.assertFalse(
+                    manager._reclaim_model_cache_ownership(
+                        Path(directory) / "models--org--model",
+                    ),
+                )
+
+    async def test_remove_container_reclaims_model_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            container = Mock()
+            container.labels = {
+                DEPLOYMENT_LABEL: "dep-1",
+                MODEL_LABEL: "org/model",
+            }
+            manager.client = Mock()
+            manager.client.containers.get.return_value = container
+            manager._reap_container_admission = AsyncMock()
+            reclaim = Mock(return_value=True)
+            manager.virtual_nas.reclaim_cached_model_ownership = reclaim
+
+            await manager.remove_container("sparkdeck-model-1")
+
+            reclaim.assert_called_once_with("org/model")
+
+    async def test_remove_container_skips_reclaim_without_a_model_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Manager(Path(directory))
+            container = Mock()
+            container.labels = {}
+            manager.client = Mock()
+            manager.client.containers.get.return_value = container
+            manager._reap_container_admission = AsyncMock()
+            reclaim = Mock(return_value=True)
+            manager.virtual_nas.reclaim_cached_model_ownership = reclaim
+
+            await manager.remove_container("sparkdeck-model-1")
+
+            reclaim.assert_not_called()
 
     def test_delete_repairs_directory_that_blocks_entry_removal(self):
         with tempfile.TemporaryDirectory() as directory:

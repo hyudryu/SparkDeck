@@ -630,6 +630,7 @@ class VirtualNAS:
         enabled_provider: Callable[[], bool],
         token_provider: Callable[[], str] | None = None,
         external_model_roots_provider: Callable[[], list[Path]] | None = None,
+        ownership_reclaimer: Callable[[Path], bool] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
@@ -639,6 +640,7 @@ class VirtualNAS:
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
+        self._ownership_reclaimer = ownership_reclaimer
         self.path = self.data_dir / "virtual_nas_transfers.json"
         self.jobs = self._load_jobs()
         self._wake = asyncio.Event()
@@ -1155,6 +1157,9 @@ class VirtualNAS:
                 download_lock = self._download_locks.setdefault(model_id, threading.Lock())
             with download_lock:
                 repository = self._model_path(model_id)
+                # Same ownership repair as the full-snapshot download: Hub
+                # writes must not collide with root-written cache entries.
+                self._reclaim_if_foreign(repository)
                 snapshot = repository / "snapshots" / revision
                 repository_complete = bool(repository_files) and all(
                     _safe_cached_snapshot_file(repository, revision, filename) is not None
@@ -1311,6 +1316,9 @@ class VirtualNAS:
             # locks. This additional per-process lock makes controller retries
             # idempotent when an earlier HTTP request is still unwinding.
             with download_lock:
+                # A previously served repository holds root-written hub
+                # metadata the unprivileged download cannot replace.
+                self._reclaim_if_foreign(self._model_path(model_id))
                 snapshot_download(
                     repo_id=model_id,
                     revision=revision,
@@ -2609,6 +2617,67 @@ class VirtualNAS:
             raise RuntimeError("source node did not report a usable cached size")
         return size
 
+    def reclaim_cached_model_ownership(self, model_id: str) -> bool:
+        """Repair one cached repository's ownership after container writes.
+
+        Model containers run as root against the same mounted hub, so serving
+        a model leaves root-owned hub metadata behind. Called when a model's
+        containers are gone so the cache is agent-owned again before the next
+        download or delete needs it.
+        """
+        try:
+            repository = self._model_path(validate_model_id(model_id))
+        except ValueError:
+            return False
+        if repository.is_symlink() or not repository.is_dir():
+            return False
+        if not self._repository_has_foreign_owner(repository):
+            return False
+        return self._reclaim_repository_ownership(repository)
+
+    def _repository_has_foreign_owner(self, repository: Path) -> bool:
+        current_uid = _current_user_id()
+        if current_uid is None or repository.is_symlink() or not repository.is_dir():
+            return False
+        pending = [repository]
+        while pending:
+            current = pending.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            metadata = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        owner = _metadata_owner_id(metadata)
+                        if owner is not None and owner != current_uid:
+                            return True
+                        if stat.S_ISDIR(metadata.st_mode):
+                            pending.append(Path(entry.path))
+            except OSError:
+                continue
+        return False
+
+    def _reclaim_if_foreign(self, repository: Path) -> None:
+        """Restore ownership before Hub writes into a previously served tree."""
+        if self._repository_has_foreign_owner(repository):
+            self._reclaim_repository_ownership(repository)
+
+    def _reclaim_repository_ownership(self, repository: Path) -> bool:
+        """Run the host-provided reclaimer over one cache tree.
+
+        Failures are reported as ``False`` rather than raised so cache
+        operations can fall back to the privileged removal path instead of
+        failing only because the repair channel is unavailable.
+        """
+        reclaimer = self._ownership_reclaimer
+        if reclaimer is None:
+            return False
+        try:
+            return bool(reclaimer(repository))
+        except Exception:
+            return False
+
     def delete_model(self, model_id: str) -> dict[str, Any]:
         model_id = validate_storage_model_id(model_id)
         if self.model_in_transfer(model_id, LOCAL_NODE_ID):
@@ -2643,8 +2712,7 @@ class VirtualNAS:
             # complete external install: delete the externally managed files.
         return self._delete_external_model(model_id)
 
-    @staticmethod
-    def _delete_cached_repository(repository: Path, hub: Path) -> None:
+    def _delete_cached_repository(self, repository: Path, hub: Path) -> None:
         """Delete a validated cache tree, repairing exact failed paths."""
 
         current_uid = _current_user_id()
@@ -2690,7 +2758,7 @@ class VirtualNAS:
             except OSError as repair_error:
                 raise repair_error from exc_info[1]
 
-        try:
+        def attempt_removal() -> None:
             # A scandir permission failure cannot resume traversal from an
             # onerror callback. The first pass repairs only paths reported by
             # rmtree; a second pass then traverses the now-accessible tree.
@@ -2700,15 +2768,27 @@ class VirtualNAS:
                 shutil.rmtree(repository, onerror=repair_failed_path)
             if repository.exists():
                 raise PermissionError("cached model repository remains")
+
+        try:
+            attempt_removal()
+            return
         except OSError as exc:
             if not foreign_owned:
                 raise RuntimeError(
                     "could not delete cached model files; check cache ownership "
                     "and permissions"
                 ) from exc
-            # A root-writing model container leaves root-owned hub metadata in
-            # the cache this node mounts into it; that needs privilege to go.
-            _remove_repository_with_privilege(repository, hub)
+        # A root-writing model container leaves root-owned hub metadata in the
+        # cache this node mounts into it. Restore this process's ownership
+        # through the node's own Docker access and try again; passwordless
+        # sudo stays as the fallback for agents that can elevate directly.
+        if self._reclaim_repository_ownership(repository):
+            try:
+                attempt_removal()
+                return
+            except OSError:
+                pass
+        _remove_repository_with_privilege(repository, hub)
 
     def _delete_external_model(self, model_id: str) -> dict[str, Any]:
         """Unlink an externally managed ComfyUI bundle's real files.

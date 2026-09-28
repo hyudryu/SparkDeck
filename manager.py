@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import quote
 
 import docker
+from docker.types import Mount
 import anyio
 import httpx
 import requests
@@ -892,6 +893,7 @@ class Manager:
             self.node_registry,
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
             self._resolved_hf_token,
+            ownership_reclaimer=self._reclaim_model_cache_ownership,
         )
         # Embedding inference keeps its own virtual environment and worker
         # processes: the controller's dependency set stays untouched, and a
@@ -2468,6 +2470,68 @@ class Manager:
             inputs=inputs,
             normalize=normalize,
         )
+
+    def _posix_identity(self) -> tuple[int, int] | None:
+        """This process's POSIX uid/gid, or None where they do not exist."""
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            return None
+        getgid = getattr(os, "getgid", None)
+        return getuid(), getgid() if getgid is not None else getuid()
+
+    def _ownership_reclaim_image(self) -> str:
+        """Pick an image for the one-shot ownership repair container.
+
+        Model runtime images are always present on a serving node and ship a
+        POSIX userland, so they are preferred before a tiny image that Docker
+        would have to pull.
+        """
+        candidates: list[str] = []
+        for raw in (
+            self.settings.get("vllm_image"),
+            DEFAULT_SGLANG_IMAGE,
+            DEFAULT_LLAMA_IMAGE,
+            DEFAULT_LAYA_IMAGE,
+        ):
+            tag = str(raw or "").strip()
+            if tag and tag not in candidates:
+                candidates.append(tag)
+        for tag in candidates:
+            try:
+                self.client.images.get(tag)
+            except docker.errors.ImageNotFound:
+                continue
+            return tag
+        return "busybox:latest"
+
+    def _reclaim_model_cache_ownership(self, repository: Path) -> bool:
+        """Chown one cached repository back to this process's user via Docker.
+
+        Model containers run as root with the host Hugging Face cache
+        bind-mounted, so serving a model leaves root-owned hub metadata the
+        unprivileged agent can neither chmod nor unlink. The agent does hold
+        Docker socket access, so a one-shot container restores ownership
+        without relying on sudo, which the systemd user service can never
+        elevate. Returns whether the repair ran.
+        """
+        identity = self._posix_identity()
+        if identity is None:
+            return False
+        uid, gid = identity
+        try:
+            image = self._ownership_reclaim_image()
+            self.client.containers.run(
+                image,
+                command=[f"chown -R {uid}:{gid} /reclaim-hub"],
+                entrypoint=["/bin/sh", "-c"],
+                mounts=[Mount("/reclaim-hub", str(repository), type="bind")],
+                detach=False,
+                remove=True,
+            )
+        except Exception:
+            logger.exception("cache ownership reclaim of %s failed", repository)
+            return False
+        return True
 
     async def model_cache_inventory(
         self, enrich_expected_sizes: bool = False,
@@ -17363,6 +17427,7 @@ class Manager:
 
     async def remove_container(self, name: str) -> dict:
         removed_deployment: list[str] = []
+        removed_models: list[str] = []
 
         def _do():
             ledger = getattr(self, "managed_workload_ledger", None)
@@ -17371,6 +17436,9 @@ class Manager:
                 removed_deployment.append(
                     _label_value(container.labels or {}, DEPLOYMENT_LABEL)
                 )
+                removed_models.append(
+                    _label_value(container.labels or {}, MODEL_LABEL)
+                )
                 container.remove(force=True)
                 return
             with ledger.locked():
@@ -17378,6 +17446,9 @@ class Manager:
                     container = self.client.containers.get(name)
                     removed_deployment.append(
                         _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                    )
+                    removed_models.append(
+                        _label_value(container.labels or {}, MODEL_LABEL)
                     )
                     container.remove(force=True)
                 except docker.errors.NotFound:
@@ -17391,6 +17462,16 @@ class Manager:
             )
         except Exception:
             logger.exception("admission reap after removing %s failed", name)
+        if removed_models and removed_models[0]:
+            try:
+                await asyncio.to_thread(
+                    self.virtual_nas.reclaim_cached_model_ownership,
+                    removed_models[0],
+                )
+            except Exception:
+                logger.exception(
+                    "cache ownership reclaim after removing %s failed", name,
+                )
         getattr(self, "_explicitly_stopped_containers", set()).discard(name)
         getattr(self, "cluster_member_launches", {}).pop(name, None)
         aliases = getattr(self, "container_aliases", {})

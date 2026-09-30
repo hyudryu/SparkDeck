@@ -34,6 +34,7 @@ from .catalog import (
     canonical_quantization,
     quantization_from_text,
 )
+from .codex_models import codex_model
 from .embeddings import embeddings_response
 from .envfile_settings import (
     EnvFileConflictError,
@@ -6549,8 +6550,9 @@ class SparkDeckService:
         Records may share repository and served selectors while saved or
         stopped; the conflict only matters once two launches would answer at
         the same time and a bare model id could no longer be routed
-        unambiguously. External endpoints are skipped: SparkDeck does not
-        launch them and cannot derive their served names.
+        unambiguously. Registered external endpoints reserve only the names
+        actually advertised while healthy; their desired state cannot reserve
+        a launch because SparkDeck does not own their lifecycle.
         """
         if str(deployment.get("kind") or "") != DeploymentKind.MANAGED.value:
             return
@@ -6577,6 +6579,16 @@ class SparkDeckService:
         for item in await self.deployments():
             item_id = str(item.get("id") or "")
             if item_id == str(deployment.get("id")):
+                continue
+            external_endpoint = (
+                item.get("kind") == DeploymentKind.EXTERNAL.value
+                and not item_id.startswith("container:")
+                and not item.get("has_start_hook")
+                and not item.get("has_stop_hook")
+            )
+            if external_endpoint and item.get("status") != "running":
+                # Saved intent does not control an external server. An offline
+                # copied endpoint must not prevent a real managed launch.
                 continue
             instances = item.get("instances")
             # Independent Stop leaves the parent running intent intact. Once
@@ -6606,7 +6618,7 @@ class SparkDeckService:
                 continue
             item_alias = str(item.get("alias") or "")
             public_ids = self._deployment_public_model_ids(item)
-            if public_ids == ([item_alias] if item_alias else []):
+            if not external_endpoint and public_ids == ([item_alias] if item_alias else []):
                 # A live record without configured served names publishes its
                 # repository id (the runtime default request id) alongside
                 # its alias.
@@ -6880,7 +6892,13 @@ class SparkDeckService:
             if model.get("dimension") is not None:
                 entry["dimension"] = model["dimension"]
             data.append(entry)
-        return {"object": "list", "data": data}
+        return {
+            "object": "list", "data": data,
+            "models": [
+                codex_model(item["id"]) for item in data
+                if item.get("type") != "embedding"
+            ],
+        }
 
     async def _cached_embedding_models(self) -> list[dict[str, Any]]:
         """Return embedding models to advertise, never failing the model list.

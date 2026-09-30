@@ -1479,6 +1479,44 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started["status"], "starting")
         self.manager.create_deployment.assert_awaited()
 
+    async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
+        saved = await self.service.create_deployment({
+            "model": "org/model", "alias": "Managed", "runtime": "sglang",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        requested = self.service.store.deployment(saved["id"], include_private=True)
+        external = {
+            "id": "external-copy", "alias": "(Copy) Hosted", "kind": "external",
+            "status": "error", "desired_state": "running", "runtime": "sglang",
+            "model": {"repository": "org/model"}, "settings": {},
+        }
+        for status in ("error", "unreachable", "registered", "running"):
+            with self.subTest(status=status), patch.object(
+                self.service, "deployments", AsyncMock(return_value=[{**external, "status": status}]),
+            ):
+                await self.service._assert_deployment_start_selectors(requested)
+        with patch.object(self.service, "deployments", AsyncMock(return_value=[external])):
+            result = await self.service.deployment_action(saved["id"], "start")
+        self.assertEqual(result["status"], "starting")
+        self.manager.create_deployment.assert_awaited()
+
+    async def test_live_external_alias_conflicts_and_discovered_container_selectors_remain_protected(self):
+        requested = {"id": "new", "kind": "managed", "alias": "Managed",
+                     "model": {"repository": "org/model"}, "settings": {}}
+        endpoint = {"id": "external", "kind": "external", "alias": "org/model",
+                    "status": "running", "model": {"repository": "elsewhere"}}
+        discovered = {"id": "container:existing", "kind": "external", "alias": "Existing",
+                      "status": "running", "model": {"repository": "org/model"}}
+        for live in (endpoint, discovered):
+            with self.subTest(live=live), patch.object(
+                self.service, "deployments", AsyncMock(return_value=[live]),
+            ), self.assertRaisesRegex(ValueError, "selector 'org/model' is already served"):
+                await self.service._assert_deployment_start_selectors(requested)
+        with patch.object(self.service, "deployments", AsyncMock(return_value=[endpoint])), self.assertRaisesRegex(
+            ValueError, "already in use",
+        ):
+            await self.service._assert_deployment_alias_available("org/model", "new")
+
     async def test_start_releases_selector_after_all_groups_explicitly_stop(self):
         for alias in ("TP2", "TP4"):
             await self.service.create_deployment({

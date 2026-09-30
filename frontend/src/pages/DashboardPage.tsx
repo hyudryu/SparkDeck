@@ -33,6 +33,14 @@ function temperatureTone(value: number | null | undefined) {
   return ''
 }
 
+// Spark-class boards report the unified GB10 SoC as their GPU; the card shows
+// just the chip name there and omits the CPU row, since both are the same die.
+function gpuDisplayName(name?: string | null) {
+  if (!name) return undefined
+  if (/gb10/i.test(name)) return 'GB10'
+  return name.replace(/^NVIDIA\s+/i, '') || name
+}
+
 const ACTIVE_DEPLOYMENT_STATUSES = new Set(['running', 'ready', 'starting', 'launching', 'degraded'])
 
 /**
@@ -406,11 +414,15 @@ export function DashboardPage() {
               {clusterNodes.map((node) => {
                 const nodeStats = node.stats
                 const nodeGpu = nodeStats?.gpus?.find((item) => !item.error)
+                const gpuName = gpuDisplayName(nodeGpu?.name)
+                const sparkSoc = gpuName === 'GB10'
                 const nodeMemory = memorySnapshot(nodeStats)
                 const sessions = Object.values(nodeStats?.active_requests ?? {}).reduce((sum, request) => sum + (request.connections ?? 0), 0)
                 return <Panel className="cluster-health-card" key={node.id}>
                   <div className="cluster-health-heading"><div><Server size={16} /><div><h3>{node.name}</h3><p>{node.local ? 'Current entry node' : node.id}</p></div></div><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div>
                   {node.online ? <dl>
+                    {!sparkSoc && <div><dt>CPU</dt><dd>{nodeStats?.cpu_model || '—'}</dd></div>}
+                    <div><dt>GPU</dt><dd>{gpuName ?? '—'}</dd></div>
                     <div><dt>CPU temp</dt><dd className={temperatureTone(nodeStats?.cpu_temp_c)}>{displayValue(nodeStats?.cpu_temp_c, '°C', 1)}</dd></div>
                     <div><dt>GPU temp</dt><dd className={temperatureTone(nodeGpu?.temp)}>{displayValue(nodeGpu?.temp, '°C', 1)}</dd></div>
                     <div><dt>{nodeMemory?.label ?? 'Memory'}</dt><dd>{nodeMemory ? `${nodeMemory.used.toFixed(1)} / ${nodeMemory.total.toFixed(1)} GB` : '—'}</dd></div>

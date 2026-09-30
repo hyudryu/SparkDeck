@@ -834,6 +834,7 @@ export interface SystemStats {
   cpu_pct?: number | null
   cpu_logical_count?: number | null
   cpu_temp_c?: number | null
+  cpu_model?: string | null
   mem?: { total?: number; used?: number; available?: number; pct?: number }
   gpus?: GpuStats[]
   active_requests?: Record<string, ActiveRequestStats>

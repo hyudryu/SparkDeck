@@ -890,12 +890,36 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 "settings": {"environment": {"VLLM_CONFIG": "first\nsecond"}},
             })
 
-        with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
-            await self.service.create_deployment({
-                "model": "org/model", "alias": "sg-env", "runtime": "sglang",
-                "node_ids": ["local"], "deployment_mode": "single",
-                "settings": {"environment": {"NCCL_DEBUG": "WARN"}},
-            })
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "sg-env", "runtime": "sglang",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"environment": {"NCCL_DEBUG": "WARN"}},
+        })
+        self.assertEqual(created["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+
+    async def test_sglang_affinity_and_environment_survive_saved_launch(self):
+        environment = {"NCCL_IB_HCA": "rocep1s0f1,roceP2p1s0f1", "HF_HUB_OFFLINE": "1"}
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "sg-affinity", "runtime": "sglang",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"sg_cpu_affinity": "5-9,15-19", "environment": environment},
+        })
+        stored = self.service.store.deployment(created["id"], include_private=True)
+        self.assertEqual(stored["settings"]["sg_cpu_affinity"], "5-9,15-19")
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.SGLANG, "org/model", created["alias"], created["id"],
+            ModelIdentity(repository="org/model"), stored["settings"], ["remote-1"], "single", None,
+        )
+        self.assertEqual(launch["sg_cpu_affinity"], "5-9,15-19")
+        self.assertEqual(launch["environment"], environment)
+        for mask in ("9-5", "1,1", "0-9999999999"):
+            with self.subTest(mask=mask), self.assertRaises(ValueError):
+                await self.service.create_deployment({
+                    "model": "org/model", "alias": "invalid-affinity", "runtime": "sglang",
+                    "settings": {"sg_cpu_affinity": mask},
+                })
+        self.assertIsNone(self.service.store.deployment("invalid-affinity"))
+        self.manager.create_deployment.assert_not_awaited()
 
     async def test_controller_local_gguf_bookmark_is_saved_for_the_controller(self):
         artifact = Path(self.temp.name) / "local.gguf"

@@ -105,6 +105,51 @@ function renderPage() {
 }
 
 describe('models page vLLM deployment targets', () => {
+  it('saves SGLang CPU affinity and runtime environment on a new deployment', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Create deployment' }))
+    await user.type(screen.getByLabelText('Display name'), 'SGLang baseline')
+    await user.type(screen.getByLabelText('Model repository or GGUF artifact'), 'org/model')
+    await user.selectOptions(screen.getByLabelText('Runtime'), 'sglang')
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    await user.type(screen.getByLabelText('CPU affinity'), '5-9,15-19')
+    await user.type(screen.getByLabelText(/Runtime environment variables/), 'NCCL_DEBUG=WARN')
+    await user.click(screen.getByRole('button', { name: 'Save deployment' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === '/api/v1/deployments' && init?.method === 'POST')
+      expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({
+        runtime: 'sglang', kind: 'managed',
+        settings: { sg_cpu_affinity: '5-9,15-19', environment: { NCCL_DEBUG: 'WARN' } },
+      })
+    })
+  })
+
+  it('loads and clears saved SGLang CPU affinity and runtime environment', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments' && !init?.method) {
+        return new Response(JSON.stringify({ items: [{ ...runningDeployment, runtime: 'sglang', status: 'saved', settings: {
+          ...runningDeployment.settings, sg_cpu_affinity: '5-9,15-19', environment: { NCCL_DEBUG: 'WARN' },
+        } }] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return fallback(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Edit Chat model' }))
+    await user.click(screen.getByRole('button', { name: 'Launch arguments' }))
+    expect(screen.getByLabelText('CPU affinity')).toHaveValue('5-9,15-19')
+    expect(screen.getByLabelText(/Runtime environment variables/)).toHaveValue('NCCL_DEBUG=WARN')
+    await user.clear(screen.getByLabelText('CPU affinity'))
+    await user.clear(screen.getByLabelText(/Runtime environment variables/))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({ sg_cpu_affinity: null, environment: {} })
+    })
+  })
+
   it('saves runtime file mounts on a new deployment', async () => {
     const user = userEvent.setup()
     renderPage()

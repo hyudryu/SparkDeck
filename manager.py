@@ -4715,6 +4715,9 @@ class Manager:
     def _deployment_launch_settings(cls, body: dict) -> dict:
         """Return the durable, credential-free inputs for a cluster launch."""
         engine = body.get("engine") or "vllm"
+        affinity = cls._normalized_sg_cpu_affinity(body.get("sg_cpu_affinity"))
+        if affinity and engine != "sglang":
+            raise ValueError("sg_cpu_affinity is only supported for SGLang")
         extra_args = cls._without_hf_cli_credentials(
             list(body.get("extra_args") or [])
         )
@@ -4739,6 +4742,7 @@ class Manager:
             "sg_max_running_requests": body.get("sg_max_running_requests"),
             "sg_mem_fraction": body.get("sg_mem_fraction"),
             "sg_image": body.get("sg_image") or None,
+            "sg_cpu_affinity": affinity,
             "llama_artifact": body.get("llama_artifact") or None,
             "llama_context_length": body.get("llama_context_length"),
             "llama_parallel_slots": body.get("llama_parallel_slots"),
@@ -4775,6 +4779,27 @@ class Manager:
             )
             launch_settings["instances"] = body.get("instances")
         return launch_settings
+
+    @staticmethod
+    def _normalized_sg_cpu_affinity(value: Any) -> str | None:
+        """Validate Docker's CPU-list syntax without expanding unbounded ranges."""
+        if value in (None, ""):
+            return None
+        if not isinstance(value, str) or len(value) > 256 or not re.fullmatch(
+            r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", value,
+        ):
+            raise ValueError("sg_cpu_affinity must be a CPU list such as 5-9,15-19")
+        seen: set[int] = set()
+        for part in value.split(","):
+            bounds = part.split("-")
+            start, end = int(bounds[0]), int(bounds[-1])
+            if start > end or end > 4095:
+                raise ValueError("sg_cpu_affinity CPU ranges must ascend and stay within 0-4095")
+            cpus = set(range(start, end + 1))
+            if seen.intersection(cpus):
+                raise ValueError("sg_cpu_affinity cannot contain overlapping CPU ranges")
+            seen.update(cpus)
+        return value
 
     @staticmethod
     def _normalize_runtime_environment(value: Any, engine: str = "vllm") -> dict[str, str]:
@@ -7607,6 +7632,9 @@ class Manager:
             raise ValueError(
                 "engine must be one of: " + ", ".join(_SUPPORTED_ENGINES)
             )
+        body["sg_cpu_affinity"] = self._normalized_sg_cpu_affinity(body.get("sg_cpu_affinity"))
+        if body["sg_cpu_affinity"] and engine != "sglang":
+            raise ValueError("sg_cpu_affinity is only supported for SGLang")
         body["runtime_file_mounts"] = normalize_runtime_file_mounts(
             body.get("runtime_file_mounts"), engine,
         )
@@ -8115,6 +8143,7 @@ class Manager:
             "sg_max_running_requests": body.get("sg_max_running_requests"),
             "sg_mem_fraction": body.get("sg_mem_fraction"),
             "sg_image": body.get("sg_image"),
+            "sg_cpu_affinity": body.get("sg_cpu_affinity"),
             "llama_artifact": body.get("llama_artifact"),
             "llama_context_length": body.get("llama_context_length"),
             "llama_parallel_slots": body.get("llama_parallel_slots"),
@@ -8707,7 +8736,7 @@ class Manager:
         base = {key: body.get(key) for key in (
             "model", "engine", "gpu_memory_utilization", "gpu_memory_gb",
             "shm_size", "infiniband_device", "environment", "runtime_file_mounts", "image", "sg_tp_size",
-            "sg_context_length", "sg_max_running_requests", "sg_mem_fraction", "sg_image",
+            "sg_context_length", "sg_max_running_requests", "sg_mem_fraction", "sg_image", "sg_cpu_affinity",
         )}
         base["hf_token"] = self._resolved_hf_token()
         base["extra_args"] = (
@@ -9314,6 +9343,7 @@ class Manager:
                 "sg_max_running_requests": launch.get("sg_max_running_requests"),
                 "sg_mem_fraction": launch.get("sg_mem_fraction"),
                 "sg_image": launch.get("sg_image"),
+                "sg_cpu_affinity": launch.get("sg_cpu_affinity"),
                 "llama_artifact": None,
                 "llama_context_length": None,
                 "llama_parallel_slots": None,
@@ -14278,6 +14308,7 @@ class Manager:
         sg_max_running_requests: int | None = None,
         sg_mem_fraction: float | None = None,
         sg_image: str | None = None,
+        sg_cpu_affinity: str | None = None,
         deployment_mode: str = "single",
         node_ids: list[str] | None = None,
         launch_controls: dict | None = None,
@@ -14298,6 +14329,9 @@ class Manager:
             "sg_max_running_requests", sg_max_running_requests,
         )
         sg_mem_fraction = self._validated_sg_scalar("sg_mem_fraction", sg_mem_fraction)
+        sg_cpu_affinity = self._normalized_sg_cpu_affinity(sg_cpu_affinity)
+        if sg_cpu_affinity and engine != "sglang":
+            raise ValueError("sg_cpu_affinity is only supported for SGLang")
         deployment_mode = deployment_mode or "single"
         if deployment_mode not in _MODE_ALLOWLIST:
             raise ValueError(
@@ -14369,6 +14403,8 @@ class Manager:
                         r["sg_mem_fraction"] = sg_mem_fraction
                     if sg_image is not None:
                         r["sg_image"] = sg_image
+                    if sg_cpu_affinity is not None:
+                        r["sg_cpu_affinity"] = sg_cpu_affinity
                     if replace_launch_inputs:
                         # Re-imports must mirror the container exactly: a
                         # managed option removed from the command clears the
@@ -14381,6 +14417,7 @@ class Manager:
                         r["sg_context_length"] = sg_context_length
                         r["sg_max_running_requests"] = sg_max_running_requests
                         r["sg_mem_fraction"] = sg_mem_fraction
+                        r["sg_cpu_affinity"] = sg_cpu_affinity
                     r["deployment_mode"] = deployment_mode or "single"
                     r["node_ids"] = list(node_ids or [LOCAL_NODE_ID])
                     if deployment_mode == "grouped_sharded":
@@ -14407,6 +14444,7 @@ class Manager:
                 "sg_max_running_requests": sg_max_running_requests,
                 "sg_mem_fraction": sg_mem_fraction,
                 "sg_image": sg_image,
+                "sg_cpu_affinity": sg_cpu_affinity,
                 "deployment_mode": deployment_mode or "single",
                 "node_ids": list(node_ids or [LOCAL_NODE_ID]),
                 "created_at": time.time(),
@@ -14436,7 +14474,7 @@ class Manager:
             "name", "model", "engine", "image", "extra_args",
             "gpu_memory_utilization", "gpu_memory_gb", "sg_tp_size",
             "sg_context_length", "sg_max_running_requests", "sg_mem_fraction",
-            "sg_image", "deployment_mode", "node_ids", "launch_controls",
+            "sg_image", "sg_cpu_affinity", "deployment_mode", "node_ids", "launch_controls",
             "environment", "instances", "tensor_parallel_size",
         }
         unknown = sorted(set(changes) - allowed)
@@ -14463,6 +14501,9 @@ class Manager:
             merged["environment"] = normalize_runtime_environment(
                 merged.get("environment"), engine,
             )
+            merged["sg_cpu_affinity"] = self._normalized_sg_cpu_affinity(merged.get("sg_cpu_affinity"))
+            if merged["sg_cpu_affinity"] and engine != "sglang":
+                raise ValueError("sg_cpu_affinity is only supported for SGLang")
             mode = merged.get("deployment_mode") or "single"
             if mode not in _MODE_ALLOWLIST:
                 raise ValueError(
@@ -16292,6 +16333,7 @@ class Manager:
         sg_max_running_requests: int | None = None,
         sg_mem_fraction: float | None = None,
         sg_image: str | None = None,
+        sg_cpu_affinity: str | None = None,
         recipe_id: str | None = None,
         cluster_member: dict | None = None,
         hf_token: str | None = None,
@@ -16326,6 +16368,7 @@ class Manager:
             sg_context_length=sg_context_length,
             sg_max_running_requests=sg_max_running_requests,
             sg_mem_fraction=sg_mem_fraction, sg_image=sg_image,
+            sg_cpu_affinity=sg_cpu_affinity,
             recipe_id=recipe_id, cluster_member=cluster_member,
             hf_token=hf_token,
             sparkdeck_deployment_id=sparkdeck_deployment_id,
@@ -16819,6 +16862,7 @@ class Manager:
         sg_max_running_requests: int | None = None,
         sg_mem_fraction: float | None = None,
         sg_image: str | None = None,
+        sg_cpu_affinity: str | None = None,
         recipe_id: str | None = None,
         cluster_member: dict | None = None,
         hf_token: str | None = None,
@@ -16836,6 +16880,9 @@ class Manager:
             raise ValueError(
                 "engine must be one of: " + ", ".join(_SUPPORTED_ENGINES)
             )
+        sg_cpu_affinity = self._normalized_sg_cpu_affinity(sg_cpu_affinity)
+        if sg_cpu_affinity and engine != "sglang":
+            raise ValueError("sg_cpu_affinity is only supported for SGLang")
         runtime_environment = self._normalize_runtime_environment(environment, engine)
         runtime_file_mounts = normalize_runtime_file_mounts(runtime_file_mounts, engine)
         # Validate before image pulls, GPU eviction, or any Docker mutation.
@@ -17021,6 +17068,10 @@ class Manager:
                         run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
                 else:
                     run_options["ports"] = {"8000/tcp": port}
+                if runtime_environment:
+                    run_options.setdefault("environment", {}).update(runtime_environment)
+                if sg_cpu_affinity:
+                    run_options["cpuset_cpus"] = sg_cpu_affinity
                 container = self._run_managed_container(run_options)
                 container.reload()
                 self._cluster_launch_update(

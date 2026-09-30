@@ -2454,11 +2454,11 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(base["environment"], {"NCCL_DEBUG": "WARN"})
             self.assertEqual(updated["environment"], {"HF_HUB_OFFLINE": "1"})
 
-            with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
-                await instance.add_recipe(
-                    "model/b", engine="sglang",
-                    environment={"NCCL_DEBUG": "WARN"},
-                )
+            sglang = await instance.add_recipe(
+                "model/b", engine="sglang",
+                environment={"NCCL_DEBUG": "WARN"},
+            )
+            self.assertEqual(sglang["environment"], {"NCCL_DEBUG": "WARN"})
 
     async def test_recipe_update_creates_missing_speculative_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

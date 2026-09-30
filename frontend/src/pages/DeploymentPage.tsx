@@ -105,7 +105,7 @@ function dropRevisionFlags(flagsText: string, staleRevision: string): string {
   return kept.map(quoteArg).join(' ')
 }
 
-type Editor = Record<keyof DeploymentLaunchControls | 'alias' | 'model' | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string>
+type Editor = Record<keyof DeploymentLaunchControls | 'alias' | 'model' | 'gpu_memory_utilization' | 'gpu_memory_gb' | 'sg_tp_size' | 'sg_mem_fraction' | 'environment' | 'extra_args', string> & { sg_cpu_affinity?: string }
 
 const editorFrom = (detail: DeploymentDetail): Editor => ({
   alias: detail.alias,
@@ -130,6 +130,7 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
   sg_tp_size: detail.sg_tp_size?.toString() ?? '',
   sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
+  sg_cpu_affinity: detail.runtime === 'sglang' && detail.managed ? (detail.sg_cpu_affinity ?? detail.settings.sg_cpu_affinity ?? '') : undefined,
   environment: formatEnvironment(detail.environment ?? detail.settings.environment),
   extra_args: detail.command_flags ?? detail.extra_args.map(quoteArg).join(' '),
 })
@@ -327,6 +328,7 @@ function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias 
     gpu_memory_gb: optionalNumber(editor.gpu_memory_gb),
     sg_tp_size: optionalNumber(editor.sg_tp_size),
     sg_mem_fraction: optionalNumber(editor.sg_mem_fraction),
+    ...(editor.sg_cpu_affinity !== undefined ? { sg_cpu_affinity: editor.sg_cpu_affinity.trim() || null } : {}),
   }
 }
 
@@ -704,9 +706,10 @@ export function DeploymentPage() {
           <label className="field"><span>Pipeline parallel size</span><input disabled={disabled} type="number" min="1" value={editor.pipeline_parallel_size} onChange={(event) => set('pipeline_parallel_size', event.target.value)} /></label>
           {!detail.id.startsWith('container:') && <label className="field"><span>GPU memory reserve (GB)</span><input disabled={disabled} type="number" min="0" step="0.1" value={editor.gpu_memory_gb} onChange={(event) => set('gpu_memory_gb', event.target.value)} /></label>}
         </>}
-        {(detail.runtime === 'vllm' || detail.runtime === 'tensorfold') && !envFileMode && <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder={detail.runtime === 'vllm' ? "VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
+        {(detail.runtime === 'vllm' || detail.runtime === 'tensorfold' || detail.runtime === 'sglang') && !envFileMode && <label className="field wide-field"><span>Runtime environment variables</span><textarea disabled={disabled} rows={8} spellCheck={false} placeholder={detail.runtime === 'vllm' ? "VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={editor.environment} onChange={(event) => set('environment', event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
         {supportsRuntimeFileMounts(detail) && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} disabled={disabled} />}
         {detail.runtime === 'sglang' && !envFileMode && <>
+          {detail.managed && <label className="field"><span>CPU affinity</span><input aria-label="CPU affinity" disabled={disabled} placeholder="5-9,15-19" value={editor.sg_cpu_affinity ?? ''} onChange={(event) => set('sg_cpu_affinity', event.target.value)} /><small>Optional CPU IDs or ranges for each container. Leave blank to use all available CPUs.</small></label>}
           <label className="field"><span>TP size</span><input disabled={disabled} type="number" min="1" value={editor.sg_tp_size} onChange={(event) => set('sg_tp_size', event.target.value)} /></label>
           <label className="field"><span>Mem fraction (static)</span><input disabled={disabled} type="number" min="0.01" max="1" step="0.01" value={editor.sg_mem_fraction} onChange={(event) => set('sg_mem_fraction', event.target.value)} /></label>
         </>}

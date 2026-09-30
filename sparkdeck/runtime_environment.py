@@ -14,7 +14,7 @@ _SECRET_NAME = re.compile(
 _PROTECTED_NAMES = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
 # Engines whose launcher reads configuration from the container environment.
-_ENVIRONMENT_CAPABLE_ENGINES = frozenset({"vllm", "laya", "tensorfold"})
+_ENVIRONMENT_CAPABLE_ENGINES = frozenset({"vllm", "sglang", "laya", "tensorfold"})
 
 # Docker inspection may expose arbitrary application credentials. Only these
 # known runtime-tuning inputs are safe and useful to carry into a recipe saved
@@ -49,7 +49,7 @@ def normalize_runtime_environment(
     """Return a bounded, credential-free environment map for a managed runtime.
 
     Engines that read their launch configuration from the environment (vLLM,
-    the Laya decision server, and TensorFold, which takes things like
+    SGLang, the Laya decision server, and TensorFold, which takes things like
     ``HF_HUB_OFFLINE`` or ``PYTORCH_CUDA_ALLOC_CONF``) accept operator
     variables. Everything else has no
     environment-driven configuration, so a non-empty map is a caller mistake
@@ -60,7 +60,7 @@ def normalize_runtime_environment(
     if engine not in _ENVIRONMENT_CAPABLE_ENGINES and value:
         raise ValueError(
             "runtime environment variables are only supported for "
-            "vLLM, Laya, and TensorFold"
+            "vLLM, SGLang, Laya, and TensorFold"
         )
     if not isinstance(value, dict):
         raise ValueError("environment must be an object of string values")

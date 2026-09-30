@@ -106,7 +106,7 @@ _LOCAL_ROUTING_KEYS = {
     # silently substitute default ports, images, and memory policies.
     "port", "image", "sg_image", "gpu_memory_gb",
     "sg_tp_size", "sg_context_length", "sg_max_running_requests",
-    "sg_mem_fraction",
+    "sg_mem_fraction", "sg_cpu_affinity",
     # The immutable revision weight preparation resolved, so the launch uses
     # exactly the prepared snapshot instead of re-resolving a mutable name.
     "prepared_revision",
@@ -2120,6 +2120,9 @@ class SparkDeckService:
             "gpu_memory_gb": gpu_memory_gb,
             "sg_tp_size": sg_tp_size,
             "sg_mem_fraction": sg_mem_fraction,
+            "sg_cpu_affinity": (
+                saved_settings if saved_only else (launch_settings or {})
+            ).get("sg_cpu_affinity"),
             "image": image,
             "environment": environment or {},
             "runtime_file_mounts": (
@@ -2220,7 +2223,7 @@ class SparkDeckService:
             "extra_args", "launch_controls",
             "environment", "runtime_file_mounts",
             "gpu_memory_utilization", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction",
+            "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity",
             "model",
         }
         unknown = sorted(set(changes) - allowed)
@@ -2566,7 +2569,7 @@ class SparkDeckService:
             "gpu_layers", "quantization", "artifact", "image", "extra_args",
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction", "alias",
+            "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity", "alias",
             "environment", "runtime_file_mounts", "instances",
             "model",
         }
@@ -2581,6 +2584,12 @@ class SparkDeckService:
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+        if "sg_cpu_affinity" in changes:
+            from manager import Manager
+            affinity = Manager._normalized_sg_cpu_affinity(changes["sg_cpu_affinity"])
+            if affinity and str(stored.get("runtime")) != RuntimeKind.SGLANG.value:
+                raise ValueError("sg_cpu_affinity is only supported for SGLang")
+            settings["sg_cpu_affinity"] = affinity
         if "environment" in changes:
             settings["environment"] = normalize_runtime_environment(
                 changes.get("environment"), str(stored.get("runtime") or "vllm"),
@@ -3282,6 +3291,12 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        if "sg_cpu_affinity" in settings:
+            from manager import Manager
+            affinity = Manager._normalized_sg_cpu_affinity(settings["sg_cpu_affinity"])
+            if affinity and runtime is not RuntimeKind.SGLANG:
+                raise ValueError("sg_cpu_affinity is only supported for SGLang")
+            settings["sg_cpu_affinity"] = affinity
         # Runtime provenance is derived from the resolved launch input below;
         # callers cannot promote a local model to public benchmark evidence.
         settings.pop("model_source", None)

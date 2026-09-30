@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .runtime_environment import normalize_runtime_environment
+
 import asyncio
 import re
 from abc import ABC, abstractmethod
@@ -361,6 +363,8 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
         extra.extend(str(item) for item in settings.get("extra_args", []))
         return await manager.create_container(
             model=model, engine="sglang", sg_image=settings.get("image"),
+            sg_cpu_affinity=settings.get("sg_cpu_affinity"),
+            environment=normalize_runtime_environment(settings.get("environment"), "sglang"),
             sg_tp_size=settings.get("tensor_parallel_size"),
             sg_context_length=settings.get("context_length"),
             sg_max_running_requests=settings.get("max_running_requests"),

@@ -950,6 +950,7 @@ class Manager:
         self._cpu_prev: tuple[int, int] | None = None
         self._stats_cache: dict[str, Any] = {}
         self._stats_ts: float = 0.0
+        self._cpu_model: str | None = None
         self._temperature_history: deque[dict[str, float | None]] = deque(
             maxlen=TEMPERATURE_HISTORY_MAX_SAMPLES,
         )
@@ -20210,6 +20211,38 @@ class Manager:
             "base": base,
         }
 
+    def _read_cpu_model(self) -> str | None:
+        """CPU brand string shown on the node card; constant per boot, so cached."""
+        if self._cpu_model is not None:
+            return self._cpu_model
+        model: str | None = None
+        try:
+            if os.name == "nt":
+                import winreg
+
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                ) as key:
+                    model, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+            elif Path("/proc/cpuinfo").exists():
+                for line in Path("/proc/cpuinfo").read_text().splitlines():
+                    if line.startswith("model name"):
+                        model = line.split(":", 1)[1].strip()
+                        break
+            else:
+                out = subprocess.run(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if out.returncode == 0:
+                    model = out.stdout.strip()
+        except Exception:
+            model = None
+        model = (model or "").strip()
+        self._cpu_model = model or None
+        return self._cpu_model
+
     def _read_gpu(self) -> list[dict]:
         try:
             r = subprocess.run(
@@ -20390,6 +20423,7 @@ class Manager:
                 "cpu_pct": self._read_cpu_pct(),
                 "cpu_logical_count": os.cpu_count(),
                 "cpu_temp_c": self._read_cpu_temp(),
+                "cpu_model": self._read_cpu_model(),
                 "cpu_clock_mhz": cpu_clock.get("current"),
                 "cpu_clock_max_mhz": cpu_clock.get("max"),
                 "cpu_clock_base_mhz": cpu_clock.get("base"),

@@ -3860,12 +3860,23 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 "--context-length", "120000",
                 "--mem-fraction-static", "0.85",
                 "--max-running-requests", "10",
-                "--max-total-tokens", "2400000",
+                "--max-total-tokens", "999",
                 "--enable-metrics",
             ],
         )
         self.assertEqual(preview["flags"].count("--max-total-tokens"), 1)
-        self.assertNotIn("999", preview["flags"])
+        self.assertNotIn("2400000", preview["flags"])
+
+    def test_sglang_runtime_controls_generate_token_limit_only_without_explicit_value(self) -> None:
+        instance = Manager.__new__(Manager)
+        flags = instance._with_sglang_runtime_controls([], 120000, 10, 2, 0.85)
+        self.assertEqual(instance._cli_option(flags, {"--max-total-tokens"}), "2400000")
+        self.assertEqual(flags.count("--max-total-tokens"), 1)
+        for raw in (["--max-total-tokens", "1000000"], ["--max-total-tokens=1000000"]):
+            with self.subTest(raw=raw):
+                flags = instance._with_sglang_runtime_controls(raw, 262144, 10, 2, 0.825)
+                self.assertEqual(instance._cli_option(flags, {"--max-total-tokens"}), "1000000")
+                self.assertNotIn("5242880", flags)
 
     def test_sglang_runtime_controls_preserve_standalone_token_limit(self) -> None:
         instance = Manager.__new__(Manager)

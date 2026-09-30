@@ -5356,10 +5356,11 @@ class Manager:
             {"--max-running-requests"},
         ):
             flags = self._replace_command_option(flags, names, None)
-        if max_running is not None:
-            flags = self._replace_command_option(
-                flags, {"--max-total-tokens"}, None,
-            )
+        explicit_token_limit = any(
+            str(arg) == "--max-total-tokens"
+            or str(arg).startswith("--max-total-tokens=")
+            for arg in args
+        )
         generated: list[str] = []
         if tp_size is not None:
             generated += ["--tp-size", str(tp_size)]
@@ -5369,10 +5370,11 @@ class Manager:
             generated += ["--mem-fraction-static", str(mem_fraction)]
         if max_running is not None:
             generated += ["--max-running-requests", str(max_running)]
-            generated += [
-                "--max-total-tokens",
-                str(max_running * (context_length or 32768) * 2),
-            ]
+            if not explicit_token_limit:
+                generated += [
+                    "--max-total-tokens",
+                    str(max_running * (context_length or 32768) * 2),
+                ]
         return generated + shlex.split(flags)
 
     def update_deployment_settings(self, deployment_id: str, body: dict) -> dict:

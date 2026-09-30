@@ -51,12 +51,15 @@ class SglangAffinityTests(unittest.IsolatedAsyncioTestCase):
         await instance.create_container(
             "org/model", port=30000, engine="sglang", sg_cpu_affinity="5-9,15-19",
             environment=environment, infiniband_device=False,
+            extra_args=["--max-total-tokens", "1000000"],
+            sg_context_length=262144, sg_max_running_requests=10,
             cluster_member={"deployment_id": "dep", "node_id": "worker", "rank": 1,
                             "nnodes": 2, "mode": "sharded", "fabric_interface": "fabric0"},
         )
         options = instance._run_managed_container.call_args.args[0]
         self.assertEqual(options["cpuset_cpus"], "5-9,15-19")
         self.assertEqual(options["network_mode"], "host")
+        self.assertEqual(instance._cli_option(options["command"], {"--max-total-tokens"}), "1000000")
         self.assertEqual(options["environment"], {"HF_TOKEN": "managed", **environment})
 
     async def test_unset_affinity_retains_existing_default(self):

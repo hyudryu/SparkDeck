@@ -890,12 +890,36 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 "settings": {"environment": {"VLLM_CONFIG": "first\nsecond"}},
             })
 
-        with self.assertRaisesRegex(ValueError, "only supported for vLLM"):
-            await self.service.create_deployment({
-                "model": "org/model", "alias": "sg-env", "runtime": "sglang",
-                "node_ids": ["local"], "deployment_mode": "single",
-                "settings": {"environment": {"NCCL_DEBUG": "WARN"}},
-            })
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "sg-env", "runtime": "sglang",
+            "node_ids": ["local"], "deployment_mode": "single",
+            "settings": {"environment": {"NCCL_DEBUG": "WARN"}},
+        })
+        self.assertEqual(created["settings"]["environment"], {"NCCL_DEBUG": "WARN"})
+
+    async def test_sglang_affinity_and_environment_survive_saved_launch(self):
+        environment = {"NCCL_IB_HCA": "rocep1s0f1,roceP2p1s0f1", "HF_HUB_OFFLINE": "1"}
+        created = await self.service.create_deployment({
+            "model": "org/model", "alias": "sg-affinity", "runtime": "sglang",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+            "settings": {"sg_cpu_affinity": "5-9,15-19", "environment": environment},
+        })
+        stored = self.service.store.deployment(created["id"], include_private=True)
+        self.assertEqual(stored["settings"]["sg_cpu_affinity"], "5-9,15-19")
+        launch = self.service._cluster_launch_body(
+            RuntimeKind.SGLANG, "org/model", created["alias"], created["id"],
+            ModelIdentity(repository="org/model"), stored["settings"], ["remote-1"], "single", None,
+        )
+        self.assertEqual(launch["sg_cpu_affinity"], "5-9,15-19")
+        self.assertEqual(launch["environment"], environment)
+        for mask in ("9-5", "1,1", "0-9999999999"):
+            with self.subTest(mask=mask), self.assertRaises(ValueError):
+                await self.service.create_deployment({
+                    "model": "org/model", "alias": "invalid-affinity", "runtime": "sglang",
+                    "settings": {"sg_cpu_affinity": mask},
+                })
+        self.assertIsNone(self.service.store.deployment("invalid-affinity"))
+        self.manager.create_deployment.assert_not_awaited()
 
     async def test_controller_local_gguf_bookmark_is_saved_for_the_controller(self):
         artifact = Path(self.temp.name) / "local.gguf"
@@ -1454,6 +1478,44 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             started = await self.service.deployment_action("TP4", "start")
         self.assertEqual(started["status"], "starting")
         self.manager.create_deployment.assert_awaited()
+
+    async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
+        saved = await self.service.create_deployment({
+            "model": "org/model", "alias": "Managed", "runtime": "sglang",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        requested = self.service.store.deployment(saved["id"], include_private=True)
+        external = {
+            "id": "external-copy", "alias": "(Copy) Hosted", "kind": "external",
+            "status": "error", "desired_state": "running", "runtime": "sglang",
+            "model": {"repository": "org/model"}, "settings": {},
+        }
+        for status in ("error", "unreachable", "registered", "running"):
+            with self.subTest(status=status), patch.object(
+                self.service, "deployments", AsyncMock(return_value=[{**external, "status": status}]),
+            ):
+                await self.service._assert_deployment_start_selectors(requested)
+        with patch.object(self.service, "deployments", AsyncMock(return_value=[external])):
+            result = await self.service.deployment_action(saved["id"], "start")
+        self.assertEqual(result["status"], "starting")
+        self.manager.create_deployment.assert_awaited()
+
+    async def test_live_external_alias_conflicts_and_discovered_container_selectors_remain_protected(self):
+        requested = {"id": "new", "kind": "managed", "alias": "Managed",
+                     "model": {"repository": "org/model"}, "settings": {}}
+        endpoint = {"id": "external", "kind": "external", "alias": "org/model",
+                    "status": "running", "model": {"repository": "elsewhere"}}
+        discovered = {"id": "container:existing", "kind": "external", "alias": "Existing",
+                      "status": "running", "model": {"repository": "org/model"}}
+        for live in (endpoint, discovered):
+            with self.subTest(live=live), patch.object(
+                self.service, "deployments", AsyncMock(return_value=[live]),
+            ), self.assertRaisesRegex(ValueError, "selector 'org/model' is already served"):
+                await self.service._assert_deployment_start_selectors(requested)
+        with patch.object(self.service, "deployments", AsyncMock(return_value=[endpoint])), self.assertRaisesRegex(
+            ValueError, "already in use",
+        ):
+            await self.service._assert_deployment_alias_available("org/model", "new")
 
     async def test_start_releases_selector_after_all_groups_explicitly_stop(self):
         for alias in ("TP2", "TP4"):

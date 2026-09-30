@@ -83,7 +83,7 @@ const groupedDetail = {
 
 const sglangDetail = {
   ...detail,
-  runtime: 'sglang', deployment_mode: 'single', node_ids: ['local'],
+  runtime: 'sglang', kind: 'managed', deployment_mode: 'single', node_ids: ['local'],
   extra_args: [
     '--speculative-algorithm', 'NEXTN', '--speculative-num-draft-tokens', '6',
     '--cuda-graph-max-bs', '160', '--chunked-prefill-size', '8192',
@@ -93,7 +93,8 @@ const sglangDetail = {
     sg_speculative_num_draft_tokens: 6, sg_cuda_graph_max_bs: 160,
     sg_chunked_prefill_size: 8192,
   },
-  gpu_memory_utilization: null, sg_tp_size: 2, sg_mem_fraction: 0.88,
+  gpu_memory_utilization: null, sg_tp_size: 2, sg_mem_fraction: 0.88, sg_cpu_affinity: '5-9,15-19',
+  environment: { NCCL_DEBUG: 'WARN' },
 }
 
 describe('deployment object page', () => {
@@ -458,6 +459,8 @@ describe('deployment object page', () => {
     expect(screen.getByLabelText('CUDA graph max batch size')).toHaveValue(160)
     expect(screen.getByLabelText('Chunked prefill size')).toHaveValue(8192)
     expect(screen.getByLabelText('TP size')).toHaveValue(2)
+    expect(screen.getByLabelText('CPU affinity')).toHaveValue('5-9,15-19')
+    expect(screen.getByLabelText(/Runtime environment variables/)).toHaveValue('NCCL_DEBUG=WARN')
     expect(screen.queryByLabelText('Speculative tokens')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('CUDA graph capture size')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Max batched tokens')).not.toBeInTheDocument()
@@ -476,9 +479,14 @@ describe('deployment object page', () => {
     const draftTokens = screen.getByLabelText('Speculative draft tokens')
     await user.clear(draftTokens)
     await user.type(draftTokens, '4')
+    await user.clear(screen.getByLabelText('CPU affinity'))
+    await user.type(screen.getByLabelText('CPU affinity'), '4-8')
+    await user.clear(screen.getByLabelText(/Runtime environment variables/))
+    await user.type(screen.getByLabelText(/Runtime environment variables/), 'NCCL_DEBUG=INFO')
     await user.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(saved).toBeDefined())
     const controls = (saved as { launch_controls: Record<string, unknown> }).launch_controls
+    expect(saved).toMatchObject({ sg_cpu_affinity: '4-8', environment: { NCCL_DEBUG: 'INFO' } })
     expect(controls.sg_speculative_num_draft_tokens).toBe(4)
     expect(controls.sg_cuda_graph_max_bs).toBe(160)
     expect(controls.sg_chunked_prefill_size).toBe(8192)

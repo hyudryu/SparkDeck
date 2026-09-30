@@ -402,6 +402,7 @@ interface WireDeploymentDetail extends WireDeployment {
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
   sg_tp_size?: number | null
+  sg_cpu_affinity?: string | null
   sg_mem_fraction?: number | null
   image?: string | null
   environment?: Record<string, string>
@@ -488,6 +489,7 @@ function deploymentDetailFromWire(item: WireDeploymentDetail): DeploymentDetail 
     gpu_memory_gb: item.gpu_memory_gb,
     sg_tp_size: item.sg_tp_size,
     sg_mem_fraction: item.sg_mem_fraction,
+    sg_cpu_affinity: item.sg_cpu_affinity ?? item.settings?.sg_cpu_affinity,
     image: item.image ?? undefined,
     environment: item.environment ?? {},
   }

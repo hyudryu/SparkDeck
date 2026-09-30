@@ -10,6 +10,7 @@ from sparkdeck.service import SparkDeckService
 def _service(deployments, native=None):
     service = SparkDeckService.__new__(SparkDeckService)
     service.manager = MagicMock(deployments=[])
+    service.manager.embedding_models = AsyncMock(return_value={"models": []})
     service.store = MagicMock()
     service.store.deployment.return_value = None
     service.deployments = AsyncMock(return_value=deployments)
@@ -79,3 +80,13 @@ class CodexModelsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_catalog_has_both_envelopes(self):
         assert await _service([]).models() == {"object": "list", "data": [], "models": []}
+
+    async def test_embedding_models_keep_openai_discovery_without_coding_advertisement(self):
+        service = _service([])
+        service.manager.embedding_models.return_value = {
+            "models": [{"model_id": "org/embed", "revision": "rev", "node_ids": ["node"]}],
+        }
+        result = await service.models()
+        assert result["data"][0]["id"] == "org/embed"
+        assert result["data"][0]["type"] == "embedding"
+        assert result["models"] == []

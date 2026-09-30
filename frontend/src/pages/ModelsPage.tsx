@@ -361,6 +361,7 @@ const seedArgsForm = (detail: SavedConfigurationDetail): ArgsForm => {
     gpu_memory_gb: detail.gpu_memory_gb?.toString() ?? '',
     sg_tp_size: detail.sg_tp_size?.toString() ?? '',
     sg_mem_fraction: detail.sg_mem_fraction?.toString() ?? '',
+    sg_cpu_affinity: detail.sg_cpu_affinity ?? '',
     remaining_flags: remainingArgs(detail.extra_args ?? []),
   }
 }
@@ -1229,13 +1230,14 @@ export function ModelsPage() {
     try {
       const settings = {
         ...form.settings,
+        sg_cpu_affinity: form.managed && form.runtime === 'sglang' ? form.settings.sg_cpu_affinity?.trim() || undefined : undefined,
         runtime_file_mounts: form.managed && form.runtime === 'vllm'
           ? (runtimeFileMounts.length || editing
               ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
               : undefined)
           : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
-        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold')
+        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang')
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
@@ -1276,6 +1278,7 @@ export function ModelsPage() {
           extra_args: settings.extra_args ?? [],
           environment: settings.environment,
           runtime_file_mounts: settings.runtime_file_mounts,
+          ...(form.runtime === 'sglang' ? { sg_cpu_affinity: settings.sg_cpu_affinity?.trim() || null } : {}),
           gpu_memory_utilization: settings.gpu_memory_utilization ?? null,
           node_ids: form.node_ids,
           deployment_mode: form.deployment_mode,
@@ -1946,6 +1949,7 @@ export function ModelsPage() {
       gpu_memory_gb: numeric(editorForm.gpu_memory_gb),
       sg_tp_size: sgTpSize,
       sg_mem_fraction: sgMemFraction,
+      ...(recipe.engine === 'sglang' ? { sg_cpu_affinity: editorForm.sg_cpu_affinity?.trim() || null } : {}),
     }
     setArgsEditor(recipe.id, { saving: true, error: undefined, saved: false })
     try {
@@ -2386,6 +2390,7 @@ export function ModelsPage() {
                         </>}
                         {!isVllm && <>
                           <label className="field"><span>TP size</span><input type="number" min="1" value={editor.form.sg_tp_size} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_tp_size: event.target.value } })} /></label>
+                          <label className="field"><span>CPU affinity</span><input aria-label="CPU affinity" placeholder="5-9,15-19" value={editor.form.sg_cpu_affinity} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_cpu_affinity: event.target.value } })} /><small>Optional CPU IDs or ranges for each container.</small></label>
                           <label className="field"><span>Mem fraction (static)</span><input type="number" step="0.01" min="0.01" max="1" value={editor.form.sg_mem_fraction} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_mem_fraction: event.target.value } })} /></label>
                           <label className="field"><span>Speculative draft tokens</span><input type="number" min="1" value={editor.form.sg_speculative_num_draft_tokens} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_speculative_num_draft_tokens: event.target.value } })} /></label>
                           <label className="field"><span>CUDA graph max batch size</span><input type="number" min="1" value={editor.form.sg_cuda_graph_max_bs} onChange={(event) => setArgsEditor(recipe.id, { form: { ...editor.form, sg_cuda_graph_max_bs: event.target.value } })} /></label>
@@ -2904,7 +2909,8 @@ export function ModelsPage() {
                 <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
                 {launchArgsOpen && <div className="args-editor">
                   {form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
-                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
+                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
+                  {form.runtime === 'sglang' && <label className="field"><span>CPU affinity</span><input aria-label="CPU affinity" placeholder="5-9,15-19" value={form.settings.sg_cpu_affinity ?? ''} onChange={(event) => setForm((current) => ({ ...current, settings: { ...current.settings, sg_cpu_affinity: event.target.value } }))} /><small>Optional CPU IDs or ranges for each container. Leave blank to use all available CPUs.</small></label>}
                   {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>

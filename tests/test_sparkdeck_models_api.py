@@ -1106,10 +1106,11 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replacement["max_concurrency"], 4)
         self.assertEqual(replacement["gpu_memory_utilization"], 0.75)
         self.assertIn("--tp-size 2", replacement["command_flags"])
-        self.assertNotIn("--max-total-tokens 999", replacement["command_flags"])
-        self.assertIn(
-            "--max-total-tokens 2097152", replacement["command_flags"]
-        )
+        # Changing context/concurrency must retain the operator's explicit
+        # token budget rather than silently inflating it to a derived default.
+        self.assertIn("--max-total-tokens 999", replacement["command_flags"])
+        self.assertEqual(replacement["command_flags"].count("--max-total-tokens"), 1)
+        self.assertNotIn("--max-total-tokens 2097152", replacement["command_flags"])
 
     async def test_discovered_detail_falls_back_when_container_is_gone(self):
         card = {

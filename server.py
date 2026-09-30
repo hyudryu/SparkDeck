@@ -1690,6 +1690,7 @@ async def agent_create_container(req: Request):
             sg_max_running_requests=body.get("sg_max_running_requests"),
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
+            sg_cpu_affinity=body.get("sg_cpu_affinity"),
             cluster_member=body.get("cluster_member"),
             hf_token=body.get("hf_token"),
             llama_artifact=body.get("llama_artifact"),
@@ -2147,6 +2148,7 @@ async def create_container(req: Request):
             sg_max_running_requests=body.get("sg_max_running_requests"),
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
+            sg_cpu_affinity=body.get("sg_cpu_affinity"),
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -2532,9 +2534,9 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
                 payload[key] = settings[source]
         if payload.get("sg_image") is None and settings.get("image"):
             payload["sg_image"] = settings["image"]
+        if payload.get("sg_cpu_affinity") is None and settings.get("sg_cpu_affinity") is not None:
+            payload["sg_cpu_affinity"] = settings["sg_cpu_affinity"]
     else:
-        if payload.get("environment") is None and settings.get("environment") is not None:
-            payload["environment"] = settings["environment"]
         if payload.get("gpu_memory_utilization") is None and settings.get("gpu_memory_utilization") is not None:
             payload["gpu_memory_utilization"] = settings["gpu_memory_utilization"]
         context_length = settings.get("max_model_len") or settings.get("context_length")
@@ -2543,6 +2545,8 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
         max_running = settings.get("max_running_requests")
         if max_running is not None and controls.get("max_concurrency") is None:
             controls["max_concurrency"] = max_running
+    if payload.get("environment") is None and settings.get("environment") is not None:
+        payload["environment"] = settings["environment"]
 
     payload["launch_controls"] = controls or None
     if payload.get("image") is None and settings.get("image"):
@@ -2571,6 +2575,7 @@ async def create_recipe(req: Request):
             sg_max_running_requests=body.get("sg_max_running_requests"),
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
+            sg_cpu_affinity=body.get("sg_cpu_affinity"),
             deployment_mode=body.get("deployment_mode", "single"),
             node_ids=body.get("node_ids"),
             launch_controls=body.get("launch_controls"),
@@ -2735,7 +2740,7 @@ async def v1_update_deployment_settings(deployment_id: str, req: Request):
         "extra_args", "command_flags", "launch_controls",
         "environment", "runtime_file_mounts",
         "gpu_memory_utilization", "gpu_memory_gb",
-        "sg_tp_size", "sg_mem_fraction",
+        "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity",
         # Hook-backed env-file cards accept their file-backed contract; which
         # keys apply is decided per container in the service.
         "served_model_name", "env_file_mtime",
@@ -2808,6 +2813,7 @@ def _public_recipe(recipe: dict) -> dict:
         "sg_max_running_requests": recipe.get("sg_max_running_requests"),
         "sg_mem_fraction": recipe.get("sg_mem_fraction"),
         "sg_image": recipe.get("sg_image"),
+        "sg_cpu_affinity": recipe.get("sg_cpu_affinity"),
         **contract,
         "node_ids": list(recipe.get("node_ids") or [LOCAL_NODE_ID]),
         "extra_args_count": saved_count,
@@ -2858,7 +2864,7 @@ async def v1_update_recipe(recipe_id: str, req: Request):
         "environment",
         "gpu_memory_utilization", "gpu_memory_gb",
         "sg_tp_size", "sg_context_length",
-        "sg_max_running_requests", "sg_mem_fraction", "sg_image",
+        "sg_max_running_requests", "sg_mem_fraction", "sg_image", "sg_cpu_affinity",
     }
     unknown = sorted(set(body) - allowed)
     if unknown:
@@ -2953,6 +2959,7 @@ async def v1_deploy_recipe(recipe_id: str, req: Request):
             "max_running_requests": recipe.get("sg_max_running_requests"),
             "mem_fraction_static": recipe.get("sg_mem_fraction"),
             "image": recipe.get("sg_image") or recipe.get("image"),
+            "sg_cpu_affinity": recipe.get("sg_cpu_affinity"),
         })
     if contract["deployment_mode"] == "grouped_sharded":
         # The grouped topology is per group, not a whole-world argv flag: the

@@ -34,6 +34,7 @@ from .catalog import (
     canonical_quantization,
     quantization_from_text,
 )
+from .codex_models import codex_model
 from .embeddings import embeddings_response
 from .envfile_settings import (
     EnvFileConflictError,
@@ -106,7 +107,7 @@ _LOCAL_ROUTING_KEYS = {
     # silently substitute default ports, images, and memory policies.
     "port", "image", "sg_image", "gpu_memory_gb",
     "sg_tp_size", "sg_context_length", "sg_max_running_requests",
-    "sg_mem_fraction",
+    "sg_mem_fraction", "sg_cpu_affinity",
     # The immutable revision weight preparation resolved, so the launch uses
     # exactly the prepared snapshot instead of re-resolving a mutable name.
     "prepared_revision",
@@ -2120,6 +2121,9 @@ class SparkDeckService:
             "gpu_memory_gb": gpu_memory_gb,
             "sg_tp_size": sg_tp_size,
             "sg_mem_fraction": sg_mem_fraction,
+            "sg_cpu_affinity": (
+                saved_settings if saved_only else (launch_settings or {})
+            ).get("sg_cpu_affinity"),
             "image": image,
             "environment": environment or {},
             "runtime_file_mounts": (
@@ -2220,7 +2224,7 @@ class SparkDeckService:
             "extra_args", "launch_controls",
             "environment", "runtime_file_mounts",
             "gpu_memory_utilization", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction",
+            "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity",
             "model",
         }
         unknown = sorted(set(changes) - allowed)
@@ -2566,7 +2570,7 @@ class SparkDeckService:
             "gpu_layers", "quantization", "artifact", "image", "extra_args",
             "gpu_memory_utilization", "node_ids", "deployment_mode",
             "launch_controls", "gpu_memory_gb",
-            "sg_tp_size", "sg_mem_fraction", "alias",
+            "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity", "alias",
             "environment", "runtime_file_mounts", "instances",
             "model",
         }
@@ -2581,6 +2585,12 @@ class SparkDeckService:
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+        if "sg_cpu_affinity" in changes:
+            from manager import Manager
+            affinity = Manager._normalized_sg_cpu_affinity(changes["sg_cpu_affinity"])
+            if affinity and str(stored.get("runtime")) != RuntimeKind.SGLANG.value:
+                raise ValueError("sg_cpu_affinity is only supported for SGLang")
+            settings["sg_cpu_affinity"] = affinity
         if "environment" in changes:
             settings["environment"] = normalize_runtime_environment(
                 changes.get("environment"), str(stored.get("runtime") or "vllm"),
@@ -3282,6 +3292,12 @@ class SparkDeckService:
         runtime = RuntimeKind(str(body.get("runtime") or "vllm"))
         kind = DeploymentKind(str(body.get("kind") or ("external" if body.get("base_url") else "managed")))
         settings = dict(body.get("settings") or {})
+        if "sg_cpu_affinity" in settings:
+            from manager import Manager
+            affinity = Manager._normalized_sg_cpu_affinity(settings["sg_cpu_affinity"])
+            if affinity and runtime is not RuntimeKind.SGLANG:
+                raise ValueError("sg_cpu_affinity is only supported for SGLang")
+            settings["sg_cpu_affinity"] = affinity
         # Runtime provenance is derived from the resolved launch input below;
         # callers cannot promote a local model to public benchmark evidence.
         settings.pop("model_source", None)
@@ -6534,8 +6550,9 @@ class SparkDeckService:
         Records may share repository and served selectors while saved or
         stopped; the conflict only matters once two launches would answer at
         the same time and a bare model id could no longer be routed
-        unambiguously. External endpoints are skipped: SparkDeck does not
-        launch them and cannot derive their served names.
+        unambiguously. Registered external endpoints reserve only the names
+        actually advertised while healthy; their desired state cannot reserve
+        a launch because SparkDeck does not own their lifecycle.
         """
         if str(deployment.get("kind") or "") != DeploymentKind.MANAGED.value:
             return
@@ -6562,6 +6579,16 @@ class SparkDeckService:
         for item in await self.deployments():
             item_id = str(item.get("id") or "")
             if item_id == str(deployment.get("id")):
+                continue
+            external_endpoint = (
+                item.get("kind") == DeploymentKind.EXTERNAL.value
+                and not item_id.startswith("container:")
+                and not item.get("has_start_hook")
+                and not item.get("has_stop_hook")
+            )
+            if external_endpoint and item.get("status") != "running":
+                # Saved intent does not control an external server. An offline
+                # copied endpoint must not prevent a real managed launch.
                 continue
             instances = item.get("instances")
             # Independent Stop leaves the parent running intent intact. Once
@@ -6591,7 +6618,7 @@ class SparkDeckService:
                 continue
             item_alias = str(item.get("alias") or "")
             public_ids = self._deployment_public_model_ids(item)
-            if public_ids == ([item_alias] if item_alias else []):
+            if not external_endpoint and public_ids == ([item_alias] if item_alias else []):
                 # A live record without configured served names publishes its
                 # repository id (the runtime default request id) alongside
                 # its alias.
@@ -6865,7 +6892,13 @@ class SparkDeckService:
             if model.get("dimension") is not None:
                 entry["dimension"] = model["dimension"]
             data.append(entry)
-        return {"object": "list", "data": data}
+        return {
+            "object": "list", "data": data,
+            "models": [
+                codex_model(item["id"]) for item in data
+                if item.get("type") != "embedding"
+            ],
+        }
 
     async def _cached_embedding_models(self) -> list[dict[str, Any]]:
         """Return embedding models to advertise, never failing the model list.

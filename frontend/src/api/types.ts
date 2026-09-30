@@ -70,6 +70,7 @@ export interface RuntimeFileMount {
 }
 
 export interface DeploymentSettings {
+  sg_cpu_affinity?: string
   node_ids?: string[]
   image?: string
   context_length?: number
@@ -228,6 +229,7 @@ export interface DeploymentDetail extends Deployment {
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
   sg_tp_size?: number | null
+  sg_cpu_affinity?: string | null
   sg_mem_fraction?: number | null
   image?: string
 }
@@ -261,6 +263,7 @@ export interface DeploymentUpdateInput {
   gpu_memory_utilization?: number | null
   gpu_memory_gb?: number | null
   sg_tp_size?: number | null
+  sg_cpu_affinity?: string | null
   sg_mem_fraction?: number | null
 }
 
@@ -272,6 +275,7 @@ export interface RuntimeFlagsPreview {
 
 // Editable fields of a saved deployment bookmark (before its first launch).
 export interface SavedDeploymentUpdateInput {
+  sg_cpu_affinity?: string | null
   alias?: string
   image?: string | null
   context_length?: number | null
@@ -1008,6 +1012,7 @@ export interface SavedConfiguration {
   sg_tp_size?: number | null
   sg_context_length?: number | null
   sg_max_running_requests?: number | null
+  sg_cpu_affinity?: string | null
   sg_mem_fraction?: number | null
   sg_image?: string | null
   deployment_mode: string
@@ -1050,6 +1055,7 @@ export interface RecipeUpdateInput {
   sg_tp_size?: number | null
   sg_context_length?: number | null
   sg_max_running_requests?: number | null
+  sg_cpu_affinity?: string | null
   sg_mem_fraction?: number | null
   sg_image?: string | null
 }

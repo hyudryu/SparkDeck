@@ -4810,15 +4810,13 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
         name: path for name, path in files.items()
         if name.endswith((".safetensors.index.json", ".bin.index.json"))
     }
-    required_indexes = set()
+    families: dict[str, set[str]] = {}
     for name in files:
         match = _WEIGHT_SHARD.match(name)
         if match and match.group("suffix").casefold() != ".gguf":
-            required_indexes.add(
-                f"{match.group('prefix')}{match.group('suffix')}.index.json".casefold()
-            )
-    if not required_indexes <= indexes.keys():
-        return False
+            index_name = f"{match.group('prefix')}{match.group('suffix')}.index.json".casefold()
+            families.setdefault(index_name, set()).add(name)
+    coverage: dict[str, set[str]] = {}
     for index_name, path in indexes.items():
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -4826,6 +4824,7 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
             if not isinstance(weight_map, dict) or not weight_map:
                 return False
             index_directory = PurePosixPath(index_name).parent
+            covered: set[str] = set()
             for raw in weight_map.values():
                 candidate = PurePosixPath(str(raw or ""))
                 if (
@@ -4833,11 +4832,35 @@ def _weight_indexes_are_complete(files: dict[str, Path]) -> bool:
                     or ".." in candidate.parts
                 ):
                     return False
-                candidates = {candidate.as_posix().casefold()}
-                if index_directory != PurePosixPath("."):
-                    candidates.add((index_directory / candidate).as_posix().casefold())
-                if not candidates & files.keys():
+                # Hub indexes resolve filenames relative to their directory.
+                # Retain support for snapshot-relative paths used by older
+                # component indexes, but prefer the local file if both exist.
+                relative = (index_directory / candidate).as_posix().casefold()
+                rooted = candidate.as_posix().casefold()
+                resolved = relative if relative in files else rooted
+                if resolved not in files:
                     return False
+                covered.add(resolved)
+            coverage[index_name] = covered
         except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+    # A shared index must itself be the canonical index of a fully covered
+    # shard family. An unrelated index cannot validate an otherwise indexless
+    # checkpoint just by mentioning its files.
+    canonical = {
+        name: covered for name, covered in coverage.items()
+        if name in families and families[name] <= covered
+    }
+    for expected_index, shards in families.items():
+        if expected_index in coverage:
+            if not shards <= coverage[expected_index]:
+                return False
+            continue
+        if not any(
+            PurePosixPath(name).parent == PurePosixPath(expected_index).parent
+            and name.endswith(".safetensors.index.json") == expected_index.endswith(".safetensors.index.json")
+            and shards <= covered
+            for name, covered in canonical.items()
+        ):
             return False
     return True

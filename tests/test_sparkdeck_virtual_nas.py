@@ -1782,6 +1782,59 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(nas.inventory()[0]["partial"])
 
+    def test_inventory_accepts_shared_index_covering_complete_extra_weight_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hub = root / "hub"
+            repository = create_cached_model(hub)
+            snapshot = repository / "snapshots" / "revision-1"
+            (snapshot / "model.safetensors").unlink()
+            shards = [f"model-{part:05}-of-00005.safetensors" for part in range(1, 6)]
+            extra = "model-extra-00001-of-00001.safetensors"
+            for filename in [*shards, extra]:
+                (snapshot / filename).write_bytes(b"weights")
+            index = snapshot / "model.safetensors.index.json"
+            index.write_text(json.dumps({"weight_map": {
+                f"layer.{part}": filename for part, filename in enumerate([*shards, extra])
+            }}), encoding="utf-8")
+            nas = VirtualNAS(root, lambda: hub, FakeRegistry(), lambda: False)
+            self.assertFalse(nas.inventory()[0]["partial"])
+            self.assertIn("revision-1", nas.inventory()[0]["revisions"])
+            # Existing files alone cannot prove an extra family is part of
+            # this checkpoint: every member must be named in a valid index.
+            index.write_text(json.dumps({"weight_map": {
+                f"layer.{part}": filename for part, filename in enumerate(shards)
+            }}), encoding="utf-8")
+            self.assertTrue(nas.inventory()[0]["partial"])
+            index.write_text(json.dumps({"weight_map": {
+                "main": shards[0], "extra": extra,
+            }}), encoding="utf-8")
+            self.assertTrue(nas.inventory()[0]["partial"])
+
+    def test_shared_index_rejects_incomplete_families_and_unsafe_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory)
+            main = "model-00001-of-00001.safetensors"
+            extra = "model-extra-00001-of-00002.safetensors"
+            for filename in (main, extra):
+                (snapshot / filename).write_bytes(b"weights")
+            index = snapshot / "model.safetensors.index.json"
+            index.write_text(json.dumps({"weight_map": {"main": main, "extra": extra}}), encoding="utf-8")
+            self.assertFalse(virtual_nas._is_complete_snapshot(snapshot, None))
+            extra_second = "model-extra-00002-of-00002.safetensors"
+            (snapshot / extra_second).write_bytes(b"weights")
+            files = {item.name: item for item in snapshot.iterdir()}
+            self.assertFalse(virtual_nas._weight_indexes_are_complete(files))
+            for unsafe in ("../outside.safetensors", "/outside.safetensors", "missing.safetensors"):
+                index.write_text(json.dumps({"weight_map": {
+                    "main": main, "extra.0": extra, "extra.1": extra_second, "unsafe": unsafe,
+                }}), encoding="utf-8")
+                self.assertFalse(virtual_nas._weight_indexes_are_complete(files))
+            index.write_text(json.dumps({"weight_map": {
+                "main": main, "extra.0": extra, "extra.1": extra_second,
+            }}), encoding="utf-8")
+            self.assertTrue(virtual_nas._weight_indexes_are_complete(files))
+
     async def test_streamed_export_import_uses_exact_repository(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
             source_hub = Path(source_dir) / "hub"

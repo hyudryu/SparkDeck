@@ -1,6 +1,7 @@
 import type {
   AppSettings,
   BenchmarkAggregate,
+  BenchmarkHardware,
   CommunityAggregatesResponse,
   BenchmarkSample,
   BenchmarkModelDetail,
@@ -414,7 +415,9 @@ interface WireBenchmark {
   deployment_id?: string
   model: { repository: string; revision?: string; artifact?: string; quantization?: string }
   runtime: RuntimeKind
-  hardware?: { hardware_class?: string; gpu_model?: string }
+  hardware?: BenchmarkHardware & { gpu_model?: string }
+  hardware_key?: string
+  hardware_label?: string
   configuration?: Record<string, unknown>
   input_tokens: number
   output_tokens: number
@@ -802,6 +805,9 @@ export const api = {
         runtime: item.runtime,
         quantization: item.model.quantization,
         hardware_class: item.hardware?.hardware_class ?? item.hardware?.gpu_model,
+        hardware: item.hardware,
+        hardware_key: item.hardware_key,
+        hardware_label: item.hardware_label,
         input_tokens: item.input_tokens,
         output_tokens: item.output_tokens,
         latency_ms: item.latency_ms,

@@ -327,6 +327,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             model="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
         )
         self.assertEqual(self.service.store.outbox_batch(), [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
             "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
@@ -675,6 +677,8 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(self.service.store.outbox_batch(), [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
             "model_id": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
@@ -871,10 +875,45 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         samples, total = self.service.store.benchmarks()
         self.assertEqual(total, 1)
         self.assertEqual(samples[0]["hardware"], {
-            "hardware_class": "unknown", "gpu_count": None, "gpus": [],
+            "hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": [],
         })
         self.assertFalse(samples[0]["eligible_for_community"])
         self.assertEqual(self.service.store.outbox_batch(), [])
+
+    async def test_coordinated_replica_counters_cannot_claim_primary_spark_hardware(self):
+        self.manager._stats_cache = {
+            "architecture": "aarch64",
+            "gpus": [{"name": "NVIDIA GB10", "mem_total_mib": 128000}],
+        }
+        self.service.store.set_setting("device_pairing", {"status": "paired"})
+        self.service.store.set_community_consent(True)
+        for mode in ("replicated", "grouped_sharded"):
+            with self.subTest(mode=mode):
+                deployment_id = f"coordinated-{mode}"
+                members = [
+                    {"node_id": "local", "instance_id": 0},
+                    {"node_id": "ws1", "instance_id": 1},
+                ]
+                cluster = {"mode": mode, "members": members}
+                self.manager._cluster_primary_member = lambda _: (cluster, members[0])
+                self.service.store.add_deployment(Deployment(
+                    id=deployment_id, alias=deployment_id, runtime=RuntimeKind.VLLM,
+                    kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+                    settings={"context_length": 4096, "model_source": "public_repository",
+                              "manager_deployment_id": "cluster"},
+                ))
+                await self.service.record_benchmark_series_point({
+                    "deployment_id": deployment_id, "concurrency": 1,
+                    "request_count": 2, "prompt_tokens": 400,
+                    "generation_tokens": 200, "prompt_seconds": 0.5,
+                    "wall_seconds": 2,
+                })
+                samples, _ = self.service.store.benchmarks()
+                recorded = next(item for item in samples if item["deployment_id"] == deployment_id)
+                self.assertEqual(recorded["hardware_key"], "unknown")
+                self.assertFalse(recorded["eligible_for_community"])
+                self.assertEqual(self.service.store.outbox_batch(), [])
+        self.assertEqual(len(self.service.store.benchmark_model_detail("org/model")["points"]), 1)
 
     async def test_coordinated_run_resolves_manager_only_launch_metadata(self):
         manager_deployment = {
@@ -1172,6 +1211,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["availability"], "available")
         self.assertEqual(result["items"], [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
+            "hardware_label": "Unknown hardware",
             "model_id": "org/community-model",
             "quantization": "FP16",
             "prompt_tokens_bucket": 2000,
@@ -1184,7 +1226,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_policy"]["exact_match_dimensions"],
             [
                 "model_id", "quantization", "prompt_tokens_bucket",
-                "tensor_parallel_size",
+                "tensor_parallel_size", "hardware_key",
             ],
         )
 
@@ -1532,7 +1574,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
         items, _ = self.service.store.benchmarks()
-        self.assertEqual(items[0]["hardware"]["hardware_class"], "local")
+        self.assertEqual(items[0]["hardware"]["hardware_class"], "workstation")
         self.assertEqual(
             items[0]["hardware"]["gpus"][0]["model"], "NVIDIA RTX 5090",
         )

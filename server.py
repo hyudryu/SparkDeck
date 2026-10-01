@@ -4184,7 +4184,7 @@ async def v1_community_aggregates(req: Request):
         return _community_aggregates_unavailable()
     try:
         upstream = await _community_http.get(
-            f"{api_url}/v3/aggregates",
+            f"{api_url}/v4/aggregates",
             headers={
                 "Authorization": f"Bearer {id_token}",
             },
@@ -4347,11 +4347,11 @@ async def _post_community_sample(
 ) -> httpx.Response | None:
     try:
         return await _community_http.post(
-            f"{api_url}/v3/samples",
+            f"{api_url}/v4/samples",
             json=payload,
             headers={
                 "Authorization": f"Bearer {id_token}",
-                "Idempotency-Key": sample_id,
+                "Idempotency-Key": f"v4-{sample_id}",
             },
         )
     except httpx.HTTPError:

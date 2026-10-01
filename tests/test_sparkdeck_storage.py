@@ -172,6 +172,8 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.store.set_setting("device_pairing", {"status": "paired", "device_id": "device-1"})
         self.assertEqual(self.store.retry_outbox(), 1)
         self.assertEqual(self.store.outbox_batch(), [{
+            "hardware": {"hardware_class": "unknown", "architecture": "x86_64", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
             "model_id": "org/model",
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
@@ -260,7 +262,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         self.assertEqual(local[0]["model"]["artifact"], "C:/private/model.gguf")
         self.assertEqual(local[0]["model"]["revision"], "abc123")
         self.assertEqual(local[0]["runtime_version"], "registry.local/team/image:1")
-        self.assertEqual(local[0]["hardware"], {"architecture": "aarch64"})
+        self.assertEqual(local[0]["hardware"]["architecture"], "aarch64")
         self.assertEqual(local[0]["sync_state"], "local")
 
     def test_withdrawing_consent_removes_unsent_uploads_but_keeps_samples(self):
@@ -640,9 +642,9 @@ class SparkDeckStoreTests(unittest.TestCase):
         local, _ = self.store.benchmarks()
         upload = self.store.outbox_batch()
 
-        self.assertEqual(local[0]["hardware"], {"hardware_class": "dgx-spark"})
+        self.assertEqual(local[0]["hardware"]["hardware_class"], "unknown")
         self.assertLessEqual(set(upload[0]), COMMUNITY_UPLOAD_FIELDS)
-        self.assertNotIn("hardware", upload[0])
+        self.assertEqual(upload[0]["hardware"]["hardware_class"], "unknown")
 
     def test_context_and_speed_are_required_at_the_upload_boundary(self):
         base = BenchmarkSample(
@@ -675,7 +677,7 @@ class SparkDeckStoreTests(unittest.TestCase):
             "minimum_samples": 10,
             "exact_match_dimensions": [
                 "model_id", "quantization", "prompt_tokens_bucket",
-                "tensor_parallel_size",
+                "tensor_parallel_size", "hardware_key",
             ],
             "metric": "inference_tokens_per_second",
         })
@@ -941,6 +943,8 @@ class SparkDeckStoreTests(unittest.TestCase):
         local, _ = self.store.benchmarks()
         self.assertEqual(local[0]["configuration"]["tensor_parallel_size"], 4)
         self.assertEqual(self.store.outbox_batch(), [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
             "model_id": "org/model", "quantization": "UNKNOWN",
             "prompt_tokens_bucket": 400,
             "inference_tokens_per_second": 50.0,
@@ -1003,6 +1007,9 @@ class SparkDeckStoreTests(unittest.TestCase):
 
         self.assertEqual(aggregates, [
             {
+                "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+                "hardware_key": "unknown",
+                "hardware_label": "Unknown hardware",
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 400,
@@ -1012,6 +1019,9 @@ class SparkDeckStoreTests(unittest.TestCase):
                 "unique_cluster_count": 2,
             },
             {
+                "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+                "hardware_key": "unknown",
+                "hardware_label": "Unknown hardware",
                 "model_id": "org/model",
                 "quantization": "NVFP4",
                 "prompt_tokens_bucket": 2000,
@@ -1033,6 +1043,7 @@ class SparkDeckStoreTests(unittest.TestCase):
         rows = [{
             "model_json": '{"repository":"org/model","quantization":"NVFP4"}',
             "configuration_json": '{"context_length":4096}',
+            "hardware_json": '{}',
             "input_tokens": 400,
             "generation_tps": 80.0,
             "telemetry_cluster_id": "33333333-3333-4333-8333-333333333333",
@@ -1062,6 +1073,9 @@ class SparkDeckStoreTests(unittest.TestCase):
         aggregates = store.community_aggregates()
 
         self.assertEqual(aggregates, [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
+            "hardware_label": "Unknown hardware",
             "model_id": "org/model",
             "quantization": "NVFP4",
             "prompt_tokens_bucket": 400,
@@ -1110,6 +1124,9 @@ class SparkDeckStoreTests(unittest.TestCase):
                 )
 
         self.assertEqual(self.store.community_aggregates(), [{
+            "hardware": {"hardware_class": "unknown", "architecture": "unknown", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
+            "hardware_label": "Unknown hardware",
             "model_id": "deepseek-r1",
             "quantization": "Q4_K_M",
             "prompt_tokens_bucket": 400,

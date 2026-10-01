@@ -5045,6 +5045,70 @@ class SparkDeckService:
             ),
             None,
         ) if manager_id else None
+        if manager_id and linked is None and discovered is None and action == "start":
+            # A saved card can outlive its Manager launch. Recover the durable
+            # reverse link before considering a new launch of the same model.
+            recovered = owner or next((
+                item for item in getattr(self.manager, "deployments", [])
+                if isinstance(item, dict) and item.get("id")
+                and item.get("sparkdeck_record_id") == deployment["id"]
+            ), None)
+            if recovered is not None:
+                manager_id = recovered["id"]
+                linked = recovered
+                primary = (recovered.get("members") or [{}])[0]
+                port = recovered.get("api_port")
+                self.store.update_managed_routing(
+                    deployment["id"], {
+                        **(deployment.get("settings") or {}),
+                        "manager_deployment_id": manager_id,
+                        "node_ids": list(recovered.get("node_ids") or []),
+                    }, primary.get("container_name") or container,
+                    f"http://127.0.0.1:{int(port)}" if port else deployment.get("_base_url"),
+                )
+                deployment = self.store.deployment(deployment_id, include_private=True) or deployment
+            else:
+                if instance is not None or additional_node_ids:
+                    raise ValueError(
+                        "the previous deployment is missing; launch the whole saved deployment"
+                    )
+                # Probe both the old placement and the new selection. An offline
+                # old worker or a surviving orphan must never become a duplicate
+                # launch merely because the controller lost its Manager entry.
+                settings = deployment.get("settings") or {}
+                old_nodes = list(settings.get("node_ids") or ["local"])
+                probe_ids = list(dict.fromkeys([*old_nodes, *(node_ids or [])]))
+                invalidate = getattr(getattr(self.manager, "node_registry", None), "invalidate_status", None)
+                if callable(invalidate):
+                    for node_id in probe_ids:
+                        invalidate(node_id)
+                nodes = await self.manager.selected_cluster_nodes(probe_ids)
+                for node in nodes:
+                    if (
+                        not node.get("online") or not node.get("docker_ready")
+                        or node.get("inventory_available") is not True
+                        or not isinstance(node.get("containers"), list)
+                    ):
+                        raise RuntimeError(
+                            f"cannot verify the previous deployment on {node.get('name') or node['id']}; "
+                            "restore its container inventory before launching"
+                        )
+                    if any(
+                        (item.get("deployment_id") == manager_id
+                         or (container and item.get("name") == container))
+                        # agent_status also reports failed pre-container launch
+                        # progress. Docker inventory was successful above and
+                        # Docker itself has no "error" container state.
+                        and item.get("status") != "error"
+                        for item in node["containers"] if isinstance(item, dict)
+                    ):
+                        raise RuntimeError(
+                            f"the previous deployment still has a container on {node.get('name') or node['id']}; "
+                            "restore its deployment registration before launching"
+                        )
+                # Keep the old routing intact if validation or creation fails.
+                # Successful launch replaces it through _link_cluster_record.
+                return await self._launch_saved_deployment(deployment, node_ids)
         launch_settings = (owner or linked or {}).get("launch_settings")
         if action == "add_instance":
             # Start another engine group of the same deployment on nodes the

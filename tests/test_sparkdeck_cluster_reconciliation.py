@@ -880,6 +880,7 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["id"] for item in listed], ["record-1"])
 
     async def test_start_poll_during_replacement_keeps_one_public_record(self):
+        self.manager.deployments = [{"id": "old-manager"}]
         replacement = {
             "id": "replacement-manager", "sparkdeck_record_id": "record-1",
             "model": "org/model", "engine": "vllm", "node_ids": ["worker-1"],
@@ -971,6 +972,7 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_settings_dirty_start_result_immediately_reconciles_replacement(self):
+        self.manager.deployments = [{"id": "old-manager"}]
         self.manager.deployment_action.return_value = {
             "ok": True,
             "errors": [],
@@ -994,6 +996,7 @@ class ReplacementReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["desired_state"], "running")
 
     async def test_concurrent_start_then_stop_finishes_durably_stopped(self):
+        self.manager.deployments = [{"id": "old-manager"}]
         start_entered = asyncio.Event()
         release_start = asyncio.Event()
 

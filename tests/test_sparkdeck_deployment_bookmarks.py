@@ -107,6 +107,99 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.temp.cleanup()
 
+    def _stale_launch(self):
+        self.service.store.add_deployment(Deployment(
+            id="stale-record", alias="Saved Qwen", runtime=RuntimeKind.SGLANG,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model", revision=CACHED_REVISION),
+            container_name="old-rank",
+            settings={"manager_deployment_id": "old-manager", "node_ids": ["remote-1"],
+                      "deployment_mode": "single", "context_length": 8192},
+        ), "http://127.0.0.1:8000")
+        for target in self.manager.nodes:
+            target.update(inventory_available=True, containers=[])
+
+    async def test_start_recreates_missing_manager_launch_without_losing_saved_profile(self):
+        self._stale_launch()
+        await self.service.deployment_action("stale-record", "start", ["remote-1"])
+        self.manager.deployment_action.assert_not_awaited()
+        self.manager.create_deployment.assert_awaited_once()
+        payload = self.manager.create_deployment.await_args.args[0]
+        self.assertEqual(payload["sparkdeck_record_id"], "stale-record")
+        self.assertEqual(payload["deployment_name"], "Saved Qwen")
+        self.assertIn(CACHED_REVISION, payload["extra_args"])
+        stored = self.service.store.deployment("stale-record", include_private=True)
+        self.assertEqual(stored["settings"]["manager_deployment_id"], "cluster-1")
+        self.assertEqual(stored["settings"]["context_length"], 8192)
+        self.assertEqual(stored["model"]["revision"], CACHED_REVISION)
+        self.assertEqual(stored["container_name"], "rank-0")
+
+    async def test_stale_manager_start_recovers_existing_reverse_link(self):
+        self._stale_launch()
+        self.manager.deployments = [{
+            "id": "replacement", "sparkdeck_record_id": "stale-record",
+            "node_ids": ["remote-1"], "api_port": 8010,
+            "members": [{"container_name": "new-rank"}],
+        }]
+        await self.service.deployment_action("stale-record", "start")
+        self.manager.create_deployment.assert_not_awaited()
+        self.manager.deployment_action.assert_awaited_once_with("replacement", "start")
+        stored = self.service.store.deployment("stale-record", include_private=True)
+        self.assertEqual(stored["settings"]["manager_deployment_id"], "replacement")
+        self.assertEqual(stored["container_name"], "new-rank")
+
+    async def test_stale_manager_start_recovers_container_owner(self):
+        self._stale_launch()
+        self.manager.deployments = [{
+            "id": "owner", "node_ids": ["remote-1"], "api_port": 8010,
+            "members": [{"container_name": "old-rank"}],
+        }]
+        await self.service.deployment_action("stale-record", "start")
+        self.manager.create_deployment.assert_not_awaited()
+        self.manager.deployment_action.assert_awaited_once_with("owner", "start")
+
+    async def test_missing_launch_checks_old_placement_when_relocating(self):
+        self._stale_launch()
+        self.manager.nodes[1]["inventory_available"] = False
+        with self.assertRaisesRegex(RuntimeError, "cannot verify"):
+            await self.service.deployment_action("stale-record", "start", ["local"])
+        self.manager.selected_cluster_nodes.assert_awaited_once_with(["remote-1", "local"])
+        self.manager.create_deployment.assert_not_awaited()
+
+    async def test_missing_launch_ignores_failed_precontainer_progress(self):
+        self._stale_launch()
+        self.manager.nodes[1]["containers"] = [{
+            "name": "old-rank", "deployment_id": "old-manager",
+            "status": "error", "phase": {"phase": "error", "message": "create failed"},
+        }]
+        await self.service.deployment_action("stale-record", "start")
+        self.manager.create_deployment.assert_awaited_once()
+
+    async def test_missing_launch_rejects_unavailable_or_orphaned_inventory(self):
+        self._stale_launch()
+        target = self.manager.nodes[1]
+        for changes in (
+            {"inventory_available": False, "containers": []},
+            {"inventory_available": True, "containers": [{"name": "old-rank", "status": "running"}]},
+            {"inventory_available": True, "containers": [{"name": "another-rank", "deployment_id": "old-manager"}]},
+            {"inventory_available": True, "online": False, "containers": []},
+        ):
+            target.update(changes)
+            with self.assertRaises(RuntimeError):
+                await self.service.deployment_action("stale-record", "start")
+            self.manager.create_deployment.assert_not_awaited()
+            self.assertEqual(self.service.store.deployment("stale-record")["settings"]["manager_deployment_id"], "old-manager")
+
+    async def test_missing_launch_failure_keeps_previous_durable_routing(self):
+        self._stale_launch()
+        self.manager.create_deployment.side_effect = RuntimeError("create failed")
+        with self.assertRaisesRegex(RuntimeError, "create failed"):
+            await self.service.deployment_action("stale-record", "start")
+        stored = self.service.store.deployment("stale-record", include_private=True)
+        self.assertEqual(stored["settings"]["manager_deployment_id"], "old-manager")
+        self.assertEqual(stored["container_name"], "old-rank")
+        self.assertEqual(stored["_base_url"], "http://127.0.0.1:8000")
+
     async def test_create_saves_bookmark_without_launching(self):
         created = await self.service.create_deployment({
             "model": "org/model",

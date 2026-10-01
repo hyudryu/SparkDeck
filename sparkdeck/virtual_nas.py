@@ -41,6 +41,7 @@ LOCAL_NODE_ID = "local"
 _MODEL_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _HUB_BLOB_KEY = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_SHARED_BLOB_NORMALIZATION_LOCK = threading.Lock()
 VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
@@ -4022,6 +4023,88 @@ def _ensure_safe_snapshot_directory(repository: Path, revision: str) -> Path:
     return snapshot
 
 
+def _normalize_shared_hub_blobs(repository: Path) -> None:
+    """Make Hub shared blobs compatible with repository-contained transfers.
+
+    huggingface-hub 1.33 stores Xet payloads in ``hub/blobs/xx/<hash>`` and
+    links repository blobs to that store. Replace only that exact, marked
+    layout with hardlinks: no payload is copied and snapshot links stay valid.
+    This idempotent repair also runs during inventory so existing downloads
+    become usable without requiring another download or weakening containment.
+    Read-only caches and unsupported filesystems retain the existing rejection.
+    """
+    with _SHARED_BLOB_NORMALIZATION_LOCK:
+        _normalize_shared_hub_blobs_locked(repository)
+
+
+def _normalize_shared_hub_blobs_locked(repository: Path) -> None:
+    try:
+        if repository.is_symlink() or not repository.is_dir():
+            return
+        local_blobs = repository / "blobs"
+        shared_blobs = repository.parent / "blobs"
+        marker = shared_blobs / ".huggingface-shared-blobs"
+        if (
+            local_blobs.is_symlink() or not local_blobs.is_dir()
+            or shared_blobs.is_symlink() or not shared_blobs.is_dir()
+            or marker.is_symlink() or not marker.is_file()
+            or marker.stat().st_size != 2
+            or marker.read_bytes() != b"1\n"
+        ):
+            return
+        candidates = list(local_blobs.iterdir())
+    except (OSError, RuntimeError):
+        return
+    for blob in candidates:
+        staged: Path | None = None
+        try:
+            original = blob.lstat()
+            if not stat.S_ISLNK(original.st_mode) or not _HUB_BLOB_KEY.fullmatch(blob.name):
+                continue
+            target = Path(os.readlink(blob))
+            parts = target.parts
+            if (
+                len(parts) != 5 or parts[:3] != ("..", "..", "blobs")
+                or re.fullmatch(r"[0-9a-f]{64}", parts[4]) is None
+                or parts[3] != parts[4][:2]
+            ):
+                continue
+            prefix = shared_blobs / parts[3]
+            payload = prefix / parts[4]
+            if prefix.is_symlink() or not prefix.is_dir():
+                continue
+            payload_stat = payload.lstat()
+            if not stat.S_ISREG(payload_stat.st_mode) or payload_stat.st_size <= 0:
+                continue
+            staged = local_blobs / f".sparkdeck-shared-{uuid.uuid4().hex}"
+            # Do not follow a payload swapped to a symlink during the repair.
+            os.link(payload, staged, follow_symlinks=False)
+            staged_stat = staged.lstat()
+            if (
+                not stat.S_ISREG(staged_stat.st_mode)
+                or (staged_stat.st_dev, staged_stat.st_ino)
+                != (payload_stat.st_dev, payload_stat.st_ino)
+            ):
+                continue
+            current = blob.lstat()
+            if (
+                not stat.S_ISLNK(current.st_mode)
+                or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                or Path(os.readlink(blob)) != target
+            ):
+                continue
+            os.replace(staged, blob)
+        except (OSError, RuntimeError, ValueError):
+            # Preserve the original pointer if it cannot be normalized safely.
+            continue
+        finally:
+            if staged is not None:
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def _safe_cached_snapshot_file(
     repository: Path, revision: str, filename: str,
 ) -> Path | None:
@@ -4035,6 +4118,17 @@ def _safe_cached_snapshot_file(
             if candidate.is_symlink()
             else snapshot.resolve(strict=True)
         )
+        if (
+            candidate.is_symlink() and not resolved.is_relative_to(allowed)
+            and resolved.parent.parent == repository.parent / "blobs"
+            and re.fullmatch(r"[0-9a-f]{64}", resolved.name) is not None
+            and resolved.parent.name == resolved.name[:2]
+        ):
+            # Inventory normalizes once per repository. Direct file lookups
+            # only need the repair when they encounter a new shared pointer;
+            # ordinary snapshot links must not rescan every repository blob.
+            _normalize_shared_hub_blobs(repository)
+            resolved = candidate.resolve(strict=True)
         resolved.relative_to(allowed)
         if not candidate.is_file():
             return None
@@ -4170,6 +4264,7 @@ def _selective_files_by_revision(
 
 def _complete_snapshot_revisions(repository: Path) -> set[str]:
     """Return only revisions containing a usable, fully resolved model snapshot."""
+    _normalize_shared_hub_blobs(repository)
     try:
         snapshots = repository / "snapshots"
         blobs = repository / "blobs"

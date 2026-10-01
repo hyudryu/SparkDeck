@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NodeInventoryItem } from '../api/types'
@@ -70,7 +70,8 @@ describe('DashboardPage', () => {
     expect(first.getByText('10.0 tok/s')).toBeInTheDocument()
     expect(first.queryByText('50.0 tok/s')).not.toBeInTheDocument()
     const second = within(screen.getByText('Group 2 · Node 3 + Node 4').closest('.session-row') as HTMLElement)
-    expect(second.getAllByText('Measuring…')).toHaveLength(2)
+    expect(second.getByText('Unavailable')).toBeInTheDocument()
+    expect(second.getAllByText('Measuring…')).toHaveLength(1)
     expect(second.getByText('70.0 tok/s')).toBeInTheDocument()
     expect(second.getByText('Thinking')).toBeInTheDocument()
   })
@@ -127,6 +128,46 @@ describe('DashboardPage', () => {
     const rates = within((await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement)
     expect(rates.getByText('1200.0 tok/s')).toBeInTheDocument()
     expect(rates.queryByText(/Prefilling/)).not.toBeInTheDocument()
+  })
+
+  it('shows runtime prompt throughput during prefill and retains it while thinking', async () => {
+    MockWebSocket.instances = []
+    MockWebSocket.autoOpen = true
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    const request = {
+      group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+      connections: 1, pp_tok_s: null as number | null, output_tok_s: 0, thinking_tok_s: 0,
+      prefill_sessions: 1, prefill_seconds: 3, thinking_sessions: 0,
+    }
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: { first: request } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const row = (await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement
+    expect(within(row).getByText('Prefilling 3s')).toBeInTheDocument()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    await act(async () => MockWebSocket.instances[0].emit({ type: 'snapshot', stats: { active_request_groups: {
+      first: { ...request, pp_tok_s: 800, pp_rate_source: 'runtime_ttft', pp_sample_seconds: 1 },
+    } } }))
+    expect(within(row).getByText('800.0 tok/s (est.)')).toBeInTheDocument()
+    expect(within(row).queryByText(/Prefilling/)).not.toBeInTheDocument()
+    await act(async () => MockWebSocket.instances[0].emit({ type: 'snapshot', stats: { active_request_groups: {
+      first: { ...request, pp_tok_s: 800, pp_rate_source: 'runtime_ttft', pp_sample_seconds: 1,
+        prefill_sessions: 0, prefill_seconds: null, thinking_sessions: 1, thinking_tok_s: 20 },
+    } } }))
+    expect(within(row).getByText('800.0 tok/s (est.)')).toBeInTheDocument()
+    expect(within(row).getByText('20.0 tok/s')).toBeInTheDocument()
+    expect(within(row).queryByText('Unavailable')).not.toBeInTheDocument()
+  })
+
+  it('ends prompt measurement when generation has begun without usable telemetry', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
+      first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1'],
+        connections: 1, pp_tok_s: null, thinking_tok_s: 30, prefill_sessions: 0, thinking_sessions: 1 },
+    } }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const row = (await screen.findByText('Group 1 · Node 1')).closest('.session-row') as HTMLElement
+    const promptStage = within(row).getByText('Prompt processing').parentElement as HTMLElement
+    expect(promptStage).toHaveTextContent('Unavailable')
+    expect(promptStage).not.toHaveTextContent('Measuring')
   })
 
   it('omits state counts for entries from an older telemetry payload', async () => {
@@ -843,7 +884,8 @@ describe('DashboardPage', () => {
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
     expect(await screen.findByText('live-model')).toBeInTheDocument()
-    expect(screen.getAllByText('Measuring…')).toHaveLength(3)
+    expect(screen.getByText('Unavailable')).toBeInTheDocument()
+    expect(screen.getAllByText('Measuring…')).toHaveLength(2)
   })
 
   it('prefers fresh local stats over retained local node telemetry', () => {

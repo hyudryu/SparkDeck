@@ -263,10 +263,8 @@ export function sessionStateCounts(requests: { request: ActiveRequestStats }[]) 
 }
 
 /**
- * Describe live session states for the dashboard. Prompt processing is reported
- * as a held session count with elapsed time rather than a rate: the engine sends
- * no prompt-token evidence until the first output token, so a live prefill rate
- * cannot be measured and must not be invented.
+ * Describe live session states independently of throughput measurements. Elapsed
+ * time remains useful while native prompt-token counters are not available.
  */
 export function sessionStateSummary(requests: { request: ActiveRequestStats }[]) {
   const states = sessionStateCounts(requests)
@@ -518,13 +516,19 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
   const outputSessions = request.output_sessions ?? 0
   const thinkingSessions = request.thinking_sessions ?? 0
   const prefillSessions = request.prefill_sessions ?? 0
-  // A prefill has no rate until the first token arrives, so report how many
-  // sessions are held and how long the longest has been waiting instead of a
-  // number the engine cannot provide yet.
+  // Native runtime estimates describe the latest completed prefills in this
+  // group. Keep elapsed time when that measurement is not available yet.
   const prefillSeconds = request.prefill_seconds
   const prefillLabel = typeof prefillSeconds === 'number' && Number.isFinite(prefillSeconds)
     ? `Prefilling ${Math.round(prefillSeconds)}s`
     : 'Prefilling…'
+  const promptRate = request.pp_tok_s
+  const hasPromptRate = typeof promptRate === 'number' && Number.isFinite(promptRate) && promptRate > 0
+  const sampledPromptRate = request.pp_rate_source === 'runtime_ttft'
+  const promptLabel = waiting ? 'Waiting'
+    : prefillSessions > 0 && !sampledPromptRate ? prefillLabel
+      : hasPromptRate ? `${promptRate.toFixed(1)} tok/s${sampledPromptRate ? ' (est.)' : ''}`
+        : prefillSessions > 0 ? prefillLabel : 'Unavailable'
   const states = [
     outputSessions > 0 ? `${outputSessions} outputting` : '',
     thinkingSessions > 0 ? `${thinkingSessions} thinking` : '',
@@ -544,7 +548,7 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
         {callers.length > 0 && <small>{callers.join(' · ')}</small>}
       </div>
       <div className="session-stages" role="group" aria-label="Token rate by stage">
-        <span className="session-stage"><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{prefillSessions > 0 ? prefillLabel : stageRate(request.pp_tok_s, waiting)}</span></span>
+        <span className="session-stage" title={sampledPromptRate && hasPromptRate ? 'Latest prompt-speed estimate from uncached tokens and engine time to first token, including scheduling.' : undefined}><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{promptLabel}</span></span>
         <span className="session-stage"><span className="session-stage-label">Output</span><span className="session-stage-value">{stageRate(request.output_tok_s, waiting)}</span></span>
         <span className="session-stage"><span className="session-stage-label">Thinking</span><span className="session-stage-value">{stageRate(request.thinking_tok_s, waiting)}</span></span>
       </div>

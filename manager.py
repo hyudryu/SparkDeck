@@ -12627,6 +12627,7 @@ class Manager:
             "admission_target": admission_target,
             "nudge_event": nudge_event,
             "deployment_id": deployment_id,
+            "container_name": container_name,
             "caller_ip": caller_ip,
             "paused": False,
             "startup_benchmark": startup_benchmark,
@@ -12922,6 +12923,28 @@ class Manager:
                     if e["pp_time_s"] > 0
                     else None
                 )
+        # Native prompt-token and TTFT histograms describe the same first-output
+        # cohort, independently of the terminal per-request usage chunk.
+        measurements = getattr(self, "_runtime_prompt_samples", {})
+        active_groups = {
+            rec["group"]["group_id"]
+            for rec in getattr(self, "_active_reqs", {}).values()
+            if not rec.get("paused") and rec.get("group")
+        }
+        runtime_rates = {}
+        for group_id, sample in measurements.items():
+            if group_id not in active_groups or now - sample.get("refreshed_at", -math.inf) > 10:
+                continue
+            entry_key = group_id if _grouped else sample["model"]
+            if entry_key not in out or out[entry_key].get("pp_tok_s") is not None:
+                continue
+            runtime_rates.setdefault(entry_key, []).append(sample)
+        for entry_key, samples in runtime_rates.items():
+            out[entry_key].update(
+                pp_tok_s=round(sum(sample["rate"] for sample in samples), 1),
+                pp_rate_source="runtime_ttft",
+                pp_sample_seconds=round(max(sample["seconds"] for sample in samples), 2),
+            )
         admission_running: dict[str, int] = {}
         for target, admission in self.inference_admission().items():
             model = admission.get("model")
@@ -20460,11 +20483,171 @@ class Manager:
         except Exception as e:
             print(f"[fit] container listing failed: {e}")
 
+    @staticmethod
+    def _runtime_prompt_counters(text: str) -> dict[str, float]:
+        """Read only vLLM's local-compute counters, excluding all cache sources."""
+        counters = {}
+        for line in text.splitlines():
+            match = re.fullmatch(
+                r'vllm:prompt_tokens_by_source_total\{([^}]*)\}\s+([^\s]+)(?:\s+[^\s]+)?',
+                line.strip(),
+            )
+            if not match:
+                continue
+            labels = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match[1]))
+            if labels.get("source") != "local_compute":
+                continue
+            try:
+                value = float(match[2])
+            except ValueError:
+                continue
+            if math.isfinite(value) and value >= 0:
+                counters[json.dumps(labels, sort_keys=True)] = value
+        return counters
+
+    @classmethod
+    def _runtime_prompt_observations(cls, text: str) -> dict[str, dict[str, float]]:
+        """Pair computed tokens with native TTFT, using matching engine labels."""
+        observations = {}
+        for labels_json, value in cls._runtime_prompt_counters(text).items():
+            labels = json.loads(labels_json)
+            labels.pop("source")
+            observations[json.dumps(labels, sort_keys=True)] = {"tokens": value}
+        for line in text.splitlines():
+            match = re.fullmatch(
+                r'vllm:time_to_first_token_seconds_(sum|count)\{([^}]*)\}\s+([^\s]+)(?:\s+[^\s]+)?',
+                line.strip(),
+            )
+            if not match:
+                continue
+            labels = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match[2]))
+            key = json.dumps(labels, sort_keys=True)
+            try:
+                value = float(match[3])
+            except ValueError:
+                continue
+            if key in observations and math.isfinite(value) and value >= 0:
+                observations[key][match[1]] = value
+        return {key: value for key, value in observations.items() if len(value) == 3}
+
+    @staticmethod
+    def _runtime_prompt_endpoint(container) -> tuple | None:
+        """Use inspected attributes only; skip inventory/image inspection work."""
+        attrs = container.attrs or {}
+        labels = (attrs.get("Config") or {}).get("Labels") or {}
+        image = (attrs.get("Config") or {}).get("Image") or ""
+        engine = _label_value(labels, ENGINE_LABEL, "")
+        if engine != "vllm" and (engine or not _is_vllm_image(image)):
+            return None
+        port = None
+        for bindings in ((attrs.get("NetworkSettings") or {}).get("Ports") or {}).values():
+            if bindings:
+                port = int(bindings[0]["HostPort"])
+                break
+        if port is None and _label_value(labels, SERVICE_PORT_LABEL):
+            port = int(_label_value(labels, SERVICE_PORT_LABEL))
+        if port is None:
+            return None
+        return container.id, (attrs.get("State") or {}).get("StartedAt"), port
+
+    async def _sample_runtime_prompt_rates(self) -> None:
+        """Sample active local engines without changing their running configuration."""
+        if not hasattr(self, "client") or not hasattr(self, "http"):
+            return
+        now = time.monotonic()
+        if getattr(self, "_runtime_prompt_sampling", False) or now - getattr(self, "_runtime_prompt_sample_at", -math.inf) < 0.8:
+            return
+        self._runtime_prompt_sample_at = now
+        baselines = getattr(self, "_runtime_prompt_baselines", {})
+        samples = getattr(self, "_runtime_prompt_samples", {})
+        self._runtime_prompt_baselines = baselines
+        self._runtime_prompt_samples = samples
+        targets = {}
+        for request_id, rec in list(getattr(self, "_active_reqs", {}).items()):
+            group = rec.get("group") or {}
+            if rec.get("paused") or "local" not in (group.get("node_ids") or []):
+                continue
+            if rec.get("container_name"):
+                target = targets.setdefault(group["group_id"], (rec["container_name"], rec["key"], set()))
+                target[2].add(request_id)
+        for group_id in list(baselines):
+            if group_id not in targets:
+                baselines.pop(group_id, None)
+                samples.pop(group_id, None)
+
+        async def sample(group_id, name, model, request_ids):
+            try:
+                inspections = getattr(self, "_runtime_prompt_inspections", None)
+                if inspections is None:
+                    inspections = self._runtime_prompt_inspections = {}
+                inspection = inspections.get(name)
+                if inspection is None:
+                    inspection = inspections[name] = asyncio.create_task(
+                        asyncio.to_thread(self.client.containers.get, name)
+                    )
+                    inspection.add_done_callback(
+                        lambda task: task.exception() if not task.cancelled() else None
+                    )
+                try:
+                    container = await asyncio.wait_for(asyncio.shield(inspection), timeout=0.5)
+                finally:
+                    if inspection.done():
+                        inspections.pop(name, None)
+                identity = self._runtime_prompt_endpoint(container)
+                if identity is None:
+                    raise ValueError("runtime counter unavailable")
+                response = await self.http.get(f"http://localhost:{identity[2]}/metrics", timeout=1)
+                response.raise_for_status()
+                counters = self._runtime_prompt_observations(response.text)
+                if not counters:
+                    raise ValueError("runtime counter unavailable")
+                observed = time.monotonic()
+                previous = baselines.get(group_id)
+                baselines[group_id] = (identity, observed, counters, request_ids)
+                if (previous is None or previous[0] != identity
+                        or previous[2].keys() != counters.keys()
+                        or previous[3].isdisjoint(request_ids)):
+                    samples.pop(group_id, None)
+                    return
+                deltas = [{field: value[field] - previous[2][key][field]
+                           for field in ("tokens", "sum", "count")}
+                          for key, value in counters.items()]
+                interval = observed - previous[1]
+                if any(value < 0 for delta in deltas for value in delta.values()) or interval <= 0 or interval > 10:
+                    samples.pop(group_id, None)
+                    return
+                # Tokens are reported in a burst when prefill completes. Dividing
+                # by scrape time would turn a long prefill into an inflated rate.
+                # Require the corresponding native TTFT cohort instead.
+                computed = [delta for delta in deltas if delta["tokens"] > 0]
+                if computed and all(delta["sum"] > 0 and delta["count"] > 0 for delta in computed):
+                    tokens = sum(delta["tokens"] for delta in computed)
+                    seconds = sum(delta["sum"] for delta in computed)
+                    samples[group_id] = {"model": model, "rate": tokens / seconds,
+                                         "seconds": seconds, "measured_at": observed,
+                                         "refreshed_at": observed}
+                elif computed:
+                    samples.pop(group_id, None)
+                elif group_id in samples:
+                    # Keep the latest computed-prompt sample while this same
+                    # engine is healthy and its active request keeps generating.
+                    samples[group_id]["refreshed_at"] = observed
+            except Exception:
+                baselines.pop(group_id, None)
+                samples.pop(group_id, None)
+
+        self._runtime_prompt_sampling = True
+        try:
+            await asyncio.gather(*(sample(group_id, *target) for group_id, target in targets.items()))
+        finally:
+            self._runtime_prompt_sampling = False
+
     async def get_stats(self) -> dict:
         # Light cache so several browser tabs don't pile on nvidia-smi.
         # Frontend polls at 1 Hz; serve fresh data at slightly under that.
         # Live request stats skip the cache so the Tokens widget really
         # updates once per second while streams are active.
+        await self._sample_runtime_prompt_rates()
         now = time.time()
         if now - self._stats_ts < 0.8 and self._stats_cache:
             self._record_temperature_sample(self._stats_cache, now)

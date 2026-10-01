@@ -815,6 +815,10 @@ export interface ActiveRequestStats {
   thinking_tok_s?: number
   output_tok_s?: number
   pp_tok_s?: number | null
+  /** Uncached prompt tokens divided by engine time to first token, including scheduling. */
+  pp_rate_source?: 'runtime_ttft'
+  /** Total engine time to first token for the measured cohort. */
+  pp_sample_seconds?: number
   admission_limit?: number
   /** Live sessions whose trailing window shows generated output tokens. */
   output_sessions?: number

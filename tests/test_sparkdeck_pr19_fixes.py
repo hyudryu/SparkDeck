@@ -398,6 +398,10 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.get_cluster_member_logs.assert_awaited_once_with("legacy-model", 300)
 
     async def test_start_forwards_node_selection_to_manager(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "model": "org/model",
+        }]
         self.service.store.add_deployment(Deployment(
             id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
@@ -415,6 +419,10 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.manager.deployment_action.assert_awaited_once_with("cluster-1", "start", ["a"], model_revision="a" * 40)
 
     async def test_start_rejects_nodes_without_cached_weights(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "model": "org/model",
+        }]
         self.service.store.add_deployment(Deployment(
             id="dep-1", alias="model", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
@@ -576,6 +584,10 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replacement["sparkdeck_record_id"], started["id"])
 
     async def test_start_rejects_remote_node_for_controller_local_models(self):
+        self.manager.deployments = [{
+            "id": "cluster-1", "status": "stopped", "engine": "vllm",
+            "model": "/models/weights",
+        }]
         self.service.store.add_deployment(Deployment(
             id="dep-local", alias="local weights", runtime=RuntimeKind.VLLM,
             kind=DeploymentKind.MANAGED, model=ModelIdentity("/models/weights"),

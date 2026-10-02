@@ -7,6 +7,7 @@ import copy
 import hmac
 import json
 import math
+import re
 import statistics
 import time
 import uuid
@@ -20,6 +21,7 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from sparkdeck.virtual_nas import validate_model_id, validate_revision
 
 
 ROOT = Path(__file__).resolve().parent
@@ -457,6 +459,65 @@ class ControllerClient:
         return await self._request(
             "POST", "/api/v1/storage/transfers", json_body=body,
             timeout=300,
+        )
+
+    async def download_huggingface_model(
+        self, model_id: str, node_id: str, *, revision: str = "main",
+    ) -> dict[str, Any]:
+        """Queue the app's tracked preparation for one explicit destination."""
+        try:
+            model = validate_model_id(model_id)
+            requested_revision = validate_revision(revision)
+        except ValueError as exc:
+            raise ControllerError(str(exc)) from exc
+        node = str(node_id).strip()
+        if not node:
+            raise ControllerError("node_id must not be empty")
+        preflight = await self._request(
+            "POST", "/api/v1/storage/transfers/preflight",
+            json_body={"model_id": model, "revision": requested_revision},
+            timeout=1800,
+        )
+        # Sources come from the app's online, complete, transferable cache
+        # checks. A guarded transfer pins the revision and only mutates the
+        # requested destination; source-cache loss fails closed at queue time.
+        resolved_revision = preflight.get("resolved_revision")
+        target = next((item for item in preflight.get("targets", [])
+                       if item.get("node_id") == node), {})
+        if not target.get("has_required_weights") and re.fullmatch(r"[0-9a-f]{40}", str(resolved_revision or "")):
+            # A branch request can classify our SHA-pinned workflow as a
+            # conflict rather than active_job_id. Inspect exact tracked jobs.
+            async def matching_active_job() -> dict[str, Any] | None:
+                for active in (await self.storage()).get("jobs", []):
+                    if (
+                        active.get("model_id") == model
+                        and active.get("revision") == resolved_revision
+                        and active.get("status") in {"queued", "running"}
+                        and active.get("kind") in {"transfer", "download"}
+                        and active.get("target_node_id") == node
+                    ):
+                        return {"job_ids": [active["id"]], "jobs": [active]}
+                return None
+
+            active_result = await matching_active_job()
+            if active_result:
+                return active_result
+            source = next((item for item in preflight.get("sources", [])
+                           if item.get("node_id") and item["node_id"] != node), None)
+            if source and target.get("eligible") and not target.get("has_model_cache"):
+                try:
+                    return await self.transfer_storage_weights(
+                        model, source["node_id"], [node], revision=resolved_revision,
+                    )
+                except ControllerError:
+                    # Another request can win the queue lock after both read
+                    # an empty job list. Reuse only its exact active preparation.
+                    active_result = await matching_active_job()
+                    if active_result:
+                        return active_result
+                    raise
+        return await self.pull_storage_weights(
+            model, [node], revision=requested_revision, download_node_id=node,
         )
 
     async def delete_storage_weights(
@@ -908,6 +969,32 @@ def build_server(
             node_ids,
             revision=revision,
             download_node_id=download_node_id,
+        )
+
+    @server.tool()
+    async def download_huggingface_model(
+        model_id: str,
+        node_id: str,
+        revision: str = "main",
+    ) -> dict[str, Any]:
+        """Download Hugging Face model weights onto one selected Storage node.
+
+        Use an exact repository ID such as ``nvidia/Qwen3.8-27B-NVFP4`` and a
+        stable node ID from ``list_storage_weights``. Revision accepts a branch,
+        tag, or commit SHA; SparkDeck resolves it to an immutable commit.
+        Downloads are queued in the app's Storage view, with resumable weights
+        and the configured Hugging Face credentials. Existing complete weights
+        are reused; a cached copy on another node may be transferred instead.
+
+        Returns queued job IDs/progress immediately. Preparation responses may
+        include a plan and workflow ID; peer transfers and active retries may
+        omit both. Matching active work is reused. Poll each job with
+        ``get_storage_transfer`` (or list jobs
+        with ``list_storage_transfers``) until completed, failed, or canceled.
+        An already-ready plan has no jobs. Virtual NAS must be enabled in Storage.
+        """
+        return await client.download_huggingface_model(
+            model_id, node_id, revision=revision,
         )
 
     @server.tool()

@@ -920,6 +920,8 @@ export interface StorageTransferJob {
   target_node_name: string
   status: string
   kind?: 'download' | 'transfer'
+  // Running downloads require a node agent that can stop its managed writer.
+  download_cancelable?: boolean
   revision?: string
   depends_on_job_id?: string | null
   workflow_id?: string | null

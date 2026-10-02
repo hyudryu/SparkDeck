@@ -39,6 +39,7 @@ import type {
   JoinClusterInput,
   CreateStorageTransferInput,
   StorageState,
+  StorageTransferJob,
   StorageTransferPreflight,
   StorageTransferResult,
   RecipePreparationPlan,
@@ -971,7 +972,7 @@ export const api = {
         download_node_id: downloadNodeId || undefined,
       }),
     }, NO_REQUEST_TIMEOUT),
-    cancel: (id: string) => request<void>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
+    cancel: (id: string) => request<StorageTransferJob | undefined>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
     removeModel: (nodeId: string, modelId: string) => request<void>(

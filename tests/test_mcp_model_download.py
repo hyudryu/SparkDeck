@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -6,6 +7,7 @@ from mcp.server.mcpserver.exceptions import UnexpectedToolError
 
 from mcp_server import ControllerClient, ControllerError, build_server
 from manager import Manager
+from sparkdeck.virtual_nas import VirtualNAS
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -93,45 +95,61 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         manager = Manager.__new__(Manager)
-        manager.virtual_nas = Mock()
-        manager.virtual_nas.list_transfers.side_effect = lambda: {"items": jobs}
-        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={"resolved_revision": sha})
+        manager.virtual_nas = VirtualNAS.__new__(VirtualNAS)
+        nas = manager.virtual_nas
+        nas.jobs = jobs
+        nas._enabled_provider = lambda: True
+        nas._queue_lock = asyncio.Lock()
+        nas._validate_online_node = AsyncMock(return_value={"online": True})
+        nas._node_storage = AsyncMock(side_effect=lambda node: {
+            "models": [{"model_id": model, "revision": sha, "revisions": [sha], "size_bytes": 100}]
+            if node == "spark" else [], "free_size": 100_000_000_000,
+        })
+        nas._save = Mock()
+        nas.start = Mock()
+        nas._wake = asyncio.Event()
         manager.virtual_nas.queue_download_and_transfer = AsyncMock()
         manager.virtual_nas_transfer_preflight = AsyncMock(return_value=preflight)
         manager._public_virtual_nas_job = lambda job: dict(job)
 
-        async def transfer(model_id, source, targets, revision, workflow, nodes, requested):
-            jobs.append({"id": "transfer-1", "kind": "transfer", "status": "queued",
-                         "model_id": model_id, "revision": revision, "requested_revision": requested,
-                         "source_node_id": source, "target_node_id": targets[0],
-                         "workflow_id": workflow, "workflow_node_ids": nodes})
-            return {"job_ids": ["transfer-1"], "jobs": jobs}
-
-        manager.queue_virtual_nas_transfer = AsyncMock(side_effect=transfer)
+        transfer = AsyncMock(wraps=manager.queue_virtual_nas_transfer)
+        preparation = AsyncMock()
         mcp = build_server(ControllerClient("http://test", transport=httpx.ASGITransport(app=application.app)))
         with (
             patch.object(application.manager, "virtual_nas_enabled", return_value=True),
             patch.object(application.manager, "selected_cluster_nodes", AsyncMock()),
             patch.object(application.manager, "virtual_nas_transfer_preflight", manager.virtual_nas_transfer_preflight),
-            patch.object(application.manager, "queue_recipe_model_preparation", manager.queue_recipe_model_preparation),
+            patch.object(application.manager, "queue_recipe_model_preparation", preparation),
+            patch.object(application.manager, "queue_virtual_nas_transfer", transfer),
             patch.object(application.manager, "virtual_nas_inventory", AsyncMock(side_effect=lambda: {"jobs": jobs})),
         ):
             result = await mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
-            self.assertEqual(result.structured_content["plan"]["action"], "transfer")
-            self.assertEqual(manager.queue_virtual_nas_transfer.await_args.args[:4],
+            self.assertNotIn("plan", result.structured_content)
+            self.assertEqual(transfer.await_args.args[:4],
                              (model, "spark", ["ws1"], sha))
-            manager.virtual_nas.resolve_download_revision.assert_awaited_once_with(model, sha)
             # The original peer disappearing must not change the active workflow's selected set.
             preflight["sources"] = [{"node_id": "new-peer", "size_bytes": 50}]
             # Global branch preflight reports SHA-requested work as a conflict,
             # so retry cannot rely on active_job_id being populated.
             preflight["targets"][1]["has_preparation_conflict"] = True
             retry = await mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
-            self.assertEqual(retry.structured_content["job_ids"], ["transfer-1"])
-            self.assertEqual(retry.structured_content["workflow_id"], result.structured_content["workflow_id"])
+            self.assertEqual(retry.structured_content["job_ids"], result.structured_content["job_ids"])
             self.assertNotIn("plan", retry.structured_content)
-            self.assertEqual(manager.queue_virtual_nas_transfer.await_count, 1)
+            self.assertEqual(transfer.await_count, 1)
+            preparation.assert_not_awaited()
             manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
+            # Simulate a source disappearing after discovery but before the
+            # guarded transfer queues. Real VirtualNAS must reject it, with no
+            # preparation path that might populate the unrequested peer.
+            jobs.clear()
+            preflight["sources"] = [{"node_id": "spark", "size_bytes": 100}]
+            nas._node_storage.side_effect = lambda node: {"models": [], "free_size": 100_000_000_000}
+            with self.assertRaises(UnexpectedToolError) as raised:
+                await mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
+            self.assertIn("cached source model revision not found", str(raised.exception.__cause__))
+            self.assertEqual(jobs, [])
+            preparation.assert_not_awaited()
+            nas.queue_download_and_transfer.assert_not_awaited()
 
     async def test_invalid_repository_revision_or_empty_node_never_posts(self):
         client = ControllerClient()
@@ -141,6 +159,22 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(values=values), self.assertRaises(ControllerError):
                     await client.download_huggingface_model(values[0], values[1], revision=values[2])
         request.assert_not_awaited()
+
+    async def test_partial_destination_download_never_selects_cached_peer(self):
+        client = ControllerClient()
+        preflight = {"resolved_revision": "a" * 40,
+                     "sources": [{"node_id": "spark"}],
+                     "targets": [{"node_id": "ws1", "has_model_cache": True}]}
+        with (
+            patch.object(client, "_request", AsyncMock(return_value=preflight)),
+            patch.object(client, "storage", AsyncMock(return_value={"jobs": []})),
+            patch.object(client, "pull_storage_weights", AsyncMock(return_value={"job_ids": ["resume"]})) as pull,
+            patch.object(client, "transfer_storage_weights", AsyncMock()) as transfer,
+        ):
+            result = await client.download_huggingface_model("org/model", "ws1")
+        pull.assert_awaited_once_with("org/model", ["ws1"], revision="main", download_node_id="ws1")
+        transfer.assert_not_awaited()
+        self.assertEqual(result["job_ids"], ["resume"])
 
     async def test_tool_schema_requires_explicit_node_and_exposes_no_credentials(self):
         tools = {tool.name: tool for tool in await build_server(ControllerClient()).list_tools()}

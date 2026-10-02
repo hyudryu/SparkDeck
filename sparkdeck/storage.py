@@ -897,8 +897,7 @@ class SparkDeckStore:
                 """SELECT points.*, samples.hardware_json
                    FROM benchmark_series_points points
                    LEFT JOIN benchmark_samples samples ON samples.id = points.sample_id
-                   ORDER BY points.created_at DESC, points.id DESC LIMIT ?""",
-                (_COMMUNITY_AGGREGATE_ROW_LIMIT,),
+                   ORDER BY points.created_at DESC, points.id DESC""",
             ).fetchall()
         groups = {}
         for row in rows:
@@ -928,8 +927,8 @@ class SparkDeckStore:
                    FROM benchmark_series_points points
                    LEFT JOIN benchmark_samples samples ON samples.id = points.sample_id
                    WHERE points.model_id = ?
-                   ORDER BY points.created_at DESC, points.id DESC LIMIT ?""",
-                (model_id, _COMMUNITY_AGGREGATE_ROW_LIMIT),
+                   ORDER BY points.created_at DESC, points.id DESC""",
+                (model_id,),
             ).fetchall()
         if not rows:
             return None

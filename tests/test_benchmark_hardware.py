@@ -1,9 +1,10 @@
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from sparkdeck.benchmark_hardware import benchmark_hardware
 from sparkdeck.models import BenchmarkSample, ModelIdentity, RuntimeKind
@@ -54,6 +55,51 @@ class HardwareProfileTests(unittest.TestCase):
 
 
 class HardwareStorageTests(unittest.TestCase):
+    def test_local_history_keeps_older_models_cohorts_and_maxima_beyond_community_limit(self):
+        with tempfile.TemporaryDirectory() as directory, closing(SparkDeckStore(Path(directory) / "db.sqlite")) as store:
+            for index, model_id, gpu, speed in [
+                (0, "org/older-model", "NVIDIA GB10", 500),
+                (1, "org/model", "NVIDIA RTX PRO 6000 Blackwell", 200),
+                (2, "org/model", "NVIDIA GB10", 120),
+                (3, "org/model", "NVIDIA GB10", 20),
+                (4, "org/model", "NVIDIA GB10", 40),
+            ]:
+                created_at = f"2026-10-01T00:00:0{index}+00:00"
+                point = {"id": f"history-{index}", "created_at": created_at,
+                         "model_id": model_id, "context_window_size": 8192 if index == 1 else 4096,
+                         "concurrency": 1, "tensor_parallel_size": 2 if index == 1 else 1,
+                         "prompt_tokens_per_second": speed * 10,
+                         "generation_tokens_per_second": speed, "request_count": 1}
+                store.add_coordinated_benchmark(point, replace(
+                    sample(str(index), hardware(gpu), speed), created_at=created_at,
+                    model=ModelIdentity(model_id, quantization="NVFP4")), queue=False)
+            with patch("sparkdeck.storage._COMMUNITY_AGGREGATE_ROW_LIMIT", 2):
+                summaries = store.benchmark_model_summaries()
+                detail = store.benchmark_model_detail("org/model")
+            with self.subTest(view="summaries"):
+                self.assertEqual(len(summaries), 3)
+                self.assertIn("org/older-model", {row["model_id"] for row in summaries})
+                spark = next(row for row in summaries if row["model_id"] == "org/model"
+                             and row["hardware"]["hardware_class"] == "dgx-spark")
+                self.assertEqual(spark["run_count"], 3)
+                self.assertEqual(spark["best_generation_tokens_per_second"], 120)
+                self.assertEqual(spark["best_prompt_tokens_per_second"], 1200)
+                workstation = next(row for row in summaries
+                                   if row["hardware"]["hardware_class"] == "workstation")
+                self.assertEqual(workstation["context_windows"], [8192])
+                self.assertEqual(workstation["tensor_parallel_sizes"], [2])
+            with self.subTest(view="detail"):
+                self.assertEqual(len(detail["points"]), 2)
+                spark = next(row for row in detail["points"]
+                             if row["hardware"]["hardware_class"] == "dgx-spark")
+                self.assertEqual(spark["sample_count"], 3)
+                self.assertEqual(spark["generation_tokens_per_second"], 60)
+                self.assertEqual(spark["prompt_tokens_per_second"], 600)
+                workstation = next(row for row in detail["points"]
+                                   if row["hardware"]["hardware_class"] == "workstation")
+                self.assertEqual(workstation["context_window_size"], 8192)
+                self.assertEqual(workstation["tensor_parallel_size"], 2)
+
     def test_upload_means_and_local_evidence_never_mix_spark_and_workstation(self):
         with tempfile.TemporaryDirectory() as directory, closing(SparkDeckStore(Path(directory) / "db.sqlite")) as store:
             store.set_setting("device_pairing", {"status": "paired"})

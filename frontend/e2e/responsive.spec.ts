@@ -378,6 +378,34 @@ test('keeps community sharing disclosure and estimates clear on every viewport',
   expect(overflow).toBeLessThanOrEqual(1)
 })
 
+test('keeps benchmark hardware visible and selectable on both Explore tabs', async ({ page }) => {
+  await page.route('**/api/v1/community/session', (route) => route.fulfill({ json: { status: 'signed-in', email: 'test@example.com' } }))
+  const base = { model_id: 'org/test-model', quantization: 'NVFP4', tensor_parallel_size: 1, prompt_tokens_bucket: 1000, sample_count: 12, unique_cluster_count: 4 }
+  const spark = { ...base, hardware_key: 'spark-one', hardware_label: 'DGX Spark - NVIDIA GB10', hardware: { hardware_class: 'dgx-spark', architecture: 'aarch64', gpu_count: 1, gpus: [{ model: 'NVIDIA GB10', memory_mib: 128000 }] }, inference_tokens_per_second: 42.5 }
+  const workstation = { ...base, hardware_key: 'rtx-pro', hardware_label: 'NVIDIA RTX PRO 6000 Blackwell', hardware: { hardware_class: 'workstation', architecture: 'x86_64', gpu_count: 1, gpus: [{ model: 'NVIDIA RTX PRO 6000 Blackwell', memory_mib: 96000 }] }, inference_tokens_per_second: 146.7 }
+  await page.route('**/api/v1/community/aggregates', (route) => route.fulfill({ json: { items: [spark, workstation], availability: 'available', evidence_policy: {} } }))
+  await page.route('**/api/v1/catalog/models*', (route) => route.fulfill({ json: { items: [{ id: base.model_id, community: workstation }], total: 1 } }))
+  await page.goto('/explore')
+  const selector = page.getByRole('combobox', { name: 'Benchmark hardware' })
+  await expect(selector).toBeVisible()
+  await expect(selector).toHaveValue('dgx-spark')
+  await page.getByRole('tab', { name: 'Community Run Models' }).click()
+  await selector.selectOption('rtx-pro')
+  await expect(page.getByText('146.7 tok/s', { exact: true })).toBeVisible()
+  await page.getByRole('tab', { name: 'Hugging Face', exact: true }).click()
+  await expect(selector).toBeVisible()
+  await expect(selector).toHaveValue('rtx-pro')
+  await page.getByRole('button', { name: 'Expand org/test-model' }).click()
+  await expect(page.getByText(/NVIDIA RTX PRO 6000 Blackwell.*146\.7 tok\/s/)).toBeVisible()
+  await selector.selectOption('dgx-spark')
+  await page.getByRole('button', { name: 'Expand org/test-model' }).click()
+  await expect(page.getByText(/DGX Spark.*42\.5 tok\/s/)).toBeVisible()
+  await expect(page.getByText(/146\.7 tok\/s/)).toHaveCount(0)
+  await page.getByRole('tab', { name: 'Community Run Models' }).click()
+  await expect(selector).toHaveValue('dgx-spark')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+})
+
 test('offers node targets for image pulls and deployments', async ({ page }) => {
   await page.goto('/images')
   await expect(page.getByLabel('Available on Studio Spark')).toContainText('Studio Spark')

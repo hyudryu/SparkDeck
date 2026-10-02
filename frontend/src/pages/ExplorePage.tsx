@@ -684,13 +684,13 @@ export function ExplorePage() {
           </label>}
           <button className="button button-primary" type="submit">Search</button>
         </form>
-        {tab === 'community' && <label className="select-field compact-select">
+        <label className="select-field compact-select">
           <span>Benchmark hardware</span>
           <select aria-label="Benchmark hardware" value={selectedHardware} onChange={(event) => setSelectedHardware(event.target.value)}>
             <option value={SPARK_HARDWARE}>DGX Spark</option>
             {hardwareOptions([...(aggregates.data?.items ?? []), ...(catalog.data?.items.flatMap((item) => item.community ? [item.community] : []) ?? [])]).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
           </select>
-        </label>}
+        </label>
         <div className="catalog-filters" aria-label="Model filters">
           <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isSingleNodeRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isSingleNodeRuntime(activeRuntime) ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}

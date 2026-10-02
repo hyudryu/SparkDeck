@@ -63,7 +63,7 @@ from sparkdeck.request_limits import (
     read_limited_json,
 )
 from sparkdeck.storage import COMMUNITY_API_URL, COMMUNITY_EVIDENCE_POLICY
-from sparkdeck.virtual_nas import FILE_STREAM_CONTENT_TYPE
+from sparkdeck.virtual_nas import FILE_STREAM_CONTENT_TYPE, TransferCanceled
 from sparkdeck.onboarding import (
     FORWARD_CLIENT_HEADER,
     FORWARD_HEADERS,
@@ -1253,6 +1253,8 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         operation_kwargs = {"operation_id": operation_id} if operation_id is not None else {}
         result = await manager.virtual_nas.download_model_checked(*download_args, **operation_kwargs)
         return _public_storage_payload(result)
+    except TransferCanceled:
+        return {"operation_id": operation_id, "status": "canceled"}
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
     except (ValueError, LookupError, RuntimeError) as exc:

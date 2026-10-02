@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from sparkdeck.onboarding import is_forwardable_path
-from sparkdeck.virtual_nas import VirtualNAS
+from sparkdeck.virtual_nas import TransferCanceled, VirtualNAS
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -461,6 +461,20 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400, response.text)
         checked.assert_not_awaited()
         checked_files.assert_not_awaited()
+
+    async def test_agent_download_cancellation_returns_safe_terminal_result(self):
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        checked = AsyncMock(side_effect=TransferCanceled("private worker detail"))
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={"revision": "a" * 40, "operation_id": operation_id},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"operation_id": operation_id, "status": "canceled"})
 
     async def test_agent_download_cancel_waits_for_confirmed_core_result(self):
         operation_id = "11111111-1111-4111-8111-111111111111"

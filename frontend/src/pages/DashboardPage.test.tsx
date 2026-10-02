@@ -1,7 +1,7 @@
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { NodeInventoryItem } from '../api/types'
+import type { NodeInventoryItem, SystemStats } from '../api/types'
 import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot } from './DashboardPage'
 
 function json(body: unknown) {
@@ -56,6 +56,18 @@ function stubDashboardFetch(stats: Record<string, unknown>) {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('DashboardPage', () => {
+  it('labels an indexless GPU discovery error without inventing a card identity', async () => {
+    const stats = { cpu_pct: 20, gpus: [{ error: 'nvidia-smi unavailable' }], active_requests: {} } satisfies SystemStats
+    vi.stubGlobal('fetch', stubDashboardFetch(stats))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const discovery = await screen.findByRole('region', { name: 'Local node GPU telemetry' })
+    expect(within(discovery).getByText('GPU telemetry', { exact: true })).toBeInTheDocument()
+    expect(within(discovery).getByText('GPU telemetry unavailable: nvidia-smi unavailable')).toBeInTheDocument()
+    expect(within(discovery).queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.queryByText(/GPU undefined/)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/GPU undefined/)).not.toBeInTheDocument()
+  })
+
   it('shows each group per-stage prompt/output/thinking rates without merging separate thinking into output', async () => {
     vi.stubGlobal('fetch', stubDashboardFetch({ active_request_groups: {
       first: { group_id: 'first', instance_id: 0, model: 'shared', node_names: ['Node 1', 'Node 2'], connections: 2, pp_tok_s: 1200, output_tok_s: 40, thinking_tok_s: 10 },

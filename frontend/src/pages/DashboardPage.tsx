@@ -150,15 +150,17 @@ function NodeResourceCard({ node, stats, fallback, refreshPaused, now }: { node:
       </div>
       <dl className="node-host-details"><div><dt>CPU temp</dt><dd className={temperatureTone(stats?.cpu_temp_c)}>{displayValue(stats?.cpu_temp_c, '\u00b0C', 1)}</dd></div><div><dt>Sessions</dt><dd>{sessions ?? '\u2014'}</dd></div></dl>
       <div className="node-gpu-list">
-        {stats?.gpus?.map((gpu, position) => <section className="node-gpu-card" key={`${gpu.index}-${position}`} aria-label={`${node.name} GPU ${gpu.index}`}>
-          <div className="node-gpu-heading"><strong>GPU {gpu.index}</strong><span>{gpuDisplayName(gpu.name) ?? 'Model unavailable'}</span></div>
+        {stats?.gpus?.map((gpu, position) => {
+          const gpuLabel = gpu.index == null ? 'GPU telemetry' : `GPU ${gpu.index}`
+          return <section className="node-gpu-card" key={`${gpu.index ?? 'discovery'}-${position}`} aria-label={`${node.name} ${gpuLabel}`}>
+          <div className="node-gpu-heading"><strong>{gpuLabel}</strong><span>{gpuDisplayName(gpu.name) ?? 'Model unavailable'}</span></div>
           {gpu.error ? <p className="node-telemetry-notice">GPU telemetry unavailable: {gpu.error}</p> : <>
             <div className="node-resource-label"><span>GPU utilization</span><strong>{displayValue(finiteNumber(gpu.util), '%', 1)}</strong></div>
-            <MetricBar value={gpu.util} label={`${node.name} GPU ${gpu.index} utilization`} />
+            <MetricBar value={gpu.util} label={`${node.name} ${gpuLabel} utilization`} />
             <dl><div><dt>GPU temp</dt><dd className={temperatureTone(gpu.temp)}>{displayValue(gpu.temp, '\u00b0C', 1)}</dd></div></dl>
-            {/gb10/i.test(gpu.name ?? '') ? <p className="node-gpu-memory-note">Shares unified memory shown above</p> : <MemoryMetric used={finiteNumber(gpu.mem_used_mib) === undefined ? undefined : Number(gpu.mem_used_mib) / 1024} total={finiteNumber(gpu.mem_total_mib) === undefined ? undefined : Number(gpu.mem_total_mib) / 1024} label="GPU memory" gaugeLabel={`${node.name} GPU ${gpu.index} memory allocation`} />}
+            {/gb10/i.test(gpu.name ?? '') ? <p className="node-gpu-memory-note">Shares unified memory shown above</p> : <MemoryMetric used={finiteNumber(gpu.mem_used_mib) === undefined ? undefined : Number(gpu.mem_used_mib) / 1024} total={finiteNumber(gpu.mem_total_mib) === undefined ? undefined : Number(gpu.mem_total_mib) / 1024} label="GPU memory" gaugeLabel={`${node.name} ${gpuLabel} memory allocation`} />}
           </>}
-        </section>)}
+        </section>})}
         {!stats?.gpus?.length && <p className="node-telemetry-notice">GPU telemetry unavailable.</p>}
       </div>
     </> : <p className="cluster-health-offline">Telemetry unavailable while this node is offline.</p>}

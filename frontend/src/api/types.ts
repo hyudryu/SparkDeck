@@ -798,7 +798,8 @@ export interface ChatStreamResult {
 }
 
 export interface GpuStats {
-  index: number
+  /** Discovery failures may contain only an error, before any GPU is identified. */
+  index?: number
   name?: string
   util?: number | null
   mem_used_mib?: number | null

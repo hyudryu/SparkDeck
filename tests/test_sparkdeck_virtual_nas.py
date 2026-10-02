@@ -3992,7 +3992,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 }])
                 nas.free_bytes = Mock(return_value=free_bytes)
                 nas.estimate_download_size = AsyncMock(return_value=expected)
-                nas.download_model = Mock(return_value={
+                nas._download_model_process = AsyncMock(return_value={
                     "ok": True, "model_id": "org/model", "size_bytes": expected,
                 })
                 if succeeds:
@@ -4001,7 +4001,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                         requested_revision="release-1",
                         download_cache_baseline_bytes=100,
                     )
-                    nas.download_model.assert_called_once()
+                    nas._download_model_process.assert_awaited_once()
                 else:
                     with self.assertRaisesRegex(RuntimeError, "insufficient free cache space"):
                         await nas.download_model_checked(
@@ -4009,7 +4009,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                             requested_revision="release-1",
                             download_cache_baseline_bytes=100,
                         )
-                    nas.download_model.assert_not_called()
+                    nas._download_model_process.assert_not_awaited()
 
 
 class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):

@@ -891,7 +891,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("partial model cache no longer exists", job["error"])
             registry.request.assert_not_awaited()
 
-    async def test_stop_waits_for_uncancelable_local_download_without_requeue(self):
+    async def test_shutdown_waits_for_managed_local_writer_before_requeue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             registry = Registry()
@@ -910,13 +910,16 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             started = threading.Event()
             release = threading.Event()
 
-            def blocking_download(*_args):
+            async def blocking_download(*_args, **_kwargs):
                 started.set()
-                if not release.wait(5):
+                if not await asyncio.to_thread(release.wait, 5):
                     raise RuntimeError("test download timed out")
                 return {"ok": True, "size_bytes": MODEL_BYTES}
 
-            nas.download_model = Mock(side_effect=blocking_download)
+            nas._download_model_process = AsyncMock(side_effect=blocking_download)
+            async def stop_writer(_id):
+                await asyncio.to_thread(release.wait, 5)
+            nas.cancel_download_operation = AsyncMock(side_effect=stop_writer)
             active = asyncio.create_task(nas._run_download(job))
             nas._active["local"] = active
             nas._dispatcher = asyncio.create_task(asyncio.Event().wait())
@@ -929,11 +932,9 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.wait_for(stopping, 2)
 
-            self.assertEqual(job["status"], "completed")
-            self.assertEqual(nas.download_model.call_count, 1)
-            nas.start()
-            await asyncio.sleep(0.05)
-            self.assertEqual(nas.download_model.call_count, 1)
+            self.assertEqual(job["status"], "queued")
+            self.assertEqual(nas._download_model_process.await_count, 1)
+            nas.cancel_download_operation.assert_awaited_once_with(job["id"])
             await nas.stop()
 
     async def test_stop_waits_for_remote_agent_download_without_requeue(self):

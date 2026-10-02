@@ -7,6 +7,7 @@ import copy
 import hmac
 import json
 import math
+import re
 import statistics
 import time
 import uuid
@@ -472,6 +473,40 @@ class ControllerClient:
         node = str(node_id).strip()
         if not node:
             raise ControllerError("node_id must not be empty")
+        preflight = await self._request(
+            "POST", "/api/v1/storage/transfers/preflight",
+            json_body={"model_id": model, "revision": requested_revision},
+            timeout=1800,
+        )
+        # Sources come from the app's online, complete, transferable cache
+        # checks. Include only one existing source, never another missing node.
+        # Pin before revalidation so a moving branch cannot download to the peer.
+        resolved_revision = preflight.get("resolved_revision")
+        target = next((item for item in preflight.get("targets", [])
+                       if item.get("node_id") == node), {})
+        if not target.get("has_required_weights") and re.fullmatch(r"[0-9a-f]{40}", str(resolved_revision or "")):
+            # A branch request can classify our SHA-pinned workflow as a
+            # conflict rather than active_job_id. Inspect exact tracked jobs.
+            for active in (await self.storage()).get("jobs", []):
+                workflow_nodes = active.get("workflow_node_ids") or []
+                if (
+                    active.get("model_id") == model
+                    and active.get("revision") == resolved_revision
+                    and active.get("requested_revision") == resolved_revision
+                    and active.get("status") in {"queued", "running"}
+                    and active.get("workflow_id")
+                    and len(workflow_nodes) == 2 and node in workflow_nodes
+                    and active.get("target_node_id") == node
+                ):
+                    return await self.pull_storage_weights(
+                        model, workflow_nodes, revision=resolved_revision,
+                    )
+            source = next((item for item in preflight.get("sources", [])
+                           if item.get("node_id") and item["node_id"] != node), None)
+            if source:
+                return await self.pull_storage_weights(
+                    model, [source["node_id"], node], revision=resolved_revision,
+                )
         return await self.pull_storage_weights(
             model, [node], revision=requested_revision, download_node_id=node,
         )
@@ -942,8 +977,9 @@ def build_server(
         and the configured Hugging Face credentials. Existing complete weights
         are reused; a cached copy on another node may be transferred instead.
 
-        Returns the preparation plan, workflow ID, and queued job IDs/progress
-        immediately. Poll each job with ``get_storage_transfer`` (or list jobs
+        Returns the workflow ID and queued job IDs/progress immediately, with a
+        preparation plan for new work. An identical active workflow is reused
+        and may omit the plan. Poll each job with ``get_storage_transfer`` (or list jobs
         with ``list_storage_transfers``) until completed, failed, or canceled.
         An already-ready plan has no jobs. Virtual NAS must be enabled in Storage.
         """

@@ -752,6 +752,7 @@ class MCPToolSchemaTests(unittest.IsolatedAsyncioTestCase):
         )
         for name in (
             "list_storage_weights", "pull_storage_weights",
+            "download_huggingface_model",
             "transfer_storage_weights", "list_storage_transfers",
             "get_storage_transfer", "delete_storage_weights",
         ):

@@ -38,7 +38,7 @@ describe('SparkDeck application shell', () => {
     expect(screen.getByRole('link', { name: 'Switch' })).toHaveAttribute('title', 'Switch is not detected')
     expect(screen.queryByRole('link', { name: 'Fan Control' })).not.toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument()
-    expect(screen.getByRole('region', { name: 'System overview' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Inference overview' })).toBeInTheDocument()
   })
 
   it('enables the Switch destination when RouterOS is detected', async () => {

@@ -427,6 +427,33 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .saved-configuration-card dl { display: grid; gap: 7px; margin: 14px 0; padding-block: 11px; border-block: 1px solid var(--border-subtle); }.saved-configuration-card dl > div { min-width: 0; display: flex; justify-content: space-between; gap: 12px; }.saved-configuration-card dt { color: var(--text-secondary); font-size: 11px; }.saved-configuration-card dd { min-width: 0; overflow: hidden; font-size: 11px; font-weight: 600; text-align: right; text-overflow: ellipsis; white-space: nowrap; }.saved-configuration-card .button { width: 100%; margin-top: auto; }.saved-configuration-warning { margin: -3px 0 12px; color: var(--warning); font-size: 11px; }
 
 .cluster-health { margin-top: 26px; }.cluster-health .section-heading { align-items: center; margin-bottom: 12px; }.cluster-health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }.cluster-health-card { min-width: 0; padding: 14px; }.cluster-health-heading, .cluster-health-heading > div { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 9px; }.cluster-health-heading > div { justify-content: flex-start; }.cluster-health-heading > div > div { min-width: 0; }.cluster-health-heading svg { flex: 0 0 auto; color: var(--text-tertiary); }.cluster-health-heading h3, .cluster-health-heading p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.cluster-health-heading h3 { font-size: 13px; }.cluster-health-heading p { color: var(--text-tertiary); font-size: 10px; }.cluster-health-card dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 13px; }.cluster-health-card dl div { padding: 8px; background: var(--bg-subtle); border-radius: 7px; }.cluster-health-card dt { color: var(--text-secondary); font-size: 10px; }.cluster-health-card dd { margin-top: 2px; font-size: 12px; font-weight: 600; }.cluster-health-offline { min-height: 75px; display: grid; place-items: center; color: var(--text-secondary); font-size: 11px; text-align: center; }
+.dashboard-inference-overview { margin-bottom: 18px; }
+.dashboard-inference-overview .metric-panel { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.dashboard-inference-overview .metric-panel > strong, .dashboard-inference-overview .metric-status { margin-top: 0; }
+.dashboard-inference-overview .metric-context { flex: 1; white-space: normal; margin-top: 0; }
+.cluster-health-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); align-items: start; }
+.node-resource-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.node-resource-metric { min-width: 0; }
+.node-resource-label { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; color: var(--text-secondary); font-size: 11px; }
+.node-resource-label strong { color: var(--text-primary); font-size: 17px; font-weight: 600; white-space: nowrap; }
+.node-resource-metric > p, .node-gpu-memory-note { color: var(--text-tertiary); font-size: 10px; margin-top: 5px; overflow-wrap: anywhere; }
+.node-resource-metric .metric-bar, .node-gpu-card > .metric-bar { margin-top: 7px; }
+.node-telemetry-notice { color: var(--text-secondary); font-size: 11px; margin-top: 10px; overflow-wrap: anywhere; }
+.node-gpu-list { display: grid; gap: 10px; margin-top: 12px; }
+.node-gpu-card { min-width: 0; padding: 10px; border: 1px solid var(--border-subtle); border-radius: 8px; }
+.node-gpu-heading { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; font-size: 11px; }
+.node-gpu-heading > strong { flex-shrink: 0; }
+.node-gpu-heading > span { min-width: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+.node-gpu-card .node-resource-metric { margin-top: 10px; }
+.cluster-health-card .node-gpu-card dl { grid-template-columns: 1fr; gap: 0; margin-top: 8px; }
+.cluster-health-card .node-gpu-card dl div { display: flex; justify-content: space-between; gap: 8px; padding: 0; background: none; }
+.cluster-health-card .node-gpu-card dd { margin-top: 0; }
+.metric-bar-unavailable { opacity: .45; }
+@media (max-width: 420px) {
+  .node-resource-grid { grid-template-columns: 1fr; }
+  .dashboard-inference-overview .metric-context { flex-basis: 100%; order: 1; }
+}
+
 
 .usage-overview-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); padding: 0; overflow: hidden; }.usage-overview-metrics > div { min-width: 0; padding: 16px; text-align: center; border-right: 1px solid var(--border-subtle); }.usage-overview-metrics > div:last-child { border-right: 0; }.usage-overview-metrics strong, .usage-overview-metrics span { display: block; }.usage-overview-metrics strong { font-size: 17px; font-weight: 650; }.usage-overview-metrics span { margin-top: 4px; color: var(--text-secondary); font-size: 11px; }
 .usage-activity-panel, .usage-trend-panel, .usage-share-panel { min-width: 0; margin-top: 14px; padding: 16px; }.usage-panel-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 14px; }.usage-panel-heading h2 { font-size: 13px; }.usage-panel-heading p { margin-top: 2px; color: var(--text-secondary); font-size: 11px; }

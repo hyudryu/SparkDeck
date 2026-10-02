@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StorageState } from '../api/types'
@@ -40,6 +40,87 @@ afterEach(() => {
 })
 
 describe('StoragePage', () => {
+  it('stops a running Hugging Face download from the node card and waits for confirmed cancellation', async () => {
+    const user = userEvent.setup()
+    const job = { ...enabledStorage.jobs[0], id: 'download-live', kind: 'download' as const, download_cancelable: true, model_id: 'nvidia/Qwen3.8-27B-NVFP4', source_node_id: 'huggingface', source_node_name: 'Hugging Face' }
+    let currentJob = job
+    let finishCancel!: (response: Response) => void
+    const cancellation = new Promise<Response>((resolve) => { finishCancel = resolve })
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/v1/storage/transfers/download-live') && init?.method === 'DELETE') return cancellation
+      return json({ ...enabledStorage, jobs: [currentJob] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<StoragePage />)
+    const card = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const actionName = `Stop download of ${job.model_id} on Backup Spark`
+    expect(within(card).getByRole('button', { name: actionName })).toBeEnabled()
+    expect(within(screen.getByRole('table', { name: 'Model transfer queue' })).getByRole('button', { name: actionName })).toBeEnabled()
+    await user.click(within(card).getByRole('button', { name: actionName }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/storage/transfers/download-live', expect.objectContaining({ method: 'DELETE' })))
+    expect(within(card).getByRole('button', { name: actionName })).toBeDisabled()
+    expect(within(card).getByRole('button', { name: actionName })).toHaveTextContent('Stopping...')
+    expect(screen.queryByText(/Stopped download of/)).not.toBeInTheDocument()
+    currentJob = { ...job, status: 'canceled' }
+    await act(async () => finishCancel(json(currentJob)))
+    expect(await screen.findByText(/Stopped download of nvidia\/Qwen3.8-27B-NVFP4 on Backup Spark\. Cached files are kept/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: actionName })).not.toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Model transfer queue' })).toHaveTextContent('canceled')
+    expect(screen.queryByRole('button', { name: /Pause/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps a failed Stop download retryable and accepts the recent-list Stop control', async () => {
+    const user = userEvent.setup()
+    const job = { ...enabledStorage.jobs[0], id: 'download-retry', kind: 'download' as const, download_cancelable: true, model_id: 'org/retry' }
+    let stopAttempts = 0
+    let currentJob = job
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/v1/storage/transfers/download-retry') && init?.method === 'DELETE') {
+        stopAttempts += 1
+        if (stopAttempts === 1) return json({ detail: 'Node could not stop the download; retry.' }, 503)
+        currentJob = { ...job, phase: 'canceling' }
+        return json(currentJob)
+      }
+      return json({ ...enabledStorage, jobs: [currentJob] })
+    }))
+    render(<StoragePage />)
+    const actionName = 'Stop download of org/retry on Backup Spark'
+    const table = await screen.findByRole('table', { name: 'Model transfer queue' })
+    await user.click(within(table).getByRole('button', { name: actionName }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Node could not stop the download; retry.')
+    await waitFor(() => expect(within(table).getByRole('button', { name: actionName })).toBeEnabled())
+    expect(screen.queryByText(/Stopped download of/)).not.toBeInTheDocument()
+    await user.click(within(table).getByRole('button', { name: actionName }))
+    await waitFor(() => expect(within(table).getByRole('button', { name: actionName })).toBeDisabled())
+    expect(within(table).getByRole('button', { name: actionName })).toHaveTextContent('Stopping...')
+    expect(stopAttempts).toBe(2)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Stopped download of/)).not.toBeInTheDocument()
+  })
+
+  it('allows retry when the server could not confirm a pending cancellation', async () => {
+    const user = userEvent.setup()
+    const job = { ...enabledStorage.jobs[0], id: 'stop-unconfirmed', kind: 'download' as const, download_cancelable: true, model_id: 'org/unconfirmed', phase: 'canceling', error: 'Could not confirm download cancellation; retry Stop or check the node' }
+    let currentJob = job
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/v1/storage/transfers/stop-unconfirmed') && init?.method === 'DELETE') {
+        currentJob = { ...job, status: 'canceled', phase: 'canceling', error: '' }
+        return json(currentJob)
+      }
+      return json({ ...enabledStorage, jobs: [currentJob] })
+    }))
+    render(<StoragePage />)
+    const card = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const retry = within(card).getByRole('button', { name: 'Stop download of org/unconfirmed on Backup Spark' })
+    expect(retry).toBeEnabled()
+    expect(retry).toHaveTextContent('Retry stop')
+    expect(within(card).getByText(/Stop not confirmed/)).toBeInTheDocument()
+    expect(within(card).getByRole('alert')).toHaveTextContent('Could not confirm download cancellation')
+    await user.click(retry)
+    expect(await screen.findByText(/Stopped download of org\/unconfirmed on Backup Spark/)).toBeInTheDocument()
+    expect(screen.queryByText('Stopping...')).not.toBeInTheDocument()
+  })
+
   it('enables Virtual NAS from its explanatory disabled state', async () => {
     let enabled = false
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
@@ -524,7 +605,9 @@ describe('StoragePage', () => {
     expect(within(copy).getByText(/1\.25 GB\/s/)).toBeInTheDocument()
     expect(copy).not.toHaveTextContent('avg')
     expect(within(nodePanel).getByRole('button', { name: 'Cancel org/copy transfer' })).toBeInTheDocument()
-    expect(within(nodePanel).queryByRole('button', { name: 'Cancel org/download download' })).not.toBeInTheDocument()
+    expect(within(download).getByText('Update node agent to stop')).toBeInTheDocument()
+    expect(within(nodePanel).getByRole('button', { name: 'Stop download of org/download on Backup Spark' })).toBeDisabled()
+    expect(within(nodePanel).getByRole('button', { name: 'Stop download of org/download on Backup Spark' })).toHaveAttribute('title', 'Update this node agent to stop a running download safely.')
   })
 
   it('marks a running job as measuring its speed until the cluster reports one', async () => {

@@ -93,6 +93,7 @@ function formatTransferRate(job: StorageTransferJob) {
 }
 
 function transferRateText(job: StorageTransferJob) {
+  if (job.phase === 'canceling') return ''
   const rate = formatTransferRate(job)
   if (rate) return ` · ${rate}`
   // A live rate needs two cluster inventory samples, which can be more than
@@ -123,8 +124,16 @@ function isActive(job: StorageTransferJob) {
   return !['completed', 'failed', 'cancelled', 'canceled'].includes(job.status.toLowerCase())
 }
 
-function canCancel(job: StorageTransferJob) {
-  return isActive(job) && !(job.kind === 'download' && job.status.toLowerCase() === 'running')
+function JobCancelButton({ job, stopping, busy, onCancel }: { job: StorageTransferJob; stopping: boolean; busy: boolean; onCancel: () => void }) {
+  if (!isActive(job)) return null
+  const download = job.kind === 'download'
+  const unsupported = download && job.status.toLowerCase() === 'running' && job.download_cancelable !== true && !stopping
+  return <Button variant="tertiary" className={download ? 'storage-download-stop' : undefined}
+    aria-label={download ? `Stop download of ${job.model_id} on ${job.target_node_name}` : `Cancel ${job.model_id} ${job.kind ?? 'transfer'}`}
+    title={unsupported ? 'Update this node agent to stop a running download safely.' : download ? 'Stop downloading and keep cached files for resuming later.' : undefined}
+    disabled={busy || stopping || unsupported}
+    onClick={onCancel}
+  >{stopping ? 'Stopping...' : download ? job.phase === 'canceling' && job.error ? 'Retry stop' : 'Stop download' : 'Cancel'}</Button>
 }
 
 export function StoragePage() {
@@ -137,6 +146,8 @@ export function StoragePage() {
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [queuedJobs, setQueuedJobs] = useState<StorageTransferJob[]>([])
+  const [stoppingDownloads, setStoppingDownloads] = useState<Set<string>>(new Set())
+  const [stopRequests, setStopRequests] = useState<Set<string>>(new Set())
   const [modelSearch, setModelSearch] = useState('')
   const [draggedModel, setDraggedModel] = useState<DraggedModel>()
   const [dropTargetId, setDropTargetId] = useState<string>()
@@ -176,6 +187,15 @@ export function StoragePage() {
     const knownJobIds = new Set(serverJobs.map((job) => job.id))
     return [...serverJobs, ...queuedJobs.filter((job) => !knownJobIds.has(job.id))]
   }, [queuedJobs, resource.data?.jobs])
+  useEffect(() => {
+    const terminal = transferJobs.filter((job) => stoppingDownloads.has(job.id) && (!isActive(job) || (job.phase === 'canceling' && Boolean(job.error) && !stopRequests.has(job.id))))
+    if (!terminal.length) return
+    const canceled = terminal.find((job) => ['canceled', 'cancelled'].includes(job.status.toLowerCase()))
+    if (canceled) setNotice(`Stopped download of ${canceled.model_id} on ${canceled.target_node_name}. Cached files are kept; use Finish download to resume.`)
+    else setNotice(undefined)
+    setStoppingDownloads((current) => new Set([...current].filter((id) => !terminal.some((job) => job.id === id))))
+  }, [transferJobs, stoppingDownloads, stopRequests])
+  const isStopping = (job: StorageTransferJob) => isActive(job) && ((job.phase === 'canceling' && !job.error) || stoppingDownloads.has(job.id) || stopRequests.has(job.id))
   const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes])
   const visibleTransferJobs = useMemo(
     () => transferJobs.filter((job) =>
@@ -341,13 +361,23 @@ export function StoragePage() {
     setBusy(job.id)
     setError(undefined)
     setNotice(undefined)
+    const download = job.kind === 'download'
+    if (download) {
+      setStoppingDownloads((current) => new Set(current).add(job.id))
+      setStopRequests((current) => new Set(current).add(job.id))
+    }
     try {
-      await api.storage.cancel(job.id)
-      setNotice(`Cancelled transfer of ${job.model_id} to ${job.target_node_name}.`)
+      const updated = await api.storage.cancel(job.id)
+      if (updated?.id === job.id) resource.setData((current) => current ? { ...current, jobs: current.jobs.some((item) => item.id === updated.id) ? current.jobs.map((item) => item.id === updated.id ? updated : item) : [...current.jobs, updated] } : current)
+      if (download && (!updated || (isActive(updated) && !updated.error))) setNotice(`Stopping download of ${job.model_id} on ${job.target_node_name}. Waiting for the node to confirm it stopped; cached files will be kept.`)
+      else if (!download) setNotice(`Cancelled transfer of ${job.model_id} to ${job.target_node_name}.`)
       resource.reload()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not cancel transfer')
+      if (download) setStoppingDownloads((current) => { const next = new Set(current); next.delete(job.id); return next })
+      setError(reason instanceof Error ? reason.message : download ? 'Could not stop download' : 'Could not cancel transfer')
+      resource.reload()
     } finally {
+      if (download) setStopRequests((current) => { const next = new Set(current); next.delete(job.id); return next })
       setBusy(undefined)
     }
   }
@@ -481,7 +511,8 @@ export function StoragePage() {
                   const downloading = job.kind === 'download'
                   const running = job.status.toLowerCase() === 'running'
                   const finalizing = isFinalizing(job)
-                  const activity = finalizing ? `Finalizing on ${node.name}` : downloading
+                  const stopping = isStopping(job)
+                  const activity = job.phase === 'canceling' && job.error && !stopping ? 'Stop not confirmed' : stopping ? downloading ? 'Stopping download' : 'Stopping transfer' : finalizing ? `Finalizing on ${node.name}` : downloading
                     ? running ? 'Downloading from Hugging Face' : 'Download queued'
                     : running ? `Transferring from ${job.source_node_name}` : 'Transfer queued'
                   const phaseLabel = finalizationLabel(job)
@@ -492,8 +523,8 @@ export function StoragePage() {
                     style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
                   >
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <ArrowLeftRight size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</small>{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
-                    {canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</small>{downloading && <small>{running && job.download_cancelable !== true && !stopping ? 'Update node agent to stop' : 'Stop keeps cached files'}</small>}{job.error && <small role="alert" title={job.error}>{job.error}</small>}{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
+                    <JobCancelButton job={job} stopping={isStopping(job)} busy={busy === job.id} onCancel={() => void cancel(job)} />
                   </li>
                 })}
               </ul>}
@@ -543,9 +574,9 @@ export function StoragePage() {
               return <div className="table-row" role="row" key={job.id}>
                 <div role="cell" data-label="Model"><strong>{job.model_id}</strong><small>Created {formatTimestamp(job.created_at)}</small></div>
                 <div role="cell" data-label="Route" className="storage-route"><span>{job.source_node_name}</span><ArrowRight size={13} aria-label="to" /><span>{job.target_node_name}</span></div>
-                <div role="cell" data-label="Status"><Status status={job.status} />{job.error && <small className="storage-job-error" role="alert" title={job.error}>{job.error}</small>}</div>
+                <div role="cell" data-label="Status"><Status status={isStopping(job) ? 'waiting' : job.status}>{isStopping(job) ? 'Stopping...' : isActive(job) && job.phase === 'canceling' && job.error ? 'Stop not confirmed' : job.status}</Status>{job.kind === 'download' && ['canceled', 'cancelled'].includes(job.status.toLowerCase()) && <small>Cached files kept. Finish download to resume.</small>}{job.error && <small className="storage-job-error" role="alert" title={job.error}>{job.error}</small>}</div>
                 <div role="cell" data-label="Progress" className="storage-job-progress"><SmoothProgress value={progress} label={`Transfer ${job.model_id} progress`} /><span>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</span>{finalizing && <><span className="storage-finalization-label">{phaseLabel}</span><FinalizationProgress label={phaseLabel} /></>}</div>
-                <div role="cell" data-label="Actions" className="row-actions">{canCancel(job) && <Button variant="tertiary" aria-label={`Cancel ${job.model_id} ${job.kind ?? 'transfer'}`} disabled={busy === job.id} onClick={() => void cancel(job)}>Cancel</Button>}</div>
+                <div role="cell" data-label="Actions" className="row-actions"><JobCancelButton job={job} stopping={isStopping(job)} busy={busy === job.id} onCancel={() => void cancel(job)} /></div>
               </div>
             })}
           </div>

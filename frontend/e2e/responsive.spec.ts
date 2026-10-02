@@ -412,6 +412,46 @@ test('keeps storage inventory and transfer controls touch friendly', async ({ pa
   expect(overflow).toBeLessThanOrEqual(1)
 })
 
+test('keeps Stop download usable on storage cards and waits for the node confirmation', async ({ page }, testInfo) => {
+  let releaseStop!: () => void
+  const stopPending = new Promise<void>((resolve) => { releaseStop = resolve })
+  let canceled = false
+  const job = {
+    id: 'download-ws1', kind: 'download', model_id: 'nvidia/Qwen3.8-27B-NVFP4',
+    source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+    target_node_id: 'ws1', target_node_name: 'WS1', status: 'running', download_cancelable: true,
+    bytes_total: 22_000_000_000, bytes_transferred: 4_000_000_000, bytes_per_second: 60_000_000,
+    created_at: Date.now() / 1000,
+  }
+  await page.route('**/api/v1/storage', (route) => route.fulfill({ json: {
+    enabled: true, nodes: [{ id: 'ws1', name: 'WS1', online: true, total_size: 4_000_000_000, models: [{ model_id: job.model_id, size_bytes: 4_000_000_000, partial: true }] }],
+    jobs: [{ ...job, status: canceled ? 'canceled' : 'running' }], instructions: [],
+  } }))
+  await page.route('**/api/v1/storage/transfers/download-ws1', async (route) => {
+    expect(route.request().method()).toBe('DELETE')
+    await stopPending
+    canceled = true
+    await route.fulfill({ json: { ...job, status: 'canceled' } })
+  })
+  await page.goto('/storage')
+  const card = page.getByRole('region', { name: 'Storage on WS1', exact: true })
+  const button = card.getByRole('button', { name: `Stop download of ${job.model_id} on WS1`, exact: true })
+  await expect(button).toBeEnabled()
+  await expect(page.getByRole('table', { name: 'Model transfer queue' }).getByRole('button', { name: `Stop download of ${job.model_id} on WS1`, exact: true })).toBeEnabled()
+  const box = await button.boundingBox()
+  expect(box!.width).toBeGreaterThanOrEqual(44)
+  await page.screenshot({ path: testInfo.outputPath('storage-stop-download.png'), fullPage: true })
+  await button.click()
+  await expect(button).toBeDisabled()
+  await expect(button).toHaveText('Stopping...')
+  await expect(page.getByText(/Stopped download of/)).toHaveCount(0)
+  releaseStop()
+  await expect(page.getByText(/Stopped download of nvidia\/Qwen3.8-27B-NVFP4 on WS1/)).toBeVisible()
+  await expect(page.getByRole('button', { name: `Stop download of ${job.model_id} on WS1`, exact: true })).toHaveCount(0)
+  await expect(card.getByRole('button', { name: `Finish download of ${job.model_id} on WS1`, exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+})
+
 
 test('edits the Load Balancer limit and keeps IP rules in Settings', async ({ page }, testInfo) => {
   await page.goto('/settings')

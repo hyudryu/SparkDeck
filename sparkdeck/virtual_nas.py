@@ -668,6 +668,18 @@ class VirtualNAS:
         self._queue_lock = asyncio.Lock()
         self._download_operations: dict[str, dict[str, Any]] = {}
         self._process_download_locks: dict[str, asyncio.Lock] = {}
+        self._download_tombstone_path = self.data_dir / "virtual_nas_canceled_downloads.json"
+        self._download_tombstone_error = False
+        try:
+            canceled_ids = json.loads(self._download_tombstone_path.read_text(encoding="utf-8"))
+            if not isinstance(canceled_ids, list):
+                raise ValueError("invalid cancellation registry")
+            self._canceled_download_ids = {str(uuid.UUID(value)) for value in canceled_ids}
+        except FileNotFoundError:
+            self._canceled_download_ids = set()
+        except (OSError, ValueError, TypeError, AttributeError):
+            self._canceled_download_ids = set()
+            self._download_tombstone_error = True
 
     @property
     def enabled(self) -> bool:
@@ -1062,12 +1074,19 @@ class VirtualNAS:
     async def cancel_download_operation(self, operation_id: str) -> dict[str, Any]:
         """Stop a managed writer and retain a tombstone for delayed HTTP starts."""
         operation_id = str(uuid.UUID(operation_id))
+        if self._download_tombstone_error:
+            raise RuntimeError("download cancellation registry is unavailable; repair node state before downloading")
+        self._canceled_download_ids.add(operation_id)
+        _atomic_json_write(self._download_tombstone_path, sorted(self._canceled_download_ids))
         state = self._download_operations.setdefault(operation_id, {
             "cancel": asyncio.Event(), "done": asyncio.Event(), "active": False,
         })
         state["cancel"].set()
         if state["active"]:
-            await state["done"].wait()
+            try:
+                await asyncio.wait_for(state["done"].wait(), timeout=15)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("download writer has not confirmed exit; retry cancellation") from exc
         if state.get("stop_error"):
             raise RuntimeError(state["stop_error"])
         return {"operation_id": operation_id, "status": "canceled"}
@@ -1090,6 +1109,20 @@ class VirtualNAS:
         self, model_id: str, revision: str, explicit_token: str | None = None,
         requested_revision: str | None = None, *, operation_id: str | None = None,
     ) -> dict[str, Any]:
+        model_id = validate_model_id(model_id)
+        lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
+        # Retain this per-repository reservation through process teardown,
+        # including failed stop attempts; another writer must never overlap.
+        async with lock:
+            return await self._supervised_download_model_process(
+                model_id, revision, explicit_token, requested_revision,
+                operation_id=operation_id,
+            )
+
+    async def _supervised_download_model_process(
+        self, model_id: str, revision: str, explicit_token: str | None = None,
+        requested_revision: str | None = None, *, operation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Run Hub's writer in an owned process; never cancel a writer thread."""
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
@@ -1097,6 +1130,10 @@ class VirtualNAS:
             raise ValueError("download revision must be an immutable Hugging Face commit SHA")
         requested_revision = validate_revision(requested_revision or revision)
         operation_id = str(uuid.UUID(operation_id)) if operation_id else str(uuid.uuid4())
+        if self._download_tombstone_error:
+            raise RuntimeError("download cancellation registry is unavailable; repair node state before downloading")
+        if operation_id in self._canceled_download_ids:
+            raise TransferCanceled()
         state = self._download_operations.setdefault(operation_id, {
             "cancel": asyncio.Event(), "done": asyncio.Event(), "active": False,
         })
@@ -1110,47 +1147,65 @@ class VirtualNAS:
         cancel_wait = None
         completion = None
         try:
-            lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
-            async with lock:
-                if state["cancel"].is_set():
-                    raise TransferCanceled()
-                await asyncio.to_thread(self._reclaim_if_foreign, self._model_path(model_id))
-                if state["cancel"].is_set():
-                    raise TransferCanceled()
-                launch_options = ({"creationflags": subprocess.CREATE_NO_WINDOW}
-                                  if os.name == "nt" else {"start_new_session": True})
-                process = await self._await_uncancelable(asyncio.create_subprocess_exec(
-                    sys.executable, "-m", "sparkdeck.hf_download_worker",
-                    cwd=str(Path(__file__).resolve().parent.parent),
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL, **launch_options,
-                ))
-                payload = json.dumps({"model_id": model_id, "revision": revision,
-                                      "cache_dir": str(self._hub()),
-                                      "token": explicit_token if explicit_token is not None else self._token_provider() or ""})
-                completion = asyncio.create_task(process.communicate(payload.encode()))
-                cancel_wait = asyncio.create_task(state["cancel"].wait())
-                await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
-                if state["cancel"].is_set():
-                    await self._stop_download_process(process)
-                    await completion
-                    raise TransferCanceled()
+            if state["cancel"].is_set():
+                raise TransferCanceled()
+            await asyncio.to_thread(self._reclaim_if_foreign, self._model_path(model_id))
+            if state["cancel"].is_set():
+                raise TransferCanceled()
+            launch_options = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+                              if os.name == "nt" else {"start_new_session": True})
+            launch = asyncio.create_task(asyncio.create_subprocess_exec(
+                sys.executable, "-m", "sparkdeck.hf_download_worker",
+                cwd=str(Path(__file__).resolve().parent.parent),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL, **launch_options,
+            ))
+            try:
+                process = await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                # Capture the handle even if cancellation races spawn, then
+                # propagate cancellation through cleanup rather than starting
+                # a long download after swallowing the request cancellation.
+                process = await self._await_uncancelable(launch)
+                state["cancel"].set()
+                raise
+            payload = json.dumps({"model_id": model_id, "revision": revision,
+                                  "parent_pid": os.getpid(),
+                                  "cache_dir": str(self._hub()),
+                                  "token": explicit_token if explicit_token is not None else self._token_provider() or ""})
+            completion = asyncio.create_task(process.communicate(payload.encode()))
+            cancel_wait = asyncio.create_task(state["cancel"].wait())
+            await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if state["cancel"].is_set():
+                await self._stop_download_process(process)
                 await completion
-                if process.returncode != 0:
-                    raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
-                (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
-                self._write_revision_ref(model_id, requested_revision, revision)
-                inventory = await asyncio.to_thread(self.inventory)
-                model = next((item for item in inventory if item.get("model_id") == model_id
-                              and self._has_revision(item, revision, requested_revision)), None)
-                if model is None:
-                    raise RuntimeError("download finished without a complete requested revision")
-                return {"ok": True, "model_id": model_id, "revision": revision,
-                        "size_bytes": _nonnegative_int(model.get("size_bytes"))}
+                raise TransferCanceled()
+            await completion
+            if process.returncode != 0:
+                raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
+            (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
+            self._write_revision_ref(model_id, requested_revision, revision)
+            inventory = await asyncio.to_thread(self.inventory)
+            model = next((item for item in inventory if item.get("model_id") == model_id
+                          and self._has_revision(item, revision, requested_revision)), None)
+            if model is None:
+                raise RuntimeError("download finished without a complete requested revision")
+            return {"ok": True, "model_id": model_id, "revision": revision,
+                    "size_bytes": _nonnegative_int(model.get("size_bytes"))}
         finally:
             try:
-                if process is not None and process.returncode is None:
-                    await self._await_uncancelable(self._stop_download_process(process))
+                async def finish_writer():
+                    while process is not None and process.returncode is None:
+                        try:
+                            await self._stop_download_process(process)
+                        except Exception:
+                            # An endpoint may time out, but the supervisor
+                            # keeps the model reservation until actual exit.
+                            state["stop_error"] = "download worker has not confirmed exit"
+                            await asyncio.sleep(1)
+                    state.pop("stop_error", None)
+
+                await self._await_uncancelable(finish_writer())
                 if completion is not None:
                     await self._await_uncancelable(completion)
             except Exception as exc:
@@ -3381,9 +3436,10 @@ class VirtualNAS:
     async def _await_download_with_cancel(self, operation, event: asyncio.Event, cancel_writer, job: dict) -> Any:
         worker = asyncio.ensure_future(operation)
         stop = asyncio.create_task(event.wait())
+        pending_error = None
         try:
             while True:
-                await asyncio.wait({worker, stop}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({stop} if pending_error else {worker, stop}, return_when=asyncio.FIRST_COMPLETED)
                 if event.is_set():
                     try:
                         await cancel_writer()
@@ -3401,11 +3457,33 @@ class VirtualNAS:
                         # now-unneeded HTTP waiter cannot leave cache writes.
                         worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)
+                    if pending_error is not None:
+                        raise pending_error
                     raise TransferCanceled()
-                return await worker
+                try:
+                    return await worker
+                except Exception as exc:
+                    # A dropped HTTP connection does not establish that an
+                    # agent writer stopped. Confirm exit before releasing the
+                    # model/node reservation or surfacing a terminal failure.
+                    pending_error = exc
+                    event.set()
         except asyncio.CancelledError:
-            await self._await_uncancelable(cancel_writer())
-            await self._await_uncancelable(asyncio.gather(worker, return_exceptions=True))
+            async def stop_before_shutdown():
+                while True:
+                    try:
+                        await cancel_writer()
+                        break
+                    except Exception:
+                        job["phase"] = "canceling"
+                        job["error"] = "Could not confirm download cancellation; retry Stop or check the node"
+                        self._save()
+                        await asyncio.sleep(1)
+                if not worker.done():
+                    worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+            await self._await_uncancelable(stop_before_shutdown())
             raise
         finally:
             stop.cancel()
@@ -3798,6 +3876,10 @@ class VirtualNAS:
                 if job["download_cancelable"] else self._await_uncancelable(operation)
             )
             if event.is_set() or job["status"] == "canceled":
+                raise TransferCanceled()
+            if (result or {}).get("status") == "canceled":
+                # A retained agent tombstone can reject a replay after
+                # controller shutdown. That is not a completed snapshot.
                 raise TransferCanceled()
             size_bytes = _nonnegative_int((result or {}).get("size_bytes"))
             job["status"] = "completed"

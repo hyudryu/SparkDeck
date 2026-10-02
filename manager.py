@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import socket
 import shlex
@@ -20658,6 +20659,7 @@ class Manager:
         def _gather():
             cpu_clock = self._read_cpu_clock_mhz()
             return {
+                "architecture": platform.machine(),
                 "cpu_pct": self._read_cpu_pct(),
                 "cpu_logical_count": os.cpu_count(),
                 "cpu_temp_c": self._read_cpu_temp(),

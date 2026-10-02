@@ -114,7 +114,7 @@ class CommunityAggregatesProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["availability"], "ok")
         self.assertEqual(response.json()["items"][0]["model_id"], "org/model")
-        self.assertEqual(str(seen[0].url), "https://community.example/v3/aggregates")
+        self.assertEqual(str(seen[0].url), "https://community.example/v4/aggregates")
         self.assertEqual(seen[0].headers["authorization"], "Bearer server-id-token")
         self.mint.assert_awaited_once_with("refresh-1")
 
@@ -250,11 +250,13 @@ class CommunityUploadTests(unittest.IsolatedAsyncioTestCase):
         uploads = self.sample_requests()
         self.assertEqual(len(uploads), 1)
         self.assertEqual(
-            str(uploads[0].url), "https://community.example/v3/samples")
+            str(uploads[0].url), "https://community.example/v4/samples")
         self.assertEqual(
             uploads[0].headers["authorization"], "Bearer id-1")
-        self.assertEqual(uploads[0].headers["idempotency-key"], "sample-1")
+        self.assertEqual(uploads[0].headers["idempotency-key"], "v4-sample-1")
         self.assertEqual(json.loads(uploads[0].content), {
+            "hardware": {"hardware_class": "unknown", "architecture": "x86_64", "gpu_count": None, "gpus": []},
+            "hardware_key": "unknown",
             "model_id": "org/model",
             "quantization": "UNKNOWN",
             "prompt_tokens_bucket": 400,

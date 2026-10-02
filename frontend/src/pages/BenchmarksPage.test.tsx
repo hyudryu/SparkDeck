@@ -24,6 +24,33 @@ afterEach(() => {
 })
 
 describe('BenchmarksPage community privacy', () => {
+  it('keeps charts for the same model separated by hardware', async () => {
+    const user = userEvent.setup()
+    const summary = { model_id: 'org/model', run_count: 1, best_prompt_tokens_per_second: 100, best_generation_tokens_per_second: 42.5, context_windows: [4096], tensor_parallel_sizes: [1], latest_at: '2026-10-01T00:00:00Z' }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path.endsWith('/api/v1/benchmark-models')) body = { items: [
+        { ...summary, hardware_key: 'spark', hardware_label: 'DGX Spark' },
+        { ...summary, hardware_key: 'rtx', hardware_label: 'RTX PRO 6000', best_generation_tokens_per_second: 146.7 },
+      ] }
+      else if (path.includes('/api/v1/benchmark-models/')) body = { model_id: 'org/model', points: [
+        { context_window_size: 4096, concurrency: 1, tensor_parallel_size: 1, prompt_tokens_per_second: 100, generation_tokens_per_second: 42.5, sample_count: 1, hardware_key: 'spark' },
+        { context_window_size: 16384, concurrency: 1, tensor_parallel_size: 1, prompt_tokens_per_second: 200, generation_tokens_per_second: 146.7, sample_count: 1, hardware_key: 'rtx' },
+      ] }
+      else if (path.endsWith('/api/v1/community/aggregates')) body = { items: [], availability: 'available', evidence_policy: { minimum_samples: 10 } }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><BenchmarksPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: /org\/model.*DGX Spark/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'org/model' })
+    expect((await within(dialog).findAllByText('4K context')).length).toBeGreaterThan(0)
+    expect(within(dialog).queryByText('16K context')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /org\/model.*RTX PRO 6000/ }))
+    expect((await within(dialog).findAllByText('16K context')).length).toBeGreaterThan(0)
+    expect(within(dialog).queryByText('4K context')).not.toBeInTheDocument()
+  })
+
   it('switches between the Speed and Temp panes', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)
@@ -164,11 +191,11 @@ describe('BenchmarksPage community privacy', () => {
         items: [
           {
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+            tensor_parallel_size: 1, hardware_key: 'spark-one', hardware_label: 'DGX Spark - 1 x NVIDIA GB10', hardware: { hardware_class: 'dgx-spark', architecture: 'aarch64', gpu_count: 1, gpus: [{ model: 'NVIDIA GB10', memory_mib: 128000 }] }, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           },
           {
             model_id: 'org/model', quantization: 'Q4_K_M', prompt_tokens_bucket: 1000,
-            tensor_parallel_size: 4, inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
+            tensor_parallel_size: 4, hardware_key: 'spark-one', hardware_label: 'DGX Spark - 1 x NVIDIA GB10', hardware: { hardware_class: 'dgx-spark', architecture: 'aarch64', gpu_count: 1, gpus: [{ model: 'NVIDIA GB10', memory_mib: 128000 }] }, inference_tokens_per_second: 31.2, sample_count: 8, unique_cluster_count: 3,
           },
         ],
         availability: 'available',
@@ -188,7 +215,7 @@ describe('BenchmarksPage community privacy', () => {
     expect(screen.getByText('TP1')).toBeInTheDocument()
     expect(screen.getByText('TP4')).toBeInTheDocument()
     expect(screen.getByText('12 contributors')).toBeInTheDocument()
-    expect(screen.getByText(/matched only on model name, quantization, TP size, and prompt-length bucket/)).toBeInTheDocument()
+    expect(screen.getByText(/matched on exact hardware, model name, quantization, TP size, and prompt-length bucket/)).toBeInTheDocument()
     expect(screen.getByText(/at most one average per TP setting/)).toBeInTheDocument()
     expect(screen.queryByText('vLLM')).not.toBeInTheDocument()
     expect(screen.queryByText(/hardware class/i)).not.toBeInTheDocument()
@@ -229,7 +256,7 @@ describe('BenchmarksPage community privacy', () => {
         body = {
           items: deleted ? [] : [{
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
+            tensor_parallel_size: 1, hardware_key: 'spark-one', hardware_label: 'DGX Spark - 1 x NVIDIA GB10', hardware: { hardware_class: 'dgx-spark', architecture: 'aarch64', gpu_count: 1, gpus: [{ model: 'NVIDIA GB10', memory_mib: 128000 }] }, inference_tokens_per_second: 42.5, sample_count: 1, unique_cluster_count: 1,
           }],
           availability: deleted ? 'not_configured' : 'local',
           evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'tensor_parallel_size', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },
@@ -266,7 +293,7 @@ describe('BenchmarksPage community privacy', () => {
         body = {
           items: [{
             model_id: 'org/model', quantization: 'NVFP4', prompt_tokens_bucket: 1000,
-            tensor_parallel_size: 1, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
+            tensor_parallel_size: 1, hardware_key: 'spark-one', hardware_label: 'DGX Spark - 1 x NVIDIA GB10', hardware: { hardware_class: 'dgx-spark', architecture: 'aarch64', gpu_count: 1, gpus: [{ model: 'NVIDIA GB10', memory_mib: 128000 }] }, inference_tokens_per_second: 42.5, sample_count: 12, unique_cluster_count: 5,
           }],
           availability: 'available',
           evidence_policy: { minimum_samples: 10, exact_match_dimensions: ['model_id', 'quantization', 'prompt_tokens_bucket'], metric: 'inference_tokens_per_second' },

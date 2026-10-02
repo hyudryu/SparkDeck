@@ -7,7 +7,20 @@ export interface RuntimeCompatibility {
   reason?: string
 }
 
-export interface BenchmarkAggregate {
+export interface BenchmarkHardware {
+  hardware_class: 'dgx-spark' | 'workstation' | 'mixed' | 'unknown'
+  architecture: string
+  gpu_count: number | null
+  gpus: Array<{ model: string; memory_mib: number | null }>
+}
+
+export interface BenchmarkHardwareIdentity {
+  hardware_key?: string
+  hardware_label?: string
+  hardware?: BenchmarkHardware
+}
+
+export interface BenchmarkAggregate extends BenchmarkHardwareIdentity {
   model_id: string
   quantization: string
   tensor_parallel_size: number
@@ -21,7 +34,7 @@ export interface BenchmarkAggregate {
 
 export interface CommunityEvidencePolicy {
   minimum_samples: number
-  exact_match_dimensions: Array<'model_id' | 'quantization' | 'tensor_parallel_size' | 'prompt_tokens_bucket'>
+  exact_match_dimensions: Array<'model_id' | 'quantization' | 'tensor_parallel_size' | 'prompt_tokens_bucket' | 'hardware_key'>
   metric: 'inference_tokens_per_second'
 }
 
@@ -497,7 +510,7 @@ export interface JoinClusterInput {
   name: string
 }
 
-export interface BenchmarkSample {
+export interface BenchmarkSample extends BenchmarkHardwareIdentity {
   id: string
   deployment_id?: string
   model_id: string
@@ -517,7 +530,7 @@ export interface BenchmarkSample {
   sample_count?: number
 }
 
-export interface BenchmarkModelSummary {
+export interface BenchmarkModelSummary extends BenchmarkHardwareIdentity {
   model_id: string
   run_count: number
   best_prompt_tokens_per_second: number
@@ -527,7 +540,7 @@ export interface BenchmarkModelSummary {
   latest_at: string
 }
 
-export interface BenchmarkSeriesPoint {
+export interface BenchmarkSeriesPoint extends BenchmarkHardwareIdentity {
   context_window_size: number
   concurrency: 1 | 2 | 5 | 10
   tensor_parallel_size: number

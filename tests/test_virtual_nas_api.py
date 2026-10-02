@@ -383,6 +383,9 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
                     "/api/agent/virtual-nas/models/org/model/download",
                     json={"revision": "main", "hf_token": ""},
                 ),
+                await self.client.post(
+                    "/api/agent/virtual-nas/downloads/11111111-1111-4111-8111-111111111111/cancel",
+                ),
                 await self.client.get(
                     "/api/agent/virtual-nas/models/org/model/export"
                 ),
@@ -421,6 +424,71 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
             "org/model", resolved, "ephemeral", "main", 7,
         )
         self.assertNotIn("ephemeral", response.text)
+
+    async def test_agent_download_tracks_validated_durable_operation(self):
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        checked = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={"revision": "a" * 40, "operation_id": operation_id, "hf_token": "ephemeral"},
+            )
+        self.assertEqual(response.status_code, 200)
+        checked.assert_awaited_once_with(
+            "org/model", "a" * 40, "ephemeral", "a" * 40,
+            operation_id=operation_id,
+        )
+        self.assertNotIn("ephemeral", response.text)
+
+    async def test_agent_download_rejects_invalid_or_selective_operation_ids(self):
+        checked = AsyncMock()
+        checked_files = AsyncMock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+            patch.object(server.manager.virtual_nas, "download_model_files_checked", checked_files),
+        ):
+            bodies = [{"operation_id": value} for value in ("bad-id", True, 42, [], {}, "x" * 1000)]
+            bodies.append({"operation_id": "11111111-1111-4111-8111-111111111111", "files": ["model.gguf"]})
+            for body in bodies:
+                response = await self.client.post(
+                    "/api/agent/virtual-nas/models/org/model/download",
+                    json={"revision": "a" * 40, **body},
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+        checked.assert_not_awaited()
+        checked_files.assert_not_awaited()
+
+    async def test_agent_download_cancel_waits_for_confirmed_core_result(self):
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        cancel = AsyncMock(return_value={"operation_id": operation_id, "status": "canceled", "token": "hidden"})
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "cancel_download_operation", cancel),
+        ):
+            response = await self.client.post(f"/api/agent/virtual-nas/downloads/{operation_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"operation_id": operation_id, "status": "canceled"})
+        cancel.assert_awaited_once_with(operation_id)
+
+    async def test_agent_download_cancel_rejects_invalid_operation_before_core(self):
+        cancel = AsyncMock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "cancel_download_operation", cancel),
+        ):
+            response = await self.client.post("/api/agent/virtual-nas/downloads/bad-id/cancel")
+        self.assertEqual(response.status_code, 400)
+        cancel.assert_not_awaited()
+
+    async def test_agent_health_advertises_download_cancellation(self):
+        with patch.object(server, "_require_agent"):
+            response = await self.client.get("/api/agent/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("virtual-nas-download-cancel-v1", response.json()["capabilities"])
 
     async def test_agent_download_supports_selective_files(self):
         resolved = "b" * 40

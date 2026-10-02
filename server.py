@@ -8,6 +8,7 @@ import re
 import secrets
 import sys
 import time
+import uuid
 from urllib.parse import urlsplit
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1199,16 +1200,19 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         body = await req.json()
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
-            "download_cache_baseline_bytes", "files",
+            "download_cache_baseline_bytes", "files", "operation_id",
         }:
             raise ValueError(
                 "request may contain only revision, requested_revision, hf_token, "
-                "download_cache_baseline_bytes, and files"
+                "download_cache_baseline_bytes, files, and operation_id"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
         token = body.get("hf_token")
         files = body.get("files")
+        operation_id = body.get("operation_id")
+        if operation_id is not None:
+            operation_id = _download_operation_id(operation_id)
         if revision is not None and not isinstance(revision, str):
             raise ValueError("revision must be a string")
         if token is not None and not isinstance(token, str):
@@ -1227,6 +1231,8 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         ):
             raise ValueError("download_cache_baseline_bytes must be a non-negative integer")
         if files is not None:
+            if operation_id is not None:
+                raise ValueError("operation_id cannot be combined with files")
             if baseline is not None:
                 raise ValueError(
                     "download_cache_baseline_bytes cannot be combined with files"
@@ -1244,10 +1250,32 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         ]
         if baseline is not None:
             download_args.append(baseline)
-        result = await manager.virtual_nas.download_model_checked(*download_args)
+        operation_kwargs = {"operation_id": operation_id} if operation_id is not None else {}
+        result = await manager.virtual_nas.download_model_checked(*download_args, **operation_kwargs)
         return _public_storage_payload(result)
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "request body is not valid JSON") from exc
+    except (ValueError, LookupError, RuntimeError) as exc:
+        raise _storage_error(exc) from exc
+
+
+def _download_operation_id(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 64:
+        raise ValueError("operation_id must be a UUID")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ValueError("operation_id must be a UUID") from exc
+
+
+@app.post("/api/agent/virtual-nas/downloads/{operation_id}/cancel")
+async def agent_virtual_nas_cancel_download(operation_id: str, req: Request):
+    _require_agent(req)
+    try:
+        operation_id = _download_operation_id(operation_id)
+        return _public_storage_payload(
+            await manager.virtual_nas.cancel_download_operation(operation_id)
+        )
     except (ValueError, LookupError, RuntimeError) as exc:
         raise _storage_error(exc) from exc
 

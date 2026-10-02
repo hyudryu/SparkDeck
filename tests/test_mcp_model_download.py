@@ -90,6 +90,7 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             "targets": [
                 {"node_id": "spark", "has_required_weights": True},
                 {"node_id": "ws1", "has_required_weights": False,
+                 "eligible": True,
                  "has_model_cache": False, "free_bytes": 100_000_000_000,
                  "download_eligible": False, "download_reason": "Agent lacks Hub download support"},
             ],
@@ -114,6 +115,19 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         transfer = AsyncMock(wraps=manager.queue_virtual_nas_transfer)
         preparation = AsyncMock()
+        first_scans = 0
+        both_scanned = asyncio.Event()
+
+        async def inventory():
+            nonlocal first_scans
+            snapshot = {"jobs": list(jobs)}
+            first_scans += 1
+            if first_scans <= 2:
+                if first_scans == 2:
+                    both_scanned.set()
+                await both_scanned.wait()
+            return snapshot
+
         mcp = build_server(ControllerClient("http://test", transport=httpx.ASGITransport(app=application.app)))
         with (
             patch.object(application.manager, "virtual_nas_enabled", return_value=True),
@@ -121,9 +135,16 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             patch.object(application.manager, "virtual_nas_transfer_preflight", manager.virtual_nas_transfer_preflight),
             patch.object(application.manager, "queue_recipe_model_preparation", preparation),
             patch.object(application.manager, "queue_virtual_nas_transfer", transfer),
-            patch.object(application.manager, "virtual_nas_inventory", AsyncMock(side_effect=lambda: {"jobs": jobs})),
+            patch.object(application.manager, "virtual_nas_inventory", AsyncMock(side_effect=inventory)),
         ):
-            result = await mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
+            # Both callers see no active job. The real queue lock admits one;
+            # the losing request must recover the winner's tracked job ID.
+            result, concurrent = await asyncio.gather(*[
+                mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
+                for _ in range(2)
+            ])
+            self.assertEqual(result.structured_content["job_ids"], concurrent.structured_content["job_ids"])
+            self.assertEqual(len(jobs), 1)
             self.assertNotIn("plan", result.structured_content)
             self.assertEqual(transfer.await_args.args[:4],
                              (model, "spark", ["ws1"], sha))
@@ -135,7 +156,7 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             retry = await mcp.call_tool("download_huggingface_model", {"model_id": model, "node_id": "ws1"})
             self.assertEqual(retry.structured_content["job_ids"], result.structured_content["job_ids"])
             self.assertNotIn("plan", retry.structured_content)
-            self.assertEqual(transfer.await_count, 1)
+            self.assertEqual(transfer.await_count, 2)
             preparation.assert_not_awaited()
             manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
             # Simulate a source disappearing after discovery but before the
@@ -150,6 +171,24 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(jobs, [])
             preparation.assert_not_awaited()
             nas.queue_download_and_transfer.assert_not_awaited()
+
+    async def test_transfer_capacity_block_falls_back_to_destination_download(self):
+        client = ControllerClient()
+        preflight = {"resolved_revision": "a" * 40,
+                     "sources": [{"node_id": "spark", "size_bytes": 500_000_000_000}],
+                     "targets": [{"node_id": "ws1", "has_model_cache": False,
+                                  "eligible": False, "reason": "Not enough free cache space for Virtual NAS staging",
+                                  "download_eligible": True}]}
+        with (
+            patch.object(client, "_request", AsyncMock(return_value=preflight)),
+            patch.object(client, "storage", AsyncMock(return_value={"jobs": []})),
+            patch.object(client, "pull_storage_weights", AsyncMock(return_value={"job_ids": ["download"]})) as pull,
+            patch.object(client, "transfer_storage_weights", AsyncMock()) as transfer,
+        ):
+            result = await client.download_huggingface_model("org/model", "ws1")
+        pull.assert_awaited_once_with("org/model", ["ws1"], revision="main", download_node_id="ws1")
+        transfer.assert_not_awaited()
+        self.assertEqual(result["job_ids"], ["download"])
 
     async def test_invalid_repository_revision_or_empty_node_never_posts(self):
         client = ControllerClient()

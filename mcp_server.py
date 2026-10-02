@@ -487,21 +487,35 @@ class ControllerClient:
         if not target.get("has_required_weights") and re.fullmatch(r"[0-9a-f]{40}", str(resolved_revision or "")):
             # A branch request can classify our SHA-pinned workflow as a
             # conflict rather than active_job_id. Inspect exact tracked jobs.
-            for active in (await self.storage()).get("jobs", []):
-                if (
-                    active.get("model_id") == model
-                    and active.get("revision") == resolved_revision
-                    and active.get("status") in {"queued", "running"}
-                    and active.get("kind") == "transfer"
-                    and active.get("target_node_id") == node
-                ):
-                    return {"job_ids": [active["id"]], "jobs": [active]}
+            async def matching_active_transfer() -> dict[str, Any] | None:
+                for active in (await self.storage()).get("jobs", []):
+                    if (
+                        active.get("model_id") == model
+                        and active.get("revision") == resolved_revision
+                        and active.get("status") in {"queued", "running"}
+                        and active.get("kind") == "transfer"
+                        and active.get("target_node_id") == node
+                    ):
+                        return {"job_ids": [active["id"]], "jobs": [active]}
+                return None
+
+            active_result = await matching_active_transfer()
+            if active_result:
+                return active_result
             source = next((item for item in preflight.get("sources", [])
                            if item.get("node_id") and item["node_id"] != node), None)
-            if source and not target.get("has_model_cache"):
-                return await self.transfer_storage_weights(
-                    model, source["node_id"], [node], revision=resolved_revision,
-                )
+            if source and target.get("eligible") and not target.get("has_model_cache"):
+                try:
+                    return await self.transfer_storage_weights(
+                        model, source["node_id"], [node], revision=resolved_revision,
+                    )
+                except ControllerError:
+                    # Another request can win the queue lock after both read
+                    # an empty job list. Reuse only its exact active transfer.
+                    active_result = await matching_active_transfer()
+                    if active_result:
+                        return active_result
+                    raise
         return await self.pull_storage_weights(
             model, [node], revision=requested_revision, download_node_id=node,
         )

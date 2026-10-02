@@ -2,7 +2,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NodeInventoryItem } from '../api/types'
-import { clusterResourceSnapshot, DashboardPage, inferenceSessionSnapshot } from './DashboardPage'
+import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot } from './DashboardPage'
 
 function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -373,7 +373,7 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('No models running')).toBeInTheDocument()
   })
 
-  it('renders pooled CPU, GPU, and RAM while excluding hidden nodes', async () => {
+  it('renders individual node and GPU usage while excluding hidden nodes', async () => {
     const localStats = {
       cpu_pct: 20, cpu_logical_count: 4, cpu_temp_c: 54, mem: { used: 64 * 1024 ** 3, total: 128 * 1024 ** 3, pct: 50 },
       gpus: [{ index: 0, name: 'NVIDIA GB10', util: 35, temp: 62, mem_used_mib: null, mem_total_mib: null }],
@@ -383,7 +383,9 @@ describe('DashboardPage', () => {
       cpu_pct: 60, cpu_logical_count: 12, cpu_temp_c: 58, mem: { used: 32 * 1024 ** 3, total: 64 * 1024 ** 3, pct: 50 },
       gpus: [
         { index: 0, name: 'NVIDIA RTX', util: 55, temp: 65, mem_used_mib: 8 * 1024, mem_total_mib: 16 * 1024 },
-        { index: 1, name: 'NVIDIA RTX', util: null, temp: 67, mem_used_mib: 4 * 1024, mem_total_mib: 16 * 1024 },
+        { index: 1, name: 'NVIDIA RTX', util: 90, temp: 67, mem_used_mib: 4 * 1024, mem_total_mib: 16 * 1024 },
+        { index: 2, name: 'NVIDIA RTX', util: null },
+        { index: 3, name: 'NVIDIA RTX', util: 99, error: 'GPU probe failed' },
       ],
       active_requests: {}, ts: 1_777_000_000,
     }
@@ -403,15 +405,24 @@ describe('DashboardPage', () => {
 
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
-    expect(await screen.findByText('Pooled CPU')).toBeInTheDocument()
-    expect(screen.getByText('50.0%')).toBeInTheDocument()
-    expect(screen.getByText('16 logical processors · 2 measured nodes')).toBeInTheDocument()
-    expect(screen.getByText('Pooled GPU')).toBeInTheDocument()
-    expect(screen.getByText('45.0%')).toBeInTheDocument()
-    expect(screen.getByText('3 GPUs across 2 nodes · 2 measured')).toBeInTheDocument()
-    expect(screen.getByText('Pooled RAM')).toBeInTheDocument()
-    expect(screen.getByText('96.0 GB')).toBeInTheDocument()
-    expect(screen.getByText('of 192.0 GB across 2 nodes')).toBeInTheDocument()
+    const localCard = await screen.findByLabelText('Resource usage for Spark Four')
+    const remoteCard = screen.getByLabelText('Resource usage for Spark Two')
+    expect(within(localCard).getByRole('progressbar', { name: 'Spark Four CPU load' })).toHaveAttribute('aria-valuenow', '20')
+    expect(within(remoteCard).getByRole('progressbar', { name: 'Spark Two CPU load' })).toHaveAttribute('aria-valuenow', '60')
+    expect(within(localCard).getByText('64.0 GB used / 128.0 GB')).toBeInTheDocument()
+    expect(within(remoteCard).getByText('32.0 GB used / 64.0 GB')).toBeInTheDocument()
+    expect(within(localCard).getByRole('progressbar', { name: 'Spark Four GPU 0 utilization' })).toHaveAttribute('aria-valuenow', '35')
+    expect(within(remoteCard).getByRole('progressbar', { name: 'Spark Two GPU 0 utilization' })).toHaveAttribute('aria-valuenow', '55')
+    expect(within(remoteCard).getByRole('progressbar', { name: 'Spark Two GPU 1 utilization' })).toHaveAttribute('aria-valuenow', '90')
+    const unmeasured = within(remoteCard).getByRole('progressbar', { name: 'Spark Two GPU 2 utilization' })
+    expect(unmeasured).not.toHaveAttribute('aria-valuenow')
+    expect(unmeasured).toHaveAttribute('aria-valuetext', 'Unavailable')
+    expect(within(remoteCard).getByText('8.0 GB used / 16.0 GB')).toBeInTheDocument()
+    expect(within(remoteCard).getByText('4.0 GB used / 16.0 GB')).toBeInTheDocument()
+    expect(within(remoteCard).getByText('GPU telemetry unavailable: GPU probe failed')).toBeInTheDocument()
+    expect(within(remoteCard).queryByRole('progressbar', { name: 'Spark Two GPU 3 utilization' })).not.toBeInTheDocument()
+    expect(within(screen.getByLabelText('Resource usage for Spark Three')).queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Pooled/)).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Cluster nodes' })).toBeInTheDocument()
     expect(screen.getByText('Spark Four')).toBeInTheDocument()
     expect(screen.getByText('Spark Two')).toBeInTheDocument()
@@ -442,9 +453,9 @@ describe('DashboardPage', () => {
 
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
-    expect(await screen.findByText('Pooled CPU')).toBeInTheDocument()
+    expect(await screen.findByText('CPU load')).toBeInTheDocument()
     expect(screen.getByText('20.0%')).toBeInTheDocument()
-    expect(screen.getByText('64.0 GB')).toBeInTheDocument()
+    expect(screen.getByText('64.0 GB used / 128.0 GB')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Cluster nodes' })).toBeInTheDocument()
     expect(screen.getByText(/0 of 0 visible nodes online/)).toBeInTheDocument()
     expect(screen.getByText('Cluster inventory unavailable')).toBeInTheDocument()
@@ -514,7 +525,7 @@ describe('DashboardPage', () => {
 
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
-    expect(await screen.findByText('Pooled CPU')).toBeInTheDocument()
+    expect(await screen.findByText('CPU load')).toBeInTheDocument()
     expect(screen.getByText('42.0%')).toBeInTheDocument()
     expect(screen.queryByText('Loading system overview')).not.toBeInTheDocument()
     expect(screen.getByText('Loading cluster nodes')).toBeInTheDocument()
@@ -553,7 +564,7 @@ describe('DashboardPage', () => {
     expect(nodeInventorySignal?.aborted).toBe(false)
 
     await act(async () => { finishNodeInventory?.(json({ items: [] })) })
-    expect(screen.getByText('Pooled CPU')).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Inference overview' })).toBeInTheDocument()
   })
 
   it('surfaces a stuck core telemetry request after the short dashboard timeout', async () => {
@@ -585,7 +596,7 @@ describe('DashboardPage', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     expect(screen.getByText(/The request timed out\. Check the node connection and retry\./)).toBeInTheDocument()
-    expect(screen.getByText('Pooled CPU')).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Inference overview' })).toBeInTheDocument()
     expect(screen.getByText('live-model')).toBeInTheDocument()
     expect(screen.getAllByText(/^1 active/)).toHaveLength(2)
     expect(screen.getByText('Processing')).toBeInTheDocument()
@@ -889,7 +900,7 @@ describe('DashboardPage', () => {
   })
 
   it('prefers fresh local stats over retained local node telemetry', () => {
-    const snapshot = clusterResourceSnapshot([{
+    const snapshot = nodeResourceSnapshot([{
       id: 'local', name: 'This node', local: true, online: true,
       stats: {
         cpu_pct: 10, cpu_logical_count: 8,
@@ -902,9 +913,46 @@ describe('DashboardPage', () => {
       gpus: [{ index: 0, util: 70 }],
     })
 
-    expect(snapshot.cpuPct).toBe(80)
-    expect(snapshot.ramUsed).toBe(8)
-    expect(snapshot.gpuPct).toBe(70)
+    expect(snapshot[0].stats?.cpu_pct).toBe(80)
+    expect(snapshot[0].stats?.mem?.used).toBe(8)
+    expect(snapshot[0].stats?.gpus?.[0].util).toBe(70)
+    expect(snapshot[0].source).toBe('stats')
+  })
+
+  it('retains the telemetry source when local inventory is newer than the local stats feed', () => {
+    const snapshot = nodeResourceSnapshot([{
+      id: 'local', name: 'This node', local: true, online: true,
+      stats: { cpu_pct: 90, ts: 200 },
+    }], { cpu_pct: 10, ts: 100 })
+    expect(snapshot[0].stats?.cpu_pct).toBe(90)
+    expect(snapshot[0].source).toBe('nodes')
+  })
+
+  it('marks stale telemetry and leaves missing CPU, GPU, and RAM readings unmeasured', async () => {
+    const freshTimestamp = Date.now() / 1000
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json({ cpu_pct: 5, ts: freshTimestamp })
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [
+        { id: 'missing', name: 'Missing readings', online: true, stats: { mem: { total: 16 * 1024 ** 3 }, gpus: [{ index: 0, name: 'NVIDIA RTX', mem_total_mib: 24 * 1024 }], ts: freshTimestamp } },
+        { id: 'stale', name: 'Stale worker', online: true, stats: { cpu_pct: 80, ts: freshTimestamp - 60 } },
+      ] })
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    const missing = await screen.findByLabelText('Resource usage for Missing readings')
+    expect(within(missing).getAllByRole('progressbar')).toHaveLength(4)
+    for (const bar of within(missing).getAllByRole('progressbar')) {
+      expect(bar).not.toHaveAttribute('aria-valuenow')
+      expect(bar).toHaveAttribute('aria-valuetext', 'Unavailable')
+    }
+    expect(within(missing).queryByText('0.0%')).not.toBeInTheDocument()
+    expect(within(missing).getByText('Usage unavailable / 16.0 GB')).toBeInTheDocument()
+    const stale = screen.getByLabelText('Resource usage for Stale worker')
+    expect(within(stale).getByText(/Last reported values - telemetry stale/)).toBeInTheDocument()
+    expect(within(stale).getByText('80.0%')).toBeInTheDocument()
   })
 
   it('applies pushed stream snapshots without extra fetches', async () => {
@@ -1104,13 +1152,12 @@ describe('DashboardPage', () => {
     expect(screen.getByText('90.0%')).toBeInTheDocument()
   })
 
-  it('uses equal node weighting when logical CPU counts are incomplete', () => {
-    const snapshot = clusterResourceSnapshot([
+  it('keeps CPU measurements separate when logical CPU counts are incomplete', () => {
+    const snapshot = nodeResourceSnapshot([
       { id: 'older-node', online: true, stats: { cpu_pct: 0 } },
       { id: 'newer-node', online: true, stats: { cpu_pct: 100, cpu_logical_count: 64 } },
     ] as NodeInventoryItem[])
 
-    expect(snapshot.cpuPct).toBe(50)
-    expect(snapshot.logicalProcessors).toBeUndefined()
+    expect(snapshot.map((item) => item.stats?.cpu_pct)).toEqual([0, 100])
   })
 })

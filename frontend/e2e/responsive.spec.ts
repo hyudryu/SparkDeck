@@ -89,6 +89,44 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
+test('shows each node and GPU utilization without overflow or averaging', async ({ page }, testInfo) => {
+  const local = {
+    cpu_pct: 12, cpu_model: 'NVIDIA GB10', cpu_temp_c: 51,
+    mem: { used: 48 * 1024 ** 3, total: 128 * 1024 ** 3 },
+    gpus: [{ index: 0, name: 'NVIDIA GB10', util: 24, temp: 58 }],
+    active_requests: {}, ts: Date.now() / 1000,
+  }
+  const workstation = {
+    cpu_pct: 83, cpu_model: 'AMD Ryzen Threadripper PRO 9995WX', cpu_temp_c: 64,
+    mem: { used: 96 * 1024 ** 3, total: 256 * 1024 ** 3 },
+    gpus: [
+      { index: 0, name: 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition', util: 15, temp: 49, mem_used_mib: 12 * 1024, mem_total_mib: 96 * 1024 },
+      { index: 1, name: 'NVIDIA RTX PRO 6000 Blackwell Workstation Edition', util: 95, temp: 79, mem_used_mib: 80 * 1024, mem_total_mib: 96 * 1024 },
+    ], active_requests: {}, ts: Date.now() / 1000,
+  }
+  await page.route('**/api/stats', (route) => route.fulfill({ json: local }))
+  await page.route('**/api/v1/nodes', (route) => route.fulfill({ json: { items: [
+    { id: 'local', name: 'Studio Spark', local: true, online: true, stats: local },
+    { id: 'ws1', name: 'WS1', online: true, stats: workstation },
+    { id: 'offline', name: 'Offline worker', online: false, stats: workstation },
+    { id: 'hidden', name: 'Hidden worker', hidden_from_dashboard: true, online: true, stats: workstation },
+  ] } }))
+  await page.goto('/dashboard')
+  const spark = page.getByLabel('Resource usage for Studio Spark', { exact: true })
+  const ws1 = page.getByLabel('Resource usage for WS1', { exact: true })
+  await expect(spark.getByRole('progressbar', { name: 'Studio Spark CPU load', exact: true })).toHaveAttribute('aria-valuenow', '12')
+  await expect(ws1.getByRole('progressbar', { name: 'WS1 CPU load', exact: true })).toHaveAttribute('aria-valuenow', '83')
+  await expect(ws1.getByRole('progressbar', { name: 'WS1 GPU 0 utilization', exact: true })).toHaveAttribute('aria-valuenow', '15')
+  await expect(ws1.getByRole('progressbar', { name: 'WS1 GPU 1 utilization', exact: true })).toHaveAttribute('aria-valuenow', '95')
+  await expect(ws1.getByText('80.0 GB used / 96.0 GB', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Resource usage for Offline worker').getByRole('progressbar')).toHaveCount(0)
+  await expect(page.getByText('Hidden worker', { exact: true })).toHaveCount(0)
+  await expect(page.getByText(/Pooled CPU|Pooled GPU|Pooled RAM/)).toHaveCount(0)
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  expect(overflow).toBeLessThanOrEqual(1)
+  await page.screenshot({ path: testInfo.outputPath('node-resource-metrics.png'), fullPage: true })
+})
+
 test('shows only deployment activity and errors in Logs', async ({ page }) => {
   await page.route('**/api/v1/logs', async (route) => route.fulfill({ json: { entries: [
     { timestamp: '2026-09-06 12:00:00', level: 'info', source: 'sparkdeck.lifecycle', event: 'launched', message: 'Deployment My model (engine group 1) launched' },

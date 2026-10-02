@@ -2,16 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import {
   Activity,
   Cloud,
-  Cpu,
   Gauge,
-  HardDrive,
   RefreshCw,
   Server,
   Users,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ActiveRequestGroupStats, ActiveRequestStats, AdmissionStats, Deployment, GpuStats, NodeInventoryItem, SystemStats } from '../api/types'
+import type { ActiveRequestGroupStats, ActiveRequestStats, AdmissionStats, Deployment, NodeInventoryItem, SystemStats } from '../api/types'
 import { Button, EmptyState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
@@ -19,7 +17,7 @@ import { useDashboardStream } from '../hooks/useDashboardStream'
 import type { DashboardStreamResources, DashboardStreamSource } from '../hooks/useDashboardStream'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
-  return value === null || value === undefined ? '—' : `${value.toFixed(digits)}${suffix}`
+  return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(digits)}${suffix}`
 }
 
 function percent(value: number | null | undefined) {
@@ -34,7 +32,7 @@ function temperatureTone(value: number | null | undefined) {
 }
 
 // Spark-class boards report the unified GB10 SoC as their GPU; the card shows
-// just the chip name there and omits the CPU row, since both are the same die.
+// the shortened chip name there while keeping CPU and GPU usage separate.
 function gpuDisplayName(name?: string | null) {
   if (!name) return undefined
   if (/gb10/i.test(name)) return 'GB10'
@@ -90,26 +88,12 @@ function runningDeploymentGroups(deployment: Deployment) {
 }
 
 function MetricBar({ value, label }: { value: number | null | undefined; label: string }) {
+  const measured = finiteNumber(value)
   return (
-    <div className="metric-bar" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(percent(value))}>
-      <span style={{ width: `${percent(value)}%` }} />
+    <div className={`metric-bar${measured === undefined ? ' metric-bar-unavailable' : ''}`} role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={measured === undefined ? undefined : Math.round(percent(measured))} aria-valuetext={measured === undefined ? 'Unavailable' : undefined}>
+      <span style={{ width: `${percent(measured)}%` }} />
     </div>
   )
-}
-
-function memorySnapshot(stats?: { gpus?: GpuStats[]; mem?: { total?: number; used?: number; pct?: number } }) {
-  const gpu = stats?.gpus?.find((item) => !item.error)
-  if (Number.isFinite(gpu?.mem_total_mib) && Number(gpu?.mem_total_mib) > 0) {
-    const total = Number(gpu?.mem_total_mib) / 1024
-    const used = Number(gpu?.mem_used_mib ?? 0) / 1024
-    return { label: 'GPU memory', used, total, percent: total ? used / total * 100 : 0, context: 'dedicated VRAM' }
-  }
-  if (Number.isFinite(stats?.mem?.total) && Number(stats?.mem?.total) > 0) {
-    const total = Number(stats?.mem?.total) / 1024 ** 3
-    const used = Number(stats?.mem?.used ?? 0) / 1024 ** 3
-    return { label: 'Unified memory', used, total, percent: Number(stats?.mem?.pct ?? used / total * 100), context: 'shared CPU/GPU pool' }
-  }
-  return undefined
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -118,57 +102,67 @@ function finiteNumber(value: unknown): number | undefined {
   return Number.isFinite(number) ? number : undefined
 }
 
-export function clusterResourceSnapshot(nodes: NodeInventoryItem[], fallbackStats?: SystemStats) {
-  const visibleOnline = nodes.filter((node) => node.hidden_from_dashboard !== true && node.online)
-  const telemetry = nodes.length
-    ? visibleOnline.flatMap((node) => {
-      const nodeStats = fallbackStats && (node.local || node.id === 'local')
-        ? fallbackStats
-        : node.stats
-      return nodeStats ? [{ id: node.id, stats: nodeStats }] : []
-    })
-    : fallbackStats ? [{ id: 'entry-node', stats: fallbackStats }] : []
-  let cpuTotal = 0; let cpuWeightedTotal = 0; let cpuWeight = 0; let cpuNodes = 0; let logicalProcessors = 0; let allCpuCountsKnown = true
-  let ramUsed = 0; let ramTotal = 0; let ramNodes = 0
-  let gpuUtilTotal = 0; let measuredGpus = 0; let gpuCount = 0; const gpuNodes = new Set<string>()
-
-  telemetry.forEach(({ id, stats }) => {
-    const cpuPct = finiteNumber(stats.cpu_pct)
-    if (cpuPct !== undefined) {
-      const knownProcessors = finiteNumber(stats.cpu_logical_count)
-      cpuTotal += cpuPct; cpuNodes += 1
-      if (knownProcessors && knownProcessors > 0) {
-        cpuWeightedTotal += cpuPct * knownProcessors; cpuWeight += knownProcessors; logicalProcessors += knownProcessors
-      } else {
-        allCpuCountsKnown = false
-      }
-    }
-    const used = finiteNumber(stats.mem?.used); const total = finiteNumber(stats.mem?.total)
-    if (used !== undefined && total !== undefined && total > 0) {
-      ramUsed += used; ramTotal += total; ramNodes += 1
-    }
-    const healthyGpus = (stats.gpus ?? []).filter((gpu) => !gpu.error)
-    if (healthyGpus.length) gpuNodes.add(id)
-    gpuCount += healthyGpus.length
-    healthyGpus.forEach((gpu) => {
-      const util = finiteNumber(gpu.util)
-      if (util !== undefined) { gpuUtilTotal += util; measuredGpus += 1 }
-    })
-  })
-
-  return {
-    cpuPct: cpuNodes ? (allCpuCountsKnown ? cpuWeightedTotal / cpuWeight : cpuTotal / cpuNodes) : undefined,
-    cpuNodes,
-    logicalProcessors: cpuNodes && allCpuCountsKnown ? logicalProcessors : undefined,
-    gpuPct: measuredGpus ? gpuUtilTotal / measuredGpus : undefined,
-    gpuCount,
-    measuredGpus,
-    gpuNodes: gpuNodes.size,
-    ramUsed,
-    ramTotal,
-    ramPct: ramTotal ? ramUsed / ramTotal * 100 : undefined,
-    ramNodes,
+/** Preserve machine identity: local stats are never attributed to a worker. */
+export function nodeResourceSnapshot(nodes: NodeInventoryItem[], localStats?: SystemStats) {
+  if (!nodes.length) {
+    return localStats ? [{ node: { id: 'local', name: 'Local node', local: true, online: true }, stats: localStats, fallback: true, source: 'stats' as const }] : []
   }
+  return nodes.filter((node) => node.hidden_from_dashboard !== true).map((node) => {
+    const isLocal = node.local || node.id === 'local'
+    const localTime = finiteNumber(localStats?.ts)
+    const nodeTime = finiteNumber(node.stats?.ts)
+    const preferLocal = isLocal && localStats && (localTime === undefined || nodeTime === undefined || localTime >= nodeTime)
+    return { node, stats: preferLocal ? localStats : node.stats, fallback: false, source: preferLocal ? 'stats' as const : 'nodes' as const }
+  })
+}
+
+function MemoryMetric({ used, total, percentage, label, gaugeLabel }: { used?: number; total?: number; percentage?: number; label: string; gaugeLabel: string }) {
+  const hasTotal = total !== undefined && total > 0
+  const allocation = hasTotal && used !== undefined ? used / total * 100 : percentage
+  return <div className="node-resource-metric">
+    <div className="node-resource-label"><span>{label}</span><strong>{displayValue(allocation, '%', 1)}</strong></div>
+    <MetricBar value={allocation} label={gaugeLabel} />
+    <p>{used !== undefined ? `${used.toFixed(1)} GB used` : 'Usage unavailable'}{hasTotal ? ` / ${total.toFixed(1)} GB` : ''}</p>
+  </div>
+}
+
+function NodeResourceCard({ node, stats, fallback, refreshPaused, now }: { node: NodeInventoryItem; stats?: SystemStats; fallback: boolean; refreshPaused: boolean; now: number }) {
+  const healthyGpus = stats?.gpus?.filter((gpu) => !gpu.error) ?? []
+  const sparkSoc = healthyGpus.some((gpu) => /gb10/i.test(gpu.name ?? ''))
+  const timestamp = finiteNumber(stats?.ts)
+  const stale = timestamp !== undefined && now - timestamp > 30
+  const sessionValues = stats?.active_requests ? Object.values(stats.active_requests) : undefined
+  const sessions = sessionValues?.reduce((sum, request) => sum + (request.connections ?? 0), 0)
+  const ramUsed = finiteNumber(stats?.mem?.used)
+  const ramTotal = finiteNumber(stats?.mem?.total)
+  return <Panel className="cluster-health-card" aria-label={`Resource usage for ${node.name}`}>
+    <div className="cluster-health-heading"><div><Server size={16} /><div><h3>{node.name}</h3><p>{fallback ? 'Local telemetry only' : node.local ? 'Current entry node' : node.id}</p></div></div><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div>
+    {node.online ? <>
+      {(refreshPaused || stale) && <p className="node-telemetry-notice" role="status">Last reported values{refreshPaused ? ' - refresh paused' : ' - telemetry stale'}{timestamp !== undefined ? ` (${new Date(timestamp * 1000).toLocaleTimeString()})` : ''}</p>}
+      {!stats && <p className="node-telemetry-notice">Telemetry unavailable for this node.</p>}
+      <div className="node-resource-grid">
+        <div className="node-resource-metric">
+          <div className="node-resource-label"><span>CPU load</span><strong>{displayValue(finiteNumber(stats?.cpu_pct), '%', 1)}</strong></div>
+          <MetricBar value={stats?.cpu_pct} label={`${node.name} CPU load`} />
+          <p>{stats?.cpu_model || (sparkSoc ? 'GB10 CPU' : 'CPU model unavailable')}{stats?.cpu_logical_count ? ` - ${stats.cpu_logical_count} logical processors` : ''}</p>
+        </div>
+        <MemoryMetric used={ramUsed === undefined ? undefined : ramUsed / 1024 ** 3} total={ramTotal === undefined ? undefined : ramTotal / 1024 ** 3} percentage={finiteNumber(stats?.mem?.pct)} label={sparkSoc ? 'Unified memory' : 'RAM'} gaugeLabel={`${node.name} ${sparkSoc ? 'unified memory' : 'RAM'} allocation`} />
+      </div>
+      <dl className="node-host-details"><div><dt>CPU temp</dt><dd className={temperatureTone(stats?.cpu_temp_c)}>{displayValue(stats?.cpu_temp_c, '\u00b0C', 1)}</dd></div><div><dt>Sessions</dt><dd>{sessions ?? '\u2014'}</dd></div></dl>
+      <div className="node-gpu-list">
+        {stats?.gpus?.map((gpu, position) => <section className="node-gpu-card" key={`${gpu.index}-${position}`} aria-label={`${node.name} GPU ${gpu.index}`}>
+          <div className="node-gpu-heading"><strong>GPU {gpu.index}</strong><span>{gpuDisplayName(gpu.name) ?? 'Model unavailable'}</span></div>
+          {gpu.error ? <p className="node-telemetry-notice">GPU telemetry unavailable: {gpu.error}</p> : <>
+            <div className="node-resource-label"><span>GPU utilization</span><strong>{displayValue(finiteNumber(gpu.util), '%', 1)}</strong></div>
+            <MetricBar value={gpu.util} label={`${node.name} GPU ${gpu.index} utilization`} />
+            <dl><div><dt>GPU temp</dt><dd className={temperatureTone(gpu.temp)}>{displayValue(gpu.temp, '\u00b0C', 1)}</dd></div></dl>
+            {/gb10/i.test(gpu.name ?? '') ? <p className="node-gpu-memory-note">Shares unified memory shown above</p> : <MemoryMetric used={finiteNumber(gpu.mem_used_mib) === undefined ? undefined : Number(gpu.mem_used_mib) / 1024} total={finiteNumber(gpu.mem_total_mib) === undefined ? undefined : Number(gpu.mem_total_mib) / 1024} label="GPU memory" gaugeLabel={`${node.name} GPU ${gpu.index} memory allocation`} />}
+          </>}
+        </section>)}
+        {!stats?.gpus?.length && <p className="node-telemetry-notice">GPU telemetry unavailable.</p>}
+      </div>
+    </> : <p className="cluster-health-offline">Telemetry unavailable while this node is offline.</p>}
+  </Panel>
 }
 
 export function activeRequestSnapshot(
@@ -276,6 +270,11 @@ export function sessionStateSummary(requests: { request: ActiveRequestStats }[])
 }
 
 export function DashboardPage() {
+  const [telemetryNow, setTelemetryNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = window.setInterval(() => setTelemetryNow(Date.now() / 1000), 10_000)
+    return () => window.clearInterval(timer)
+  }, [])
   const resourcesRef = useRef<DashboardStreamResources | null>(null)
   const stream = useDashboardStream(resourcesRef)
   // Poll while the socket is down, and keep polling any source the stream
@@ -332,7 +331,7 @@ export function DashboardPage() {
   const allClusterNodes = nodesResource.data ?? []
   const clusterNodes = allClusterNodes.filter((node) => node.hidden_from_dashboard !== true)
   const hiddenNodeCount = allClusterNodes.length - clusterNodes.length
-  const pooled = clusterResourceSnapshot(allClusterNodes, stats)
+  const resourceCards = nodeResourceSnapshot(allClusterNodes, stats)
   const loading = [statsResource, admissionResource, deploymentsResource, syncResource, nodesResource]
     .some((item) => item.loading)
   const queueSummary = admission
@@ -363,7 +362,7 @@ export function DashboardPage() {
       <PageHeader
         eyebrow="Cluster command center"
         title="Dashboard"
-        description="Live pooled resource health and per-machine telemetry for the SparkDeck cluster."
+        description="Live resource usage for each cluster node and each GPU, with current inference activity."
         actions={
           <div className="dashboard-refresh">
             <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}${stream.live ? ' · live' : ''}` : statsResource.loading ? 'Loading local telemetry' : 'Telemetry unavailable'}</span>
@@ -375,25 +374,7 @@ export function DashboardPage() {
       {telemetryNotice && <p className="dashboard-stale" role="status">{telemetryNotice}</p>}
 
       <>
-          <section className="metric-grid" aria-label="System overview">
-            <Panel className="metric-panel">
-              <div className="metric-label"><Cpu size={16} /><span>Pooled CPU</span></div>
-              <strong>{displayValue(pooled.cpuPct, '%', 1)}</strong>
-              <p className="metric-context">{pooled.cpuNodes ? `${pooled.logicalProcessors ? `${pooled.logicalProcessors} logical processors · ` : ''}${pooled.cpuNodes} measured ${pooled.cpuNodes === 1 ? 'node' : 'nodes'}` : 'CPU telemetry unavailable'}</p>
-              <MetricBar value={pooled.cpuPct} label="Pooled CPU load" />
-            </Panel>
-            <Panel className="metric-panel">
-              <div className="metric-label"><Gauge size={16} /><span>Pooled GPU</span></div>
-              <strong>{displayValue(pooled.gpuPct, '%', 1)}</strong>
-              <p className="metric-context">{pooled.gpuCount ? `${pooled.gpuCount} ${pooled.gpuCount === 1 ? 'GPU' : 'GPUs'} across ${pooled.gpuNodes} ${pooled.gpuNodes === 1 ? 'node' : 'nodes'}${pooled.measuredGpus === pooled.gpuCount ? '' : ` · ${pooled.measuredGpus} measured`}` : 'GPU telemetry unavailable'}</p>
-              <MetricBar value={pooled.gpuPct} label="Pooled GPU utilization" />
-            </Panel>
-            <Panel className="metric-panel">
-              <div className="metric-label"><HardDrive size={16} /><span>Pooled RAM</span></div>
-              <strong>{pooled.ramTotal ? `${(pooled.ramUsed / 1024 ** 3).toFixed(1)} GB` : '—'}</strong>
-              <p className="metric-context">{pooled.ramTotal ? `of ${(pooled.ramTotal / 1024 ** 3).toFixed(1)} GB across ${pooled.ramNodes} ${pooled.ramNodes === 1 ? 'node' : 'nodes'}` : 'RAM telemetry unavailable'}</p>
-              <MetricBar value={pooled.ramPct} label="Pooled RAM allocation" />
-            </Panel>
+          <section className="dashboard-inference-overview" aria-label="Inference overview">
             <Panel className="metric-panel">
               <div className="metric-label"><Activity size={16} /><span>Inference</span></div>
               <strong>{inferenceAvailable ? runningSessions : '—'}</strong>
@@ -403,31 +384,13 @@ export function DashboardPage() {
           </section>
 
           <section className="cluster-health" aria-labelledby="cluster-health-title">
-            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{nodesResource.loading && !nodesResource.data ? 'Loading cluster inventory' : `${clusterNodes.filter((node) => node.online).length} of ${clusterNodes.length} visible nodes online · pooled above, telemetry per machine${hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}`}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
+            <div className="section-heading"><div><h2 id="cluster-health-title">Cluster nodes</h2><p>{nodesResource.loading && !nodesResource.data ? 'Loading cluster inventory' : `${clusterNodes.filter((node) => node.online).length} of ${clusterNodes.length} visible nodes online · resource usage per node and GPU${hiddenNodeCount ? ` · ${hiddenNodeCount} hidden` : ''}`}</p></div><Link className="text-link" to="/cluster">Manage cluster</Link></div>
             {nodesResource.error && nodesResource.data && <p className="dashboard-stale" role="status">Cluster inventory refresh paused: {nodesResource.error}</p>}
             <div className="cluster-health-grid">
               {nodesResource.loading && !nodesResource.data && <LoadingState label="Loading cluster nodes" />}
               {!nodesResource.loading && !clusterNodes.length && hiddenNodeCount > 0 && <EmptyState title="No nodes shown on the dashboard" description="Use Manage cluster to show a hidden machine." action={<Link className="button button-primary" to="/cluster">Manage cluster</Link>} />}
               {!nodesResource.loading && !clusterNodes.length && hiddenNodeCount === 0 && <EmptyState title="Cluster inventory unavailable" description="Refresh to retry loading per-machine telemetry." />}
-              {clusterNodes.map((node) => {
-                const nodeStats = node.stats
-                const nodeGpu = nodeStats?.gpus?.find((item) => !item.error)
-                const gpuName = gpuDisplayName(nodeGpu?.name)
-                const sparkSoc = gpuName === 'GB10'
-                const nodeMemory = memorySnapshot(nodeStats)
-                const sessions = Object.values(nodeStats?.active_requests ?? {}).reduce((sum, request) => sum + (request.connections ?? 0), 0)
-                return <Panel className="cluster-health-card" key={node.id}>
-                  <div className="cluster-health-heading"><div><Server size={16} /><div><h3>{node.name}</h3><p>{node.local ? 'Current entry node' : node.id}</p></div></div><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div>
-                  {node.online ? <dl>
-                    {!sparkSoc && <div><dt>CPU</dt><dd>{nodeStats?.cpu_model || '—'}</dd></div>}
-                    <div><dt>GPU</dt><dd>{gpuName ?? '—'}</dd></div>
-                    <div><dt>CPU temp</dt><dd className={temperatureTone(nodeStats?.cpu_temp_c)}>{displayValue(nodeStats?.cpu_temp_c, '°C', 1)}</dd></div>
-                    <div><dt>GPU temp</dt><dd className={temperatureTone(nodeGpu?.temp)}>{displayValue(nodeGpu?.temp, '°C', 1)}</dd></div>
-                    <div><dt>{nodeMemory?.label ?? 'Memory'}</dt><dd>{nodeMemory ? `${nodeMemory.used.toFixed(1)} / ${nodeMemory.total.toFixed(1)} GB` : '—'}</dd></div>
-                    <div><dt>Sessions</dt><dd>{sessions}</dd></div>
-                  </dl> : <p className="cluster-health-offline">Telemetry unavailable while this node is offline.</p>}
-                </Panel>
-              })}
+              {resourceCards.map(({ node, stats: nodeStats, fallback, source }) => <NodeResourceCard key={node.id} node={node} stats={nodeStats} fallback={fallback} now={telemetryNow} refreshPaused={Boolean(source === 'stats' ? statsResource.error : nodesResource.error)} />)}
             </div>
           </section>
 

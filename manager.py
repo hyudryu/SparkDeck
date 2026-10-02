@@ -3120,6 +3120,10 @@ class Manager:
                     raise RuntimeError("Hugging Face reported an empty model repository")
             except (ValueError, RuntimeError) as exc:
                 download_error = str(exc)
+                # An explicit commit needs no Hub lookup to identify cached
+                # weights. Download eligibility still requires Hub metadata.
+                if IMMUTABLE_HF_REVISION.fullmatch(required_revision):
+                    resolved_revision = required_revision
         for job, job_revision in active_candidates:
             if (
                 resolved_revision

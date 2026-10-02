@@ -172,6 +172,104 @@ class MCPModelDownloadTests(unittest.IsolatedAsyncioTestCase):
             preparation.assert_not_awaited()
             nas.queue_download_and_transfer.assert_not_awaited()
 
+    async def test_immutable_cached_peer_works_when_real_preflight_hub_lookup_fails(self):
+        model, sha = "org/model", "a" * 40
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.virtual_nas = VirtualNAS.__new__(VirtualNAS)
+        nas = manager.virtual_nas
+        nas.jobs = []
+        nas._enabled_provider = lambda: True
+        nas._queue_lock = asyncio.Lock()
+        nas._validate_online_node = AsyncMock(return_value={"online": True})
+        cached = {"model_id": model, "revision": sha, "revisions": [sha], "size_bytes": 100}
+        nas._node_storage = AsyncMock(side_effect=lambda node: {
+            "models": [cached] if node == "spark" else [], "free_size": 100_000_000_000,
+        })
+        nas._save = Mock()
+        nas.start = Mock()
+        nas._wake = asyncio.Event()
+        nas.resolve_download_revision = AsyncMock(side_effect=RuntimeError("Hub metadata unavailable"))
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "spark", "online": True, "models": [cached], "cache_free_size": 100_000_000_000},
+            {"id": "ws1", "online": True, "models": [], "cache_free_size": 100_000_000_000},
+        ])
+        manager.virtual_nas_transfers = lambda: {"items": list(nas.jobs)}
+        manager._public_virtual_nas_job = lambda job: dict(job)
+        client = ControllerClient()
+        preparation = AsyncMock()
+        transfer = AsyncMock(wraps=manager.queue_virtual_nas_transfer)
+        preflights = []
+        async def request(_method, _path, *, json_body, **_kwargs):
+            preflight = await manager.virtual_nas_transfer_preflight(**json_body)
+            preflights.append(preflight)
+            return preflight
+        async def queue_transfer(model, source, targets, *, revision):
+            return await transfer(model, source, targets, revision)
+        with (
+            patch.object(client, "_request", AsyncMock(side_effect=request)),
+            patch.object(client, "storage", AsyncMock(side_effect=lambda: {"jobs": list(nas.jobs)})),
+            patch.object(client, "transfer_storage_weights", AsyncMock(side_effect=queue_transfer)),
+            patch.object(client, "pull_storage_weights", preparation),
+        ):
+            result = await client.download_huggingface_model(model, "ws1", revision=sha)
+        preparation.assert_not_awaited()
+        self.assertEqual(preflights[0]["resolved_revision"], sha)
+        self.assertEqual(preflights[0]["download_error"], "Hub metadata unavailable")
+        destination = next(item for item in preflights[0]["targets"] if item["node_id"] == "ws1")
+        self.assertTrue(destination["eligible"])
+        self.assertFalse(destination["download_eligible"])
+        self.assertEqual(result["job_ids"], [nas.jobs[0]["id"]])
+        self.assertEqual(len(nas.jobs), 1)
+        self.assertEqual(nas.jobs[0]["revision"], sha)
+        self.assertEqual(nas.jobs[0]["source_node_id"], "spark")
+        transfer.assert_awaited_once_with(model, "spark", ["ws1"], sha)
+        # Failed metadata resolution must never infer a moving branch's commit.
+        branch = await manager.virtual_nas_transfer_preflight(model, "main")
+        self.assertIsNone(branch["resolved_revision"])
+        self.assertEqual(branch["sources"], [])
+        self.assertFalse(branch["targets"][1]["eligible"])
+
+    async def test_existing_resume_or_multinode_download_is_reused(self):
+        model, sha = "org/model", "a" * 40
+        client = ControllerClient()
+        for status, workflow in [("running", {}), ("queued", {"workflow_id": "other-workflow",
+                                                           "workflow_node_ids": ["ws1", "spark"]})]:
+            with self.subTest(status=status, workflow=workflow):
+                job = {"id": "existing-download", "kind": "download", "status": status,
+                       "model_id": model, "revision": sha, "target_node_id": "ws1", **workflow}
+                preflight = {"resolved_revision": sha, "sources": [],
+                             "targets": [{"node_id": "ws1", "has_model_cache": True,
+                                          "has_preparation_conflict": True}]}
+                with (
+                    patch.object(client, "_request", AsyncMock(return_value=preflight)),
+                    patch.object(client, "storage", AsyncMock(return_value={"jobs": [job]})),
+                    patch.object(client, "pull_storage_weights", AsyncMock()) as preparation,
+                    patch.object(client, "transfer_storage_weights", AsyncMock()) as transfer,
+                ):
+                    result = await client.download_huggingface_model(model, "ws1")
+                self.assertEqual(result, {"job_ids": [job["id"]], "jobs": [job]})
+                preparation.assert_not_awaited()
+                transfer.assert_not_awaited()
+
+    async def test_unrelated_or_finished_download_is_not_adopted(self):
+        client = ControllerClient()
+        model, sha = "org/model", "a" * 40
+        for mismatch in [{"model_id": "other/model"}, {"revision": "b" * 40},
+                         {"target_node_id": "other-node"}, {"status": "completed"},
+                         {"kind": "delete"}]:
+            with self.subTest(mismatch=mismatch):
+                job = {"id": "unrelated-job", "kind": "download", "status": "running",
+                       "model_id": model, "revision": sha, "target_node_id": "ws1", **mismatch}
+                with (
+                    patch.object(client, "_request", AsyncMock(return_value={"resolved_revision": sha})),
+                    patch.object(client, "storage", AsyncMock(return_value={"jobs": [job]})),
+                    patch.object(client, "pull_storage_weights", AsyncMock(return_value={"job_ids": ["new"]})) as preparation,
+                ):
+                    result = await client.download_huggingface_model(model, "ws1")
+                self.assertEqual(result["job_ids"], ["new"])
+                preparation.assert_awaited_once()
+
     async def test_transfer_capacity_block_falls_back_to_destination_download(self):
         client = ControllerClient()
         preflight = {"resolved_revision": "a" * 40,

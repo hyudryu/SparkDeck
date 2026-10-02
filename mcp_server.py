@@ -487,19 +487,19 @@ class ControllerClient:
         if not target.get("has_required_weights") and re.fullmatch(r"[0-9a-f]{40}", str(resolved_revision or "")):
             # A branch request can classify our SHA-pinned workflow as a
             # conflict rather than active_job_id. Inspect exact tracked jobs.
-            async def matching_active_transfer() -> dict[str, Any] | None:
+            async def matching_active_job() -> dict[str, Any] | None:
                 for active in (await self.storage()).get("jobs", []):
                     if (
                         active.get("model_id") == model
                         and active.get("revision") == resolved_revision
                         and active.get("status") in {"queued", "running"}
-                        and active.get("kind") == "transfer"
+                        and active.get("kind") in {"transfer", "download"}
                         and active.get("target_node_id") == node
                     ):
                         return {"job_ids": [active["id"]], "jobs": [active]}
                 return None
 
-            active_result = await matching_active_transfer()
+            active_result = await matching_active_job()
             if active_result:
                 return active_result
             source = next((item for item in preflight.get("sources", [])
@@ -511,8 +511,8 @@ class ControllerClient:
                     )
                 except ControllerError:
                     # Another request can win the queue lock after both read
-                    # an empty job list. Reuse only its exact active transfer.
-                    active_result = await matching_active_transfer()
+                    # an empty job list. Reuse only its exact active preparation.
+                    active_result = await matching_active_job()
                     if active_result:
                         return active_result
                     raise

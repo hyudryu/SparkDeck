@@ -220,10 +220,16 @@ def partial_download_size_bytes(
 
 
 def download_required_free_bytes(expected_bytes: int, cached_bytes: int = 0) -> int:
-    """Return staging capacity needed after accounting for reusable cache data."""
+    """Return staging capacity needed after accounting for reusable cache data.
+
+    Hub downloads stream straight into the cache filesystem (hf-xet >= 1.2
+    no longer stages a separate chunk cache; older versions LRU-evict one
+    bounded near 10 GiB), so only the download itself plus bounded staging
+    metadata must fit.
+    """
     expected = _nonnegative_int(expected_bytes)
     cached = min(expected, _nonnegative_int(cached_bytes))
-    return expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+    return expected + DOWNLOAD_STAGING_RESERVE_BYTES - cached
 
 
 def transfer_required_free_bytes(expected_bytes: int) -> int:

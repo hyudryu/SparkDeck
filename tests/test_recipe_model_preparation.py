@@ -62,7 +62,7 @@ def preparation_preflight(
         "download": {
             "size_bytes": MODEL_BYTES,
             "required_free_bytes": (
-                MODEL_BYTES * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+                MODEL_BYTES + DOWNLOAD_STAGING_RESERVE_BYTES
             ),
         },
         "download_error": None,
@@ -205,7 +205,7 @@ class RecipePreparationPlanningTests(unittest.IsolatedAsyncioTestCase):
         preflight["targets"][1]["download_reason"] = "Node cannot download from Hugging Face"
         preflight["download"] = {
             "size_bytes": MODEL_BYTES,
-            "required_free_bytes": MODEL_BYTES * 2 + 1,
+            "required_free_bytes": MODEL_BYTES + 1,
         }
         manager = planning_manager(preflight)
 
@@ -736,7 +736,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 target_node_id="seed", bytes_total=1,
             )
             nas.jobs = [job]
-            required = MODEL_BYTES * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+            required = MODEL_BYTES + DOWNLOAD_STAGING_RESERVE_BYTES
             nas.estimate_download_size = AsyncMock(return_value=MODEL_BYTES)
             nas._node_storage = AsyncMock(return_value={
                 "models": [], "free_size": required - 1,
@@ -760,7 +760,7 @@ class RecipePreparationExecutionTests(unittest.IsolatedAsyncioTestCase):
                 lambda: True,
             )
             cached = 25
-            required = MODEL_BYTES * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+            required = MODEL_BYTES + DOWNLOAD_STAGING_RESERVE_BYTES - cached
             job = queued_job(
                 kind="download", source_node_id="huggingface",
                 target_node_id="seed", bytes_total=MODEL_BYTES,

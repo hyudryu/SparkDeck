@@ -499,7 +499,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 Path(directory), lambda: hub, FakeRegistry(), lambda: True,
             )
             selected_required = (
-                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES
+                selected_size + DOWNLOAD_STAGING_RESERVE_BYTES
             )
             nas.free_bytes = Mock(return_value=selected_required)
 
@@ -584,7 +584,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 Path(directory), lambda: hub, FakeRegistry(), lambda: True,
             )
             nas.free_bytes = Mock(return_value=(
-                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+                selected_size + DOWNLOAD_STAGING_RESERVE_BYTES - 3
             ))
 
             with patch.dict("sys.modules", {"huggingface_hub": huggingface_hub}):
@@ -669,7 +669,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 Path(directory), lambda: hub, FakeRegistry(), lambda: True,
             )
             nas.free_bytes = Mock(return_value=(
-                selected_size * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - 3
+                selected_size + DOWNLOAD_STAGING_RESERVE_BYTES - 3
             ))
 
             with (
@@ -3349,7 +3349,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_queue_capacity_uses_attempt_baseline_credit(self):
         expected = 100
         cached = 25
-        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        required = expected + DOWNLOAD_STAGING_RESERVE_BYTES - cached
         for free_bytes, succeeds in ((required, True), (required - 1, False)):
             with self.subTest(free_bytes=free_bytes), tempfile.TemporaryDirectory() as directory:
                 nas = VirtualNAS(
@@ -3387,7 +3387,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_resume_capacity_uses_attempt_baseline_credit(self):
         expected = 100
         cached = 25
-        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        required = expected + DOWNLOAD_STAGING_RESERVE_BYTES - cached
         for free_bytes, succeeds in ((required, True), (required - 1, False)):
             with self.subTest(free_bytes=free_bytes), tempfile.TemporaryDirectory() as directory:
                 nas = VirtualNAS(
@@ -3707,7 +3707,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager.settings = {"virtual_nas_enabled": True}
         cached = 25
         expected = 100
-        required = expected * 2 + DOWNLOAD_STAGING_RESERVE_BYTES - cached
+        required = expected + DOWNLOAD_STAGING_RESERVE_BYTES - cached
         manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "worker-a", "name": "Worker", "online": True,
             "cache_free_size": required,

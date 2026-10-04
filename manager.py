@@ -3005,9 +3005,19 @@ class Manager:
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
     async def node_supports_selective_downloads(self, node_id: str) -> bool:
+        """Report whether one node's live agent advertises selective downloads.
+
+        Capability advertisements only exist in the agent's health response;
+        the persisted pairing record never carries them, so the check must
+        read the probed status cluster_nodes assembles. Probes are cached for
+        a few seconds, so callers checking several nodes share one round trip.
+        """
         if node_id == LOCAL_NODE_ID:
             return True
-        node = self.node_registry.get(node_id)
+        node = next((
+            item for item in await self.cluster_nodes()
+            if item.get("id") == node_id
+        ), None)
         if node is None:
             return False
         return VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY in (node.get("capabilities") or [])

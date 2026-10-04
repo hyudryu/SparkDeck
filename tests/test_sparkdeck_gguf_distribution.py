@@ -9,7 +9,11 @@ import httpx
 
 from manager import Manager
 from sparkdeck.service import SparkDeckService
-from sparkdeck.virtual_nas import VirtualNAS, _is_complete_repository
+from sparkdeck.virtual_nas import (
+    VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+    VirtualNAS,
+    _is_complete_repository,
+)
 
 
 class FakeManager:
@@ -166,9 +170,11 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
         manager = Manager.__new__(Manager)
         manager.virtual_nas = self.nas
         manager.node_registry = Mock()
-        manager.node_registry.get = Mock(return_value={
-            "id": "worker-1", "capabilities": ["virtual-nas-files-download-v1"],
-        })
+        manager.node_registry.get = Mock(return_value={"id": "worker-1"})
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": ["virtual-nas-files-download-v1"],
+        }])
         manager.node_registry.request = AsyncMock(return_value={"ok": True})
         manager._resolved_hf_token = Mock(return_value="hf-controller-token")
 
@@ -185,9 +191,11 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
         manager = Manager.__new__(Manager)
         manager.virtual_nas = self.nas
         manager.node_registry = Mock()
-        manager.node_registry.get.return_value = {
-            "id": "worker-1", "capabilities": ["virtual-nas-files-download-v1"],
-        }
+        manager.node_registry.get.return_value = {"id": "worker-1"}
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": ["virtual-nas-files-download-v1"],
+        }])
         manager.node_registry.request = request
         manager._resolved_hf_token = Mock(return_value=None)
         return manager
@@ -238,9 +246,10 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_remote_seed_without_capability_fails_instead_of_whole_repo(self):
         manager = Manager.__new__(Manager)
         manager.node_registry = Mock()
-        manager.node_registry.get = Mock(return_value={
-            "id": "worker-1", "capabilities": [],
-        })
+        manager.node_registry.get = Mock(return_value={"id": "worker-1"})
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True, "capabilities": [],
+        }])
 
         with self.assertRaisesRegex(RuntimeError, "does not support selective"):
             await manager.node_download_model_files(
@@ -586,6 +595,48 @@ class LlamaCppHomesContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(homes, ["local", "worker-1", "worker-2"])
         self.assertEqual(seed, "worker-2")
+
+
+class SelectiveDownloadCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    """Capability support must come from the live agent advertisement.
+
+    The persisted pairing record never carries a capabilities field, so a
+    check that reads it would reject every remote agent that supports
+    selective downloads, including freshly updated ones.
+    """
+
+    def _manager(self, cluster_nodes):
+        manager = Manager.__new__(Manager)
+        manager.cluster_nodes = AsyncMock(return_value=cluster_nodes)
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {"id": "worker-1"}
+        return manager
+
+    async def test_advertised_capability_passes_despite_stale_pairing_record(self):
+        manager = self._manager([{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY],
+        }])
+
+        self.assertTrue(await manager.node_supports_selective_downloads("worker-1"))
+        manager.node_registry.get.assert_not_called()
+
+    async def test_unadvertised_capability_fails(self):
+        manager = self._manager([{
+            "id": "worker-1", "online": True, "capabilities": [],
+        }])
+
+        self.assertFalse(await manager.node_supports_selective_downloads("worker-1"))
+
+    async def test_unknown_node_fails(self):
+        manager = self._manager([])
+
+        self.assertFalse(await manager.node_supports_selective_downloads("worker-1"))
+
+    async def test_local_node_always_supported(self):
+        manager = self._manager([])
+
+        self.assertTrue(await manager.node_supports_selective_downloads("local"))
 
 
 if __name__ == "__main__":

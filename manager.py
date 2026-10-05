@@ -2976,8 +2976,13 @@ class Manager:
         resolution = recovered_resolution or await self.virtual_nas.resolve_download_revision(
             model_id, requested_revision,
         )
+        resolved_revision = str(resolution.get("resolved_revision") or "")
+        selective_resume = await self._selective_resume_files(
+            model_id, node_id, resolved_revision,
+        )
         preflight = await self.virtual_nas_transfer_preflight(
             model_id, requested_revision, resolution,
+            files=selective_resume,
         )
         target = next((
             item for item in preflight["targets"] if item["node_id"] == node_id
@@ -2990,6 +2995,28 @@ class Manager:
             raise RuntimeError(
                 str(target.get("download_reason") or "node is not eligible for download")
             )
+        if selective_resume:
+            # A selected-quantization partial resumes file-scoped: the Hub is
+            # never asked for the repository's other quantizations, so
+            # whole-repository transfer jobs would both mis-gate capacity and
+            # mis-track progress. The agent-side download credits incomplete
+            # blobs, so this continues where the earlier attempt stopped.
+            async def _resume_selective() -> None:
+                try:
+                    await self.node_download_model_files(
+                        node_id, model_id, resolved_revision, selective_resume,
+                        requested_revision=requested_revision,
+                    )
+                except Exception:
+                    logger.exception(
+                        "selective resume of %s on %s failed", model_id, node_id,
+                    )
+            asyncio.create_task(_resume_selective())
+            return {
+                "job_ids": [], "jobs": [],
+                "resumed_files": selective_resume,
+                "resolved_revision": resolved_revision,
+            }
         result = await self.virtual_nas.queue_download_and_transfer(
             model_id,
             preflight["resolved_revision"],
@@ -3004,6 +3031,27 @@ class Manager:
         )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
+
+    async def _selective_resume_files(
+        self, model_id: str, node_id: str, resolved_revision: str,
+    ) -> list[str] | None:
+        """Return the selected file set of a selective partial cache, if any."""
+        nodes = await self.model_cache_inventory()
+        entry = next((
+            item for item in nodes if str(item.get("id")) == node_id
+        ), None)
+        model = next((
+            item for item in (entry or {}).get("models", [])
+            if item.get("model_id") == model_id
+        ), None)
+        selective = (model or {}).get("selective_files_by_revision")
+        if not isinstance(selective, dict):
+            return None
+        files = selective.get(resolved_revision)
+        if not isinstance(files, list):
+            return None
+        cleaned = [str(value) for value in files if isinstance(value, str) and value]
+        return cleaned or None
 
     async def node_supports_selective_downloads(self, node_id: str) -> bool:
         """Report whether one node's live agent advertises selective downloads.

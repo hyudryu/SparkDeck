@@ -348,7 +348,9 @@ export function StoragePage() {
         const currentIds = new Set(current.map((job) => job.id))
         return [...current, ...(result.jobs ?? []).filter((job) => !currentIds.has(job.id))]
       })
-      setNotice(`Queued ${model.model_id} to finish downloading on ${node.name}.`)
+      setNotice(result.resumed_files
+        ? `Resumed ${model.model_id} on ${node.name} for its ${result.resumed_files.length} selected file${result.resumed_files.length === 1 ? '' : 's'}. Selective downloads run directly on the node and never appear as queue jobs; watch the partial size grow below.`
+        : `Queued ${model.model_id} to finish downloading on ${node.name}.`)
       resource.reload()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not finish model download')

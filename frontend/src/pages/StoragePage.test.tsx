@@ -438,6 +438,42 @@ describe('StoragePage', () => {
     expect(screen.getByRole('option', { name: 'org/partial-model' })).toBeInTheDocument()
   })
 
+  it('reports selective resumes as on-node downloads instead of queue jobs', async () => {
+    const user = userEvent.setup()
+    const storage: StorageState = {
+      ...enabledStorage,
+      nodes: enabledStorage.nodes.map((node) => node.id === 'node-a'
+        ? {
+            ...node,
+            models: [
+              ...node.models,
+              { model_id: 'org/partial-gguf', size_bytes: 400_000_000, partial: true },
+            ],
+          }
+        : node),
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/nodes/node-a/models/org%2Fpartial-gguf/download') && init?.method === 'POST') {
+        return json({
+          job_ids: [], jobs: [], resumed_files: ['Q4_K_M/a.gguf', 'Q4_K_M/b.gguf'],
+          resolved_revision: 'a'.repeat(40),
+        }, 202)
+      }
+      return json(storage)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<StoragePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Finish download of org/partial-gguf on Studio Spark' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-gguf?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Finish download' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Resumed org/partial-gguf on Studio Spark for its 2 selected files. Selective downloads run directly on the node and never appear as queue jobs',
+    )
+  })
+
   it('supports drag transfer, per-node deletion, and queue cancellation', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)

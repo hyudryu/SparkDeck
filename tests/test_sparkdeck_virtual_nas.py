@@ -4141,6 +4141,9 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager = Manager.__new__(Manager)
         manager.settings = {}
         manager.node_registry = FakeRegistry()
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "worker-a", "models": []},
+        ])
         manager.virtual_nas = Mock()
         manager.virtual_nas.list_transfers.return_value = {"items": [
             {
@@ -4212,6 +4215,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
                 "resume_node_id": "worker-a",
                 "download_cache_baseline_bytes": 3,
             },
+            files=None,
         )
 
         manager.virtual_nas_transfer_preflight.return_value = {
@@ -4286,11 +4290,69 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         }
         manager.virtual_nas_transfer_preflight.assert_awaited_once_with(
             "org/model", "release-gguf", pinned_resolution,
+            files=None,
         )
         manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
             "org/model", RESOLVED_REVISION, "local", [], 100,
             requested_revision="release-gguf", require_partial_cache=True,
             download_cache_baseline_bytes=None,
+        )
+
+    async def test_finish_resumes_selective_partial_file_scoped(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        expected = 100
+        cached = 5
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": []}
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 10 * expected,
+        })
+        manager.virtual_nas.estimate_download_size = AsyncMock(
+            return_value=10 * expected,
+        )
+        manager.virtual_nas.estimate_selected_files_size = AsyncMock(
+            return_value=expected,
+        )
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock()
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "local", "name": "Controller", "online": True,
+            "cache_free_size": expected + DOWNLOAD_STAGING_RESERVE_BYTES,
+            "virtual_nas_download_capable": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": cached,
+                "partial": True, "has_partial_download": True,
+                "revision": "main",
+                "partial_revision_refs": {"main": RESOLVED_REVISION},
+                "partial_revisions": [RESOLVED_REVISION],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: cached},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["UD/model-00001-of-00002.gguf"],
+                },
+            }],
+        }])
+        manager.node_download_model_files = AsyncMock(return_value={"ok": True})
+
+        result = await manager.queue_virtual_nas_download("org/model", "local")
+
+        self.assertEqual(
+            result["resumed_files"], ["UD/model-00001-of-00002.gguf"],
+        )
+        # The gate charges only the selected files minus the cached partial,
+        # never the whole multi-quantization repository.
+        manager.virtual_nas.estimate_selected_files_size.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, ["UD/model-00001-of-00002.gguf"],
+        )
+        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
+        for _ in range(100):
+            if manager.node_download_model_files.await_count:
+                break
+            await asyncio.sleep(0.01)
+        manager.node_download_model_files.assert_awaited_once_with(
+            "local", "org/model", RESOLVED_REVISION,
+            ["UD/model-00001-of-00002.gguf"], requested_revision="main",
         )
 
     async def test_resume_preflight_credits_only_bytes_after_attempt_baseline(self):

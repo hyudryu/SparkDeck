@@ -383,11 +383,14 @@ The MCP server exposes the same guarded Storage operations as the app:
 
 - `list_storage_weights` shows which model weights and revisions are present on each node;
 - `pull_storage_weights` downloads a model once and fans it out to selected nodes when needed;
+- `download_huggingface_model` queues a Hugging Face repository on one explicit node, using the same tracked jobs shown in Storage;
 - `transfer_storage_weights` starts an explicit source-to-target Virtual NAS copy;
 - `list_storage_transfers` and `get_storage_transfer` report download/copy progress, live rate, receiver phase, completion, and errors; and
 - `delete_storage_weights` removes one exact node/model copy only when `confirm=true`.
 
 Storage mutations require Virtual NAS to be enabled and retain the controller's node, revision, online-state, capacity, partial-cache, active-transfer, and in-use checks. The MCP responses use the public Storage payload and never include cache paths, paired-node credentials, or Hugging Face tokens. ComfyUI weights listed in Storage can be deleted in place; recognized complete bundles can also be transferred.
+
+For example, call `download_huggingface_model` with `model_id="nvidia/Qwen3.8-27B-NVFP4"`, the destination's stable `node_id` from `list_storage_weights`, and `revision="main"` (or a tag/commit). The app resolves the revision, checks disk capacity, and queues a resumable download or reuses a complete cached copy. Track each returned `job_ids` entry with `get_storage_transfer`; its progress, live rate, and errors also appear in Storage. A response with `plan.action="ready"` and no jobs means the requested revision is already available. Repeating an active request returns the existing job IDs. Peer transfers and active retries may omit `plan` and `workflow_id`. The MCP call queues work rather than waiting for the model files to finish downloading.
 
 MCP-created deployments are stamped with `managed_by=sparkdeck-mcp` so the app can show where a deployment came from. That marker is informational and never gates a tool: the MCP server can start, stop, reconfigure, and remove any deployment in the catalog, including deployments created in the app or by an older release.
 

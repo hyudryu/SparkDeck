@@ -1017,6 +1017,8 @@ export interface StorageTransferResult {
     download_node_id: string
     status: string
   } | null
+  resumed_files?: string[]
+  resolved_revision?: string
 }
 
 export interface RecipePreparationResult extends StorageTransferResult {

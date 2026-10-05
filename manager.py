@@ -3090,8 +3090,14 @@ class Manager:
     async def virtual_nas_transfer_preflight(
         self, model_id: str, revision: str | None = None,
         resolved_download: dict | None = None,
+        files: list[str] | None = None,
     ) -> dict:
-        """Return authoritative recipe-transfer choices without exposing paths."""
+        """Return authoritative recipe-transfer choices without exposing paths.
+
+        ``files`` narrows the pull to a selected file set (a GGUF quantization),
+        so capacity gates charge exactly what will be downloaded instead of the
+        whole repository.
+        """
         model_id = validate_model_id(model_id)
         required_revision = validate_revision(revision)
         nodes = await self.model_cache_inventory()
@@ -3127,7 +3133,12 @@ class Manager:
                 resolved_revision = validate_revision(
                     resolution.get("resolved_revision")
                 )
-                download_size = self._byte_count(resolution.get("size_bytes"))
+                if files:
+                    download_size = await self.virtual_nas.estimate_selected_files_size(
+                        model_id, resolved_revision, files,
+                    )
+                else:
+                    download_size = self._byte_count(resolution.get("size_bytes"))
                 if not download_size:
                     raise RuntimeError("Hugging Face reported an empty model repository")
             except (ValueError, RuntimeError) as exc:
@@ -3345,6 +3356,7 @@ class Manager:
         self, model_id: str, revision: str | None, node_ids: list[str],
         resolved_download: dict | None = None,
         download_node_id: str | None = None,
+        files: list[str] | None = None,
     ) -> dict:
         """Plan one selected-set preparation without mutating cluster state."""
         selected_ids = list(dict.fromkeys(str(value).strip() for value in node_ids if str(value).strip()))
@@ -3358,7 +3370,7 @@ class Manager:
                 "download_node_id must be one of the selected nodes"
             )
         preflight = await self.virtual_nas_transfer_preflight(
-            model_id, revision, resolved_download,
+            model_id, revision, resolved_download, files=files,
         )
         options = {item["node_id"]: item for item in preflight["targets"]}
         unknown = [node_id for node_id in selected_ids if node_id not in options]

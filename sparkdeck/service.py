@@ -2982,6 +2982,37 @@ class SparkDeckService:
             raise ValueError("download_node_id must be one of the selected nodes")
         return list(requested_node_ids), requested_seed
 
+    def public_gguf_pull_files(self, repository: str, artifact: str) -> list[str]:
+        """Return the expanded repo-relative file set for one GGUF artifact.
+
+        Pure validation and shard expansion: no Hub traffic, so request
+        handlers can resolve the download set before any gate runs.
+        """
+        relative = self._validate_public_gguf_artifact(repository, artifact, None)
+        return self._expand_gguf_shard_files(relative)
+
+    async def distribute_gguf_pull(
+        self, repository: str, artifact: str, revision: str,
+        node_ids: list[str], download_node_id: str | None = None,
+    ) -> dict:
+        """Pull one GGUF artifact: seed it from the Hub, fan out file-scoped.
+
+        Intended for catalog pulls of a single quantization, where downloading
+        every quantization in the repository is never the intent. Long-running
+        by design; callers run it detached from the request.
+        """
+        files = self.public_gguf_pull_files(repository, artifact)
+        resolved_revision = await self._resolved_model_revision(repository, revision)
+        await self._distribute_gguf_artifact(
+            repository, resolved_revision, files,
+            node_ids, download_node_id, revision,
+        )
+        return {
+            "model_id": repository, "artifact": artifact, "files": files,
+            "resolved_revision": resolved_revision, "node_ids": list(node_ids),
+            "download_node_id": download_node_id, "status": "complete",
+        }
+
     async def _prepare_public_gguf_artifact(
         self, repository: str, artifact: str, revision: str,
         quantization: str | None,

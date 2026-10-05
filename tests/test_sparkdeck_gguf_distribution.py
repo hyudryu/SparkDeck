@@ -81,6 +81,28 @@ class GgufDistributionTests(unittest.IsolatedAsyncioTestCase):
             ["UD/model-Q8.gguf"], "release-gguf",
         )
 
+    async def test_distribute_gguf_pull_expands_shards_for_selected_artifact(self):
+        self.service._distribute_gguf_artifact = AsyncMock()
+
+        result = await self.service.distribute_gguf_pull(
+            "org/model", "UD/model-Q8-00001-of-00002.gguf", "release-gguf",
+            ["local", "worker-1"], "local",
+        )
+
+        self.service._distribute_gguf_artifact.assert_awaited_once_with(
+            "org/model", self.revision,
+            [
+                "UD/model-Q8-00001-of-00002.gguf",
+                "UD/model-Q8-00002-of-00002.gguf",
+            ],
+            ["local", "worker-1"], "local", "release-gguf",
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["files"], [
+            "UD/model-Q8-00001-of-00002.gguf",
+            "UD/model-Q8-00002-of-00002.gguf",
+        ])
+
     async def test_existing_remote_copy_streams_to_the_controller_without_hub(self):
         self.manager.node_has_model_files = AsyncMock(
             side_effect=lambda node_id, *args, **kwargs: node_id == "worker-1"

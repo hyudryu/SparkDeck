@@ -271,7 +271,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["targets"][0]["eligible"])
-        preflight.assert_awaited_once_with("org/model", "main")
+        preflight.assert_awaited_once_with("org/model", "main", files=None)
 
     async def test_recipe_preparation_derives_model_contract_and_rejects_duplicate_nodes(self):
         recipe = {

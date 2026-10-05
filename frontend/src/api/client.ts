@@ -929,9 +929,9 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ enabled }),
     }),
-    preflight: (modelId: string, revision = 'main', signal?: AbortSignal) => request<StorageTransferPreflight>('/api/v1/storage/transfers/preflight', {
+    preflight: (modelId: string, revision = 'main', signal?: AbortSignal, artifact?: string) => request<StorageTransferPreflight>('/api/v1/storage/transfers/preflight', {
       method: 'POST',
-      body: JSON.stringify({ model_id: modelId, revision }),
+      body: JSON.stringify({ model_id: modelId, revision, artifact: artifact || undefined }),
       signal,
     }),
     transfer: (input: CreateStorageTransferInput) => request<StorageTransferResult>('/api/v1/storage/transfers', {
@@ -954,22 +954,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ node_ids: nodeIds, download_node_id: downloadNodeId || undefined }),
     }, NO_REQUEST_TIMEOUT),
-    preparationPreflightModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationPlan>('/api/v1/storage/preparations/preflight', {
+    preparationPreflightModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string, artifact?: string) => request<RecipePreparationPlan>('/api/v1/storage/preparations/preflight', {
       method: 'POST',
       body: JSON.stringify({
         model_id: modelId,
         revision: revision || undefined,
         node_ids: nodeIds,
         download_node_id: downloadNodeId || undefined,
+        artifact: artifact || undefined,
       }),
     }),
-    prepareModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string) => request<RecipePreparationResult>('/api/v1/storage/preparations', {
+    prepareModel: (modelId: string, revision: string | undefined, nodeIds: string[], downloadNodeId?: string, artifact?: string) => request<RecipePreparationResult>('/api/v1/storage/preparations', {
       method: 'POST',
       body: JSON.stringify({
         model_id: modelId,
         revision: revision || undefined,
         node_ids: nodeIds,
         download_node_id: downloadNodeId || undefined,
+        artifact: artifact || undefined,
       }),
     }, NO_REQUEST_TIMEOUT),
     cancel: (id: string) => request<StorageTransferJob | undefined>(`/api/v1/storage/transfers/${encodeURIComponent(id)}`, {

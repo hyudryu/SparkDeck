@@ -477,7 +477,7 @@ export function ExplorePage() {
   const [fitsOnly, setFitsOnly] = useState(false)
   const [communityLimit, setCommunityLimit] = useState(COMMUNITY_PAGE_SIZE)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
-  const [pullSelection, setPullSelection] = useState<{ model: DisplayCatalogModel; nodeIds: string[] }>()
+  const [pullSelection, setPullSelection] = useState<{ model: DisplayCatalogModel; nodeIds: string[]; artifact?: string }>()
   const [pullBusy, setPullBusy] = useState(false)
   const [pullError, setPullError] = useState<string>()
   const [pullNotice, setPullNotice] = useState<string>()
@@ -606,15 +606,24 @@ export function ExplorePage() {
     return next
   })
 
+  const pullArtifactOptions = pullSelection
+    ? ggufArtifactOptions(pullSelection.model.quantizations ?? EMPTY_QUANTIZATIONS)
+    : []
+
   const openPull = (model: DisplayCatalogModel) => {
     const firstNode = (nodes.data ?? []).find(isNodeSelectable)
+    const [firstArtifact] = ggufArtifactOptions(model.quantizations ?? EMPTY_QUANTIZATIONS)
     setPullError(undefined)
-    setPullSelection({ model, nodeIds: firstNode ? [firstNode.id] : [] })
+    setPullSelection({
+      model,
+      nodeIds: firstNode ? [firstNode.id] : [],
+      artifact: firstArtifact?.filename,
+    })
   }
 
   const pullWeights = async () => {
     if (!pullSelection?.nodeIds.length) return
-    const { model, nodeIds } = pullSelection
+    const { model, nodeIds, artifact } = pullSelection
     setPullBusy(true)
     setPullError(undefined)
     setPullNotice(undefined)
@@ -624,11 +633,14 @@ export function ExplorePage() {
         model.revision,
         nodeIds,
         nodeIds[0],
+        artifact,
       )
       const transferCount = result.jobs.filter((job) => job.kind === 'transfer').length
       const downloadCount = result.jobs.filter((job) => job.kind === 'download').length
       setPullSelection(undefined)
-      setPullNotice(result.jobs.length === 0
+      setPullNotice(result.artifact_pull
+        ? `Queued a selective Hugging Face download of the ${result.artifact_pull.artifact.split('/').pop()} quantization for ${model.id} on ${selectedNodeLabel(nodes.data ?? [], [result.artifact_pull.download_node_id])}.`
+        : result.jobs.length === 0
         ? `${model.id} is already available on every selected node.`
         : `Queued ${downloadCount ? `${downloadCount} Hugging Face ${downloadCount === 1 ? 'download' : 'downloads'}` : 'the cached source'}${transferCount ? ` and ${transferCount} Virtual NAS ${transferCount === 1 ? 'transfer' : 'transfers'}` : ''} for ${model.id}.`)
     } catch (reason) {
@@ -712,6 +724,23 @@ export function ExplorePage() {
         <section className="modal" role="dialog" aria-modal="true" aria-labelledby="pull-model-title">
           <div className="modal-heading"><div><p className="eyebrow">Model Explorer</p><h2 id="pull-model-title">Pull {pullSelection.model.id}</h2></div><button className="icon-button" disabled={pullBusy} onClick={() => setPullSelection(undefined)} aria-label="Close dialog">×</button></div>
           <p className="modal-description">Choose every node that should receive the weights. SparkDeck downloads once to the first selected node, then automatically transfers that copy to the rest through Virtual NAS.</p>
+          {pullArtifactOptions.length > 0 && (
+            <label className="field">
+              <span>GGUF quantization</span>
+              <select
+                value={pullSelection.artifact ?? ''}
+                onChange={(event) => setPullSelection({ ...pullSelection, artifact: event.target.value })}
+                disabled={pullBusy}
+              >
+                {pullArtifactOptions.map((option) => (
+                  <option key={option.key} value={option.filename}>
+                    {option.quantization} · {formatBytes(option.weightSize ?? null)}
+                  </option>
+                ))}
+              </select>
+              <small>Only the selected quantization is downloaded; the rest of the repository is skipped.</small>
+            </label>
+          )}
           {pullError && <p className="form-error" role="alert">{pullError}</p>}
           <NodeSelector
             nodes={nodes.data ?? []}

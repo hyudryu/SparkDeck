@@ -3292,17 +3292,26 @@ async def v1_storage_transfer_preflight(req: Request):
         body = await req.json()
         if not isinstance(body, dict):
             raise ValueError("request body must be an object")
-        if set(body) - {"model_id", "revision"}:
-            raise ValueError("request may contain only model_id and revision")
+        if set(body) - {"model_id", "revision", "artifact"}:
+            raise ValueError("request may contain only model_id, revision, and artifact")
         model_id = body.get("model_id")
         revision = body.get("revision")
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError("model_id must be a non-empty model ID")
         if revision is not None and not isinstance(revision, str):
             raise ValueError("revision must be a string")
+        artifact = body.get("artifact")
+        if artifact is not None and (
+            not isinstance(artifact, str) or not artifact.strip()
+        ):
+            raise ValueError("artifact must be a non-empty repo-relative filename")
+        files = (
+            sparkdeck.public_gguf_pull_files(model_id.strip(), artifact.strip())
+            if isinstance(artifact, str) else None
+        )
         return _public_storage_payload(
             await manager.virtual_nas_transfer_preflight(
-                model_id.strip(), revision,
+                model_id.strip(), revision, files=files,
             )
         )
     except json.JSONDecodeError as exc:
@@ -3387,14 +3396,20 @@ async def _recipe_preparation_request(recipe_id: str, req: Request) -> tuple[dic
 
 async def _async_model_preparation_request(
     req: Request,
-) -> tuple[str, str | None, list[str], str | None]:
-    """Parse a generic model preparation request body."""
+) -> tuple[str, str | None, list[str], str | None, str | None]:
+    """Parse a generic model preparation request body.
+
+    ``artifact`` selects one repo-relative GGUF quantization: the pull then
+    covers only that artifact's files instead of every quantization in the
+    repository.
+    """
     body = await req.json()
     if not isinstance(body, dict) or set(body) - {
-        "model_id", "revision", "node_ids", "download_node_id",
+        "model_id", "revision", "node_ids", "download_node_id", "artifact",
     }:
         raise ValueError(
-            "request may contain only model_id, revision, node_ids, and download_node_id"
+            "request may contain only model_id, revision, node_ids, "
+            "download_node_id, and artifact"
         )
     model_id = body.get("model_id")
     if not isinstance(model_id, str) or not model_id.strip():
@@ -3416,19 +3431,46 @@ async def _async_model_preparation_request(
     download_node_id = raw_seed.strip() if isinstance(raw_seed, str) else None
     if download_node_id and download_node_id not in selected:
         raise ValueError("download_node_id must be one of the selected nodes")
+    artifact = body.get("artifact")
+    if artifact is not None and (
+        not isinstance(artifact, str) or not artifact.strip()
+    ):
+        raise ValueError("artifact must be a non-empty repo-relative filename")
     await manager.selected_cluster_nodes(selected)
-    return model_id.strip(), revision, selected, download_node_id
+    return (
+        model_id.strip(), revision, selected, download_node_id,
+        artifact.strip() if isinstance(artifact, str) else None,
+    )
+
+
+def _spawn_artifact_pull(coro) -> None:
+    """Run a detached artifact pull, logging instead of failing silently."""
+    async def _run():
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger("sparkdeck").exception(
+                "artifact pull failed"
+            )
+    asyncio.create_task(_run())
 
 
 @app.post("/api/v1/storage/preparations/preflight")
 async def v1_model_preparation_preflight(req: Request):
     try:
-        model_id, revision, node_ids, download_node_id = (
+        model_id, revision, node_ids, download_node_id, artifact = (
             await _async_model_preparation_request(req)
+        )
+        files = (
+            sparkdeck.public_gguf_pull_files(model_id, artifact)
+            if artifact else None
         )
         return _public_storage_payload(
             await manager.recipe_model_preparation_preflight(
                 model_id, revision, node_ids, download_node_id=download_node_id,
+                files=files,
             )
         )
     except json.JSONDecodeError as exc:
@@ -3442,9 +3484,34 @@ async def v1_model_preparation(req: Request):
     _require_virtual_nas_enabled()
     _require_same_origin_or_forwarded(req)
     try:
-        model_id, revision, node_ids, download_node_id = (
+        model_id, revision, node_ids, download_node_id, artifact = (
             await _async_model_preparation_request(req)
         )
+        if artifact:
+            # A selected GGUF quantization pulls file-scoped: gate on the
+            # artifact's own size, then seed and fan out without queuing
+            # whole-repository transfer jobs.
+            files = sparkdeck.public_gguf_pull_files(model_id, artifact)
+            plan = await manager.recipe_model_preparation_preflight(
+                model_id, revision, node_ids, download_node_id=download_node_id,
+                files=files,
+            )
+            if not plan.get("eligible"):
+                raise RuntimeError(
+                    str(plan.get("reason") or "model preparation is not eligible")
+                )
+            seed = download_node_id or node_ids[0]
+            _spawn_artifact_pull(sparkdeck.distribute_gguf_pull(
+                model_id, artifact, revision or "main", node_ids, seed,
+            ))
+            return _public_storage_payload({
+                "job_ids": [], "jobs": [],
+                "artifact_pull": {
+                    "model_id": model_id, "artifact": artifact,
+                    "files": files, "node_ids": list(node_ids),
+                    "download_node_id": seed, "status": "queued",
+                },
+            })
         return _public_storage_payload(
             await manager.queue_recipe_model_preparation(
                 model_id, revision, node_ids, download_node_id,

@@ -4333,6 +4333,42 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(target["download_eligible"])
         self.assertEqual(target["download_required_free_bytes"], required)
 
+    async def test_transfer_preflight_gates_selected_files_size(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        expected = 100
+        whole_repository = 10 * expected
+        required = expected + DOWNLOAD_STAGING_RESERVE_BYTES
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker", "online": True,
+            "cache_free_size": required,
+            "virtual_nas_download_capable": True,
+            "models": [],
+        }])
+        manager.virtual_nas_transfers = Mock(return_value={"items": []})
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "main",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": whole_repository,
+        })
+        manager.virtual_nas.estimate_selected_files_size = AsyncMock(
+            return_value=expected,
+        )
+
+        result = await manager.virtual_nas_transfer_preflight(
+            "org/model", "main", files=["UD/model-00001-of-00002.gguf"],
+        )
+        target = result["targets"][0]
+
+        manager.virtual_nas.estimate_selected_files_size.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, ["UD/model-00001-of-00002.gguf"],
+        )
+        self.assertEqual(result["download"]["size_bytes"], expected)
+        self.assertEqual(result["download"]["required_free_bytes"], required)
+        self.assertTrue(target["download_eligible"])
+        self.assertEqual(target["download_required_free_bytes"], required)
+
     async def test_finish_rejects_legacy_attempt_without_immutable_revision(self):
         manager = Manager.__new__(Manager)
         manager.settings = {}

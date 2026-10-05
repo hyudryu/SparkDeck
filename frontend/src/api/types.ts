@@ -996,6 +996,14 @@ export interface RecipePreparationPlan extends StorageTransferPreflight {
 export interface StorageTransferResult {
   job_ids: string[]
   jobs: StorageTransferJob[]
+  artifact_pull?: {
+    model_id: string
+    artifact: string
+    files: string[]
+    node_ids: string[]
+    download_node_id: string
+    status: string
+  } | null
 }
 
 export interface RecipePreparationResult extends StorageTransferResult {

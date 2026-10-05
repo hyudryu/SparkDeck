@@ -35,6 +35,7 @@ from .catalog import (
     quantization_from_text,
 )
 from .codex_models import codex_model
+from .benchmark_hardware import benchmark_hardware
 from .embeddings import embeddings_response
 from .envfile_settings import (
     EnvFileConflictError,
@@ -352,7 +353,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
         raise ValueError("community aggregate response is too large")
 
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, int, int]] = set()
+    seen: set[tuple[str, str, int, int, str]] = set()
     for raw in payload["items"]:
         if not isinstance(raw, dict):
             raise ValueError("community aggregate item must be an object")
@@ -393,6 +394,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             raise ValueError("community aggregate item is invalid")
         key = (
             model_id, quantization, prompt_bucket, tensor_parallel_size,
+            benchmark_hardware(raw.get("hardware"))["hardware_key"],
         )
         if key in seen:
             raise ValueError("community aggregate response contains duplicate evidence")
@@ -405,6 +407,7 @@ def _public_community_aggregates(payload: Any) -> list[dict[str, Any]]:
             "inference_tokens_per_second": speed,
             "sample_count": sample_count,
             "unique_cluster_count": unique_cluster_count,
+            **benchmark_hardware(raw.get("hardware")),
         })
     return result
 
@@ -8444,43 +8447,57 @@ class SparkDeckService:
             return self._unknown_hardware_snapshot(), False
         manager_id = (deployment.get("settings") or {}).get("manager_deployment_id")
         if not manager_id:
-            return self._hardware_snapshot(), True
+            hardware = self._hardware_snapshot()
+            return hardware, bool(hardware.get("gpu_count"))
         try:
             if serving_member is None:
                 if require_serving_member:
                     return self._unknown_hardware_snapshot(), False
-                _, serving_member = self.manager._cluster_primary_member(manager_id)
-            node_id = serving_member.get("node_id")
-            if node_id == "local":
-                return self._hardware_snapshot(), True
-            if not node_id:
+                cluster, serving_member = self.manager._cluster_primary_member(manager_id)
+                if cluster.get("mode") in {"replicated", "grouped_sharded"}:
+                    # Coordinated counters do not carry per-request routes.
+                    # A mixed replica run cannot inherit the primary engine's
+                    # GPU profile; preserve it locally as unknown evidence.
+                    return self._unknown_hardware_snapshot(), False
+            else:
+                cluster = self.manager._deployment(manager_id) or {}
+            node_ids = sorted(scope.removeprefix("node:") for scope in
+                              self._engine_observation_scopes(cluster, serving_member))
+            if not node_ids:
                 return self._unknown_hardware_snapshot(), False
-            stats = await self.manager.node_registry.request(
-                node_id, "GET", "/api/agent/stats", timeout=5,
-            )
-            if not isinstance(stats, dict):
+
+            async def collect(node_id):
+                if node_id == "local":
+                    return self._hardware_snapshot()
+                stats = await self.manager.node_registry.request(
+                    node_id, "GET", "/api/agent/stats", timeout=5,
+                )
+                if not isinstance(stats, dict):
+                    raise ValueError("serving node did not report hardware")
+                return self._hardware_snapshot(stats)
+
+            snapshots = await asyncio.gather(*(collect(node_id) for node_id in node_ids))
+            if any(not snapshot.get("gpu_count") for snapshot in snapshots):
                 return self._unknown_hardware_snapshot(), False
-            return self._hardware_snapshot(stats), True
+            architectures = {snapshot["architecture"] for snapshot in snapshots}
+            combined = benchmark_hardware({
+                "architecture": next(iter(architectures)) if len(architectures) == 1 else "mixed",
+                "gpus": [gpu for snapshot in snapshots for gpu in snapshot["gpus"]],
+            })["hardware"]
+            return combined, True
         except Exception:
             # Hardware collection must never make an otherwise valid inference
             # fail. Unknown remote hardware remains local-only evidence.
             return self._unknown_hardware_snapshot(), False
 
     def _hardware_snapshot(self, stats: dict[str, Any] | None = None) -> dict[str, Any]:
+        local = stats is None
         if stats is None:
             stats = getattr(self.manager, "_stats_cache", {}) or {}
-        gpus = stats.get("gpus") or []
-        public_gpus = [
-            {"model": gpu.get("name"), "memory_mib": gpu.get("mem_total_mib")}
-            for gpu in gpus if isinstance(gpu, dict) and gpu.get("name")
-        ]
-        names = " ".join(str(gpu.get("model") or "") for gpu in public_gpus).casefold()
-        return {
-            "architecture": platform.machine(),
-            "hardware_class": "dgx-spark" if "gb10" in names or "dgx spark" in names else "local",
-            "gpu_count": len(public_gpus),
-            "gpus": public_gpus,
-        }
+        return benchmark_hardware({
+            "architecture": stats.get("architecture") or (platform.machine() if local else "unknown"),
+            "gpus": stats.get("gpus"),
+        })["hardware"]
 
     @staticmethod
     def _unknown_hardware_snapshot() -> dict[str, Any]:

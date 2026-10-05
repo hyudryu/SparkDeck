@@ -8,6 +8,7 @@ import { isNodeSelectable, NodeSelector, selectedNodeLabel } from '../components
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { formatBytes } from '../utils/format'
+import { hardwareKey, hardwareLabel, hardwareOptions, matchesHardware, SPARK_HARDWARE } from '../utils/benchmarkHardware'
 import { ggufArtifactOptions, type GgufArtifactOption } from '../utils/gguf'
 
 type CatalogTab = 'hugging-face' | 'community'
@@ -135,13 +136,13 @@ function aggregateQuantization(item: BenchmarkAggregate) {
 }
 
 function communityVariantKey(item: BenchmarkAggregate) {
-  return `${item.model_id}::${aggregateQuantization(item)}::${item.tensor_parallel_size}::${item.prompt_tokens_bucket}`
+  return `${hardwareKey(item)}::${item.model_id}::${aggregateQuantization(item)}::${item.tensor_parallel_size}::${item.prompt_tokens_bucket}`
 }
 
 function bestCommunityEstimates(items: BenchmarkAggregate[]) {
   const byQuantizationAndTp = new Map<string, BenchmarkAggregate>()
   for (const item of items) {
-    const key = `${aggregateQuantization(item).toLocaleLowerCase()}::${item.tensor_parallel_size}`
+    const key = `${hardwareKey(item)}::${aggregateQuantization(item).toLocaleLowerCase()}::${item.tensor_parallel_size}`
     const current = byQuantizationAndTp.get(key)
     if (
       !current
@@ -155,7 +156,7 @@ function bestCommunityEstimates(items: BenchmarkAggregate[]) {
 function formatCommunityEstimates(items: BenchmarkAggregate[]) {
   return [...items]
     .sort((left, right) => left.tensor_parallel_size - right.tensor_parallel_size)
-    .map((item) => `TP${item.tensor_parallel_size} ${formatRate(item.inference_tokens_per_second)}`)
+    .map((item) => `${hardwareLabel(item)} \u00b7 TP${item.tensor_parallel_size} ${formatRate(item.inference_tokens_per_second)}`)
     .join(' · ')
 }
 
@@ -284,7 +285,7 @@ function ModelRow({
   onToggle: () => void
   onPull: (model: DisplayCatalogModel) => void
 }) {
-  const rowKey = model.id
+  const rowKey = `${model.id}:${hardwareKey(model.community ?? {})}`
   const panelId = `model-details-${rowKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
   const modelName = model.name ?? model.id.split('/').at(-1) ?? model.id
   const details = useResource(
@@ -407,7 +408,7 @@ function ModelRow({
       <span className={`catalog-model-stat catalog-model-size fit-${fitTone(fitWeightSize, fitCapacity)}`}><small>Weights</small><strong>{fitWeightSize ? formatBytes(fitWeightSize) : '—'}</strong><em>{fitLabel(fitTone(fitWeightSize, fitCapacity))}{minFitNodes ? ` · ${minFitNodes === 1 ? '1 node' : `${minFitNodes}+ nodes`}` : ''}</em></span>
       {communityMode
         ? <>
-          <span className="catalog-model-stat"><small>Output speed</small><strong>{communityRateRange(communityBenchmarks)}</strong></span>
+          <span className="catalog-model-stat"><small>Output speed</small><strong>{communityRateRange(communityBenchmarks)}</strong><em>{hardwareLabel(model.community ?? {})}</em></span>
           <span className="catalog-model-stat"><small>Max contributors</small><strong>{formatNumber(Math.max(...communityBenchmarks.map((item) => item.sample_count ?? 0)))}</strong></span>
         </>
         : <>
@@ -474,6 +475,7 @@ export function ExplorePage() {
   const [query, setQuery] = useState('')
   const [runtime, setRuntime] = useState<RuntimeKind | ''>('')
   const [tab, setTab] = useState<CatalogTab>('hugging-face')
+  const [selectedHardware, setSelectedHardware] = useState(SPARK_HARDWARE)
   const [fitsOnly, setFitsOnly] = useState(false)
   const [communityLimit, setCommunityLimit] = useState(COMMUNITY_PAGE_SIZE)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
@@ -503,7 +505,7 @@ export function ExplorePage() {
 
   useEffect(() => {
     setCommunityLimit(COMMUNITY_PAGE_SIZE)
-  }, [aggregates.data?.items, fitsOnly, query, tab])
+  }, [aggregates.data?.items, fitsOnly, query, tab, selectedHardware])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
   const catalogFitCapacity = isSingleNodeRuntime(activeRuntime)
@@ -513,12 +515,13 @@ export function ExplorePage() {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate>()
     for (const aggregate of aggregates.data?.items ?? []) {
+      if (!matchesHardware(aggregate, selectedHardware)) continue
       const key = communityVariantKey(aggregate)
       const current = evidence.get(key)
       if (!current || aggregate.sample_count > current.sample_count) evidence.set(key, aggregate)
     }
     for (const model of communityEnabled ? catalogItems : []) {
-      if (model.community) {
+      if (model.community && matchesHardware(model.community, selectedHardware)) {
         const key = communityVariantKey(model.community)
         const current = evidence.get(key)
         if (!current || model.community.sample_count > current.sample_count) evidence.set(key, model.community)
@@ -534,20 +537,24 @@ export function ExplorePage() {
       const aggregate = bestCommunityEstimate(communityBenchmarks)
       return {
         ...model,
-        community: communityEnabled ? model.community ?? aggregate : undefined,
+        community: communityEnabled ? aggregate : undefined,
         communityBenchmarks,
       }
     })
-    const communityModels: DisplayCatalogModel[] = [...evidenceByModel.entries()].map(([modelId, communityBenchmarks]) => {
-      const catalogModel = catalogById.get(modelId)
-      const community = bestCommunityEstimate(communityBenchmarks)
-      return {
-        ...(catalogModel ?? { id: modelId, name: modelId.split('/').at(-1) }),
-        parameter_count: community.parameter_count ?? catalogModel?.parameter_count,
-        weight_size_bytes: community.weight_size_bytes ?? catalogModel?.weight_size_bytes,
-        community,
-        communityBenchmarks,
-      }
+    const communityModels: DisplayCatalogModel[] = [...evidenceByModel.entries()].flatMap(([modelId, benchmarks]) => {
+      const groups = new Map<string, BenchmarkAggregate[]>()
+      for (const item of benchmarks) groups.set(hardwareKey(item), [...(groups.get(hardwareKey(item)) ?? []), item])
+      return [...groups.values()].map((communityBenchmarks) => {
+        const catalogModel = catalogById.get(modelId)
+        const community = bestCommunityEstimate(communityBenchmarks)
+        return {
+          ...(catalogModel ?? { id: modelId, name: modelId.split('/').at(-1) }),
+          parameter_count: community.parameter_count ?? catalogModel?.parameter_count,
+          weight_size_bytes: community.weight_size_bytes ?? catalogModel?.weight_size_bytes,
+          community,
+          communityBenchmarks,
+        }
+      })
     })
     let visible = tab === 'community' ? communityModels : withEvidence
     if (tab === 'community' && query) {
@@ -590,7 +597,7 @@ export function ExplorePage() {
       visible = [...visible].sort((left, right) => Number(right.community?.sample_count ?? 0) - Number(left.community?.sample_count ?? 0))
     }
     return visible
-  }, [activeRuntime, aggregates.data?.items, catalog.data?.items, communityEnabled, fitsOnly, memory, query, tab])
+  }, [activeRuntime, aggregates.data?.items, catalog.data?.items, communityEnabled, fitsOnly, memory, query, tab, selectedHardware])
   const displayedModels = tab === 'community' ? models.slice(0, communityLimit) : models
   const remainingCommunityModels = tab === 'community' ? models.length - displayedModels.length : 0
 
@@ -689,6 +696,13 @@ export function ExplorePage() {
           </label>}
           <button className="button button-primary" type="submit">Search</button>
         </form>
+        <label className="select-field compact-select">
+          <span>Benchmark hardware</span>
+          <select aria-label="Benchmark hardware" value={selectedHardware} onChange={(event) => setSelectedHardware(event.target.value)}>
+            <option value={SPARK_HARDWARE}>DGX Spark</option>
+            {hardwareOptions([...(aggregates.data?.items ?? []), ...(catalog.data?.items.flatMap((item) => item.community ? [item.community] : []) ?? [])]).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select>
+        </label>
         <div className="catalog-filters" aria-label="Model filters">
           <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isSingleNodeRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isSingleNodeRuntime(activeRuntime) ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
@@ -715,7 +729,7 @@ export function ExplorePage() {
       {!loading && !activeError && !communityUnavailable && models.length > 0 && <section className="catalog-model-list" aria-label="Model results">
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max contributors</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
-          const rowKey = `${tab}:${model.id}`
+          const rowKey = `${tab}:${model.id}:${hardwareKey(model.community ?? {})}`
           return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}

@@ -15,23 +15,24 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import canonical_quantization
+from .benchmark_hardware import benchmark_hardware, hardware_cohort
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 
 
 COMMUNITY_UPLOAD_FIELDS = frozenset({
     "model_id", "quantization", "prompt_tokens_bucket",
     "inference_tokens_per_second", "telemetry_cluster_id",
-    "concurrency", "tensor_parallel_size",
+    "concurrency", "tensor_parallel_size", "hardware", "hardware_key",
 })
 # Bumping the contract version on startup invalidates an existing opt-in so a
 # user who accepted only passive-capture telemetry must re-consent to wording
 # that covers automatic one-shot synthetic startup benchmarks.
-COMMUNITY_CONSENT_CONTRACT_VERSION = 5
+COMMUNITY_CONSENT_CONTRACT_VERSION = 6
 COMMUNITY_EVIDENCE_POLICY = {
     "minimum_samples": 10,
     "exact_match_dimensions": [
         "model_id", "quantization", "prompt_tokens_bucket",
-        "tensor_parallel_size",
+        "tensor_parallel_size", "hardware_key",
     ],
     "metric": "inference_tokens_per_second",
 }
@@ -77,6 +78,11 @@ class SparkDeckStore:
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        self._connection.create_function(
+            "sparkdeck_hardware_key", 1,
+            lambda value: benchmark_hardware(json.loads(value or "{}"))["hardware_key"],
+            deterministic=True,
+        )
         self._connection.create_function(
             "sparkdeck_community_quantization", 1,
             lambda value: canonical_quantization(value) or "UNKNOWN",
@@ -776,6 +782,7 @@ class SparkDeckStore:
                 """WITH samples AS (
                        SELECT benchmark_samples.*,
                               upload_outbox.status AS sync_state,
+                              sparkdeck_hardware_key(hardware_json) AS hardware_key,
                               json_extract(model_json, '$.repository') AS model_id
                        FROM benchmark_samples
                        LEFT JOIN upload_outbox
@@ -783,9 +790,9 @@ class SparkDeckStore:
                        WHERE json_valid(model_json)
                    ), ranked AS (
                        SELECT samples.*,
-                              COUNT(*) OVER (PARTITION BY model_id) AS sample_count,
+                              COUNT(*) OVER (PARTITION BY model_id, hardware_key) AS sample_count,
                               ROW_NUMBER() OVER (
-                                  PARTITION BY model_id
+                                  PARTITION BY model_id, hardware_key
                                   ORDER BY created_at DESC, id DESC
                               ) AS model_rank
                        FROM samples
@@ -887,57 +894,63 @@ class SparkDeckStore:
     def benchmark_model_summaries(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
-                """SELECT model_id, COUNT(*) AS run_count,
-                          MAX(prompt_tps) AS best_prompt_tps,
-                          MAX(generation_tps) AS best_generation_tps,
-                          MAX(created_at) AS latest_at
-                   FROM benchmark_series_points
-                   GROUP BY model_id ORDER BY latest_at DESC, model_id COLLATE NOCASE"""
+                """SELECT points.*, samples.hardware_json
+                   FROM benchmark_series_points points
+                   LEFT JOIN benchmark_samples samples ON samples.id = points.sample_id
+                   ORDER BY points.created_at DESC, points.id DESC""",
             ).fetchall()
-            dimensions = self._connection.execute(
-                """SELECT DISTINCT model_id, context_window_size, tensor_parallel_size
-                   FROM benchmark_series_points"""
-            ).fetchall()
-        by_model: dict[str, dict[str, set[int]]] = {}
-        for row in dimensions:
-            values = by_model.setdefault(row["model_id"], {"windows": set(), "tp_sizes": set()})
-            values["windows"].add(int(row["context_window_size"]))
-            values["tp_sizes"].add(int(row["tensor_parallel_size"]))
-        return [{
-            "model_id": row["model_id"],
-            "run_count": int(row["run_count"]),
-            "best_prompt_tokens_per_second": float(row["best_prompt_tps"]),
-            "best_generation_tokens_per_second": float(row["best_generation_tps"]),
-            "context_windows": sorted(by_model[row["model_id"]]["windows"]),
-            "tensor_parallel_sizes": sorted(by_model[row["model_id"]]["tp_sizes"]),
-            "latest_at": row["latest_at"],
-        } for row in rows]
+        groups = {}
+        for row in rows:
+            profile = benchmark_hardware(json.loads(row["hardware_json"] or "{}"))
+            key = (row["model_id"], profile["hardware_key"])
+            value = groups.setdefault(key, {
+                "model_id": row["model_id"], **profile, "run_count": 0,
+                "best_prompt_tokens_per_second": 0.0,
+                "best_generation_tokens_per_second": 0.0,
+                "context_windows": set(), "tensor_parallel_sizes": set(),
+                "latest_at": row["created_at"],
+            })
+            value["run_count"] += 1
+            value["best_prompt_tokens_per_second"] = max(value["best_prompt_tokens_per_second"], float(row["prompt_tps"]))
+            value["best_generation_tokens_per_second"] = max(value["best_generation_tokens_per_second"], float(row["generation_tps"]))
+            value["context_windows"].add(int(row["context_window_size"]))
+            value["tensor_parallel_sizes"].add(int(row["tensor_parallel_size"]))
+        for value in groups.values():
+            value["context_windows"] = sorted(value["context_windows"])
+            value["tensor_parallel_sizes"] = sorted(value["tensor_parallel_sizes"])
+        return list(groups.values())
 
     def benchmark_model_detail(self, model_id: str) -> dict[str, Any] | None:
         with self._lock:
             rows = self._connection.execute(
-                """SELECT context_window_size, concurrency, tensor_parallel_size,
-                          AVG(prompt_tps) AS prompt_tps,
-                          AVG(generation_tps) AS generation_tps,
-                          COUNT(*) AS sample_count
-                   FROM benchmark_series_points WHERE model_id = ?
-                   GROUP BY context_window_size, concurrency, tensor_parallel_size
-                   ORDER BY tensor_parallel_size, context_window_size, concurrency""",
+                """SELECT points.*, samples.hardware_json
+                   FROM benchmark_series_points points
+                   LEFT JOIN benchmark_samples samples ON samples.id = points.sample_id
+                   WHERE points.model_id = ?
+                   ORDER BY points.created_at DESC, points.id DESC""",
                 (model_id,),
             ).fetchall()
         if not rows:
             return None
-        return {
-            "model_id": model_id,
-            "points": [{
+        groups = {}
+        for row in rows:
+            profile = benchmark_hardware(json.loads(row["hardware_json"] or "{}"))
+            key = (int(row["context_window_size"]), int(row["concurrency"]),
+                   int(row["tensor_parallel_size"]), profile["hardware_key"])
+            point = groups.setdefault(key, {
                 "context_window_size": int(row["context_window_size"]),
                 "concurrency": int(row["concurrency"]),
                 "tensor_parallel_size": int(row["tensor_parallel_size"]),
-                "prompt_tokens_per_second": float(row["prompt_tps"]),
-                "generation_tokens_per_second": float(row["generation_tps"]),
-                "sample_count": int(row["sample_count"]),
-            } for row in rows],
-        }
+                **profile, "prompt_tokens_per_second": 0.0,
+                "generation_tokens_per_second": 0.0, "sample_count": 0,
+            })
+            point["prompt_tokens_per_second"] += float(row["prompt_tps"])
+            point["generation_tokens_per_second"] += float(row["generation_tps"])
+            point["sample_count"] += 1
+        for point in groups.values():
+            point["prompt_tokens_per_second"] /= point["sample_count"]
+            point["generation_tokens_per_second"] /= point["sample_count"]
+        return {"model_id": model_id, "points": [groups[key] for key in sorted(groups)]}
 
     def community_aggregates(self) -> list[dict[str, Any]]:
         """Aggregate only the fields that are eligible for community sharing.
@@ -950,11 +963,12 @@ class SparkDeckStore:
         dimensions cannot be represented by this community contract. Manual
         benchmark detail remains available from ``benchmark_series_points``.
         """
-        grouped: dict[tuple[str, str, int, int], dict[str, list[float]]] = {}
+        grouped: dict[tuple[str, str, int, int, str], dict[str, list[float]]] = {}
+        hardware_profiles = {}
         with self._lock:
             cursor = self._connection.execute(
                 "SELECT model_json, configuration_json, input_tokens, "
-                "generation_tps, telemetry_cluster_id "
+                "generation_tps, telemetry_cluster_id, hardware_json "
                 "FROM benchmark_samples WHERE eligible = 1 "
                 f"ORDER BY created_at DESC LIMIT {_COMMUNITY_AGGREGATE_ROW_LIMIT}"
             )
@@ -968,6 +982,7 @@ class SparkDeckStore:
                         configuration = json.loads(
                             row["configuration_json"] or "{}"
                         )
+                        profile = benchmark_hardware(json.loads(row["hardware_json"] or "{}"))
                     except (TypeError, ValueError, json.JSONDecodeError):
                         continue
                     if not isinstance(model, dict) or not isinstance(configuration, dict):
@@ -997,7 +1012,9 @@ class SparkDeckStore:
                     key = (
                         model_id, quantization, prompt_bucket,
                         tensor_parallel_size,
+                        profile["hardware_key"],
                     )
+                    hardware_profiles[key[-1]] = profile
                     values = grouped.setdefault(key, {}).setdefault(
                         str(cluster_id), []
                     )
@@ -1006,7 +1023,7 @@ class SparkDeckStore:
 
         items = []
         for (
-            model_id, quantization, prompt_bucket, tensor_parallel_size
+            model_id, quantization, prompt_bucket, tensor_parallel_size, hardware_key
         ), contributors in grouped.items():
             contributor_means = [
                 _outlier_filtered_mean(values)
@@ -1022,6 +1039,7 @@ class SparkDeckStore:
                 # raw inference requests from a potentially busy installation.
                 "sample_count": len(contributor_means),
                 "unique_cluster_count": len(contributor_means),
+                **hardware_profiles[hardware_key],
             })
         return sorted(
             items,
@@ -1029,6 +1047,7 @@ class SparkDeckStore:
                 -item["sample_count"], item["model_id"].casefold(),
                 item["quantization"].casefold(), item["prompt_tokens_bucket"],
                 item["tensor_parallel_size"],
+                item["hardware_key"],
             ),
         )
 
@@ -1108,15 +1127,12 @@ class SparkDeckStore:
             ).fetchall()
         by_id = {}
         payloads_by_id = {}
-        required_keys: set[tuple[str, str, int, int]] = set()
+        required_keys: set[tuple[str, str, int, int, str]] = set()
         for row in sample_rows:
             payload = _upload_row(row)
             if payload is None:
                 continue
-            key = (
-                payload["model_id"], payload["quantization"],
-                payload["prompt_tokens_bucket"], payload["tensor_parallel_size"],
-            )
+            key = hardware_cohort(payload)
             required_keys.add(key)
             payloads_by_id[row["id"]] = (payload, key)
         contribution_averages = self._community_contribution_averages(required_keys)
@@ -1153,6 +1169,7 @@ class SparkDeckStore:
             key_fields = (
                 "model_id", "quantization", "prompt_tokens_bucket",
                 "telemetry_cluster_id", "concurrency", "tensor_parallel_size",
+                "hardware_key",
             )
             if any(
                 prepared_payload.get(field) != payload.get(field)
@@ -1163,27 +1180,24 @@ class SparkDeckStore:
                 "inference_tokens_per_second"
             ]
         else:
-            key = (
-                payload["model_id"], payload["quantization"],
-                payload["prompt_tokens_bucket"], payload["tensor_parallel_size"],
-            )
+            key = hardware_cohort(payload)
             payload["inference_tokens_per_second"] = (
                 self._community_contribution_averages({key})[key]
             )
         return {"sample_id": sample_id, "payload": payload}
 
     def _community_contribution_averages(
-        self, required_keys: set[tuple[str, str, int, int]] | None = None,
-    ) -> dict[tuple[str, str, int, int], float]:
+        self, required_keys: set[tuple[str, str, int, int, str]] | None = None,
+    ) -> dict[tuple[str, str, int, int, str], float]:
         """Build bounded robust C1 means, including requested pending cohorts."""
-        grouped: dict[tuple[str, str, int, int], list[float]] = {}
+        grouped: dict[tuple[str, str, int, int, str], list[float]] = {}
         with self._lock:
             generation = int(self.get_setting(
                 "community_consent_generation", 0,
             ))
             if required_keys:
                 for (
-                    model_id, quantization, prompt_bucket, tensor_parallel_size
+                    model_id, quantization, prompt_bucket, tensor_parallel_size, hardware_key
                 ) in required_keys:
                     rows = self._connection.execute(
                         """SELECT * FROM benchmark_samples
@@ -1192,23 +1206,26 @@ class SparkDeckStore:
                              AND community_quantization = ?
                              AND community_prompt_bucket = ?
                              AND community_tensor_parallel_size = ?
+                             AND sparkdeck_hardware_key(hardware_json) = ?
                            ORDER BY created_at DESC, id DESC LIMIT ?""",
                         (
                             generation, model_id, quantization, prompt_bucket,
-                            tensor_parallel_size,
+                            tensor_parallel_size, hardware_key,
                             _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT,
                         ),
                     ).fetchall()
                     values = grouped.setdefault(
                         (
                             model_id, quantization, prompt_bucket,
-                            tensor_parallel_size,
+                            tensor_parallel_size, hardware_key,
                         ), [],
                     )
                     for row in rows:
                         payload = _upload_row(row)
-                        if payload is not None:
+                        if payload is not None and payload["hardware_key"] == hardware_key:
                             values.append(payload["inference_tokens_per_second"])
+                            if len(values) >= _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
+                                break
             else:
                 cursor = self._connection.execute(
                     "SELECT * FROM benchmark_samples "
@@ -1224,11 +1241,7 @@ class SparkDeckStore:
                         payload = _upload_row(row)
                         if payload is None:
                             continue
-                        key = (
-                            payload["model_id"], payload["quantization"],
-                            payload["prompt_tokens_bucket"],
-                            payload["tensor_parallel_size"],
-                        )
+                        key = hardware_cohort(payload)
                         values = grouped.setdefault(key, [])
                         if len(values) < _COMMUNITY_CONTRIBUTOR_SAMPLE_LIMIT:
                             values.append(payload["inference_tokens_per_second"])
@@ -1433,11 +1446,12 @@ def _benchmark_row(row: sqlite3.Row) -> dict[str, Any]:
     # additional machine identity.
     if "hardware_class" not in hardware and "device_class" in hardware:
         hardware["hardware_class"] = hardware.pop("device_class")
+    profile = benchmark_hardware(hardware)
     value = {
         "id": row["id"], "created_at": row["created_at"],
         "deployment_id": row["deployment_id"], "model": json.loads(row["model_json"]),
         "runtime": row["runtime"], "runtime_version": row["runtime_version"],
-        "hardware": hardware,
+        **profile,
         "configuration": json.loads(row["configuration_json"]),
         "input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"],
         "latency_ms": row["latency_ms"], "ttft_ms": row["ttft_ms"],
@@ -1484,6 +1498,8 @@ def _upload_row(row: sqlite3.Row) -> dict[str, Any] | None:
         "telemetry_cluster_id": cluster_id,
         "concurrency": 1,
         "tensor_parallel_size": tensor_parallel_size,
+        "hardware": benchmark_hardware(value["hardware"])["hardware"],
+        "hardware_key": value["hardware_key"],
     }
     if not set(payload) <= COMMUNITY_UPLOAD_FIELDS:
         raise ValueError("community upload payload exceeds the public field contract")

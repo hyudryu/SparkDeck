@@ -3501,6 +3501,23 @@ async def v1_model_preparation(req: Request):
                     str(plan.get("reason") or "model preparation is not eligible")
                 )
             seed = download_node_id or node_ids[0]
+            if len(set(node_ids)) == 1:
+                # A single destination needs no fan-out, so the selective
+                # download rides the durable transfer queue: a pending entry
+                # with a live progress bar that survives controller restarts.
+                result = await manager.queue_selected_model_files(
+                    plan, seed, files,
+                )
+                return _public_storage_payload({
+                    **result,
+                    "artifact_pull": {
+                        "model_id": model_id, "artifact": artifact,
+                        "files": files, "node_ids": list(node_ids),
+                        "download_node_id": seed, "status": "queued",
+                    },
+                })
+            # Multiple destinations seed once from the Hub, then fan out
+            # file-scoped Virtual NAS streams between nodes.
             _spawn_artifact_pull(sparkdeck.distribute_gguf_pull(
                 model_id, artifact, revision or "main", node_ids, seed,
             ))

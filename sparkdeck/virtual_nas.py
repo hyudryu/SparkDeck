@@ -248,6 +248,48 @@ def cached_download_bytes(
     return max(0, current - _nonnegative_int(baseline_bytes))
 
 
+def has_selected_files_marker(
+    model: dict[str, Any] | None, revision: str | None,
+    selected: list[str] | None,
+) -> bool:
+    """Return whether the cache's selective marker recorded exactly ``selected``.
+
+    A failed selected-file download writes the marker before any blob
+    bytes, so marker presence — not byte count — proves the matching
+    partial cache exists.
+    """
+    if not selected or revision is None:
+        return False
+    selective = (model or {}).get("selective_files_by_revision")
+    if not isinstance(selective, dict):
+        return False
+    recorded = selective.get(revision)
+    if not isinstance(recorded, list):
+        return False
+    recorded_set = sorted({
+        str(item) for item in recorded if isinstance(item, str) and item
+    })
+    return recorded_set == sorted(set(selected))
+
+
+def selected_files_cache_bytes(
+    model: dict[str, Any] | None, revision: str | None,
+    selected: list[str] | None,
+) -> int:
+    """Return reusable bytes a selected-file download can honestly claim.
+
+    Revision-wide partial credit is only attributable to the selected file
+    set when the cache's own selective marker recorded exactly those files.
+    A node caching another quantization of the same revision may hold more
+    bytes than the selection needs, and none of them may belong to it, so
+    that case credits zero and lets the file-scoped download account for
+    its own resume state.
+    """
+    if not has_selected_files_marker(model, revision, selected):
+        return 0
+    return partial_download_size_bytes(model, revision)
+
+
 class TransferCanceled(Exception):
     pass
 
@@ -814,6 +856,19 @@ class VirtualNAS:
             except ValueError:
                 continue
             status = str(raw.get("status") or "failed")
+            selected_files: list[str] | None = None
+            if raw.get("selected_files") is not None:
+                if not isinstance(raw.get("selected_files"), list):
+                    continue
+                try:
+                    selected_files = list(dict.fromkeys(
+                        _validate_repo_relative_file(str(item))
+                        for item in raw["selected_files"]
+                    ))
+                except ValueError:
+                    continue
+                if not selected_files:
+                    continue
             legacy_mutable_workflow = bool(
                 raw.get("workflow_id")
                 and revision
@@ -846,6 +901,7 @@ class VirtualNAS:
                 "workflow_id": raw.get("workflow_id"),
                 "workflow_node_ids": list(raw.get("workflow_node_ids") or []),
                 "require_partial_cache": bool(raw.get("require_partial_cache")),
+                "selected_files": selected_files,
                 "download_cache_baseline_bytes": (
                     _nonnegative_int(raw.get("download_cache_baseline_bytes"))
                     if raw.get("download_cache_baseline_bytes") is not None else None
@@ -3206,6 +3262,7 @@ class VirtualNAS:
         requested_revision: str | None = None,
         require_partial_cache: bool = False,
         download_cache_baseline_bytes: int | None = None,
+        files: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._queue_lock:
             return await self._queue_download_and_transfer(
@@ -3213,7 +3270,7 @@ class VirtualNAS:
                 transfer_target_node_ids, expected_bytes, workflow_id,
                 workflow_node_ids, additional_download_node_ids,
                 source_node_id, requested_revision, require_partial_cache,
-                download_cache_baseline_bytes,
+                download_cache_baseline_bytes, files,
             )
 
     async def _queue_download_and_transfer(
@@ -3230,8 +3287,14 @@ class VirtualNAS:
         requested_revision: str | None = None,
         require_partial_cache: bool = False,
         download_cache_baseline_bytes: int | None = None,
+        files: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Persist resumable Hub downloads and any dependent NAS fan-out."""
+        """Persist resumable Hub downloads and any dependent NAS fan-out.
+
+        ``files`` narrows the Hub download to one selected file set (a GGUF
+        quantization): the job stays file-scoped end to end instead of
+        pulling the whole repository.
+        """
         if not self.enabled:
             raise RuntimeError("virtual NAS is disabled")
         model_id = validate_model_id(model_id)
@@ -3242,6 +3305,13 @@ class VirtualNAS:
         expected_bytes = _nonnegative_int(expected_bytes)
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
+        selected_files = None
+        if files is not None:
+            selected_files = list(dict.fromkeys(
+                _validate_repo_relative_file(filename) for filename in files
+            ))
+            if not selected_files:
+                raise ValueError("at least one repository file must be selected")
         download_node_id = str(download_node_id or LOCAL_NODE_ID)
         download_nodes = list(dict.fromkeys([
             download_node_id,
@@ -3300,21 +3370,37 @@ class VirtualNAS:
                 raise LookupError(
                     f"partial model cache no longer exists on node '{node_id}'"
                 )
-            fallback_cached = partial_download_size_bytes(cached_model, revision)
-            baseline = (
-                explicit_baseline
-                if node_id == download_node_id and explicit_baseline is not None
-                else max(
-                    0,
-                    _nonnegative_int((cached_model or {}).get("size_bytes"))
-                    - fallback_cached,
+            if selected_files is not None and node_id == download_node_id:
+                # File-scoped credit only when the cache's selective marker
+                # recorded exactly the requested set; another quantization
+                # of the same revision must not pre-fill this download's
+                # progress or capacity credit. The baseline pins the cache
+                # size at queue time so the live overlay can attribute this
+                # job's own byte growth even after the marker becomes the
+                # union of both selections.
+                baseline = _nonnegative_int((cached_model or {}).get("size_bytes"))
+                cached_bytes = min(
+                    expected_bytes,
+                    selected_files_cache_bytes(
+                        cached_model, revision, selected_files,
+                    ),
                 )
-            )
+            else:
+                fallback_cached = partial_download_size_bytes(cached_model, revision)
+                baseline = (
+                    explicit_baseline
+                    if node_id == download_node_id and explicit_baseline is not None
+                    else max(
+                        0,
+                        _nonnegative_int((cached_model or {}).get("size_bytes"))
+                        - fallback_cached,
+                    )
+                )
+                cached_bytes = min(
+                    expected_bytes,
+                    cached_download_bytes(cached_model, baseline, revision),
+                )
             download_baselines[node_id] = baseline
-            cached_bytes = min(
-                expected_bytes,
-                cached_download_bytes(cached_model, baseline, revision),
-            )
             download_progress_bytes[node_id] = cached_bytes
             download_required = download_required_free_bytes(
                 expected_bytes, cached_bytes,
@@ -3368,6 +3454,13 @@ class VirtualNAS:
             "revision": revision, "depends_on_job_id": None,
             "requested_revision": requested_revision,
             "require_partial_cache": bool(require_partial_cache),
+            # Only the primary download node pulls the selected file set;
+            # additional download nodes keep whole-repository semantics.
+            "selected_files": (
+                list(selected_files)
+                if selected_files is not None and node_id == download_node_id
+                else None
+            ),
             "download_cache_baseline_bytes": download_baselines[node_id],
             "download_attempted_at": None,
             "download_attempt_start_bytes": None,
@@ -3712,18 +3805,88 @@ class VirtualNAS:
         except asyncio.CancelledError:
             raise
 
+    async def _download_selected_files(self, job: dict[str, Any], token: str) -> None:
+        """Run one selected-file Hub download to its durable conclusion.
+
+        The whole-repository runner is built around complete-revision
+        inventory checks and Hub size refreshes; a selected GGUF
+        quantization gates on exactly its own files at queue time, so this
+        branch only dispatches the file-scoped download. Progress comes
+        from the inventory overlay the Storage page already reports for
+        running download jobs.
+        """
+        selected = list(dict.fromkeys(
+            _validate_repo_relative_file(filename)
+            for filename in job["selected_files"]
+        ))
+        if not selected:
+            raise ValueError("download job does not name any selected repository file")
+        revision = job.get("revision") or "main"
+        if job.get("require_partial_cache"):
+            # A queued or restart-recovered resume must fail as stale when
+            # its own selection vanished — even if another quantization of
+            # the same repository still holds a partial — instead of
+            # re-downloading the whole selection from scratch. Marker
+            # presence, not byte count: a failed attempt writes the marker
+            # before any blob bytes and remains a valid resumable partial.
+            # Artifact pulls set require_partial_cache=False precisely
+            # because they may start with none of the selected bytes
+            # present.
+            storage = await self._node_storage(job["target_node_id"])
+            cached_model = next((
+                item for item in storage["models"]
+                if item.get("model_id") == job["model_id"]
+            ), None)
+            if not has_selected_files_marker(
+                cached_model, revision, selected,
+            ):
+                raise LookupError("partial model cache no longer exists")
+        requested_revision = job.get("requested_revision") or revision
+        if job["target_node_id"] == LOCAL_NODE_ID:
+            operation = self.download_model_files_checked(
+                job["model_id"], revision, selected,
+                explicit_token=token, requested_revision=requested_revision,
+            )
+        else:
+            operation = self.node_registry.request(
+                job["target_node_id"], "POST",
+                self._model_agent_path(job["model_id"], "download"),
+                json_body={
+                    "revision": revision,
+                    "requested_revision": requested_revision,
+                    "hf_token": token,
+                    "files": selected,
+                },
+                timeout=24 * 60 * 60,
+            )
+        result = await self._await_uncancelable(operation)
+        if (result or {}).get("status") == "canceled":
+            raise TransferCanceled()
+        if not (result or {}).get("ok"):
+            raise RuntimeError("selected file download did not complete")
+        job.update({
+            "status": "completed",
+            "bytes_transferred": job["bytes_total"],
+            "completed_at": time.time(),
+        })
+
     async def _run_download(self, job: dict[str, Any]) -> None:
         event = asyncio.Event()
         self._cancel_events[job["id"]] = event
+        # The file-scoped download endpoint has no cancel admission, so a
+        # selected-file job is resumable but never cancelable mid-flight.
         job.update({
             "status": "running", "started_at": time.time(),
-            "download_cancelable": True,
+            "download_cancelable": not bool(job.get("selected_files")),
             "phase": "preparing", "phase_started_at": time.time(),
             "completed_at": None, "error": None,
         })
         self._save()
         token = str(self._token_provider() or "").strip()
         try:
+            if job.get("selected_files"):
+                await self._download_selected_files(job, token)
+                return
             storage = await self._node_storage(job["target_node_id"])
             already_complete = next((
                 item for item in storage["models"]

@@ -65,6 +65,7 @@ from sparkdeck.virtual_nas import (
     download_required_free_bytes,
     holds_requested_revision,
     partial_download_size_bytes,
+    selected_files_cache_bytes,
     transfer_required_free_bytes,
     validate_model_id,
     validate_storage_model_id,
@@ -2138,11 +2139,32 @@ class Manager:
                 ).get(str(job.get("model_id")))
                 if model is not None:
                     total = max(0, int(job.get("bytes_total") or 0))
-                    live_bytes = cached_download_bytes(
-                        model,
-                        job.get("download_cache_baseline_bytes"),
-                        job.get("revision") or "main",
-                    )
+                    if job.get("selected_files"):
+                        # File-scoped credit only counts when the cache's
+                        # selective marker still records exactly this file
+                        # set. Otherwise (an additive pull whose marker
+                        # became the union of two selections) attribute the
+                        # cache growth since the job's queue-time baseline,
+                        # so the bar tracks this download instead of
+                        # pinning at zero or jumping to done.
+                        live_bytes = selected_files_cache_bytes(
+                            model, job.get("revision") or "main",
+                            job.get("selected_files"),
+                        )
+                        if live_bytes <= 0:
+                            baseline = job.get("download_cache_baseline_bytes")
+                            if baseline is not None:
+                                live_bytes = max(
+                                    0,
+                                    int(model.get("size_bytes") or 0)
+                                    - int(baseline or 0),
+                                )
+                    else:
+                        live_bytes = cached_download_bytes(
+                            model,
+                            job.get("download_cache_baseline_bytes"),
+                            job.get("revision") or "main",
+                        )
                     snapshot["bytes_transferred"] = max(
                         max(0, int(job.get("bytes_transferred") or 0)),
                         min(total, live_bytes),
@@ -2998,22 +3020,33 @@ class Manager:
         if selective_resume:
             # A selected-quantization partial resumes file-scoped: the Hub is
             # never asked for the repository's other quantizations, so
-            # whole-repository transfer jobs would both mis-gate capacity and
-            # mis-track progress. The agent-side download credits incomplete
-            # blobs, so this continues where the earlier attempt stopped.
-            async def _resume_selective() -> None:
-                try:
-                    await self.node_download_model_files(
-                        node_id, model_id, resolved_revision, selective_resume,
-                        requested_revision=requested_revision,
-                    )
-                except Exception:
-                    logger.exception(
-                        "selective resume of %s on %s failed", model_id, node_id,
-                    )
-            asyncio.create_task(_resume_selective())
+            # whole-repository jobs would mis-charge capacity. The resume
+            # still rides the durable transfer queue, so the Storage page
+            # shows it as a pending download with a live progress bar and a
+            # controller restart recovers it like any other job. The
+            # agent-side download credits incomplete blobs, so it continues
+            # where the earlier attempt stopped.
+            if not await self.node_supports_selective_downloads(node_id):
+                raise RuntimeError(
+                    f"node '{node_id}' does not support selective model file downloads; "
+                    "update its SparkDeck agent"
+                )
+            result = await self.virtual_nas.queue_download_and_transfer(
+                model_id,
+                resolved_revision,
+                node_id,
+                [],
+                preflight["download"]["size_bytes"],
+                requested_revision=requested_revision,
+                require_partial_cache=True,
+                download_cache_baseline_bytes=resolution.get(
+                    "download_cache_baseline_bytes"
+                ),
+                files=selective_resume,
+            )
+            jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
             return {
-                "job_ids": [], "jobs": [],
+                "job_ids": result["job_ids"], "jobs": jobs,
                 "resumed_files": selective_resume,
                 "resolved_revision": resolved_revision,
             }
@@ -3028,6 +3061,35 @@ class Manager:
             download_cache_baseline_bytes=resolution.get(
                 "download_cache_baseline_bytes"
             ),
+        )
+        jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+        return {"job_ids": result["job_ids"], "jobs": jobs}
+
+    async def queue_selected_model_files(
+        self, plan: dict, node_id: str, files: list[str],
+    ) -> dict:
+        """Queue one file-scoped Hub download as a durable transfer job.
+
+        Single-destination GGUF artifact pulls need no Virtual NAS fan-out,
+        so instead of a detached distribution they ride the transfer queue:
+        the Storage page gets a pending entry with a live progress bar, and
+        a controller restart recovers the job like any other download.
+        """
+        if plan.get("action") == "ready":
+            return {"job_ids": [], "jobs": []}
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            raise ValueError("node_id must not be empty")
+        if not await self.node_supports_selective_downloads(node_id):
+            raise RuntimeError(
+                f"node '{node_id}' does not support selective model file downloads; "
+                "update its SparkDeck agent"
+            )
+        result = await self.virtual_nas.queue_download_and_transfer(
+            plan["model_id"], plan["resolved_revision"], node_id, [],
+            plan["download"]["size_bytes"],
+            requested_revision=plan["revision"],
+            files=files,
         )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}

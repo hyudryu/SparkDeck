@@ -2590,6 +2590,7 @@ class SparkDeckService:
         alias = _optional_string(changes.get("alias")) or str(stored.get("alias"))
         settings = dict(stored.get("settings") or {})
         runtime_is_llama = str(stored.get("runtime")) == RuntimeKind.LLAMA_CPP.value
+        runtime_is_ninfer = str(stored.get("runtime")) == RuntimeKind.NINFER.value
         if "sg_cpu_affinity" in changes:
             from manager import Manager
             affinity = Manager._normalized_sg_cpu_affinity(changes["sg_cpu_affinity"])
@@ -2606,7 +2607,9 @@ class SparkDeckService:
             )
         if "image" in changes:
             image = _optional_string(changes.get("image"))
-            if not runtime_is_llama and not image:
+            # NInfer has a default image, so an explicit clear restores it
+            # instead of persisting an unlaunchable bookmark.
+            if not runtime_is_llama and not runtime_is_ninfer and not image:
                 raise ValueError("image must be a non-empty container image")
             settings["image"] = image
         integer_fields = (
@@ -2713,6 +2716,14 @@ class SparkDeckService:
                         str((stored.get("model") or {}).get("repository") or ""),
                         artifact, settings.get("quantization"),
                     )
+            elif artifact and runtime_is_ninfer:
+                # NInfer artifacts must stay repo-relative Hub references:
+                # the launch resolves them against the cluster cache, and a
+                # local path can never start.
+                self._validate_public_gguf_artifact(
+                    str((stored.get("model") or {}).get("repository") or ""),
+                    artifact, None, extensions=(".ninfer",),
+                )
             settings["artifact"] = artifact
         if "launch_controls" in changes:
             controls = changes.get("launch_controls")

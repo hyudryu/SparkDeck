@@ -116,6 +116,9 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
                 "ninfer-serve", "<artifact>",
                 "--host", "0.0.0.0",
                 "--port", str(_NINFER_SERVE_PORT),
+                # The proxy routes by the repository id, so the served alias
+                # must match it rather than the artifact's embedded name.
+                "--model-id", "org/model",
             ],
         )
         self.assertIn("model.ninfer", options["command"][1])
@@ -226,12 +229,28 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
             [
                 "ninfer-serve", "<artifact>", "--host", "0.0.0.0", "--port",
                 str(_NINFER_SERVE_PORT),
+                "--model-id", "org/model",
                 "--max-context", "240000", "--kv-dtype", "fp8",
                 "--spec", "mtp", "--draft-tokens", "3",
             ],
         )
         self.assertEqual(options["name"], "ninfer-test")
         self.assertEqual(options["shm_size"], "4g")
+
+    async def test_an_explicit_model_id_override_is_preserved(self):
+        manager = _manager()
+        manager.settings["hf_cache"] = self.cache.root
+
+        await _launch(
+            manager, ninfer_artifact=self.cache.artifact,
+            extra_args=["--model-id", "custom-alias"],
+        )
+
+        command = manager._run_managed_container.call_args.args[0]["command"]
+        self.assertEqual(command.count("--model-id"), 1)
+        self.assertEqual(
+            command[command.index("--model-id") + 1], "custom-alias",
+        )
 
     async def test_cluster_member_labels_are_recorded(self):
         manager = _manager()
@@ -361,10 +380,11 @@ class NinferContainerInspectionTests(unittest.TestCase):
         self.assertEqual(settings["thinking_mode"], "disabled")
         self.assertIsNone(settings["tensor_parallel_size"])
         # Engine-owned flags and the positional artifact are stripped; the
-        # rest stays editable as flags.
+        # speculative pair has no dedicated settings keys here, so it stays
+        # in extra_args for the launch-controls parser.
         self.assertEqual(
             settings["extra_args"],
-            ["--model-id", "qwen3.8-27b"],
+            ["--spec", "mtp", "--draft-tokens", "3", "--model-id", "qwen3.8-27b"],
         )
 
 
@@ -573,6 +593,28 @@ class NinferLaunchControlsTests(unittest.TestCase):
         )
         self.assertNotIn("--spec", args)
         self.assertNotIn("--draft-tokens", args)
+
+    def test_mtp_rejects_more_than_five_draft_tokens(self):
+        manager = Manager.__new__(Manager)
+        with self.assertRaisesRegex(ValueError, "between 1 and 5"):
+            manager._apply_deployment_launch_controls(
+                ["--spec", "mtp", "--draft-tokens", "3"], "ninfer",
+                {
+                    "speculative_method": "mtp",
+                    "dspark_num_speculative_tokens": 7,
+                },
+            )
+
+    def test_dflash2_accepts_up_to_fifteen_draft_tokens(self):
+        manager = Manager.__new__(Manager)
+        args = manager._apply_deployment_launch_controls(
+            ["--spec", "dflash2"], "ninfer",
+            {
+                "speculative_method": "dflash2",
+                "dspark_num_speculative_tokens": 15,
+            },
+        )
+        self.assertEqual(args[args.index("--draft-tokens") + 1], "15")
 
     def test_revision_pin_is_not_injected_for_ninfer(self):
         args = Manager._with_saved_launch_identity(

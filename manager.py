@@ -5312,6 +5312,12 @@ class Manager:
                 method = controls.get("speculative_method")
                 method = str(method).strip() if method not in (None, "") else None
                 draft = positive_int("dspark_num_speculative_tokens")
+                if method == "mtp" and draft is not None and draft > 5:
+                    # NInfer's MTP backend accepts 1..5 draft tokens; the
+                    # wider 1..15 range belongs to DFlash and DFlash2.
+                    raise ValueError(
+                        "MTP draft tokens must be between 1 and 5"
+                    )
                 flags = self._replace_command_option(flags, {"--spec"}, method)
                 flags = self._replace_command_option(
                     flags, {"--draft-tokens"},
@@ -6763,11 +6769,14 @@ class Manager:
             # NInfer launches as ``ninfer-serve <artifact> --host ...``: the
             # artifact is positional and the serve binary replaces the vLLM
             # ``serve`` marker, so neither anchors the generic parser. Strip
-            # the engine-owned flags and the artifact path, and surface the
-            # structured controls from the remaining argv.
+            # the flags the structured settings keys above capture (--spec/
+            # --draft-tokens have no dedicated keys here, so they stay in
+            # extra_args for the launch-controls parser) and drop the
+            # artifact path and the thinking pair, which thinking_mode
+            # captures.
             managed = {
                 "--host", "--port", "--max-context", "--max-concurrency",
-                "--kv-dtype", "--spec", "--draft-tokens",
+                "--kv-dtype",
             }
             skip_tokens = {"ninfer-serve"}
             extra_args = []
@@ -17303,6 +17312,13 @@ class Manager:
                 "--host", "0.0.0.0",
                 "--port", str(_NINFER_SERVE_PORT),
             ]
+            # SparkDeck routes requests by the repository id, and NInfer
+            # rejects any other request model, so the served alias must be
+            # the repository id unless the operator pinned their own
+            # --model-id (the artifact would otherwise advertise its
+            # embedded name).
+            if not self._cli_option(list(extra_args or []), {"--model-id"}):
+                command += ["--model-id", model]
             command.extend(str(item) for item in extra_args or [])
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",

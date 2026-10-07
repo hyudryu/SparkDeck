@@ -237,19 +237,34 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["name"], "ninfer-test")
         self.assertEqual(options["shm_size"], "4g")
 
-    async def test_an_explicit_model_id_override_is_preserved(self):
+    async def test_a_foreign_model_id_override_is_rejected(self):
+        """The proxy routes requests by the repository id and NInfer rejects
+        any other request model, so a custom alias would break a healthy
+        deployment — reject it before any backend is evicted."""
+        manager = _manager()
+
+        with self.assertRaisesRegex(ValueError, "custom --model-id alias"):
+            await _launch(
+                manager, ninfer_artifact=self.cache.artifact,
+                extra_args=["--model-id", "custom-alias"],
+            )
+
+        manager.evict_other_backends.assert_not_awaited()
+        manager._run_managed_container.assert_not_called()
+
+    async def test_the_repository_id_as_model_id_is_honoured(self):
         manager = _manager()
         manager.settings["hf_cache"] = self.cache.root
 
         await _launch(
             manager, ninfer_artifact=self.cache.artifact,
-            extra_args=["--model-id", "custom-alias"],
+            extra_args=["--model-id", "org/model"],
         )
 
         command = manager._run_managed_container.call_args.args[0]["command"]
         self.assertEqual(command.count("--model-id"), 1)
         self.assertEqual(
-            command[command.index("--model-id") + 1], "custom-alias",
+            command[command.index("--model-id") + 1], "org/model",
         )
 
     async def test_cluster_member_labels_are_recorded(self):
@@ -616,6 +631,17 @@ class NinferLaunchControlsTests(unittest.TestCase):
         )
         self.assertEqual(args[args.index("--draft-tokens") + 1], "15")
 
+    def test_dflash_rejects_more_than_fifteen_draft_tokens(self):
+        manager = Manager.__new__(Manager)
+        with self.assertRaisesRegex(ValueError, "between 1 and 15"):
+            manager._apply_deployment_launch_controls(
+                ["--spec", "dflash"], "ninfer",
+                {
+                    "speculative_method": "dflash",
+                    "dspark_num_speculative_tokens": 16,
+                },
+            )
+
     def test_revision_pin_is_not_injected_for_ninfer(self):
         args = Manager._with_saved_launch_identity(
             ["--max-context", "8192"], "ninfer", model_revision="a" * 40,
@@ -897,6 +923,76 @@ class NinferLaunchSettingsTests(unittest.TestCase):
 
         self.assertEqual(configuration.get("context_length"), 16384)
         self.assertNotIn("secrets", configuration)
+
+
+class NinferPromotionTests(unittest.IsolatedAsyncioTestCase):
+    """Promoting a discovered NInfer container must recover the artifact."""
+
+    def test_recovery_rebuilds_the_artifact_reference(self):
+        manager = Manager.__new__(Manager)
+        cache_root = "/host/cache"
+        image = "sparkdeck/ninfer:latest"
+        image_mock = Mock()
+        image_mock.attrs = {"Config": {"Env": [f"HF_HOME={cache_root}"]}}
+        manager.client = Mock()
+        manager.client.images.get = Mock(return_value=image_mock)
+        manager._image_hf_cache_target = (
+            Manager._image_hf_cache_target.__get__(manager)
+        )
+
+        recovered = manager._recovered_deployment_launch_settings(
+            {
+                "name": "promoted", "model": "org/model", "engine": "ninfer",
+                "mode": "single", "node_ids": ["local"],
+            },
+            {
+                "image": image,
+                "load_settings": {
+                    "command_flags": "--max-context 240000",
+                    "extra_args": [],
+                    "artifact_path": (
+                        f"{cache_root}/hub/models--org--model/snapshots/"
+                        + ("a" * 40) + "/model.ninfer"
+                    ),
+                },
+            },
+        )
+
+        self.assertEqual(
+            recovered.get("ninfer_artifact"),
+            "models--org--model/snapshots/{}/model.ninfer".format("a" * 40),
+        )
+
+    def test_updated_command_rebuilds_the_ninfer_argv(self):
+        manager = Manager.__new__(Manager)
+        original = [
+            "ninfer-serve",
+            "/root/.cache/huggingface/hub/models--org--model/snapshots/"
+            + ("a" * 40) + "/model.ninfer",
+            "--host", "0.0.0.0", "--port", "8080",
+            "--max-context", "8192", "--spec", "mtp", "--draft-tokens", "3",
+        ]
+
+        argv = manager._updated_container_command(
+            original, "ninfer", "org/model",
+            {"context_window": 240000, "max_concurrency": 4,
+             "kv_cache_dtype": "fp8", "thinking_mode": "disabled"},
+        )
+
+        self.assertEqual(argv[0], "ninfer-serve")
+        self.assertTrue(argv[1].endswith("model.ninfer"))
+        # Host and port are preserved so Docker's port mapping stays valid.
+        self.assertEqual(
+            argv[argv.index("--host") + 1:argv.index("--host") + 2], ["0.0.0.0"],
+        )
+        self.assertEqual(argv[argv.index("--port") + 1], "8080")
+        self.assertEqual(argv[argv.index("--max-context") + 1], "240000")
+        self.assertEqual(argv[argv.index("--max-concurrency") + 1], "4")
+        self.assertEqual(argv[argv.index("--kv-dtype") + 1], "fp8")
+        self.assertIn("--no-thinking", argv)
+        # Speculation rides in the flags and survives the rebuild.
+        self.assertEqual(argv[argv.index("--spec") + 1], "mtp")
+        self.assertEqual(argv[argv.index("--draft-tokens") + 1], "3")
 
 
 if __name__ == "__main__":

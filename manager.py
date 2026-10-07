@@ -5318,6 +5318,12 @@ class Manager:
                     raise ValueError(
                         "MTP draft tokens must be between 1 and 5"
                     )
+                if method in ("dflash", "dflash2") and (
+                    draft is not None and draft > 15
+                ):
+                    raise ValueError(
+                        "DFlash draft tokens must be between 1 and 15"
+                    )
                 flags = self._replace_command_option(flags, {"--spec"}, method)
                 flags = self._replace_command_option(
                     flags, {"--draft-tokens"},
@@ -5822,6 +5828,25 @@ class Manager:
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
         }
+        if engine == "ninfer":
+            # Promotion must carry the artifact reference the launcher
+            # requires. The discovered command holds the in-container cache
+            # path; strip the image's cache mount so the hub-relative form
+            # is recovered.
+            artifact_path = str(load_settings.get("artifact_path") or "")
+            try:
+                cache_prefix = (
+                    f"{self._image_hf_cache_target((primary_container or {}).get('image'))}"
+                    "/hub/"
+                )
+            except Exception:
+                cache_prefix = None
+            reference = (
+                artifact_path[len(cache_prefix):]
+                if cache_prefix and artifact_path.startswith(cache_prefix)
+                else ""
+            )
+            recovered["ninfer_artifact"] = reference or None
         if engine == "sglang":
             # SGLang's managed container builder removes these flags from
             # extra_args and regenerates them from the structured fields.
@@ -6780,6 +6805,7 @@ class Manager:
             }
             skip_tokens = {"ninfer-serve"}
             extra_args = []
+            artifact_path = None
             artifact_seen = False
             i = 0
             while i < len(analysis_cmd):
@@ -6795,8 +6821,10 @@ class Manager:
                     i += 1
                     continue
                 if not token.startswith("-") and not artifact_seen:
-                    # The positional artifact path is not an editable flag.
+                    # The positional artifact path is not an editable flag,
+                    # but promotion needs it to rebuild ninfer_artifact.
                     artifact_seen = True
+                    artifact_path = token
                     i += 1
                     continue
                 if token in {"--no-thinking", "--preserve-thinking"}:
@@ -6829,6 +6857,10 @@ class Manager:
                 "thinking_mode": thinking_mode,
                 "extra_args": extra_args,
                 "command_flags": command_flags,
+                # Promotion maps this back to a hub-relative
+                # ninfer_artifact reference; the in-container path itself is
+                # not a durable launch input.
+                "artifact_path": artifact_path,
             }
 
         managed = {
@@ -17257,6 +17289,16 @@ class Manager:
                 "available on this node"
             )
         image = image or DEFAULT_NINFER_IMAGE
+        # SparkDeck routes requests by the repository id, and NInfer rejects
+        # any other request model, so the served alias must be the repository
+        # id. A foreign --model-id alias would break every proxied request on
+        # an otherwise healthy deployment; reject it before any eviction.
+        explicit_alias = self._cli_option(list(extra_args or []), {"--model-id"})
+        if explicit_alias and explicit_alias != model:
+            raise ValueError(
+                "NInfer deployments route requests by the repository id; a "
+                "custom --model-id alias is not supported"
+            )
         if port is None:
             port = await self._allocate_port()
         if name is None:
@@ -17314,10 +17356,10 @@ class Manager:
             ]
             # SparkDeck routes requests by the repository id, and NInfer
             # rejects any other request model, so the served alias must be
-            # the repository id unless the operator pinned their own
-            # --model-id (the artifact would otherwise advertise its
-            # embedded name).
-            if not self._cli_option(list(extra_args or []), {"--model-id"}):
+            # the repository id (the artifact would otherwise advertise its
+            # embedded name). An explicit --model-id equal to the repository
+            # id is honoured as-is.
+            if not explicit_alias:
                 command += ["--model-id", model]
             command.extend(str(item) for item in extra_args or [])
             self._cluster_launch_update(
@@ -17988,7 +18030,29 @@ class Manager:
             "thinking_mode", existing.get("thinking_mode", "default")
         )
 
-        if engine == "sglang":
+        if engine == "ninfer":
+            # NInfer exposes different flag names and no vLLM-style
+            # memory controls; map the shared scalars onto its argv and
+            # leave the remaining flags untouched.
+            flags = self._replace_command_option(
+                flags, {"--max-context"}, context_window,
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-concurrency"}, concurrency,
+            )
+            flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
+            flags = re.sub(
+                r"(?<!\S)(?:--no-thinking|--preserve-thinking)(?:=\S+)?", "",
+                flags,
+            ).strip()
+            thinking = str(thinking_mode or "default")
+            if thinking == "enabled":
+                flags = f"{flags} --preserve-thinking".strip()
+            elif thinking == "disabled":
+                flags = f"{flags} --no-thinking".strip()
+            elif thinking != "default":
+                raise ValueError("thinking_mode must be default, enabled, or disabled")
+        elif engine == "sglang":
             flags = self._replace_command_option(
                 flags, {"--mem-fraction-static"}, gpu
             )
@@ -18045,6 +18109,19 @@ class Manager:
                 prefix = original[:model_index + 2]
             except ValueError as exc:
                 raise ValueError("could not locate --model-path in the SGLang command") from exc
+        elif engine == "ninfer":
+            # ``ninfer-serve <artifact> ...``: the artifact is positional,
+            # so the preserved prefix is the binary plus the artifact path.
+            try:
+                artifact_index = next(
+                    index for index, token in enumerate(original)
+                    if index > 0 and not token.startswith("-")
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    "could not locate the artifact in the NInfer command"
+                ) from exc
+            prefix = original[:artifact_index + 1]
         else:
             try:
                 model_index = original.index("serve") + 1

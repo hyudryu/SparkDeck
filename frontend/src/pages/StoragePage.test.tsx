@@ -438,7 +438,7 @@ describe('StoragePage', () => {
     expect(screen.getByRole('option', { name: 'org/partial-model' })).toBeInTheDocument()
   })
 
-  it('reports selective resumes as on-node downloads instead of queue jobs', async () => {
+  it('reports selective resumes as tracked queue downloads', async () => {
     const user = userEvent.setup()
     const storage: StorageState = {
       ...enabledStorage,
@@ -452,11 +452,20 @@ describe('StoragePage', () => {
           }
         : node),
     }
+    const selectiveJob = {
+      id: 'selective-job', kind: 'download' as const, model_id: 'org/partial-gguf',
+      source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+      target_node_id: 'node-a', target_node_name: 'Studio Spark', status: 'queued',
+      revision: 'a'.repeat(40), selected_files: ['Q4_K_M/a.gguf', 'Q4_K_M/b.gguf'],
+      bytes_total: 1_000_000_000, bytes_transferred: 400_000_000, progress: 0.4,
+      created_at: 1,
+    }
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       const path = String(input)
       if (path.endsWith('/api/v1/storage/nodes/node-a/models/org%2Fpartial-gguf/download') && init?.method === 'POST') {
         return json({
-          job_ids: [], jobs: [], resumed_files: ['Q4_K_M/a.gguf', 'Q4_K_M/b.gguf'],
+          job_ids: ['selective-job'], jobs: [selectiveJob],
+          resumed_files: ['Q4_K_M/a.gguf', 'Q4_K_M/b.gguf'],
           resolved_revision: 'a'.repeat(40),
         }, 202)
       }
@@ -470,7 +479,7 @@ describe('StoragePage', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Finish download' }))
 
     expect(await screen.findByRole('status')).toHaveTextContent(
-      'Resumed org/partial-gguf on Studio Spark for its 2 selected files. Selective downloads run directly on the node and never appear as queue jobs',
+      'Resumed org/partial-gguf on Studio Spark for its 2 selected files. The transfer queue tracks its progress',
     )
   })
 

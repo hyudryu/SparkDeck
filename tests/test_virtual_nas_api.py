@@ -583,6 +583,71 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         queue.assert_awaited_once_with("org/model", "main", ["local", "worker-1"], "worker-1")
         self.assertEqual(missing_seed.status_code, 400)
 
+    async def test_single_node_artifact_pull_queues_a_tracked_selective_download(self):
+        resolved = "b" * 40
+        plan = {
+            "enabled": True, "eligible": True, "action": "download",
+            "model_id": "org/model", "revision": "main",
+            "resolved_revision": resolved,
+            "node_ids": ["local"], "targets": [],
+            "transfer_target_node_ids": [],
+            "download": {"size_bytes": 12},
+        }
+        queued = AsyncMock(return_value={
+            "job_ids": ["job-1"],
+            "jobs": [{
+                "id": "job-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "local",
+                "revision": resolved, "selected_files": ["q4/model.gguf"],
+                "status": "queued", "bytes_total": 12, "bytes_transferred": 0,
+                "created_at": 1.0,
+            }],
+        })
+        distribute = AsyncMock()
+        with (
+            patch.object(server.manager, "virtual_nas_enabled", return_value=True),
+            patch.object(server.manager, "selected_cluster_nodes", AsyncMock(return_value=[])),
+            patch.object(
+                server.sparkdeck, "public_gguf_pull_files",
+                return_value=["q4/model.gguf"],
+            ),
+            patch.object(
+                server.manager, "recipe_model_preparation_preflight",
+                AsyncMock(return_value=plan),
+            ),
+            patch.object(server.manager, "queue_selected_model_files", queued),
+            patch.object(server.sparkdeck, "distribute_gguf_pull", distribute),
+        ):
+            single = await self.client.post(
+                "/api/v1/storage/preparations",
+                json={
+                    "model_id": "org/model", "revision": "main",
+                    "node_ids": ["local"], "artifact": "q4/model.gguf",
+                },
+            )
+            multi = await self.client.post(
+                "/api/v1/storage/preparations",
+                json={
+                    "model_id": "org/model", "revision": "main",
+                    "node_ids": ["local", "worker-1"],
+                    "artifact": "q4/model.gguf",
+                },
+            )
+
+        self.assertEqual(single.status_code, 202)
+        payload = single.json()
+        # A single destination rides the durable queue so the Storage page
+        # shows the pending download with a progress bar.
+        self.assertEqual(payload["job_ids"], ["job-1"])
+        self.assertEqual(payload["artifact_pull"]["status"], "queued")
+        queued.assert_awaited_once_with(plan, "local", ["q4/model.gguf"])
+        # Fan-out destinations keep the detached seed-and-stream path.
+        self.assertEqual(multi.status_code, 202)
+        self.assertEqual(multi.json()["job_ids"], [])
+        distribute.assert_called_once_with(
+            "org/model", "q4/model.gguf", "main", ["local", "worker-1"], "local",
+        )
+
     async def test_recipe_preparation_preflight_forwards_an_explicit_seed(self):
         recipe = {
             "id": "recipe-1", "model": "org/model", "engine": "vllm",

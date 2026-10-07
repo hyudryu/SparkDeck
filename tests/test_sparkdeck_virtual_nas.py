@@ -3923,6 +3923,109 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(force_values, [False])
         self.assertEqual(result["jobs"][0]["bytes_transferred"], 97)
 
+    async def test_selected_files_download_queues_file_scoped_job(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+        nas._node_storage = AsyncMock(return_value={
+            "models": [{
+                "model_id": "org/model", "size_bytes": 97,
+                "partial": True, "revisions": [],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
+            }],
+            "free_size": 10 * 1024 * 1024 * 1024,
+        })
+
+        result = await nas.queue_download_and_transfer(
+            "org/model", RESOLVED_REVISION, "local", [], 100,
+            requested_revision="main", require_partial_cache=True,
+            files=["UD/model-00001-of-00002.gguf", "UD/model-00002-of-00002.gguf"],
+        )
+
+        self.assertEqual(len(result["jobs"]), 1)
+        job = result["jobs"][0]
+        self.assertEqual(job["kind"], "download")
+        self.assertEqual(
+            job["selected_files"],
+            ["UD/model-00001-of-00002.gguf", "UD/model-00002-of-00002.gguf"],
+        )
+        # The partial's reusable bytes seed the progress bar.
+        self.assertEqual(job["bytes_transferred"], 97)
+        self.assertEqual(job["bytes_total"], 100)
+
+    async def test_selected_files_job_downloads_file_scoped_without_hub_sizing(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+        nas.estimate_download_size = AsyncMock()
+        nas.download_model_files_checked = AsyncMock(return_value={
+            "ok": True, "model_id": "org/model", "revision": RESOLVED_REVISION,
+        })
+        nas.jobs = [{
+            "id": "selective-1", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "local",
+            "revision": RESOLVED_REVISION, "requested_revision": "main",
+            "depends_on_job_id": None, "workflow_id": None,
+            "workflow_node_ids": [], "require_partial_cache": True,
+            "selected_files": ["UD/model-00001-of-00002.gguf"],
+            "download_cache_baseline_bytes": None,
+            "download_attempted_at": None, "download_attempt_start_bytes": None,
+            "legacy_download_attempt_tracking": False,
+            "status": "queued", "bytes_total": 100, "bytes_transferred": 97,
+            "created_at": 0, "started_at": None, "completed_at": None,
+            "error": None,
+        }]
+
+        await nas._run_download(nas.jobs[0])
+
+        job = nas.jobs[0]
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["bytes_transferred"], 100)
+        self.assertFalse(job["download_cancelable"])
+        # A file-scoped job never pays for whole-repository Hub sizing.
+        nas.estimate_download_size.assert_not_awaited()
+        nas.download_model_files_checked.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION,
+            ["UD/model-00001-of-00002.gguf"],
+            explicit_token="", requested_revision="main",
+        )
+
+    async def test_selected_files_job_survives_controller_reload(self):
+        jobs_file = Path(self.temp.name) / "virtual_nas_transfers.json"
+        jobs_file.write_text(json.dumps([{
+            "id": "selective-1", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "local",
+            "revision": RESOLVED_REVISION, "requested_revision": "main",
+            "require_partial_cache": True,
+            "selected_files": ["UD/model-00001-of-00002.gguf"],
+            "status": "running", "bytes_total": 100, "bytes_transferred": 10,
+            "created_at": 0, "started_at": 0, "completed_at": None, "error": None,
+        }, {
+            "id": "selective-2", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "local",
+            "revision": RESOLVED_REVISION, "requested_revision": "main",
+            "require_partial_cache": True,
+            "selected_files": ["../escape.gguf"],
+            "status": "running", "bytes_total": 100, "bytes_transferred": 10,
+            "created_at": 0, "started_at": 0, "completed_at": None, "error": None,
+        }]), encoding="utf-8")
+
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+
+        # The interrupted resume is re-dispatched file-scoped; the corrupt
+        # file list is dropped with its job instead of silently widening
+        # the download back to the whole repository.
+        self.assertEqual(len(nas.jobs), 1)
+        self.assertEqual(nas.jobs[0]["id"], "selective-1")
+        self.assertEqual(nas.jobs[0]["status"], "queued")
+        self.assertEqual(
+            nas.jobs[0]["selected_files"], ["UD/model-00001-of-00002.gguf"],
+        )
+
     async def test_finish_download_never_starts_without_the_partial_cache(self):
         nas = VirtualNAS(
             Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
@@ -4316,7 +4419,18 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager.virtual_nas.estimate_selected_files_size = AsyncMock(
             return_value=expected,
         )
-        manager.virtual_nas.queue_download_and_transfer = AsyncMock()
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["job-selective-1"],
+            "jobs": [{
+                "id": "job-selective-1", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "local",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "selected_files": ["UD/model-00001-of-00002.gguf"],
+                "status": "queued", "bytes_total": expected,
+                "bytes_transferred": cached,
+                "created_at": 1.0,
+            }],
+        })
         manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "local", "name": "Controller", "online": True,
             "cache_free_size": expected + DOWNLOAD_STAGING_RESERVE_BYTES,
@@ -4345,15 +4459,66 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager.virtual_nas.estimate_selected_files_size.assert_awaited_once_with(
             "org/model", RESOLVED_REVISION, ["UD/model-00001-of-00002.gguf"],
         )
-        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
-        for _ in range(100):
-            if manager.node_download_model_files.await_count:
-                break
-            await asyncio.sleep(0.01)
-        manager.node_download_model_files.assert_awaited_once_with(
-            "local", "org/model", RESOLVED_REVISION,
-            ["UD/model-00001-of-00002.gguf"], requested_revision="main",
+        # The resume rides the durable queue so the Storage page gets a
+        # pending entry with a live progress bar.
+        self.assertEqual(result["job_ids"], ["job-selective-1"])
+        self.assertEqual(result["jobs"][0]["selected_files"], ["UD/model-00001-of-00002.gguf"])
+        self.assertEqual(result["jobs"][0]["progress"], cached / expected)
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "local", [], expected,
+            requested_revision="main",
+            require_partial_cache=True,
+            download_cache_baseline_bytes=None,
+            files=["UD/model-00001-of-00002.gguf"],
         )
+        manager.node_download_model_files.assert_not_awaited()
+
+    async def test_queue_selected_model_files_tracks_single_destination_pulls(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.node_supports_selective_downloads = AsyncMock(return_value=True)
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(return_value={
+            "job_ids": ["job-s"],
+            "jobs": [{
+                "id": "job-s", "kind": "download", "model_id": "org/model",
+                "source_node_id": "huggingface", "target_node_id": "local",
+                "revision": RESOLVED_REVISION, "selected_files": ["q4/model.gguf"],
+                "status": "queued", "bytes_total": 100, "bytes_transferred": 0,
+                "created_at": 1.0,
+            }],
+        })
+        plan = {
+            "action": "download", "model_id": "org/model",
+            "resolved_revision": RESOLVED_REVISION, "revision": "main",
+            "download": {"size_bytes": 100},
+        }
+
+        result = await manager.queue_selected_model_files(
+            plan, "local", ["q4/model.gguf"],
+        )
+
+        self.assertEqual(result["job_ids"], ["job-s"])
+        manager.virtual_nas.queue_download_and_transfer.assert_awaited_once_with(
+            "org/model", RESOLVED_REVISION, "local", [], 100,
+            requested_revision="main", files=["q4/model.gguf"],
+        )
+
+        # Already-complete destinations queue nothing.
+        manager.virtual_nas.queue_download_and_transfer.reset_mock()
+        ready = await manager.queue_selected_model_files(
+            {**plan, "action": "ready"}, "local", ["q4/model.gguf"],
+        )
+        self.assertEqual(ready, {"job_ids": [], "jobs": []})
+        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
+
+        # Agents without selective downloads fail closed before queueing.
+        manager.node_supports_selective_downloads = AsyncMock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError, "does not support selective"):
+            await manager.queue_selected_model_files(
+                plan, "worker-a", ["q4/model.gguf"],
+            )
+        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
 
     async def test_resume_preflight_credits_only_bytes_after_attempt_baseline(self):
         manager = Manager.__new__(Manager)

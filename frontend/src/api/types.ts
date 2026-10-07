@@ -937,6 +937,9 @@ export interface StorageTransferJob {
   // Running downloads require a node agent that can stop its managed writer.
   download_cancelable?: boolean
   revision?: string
+  // File-scoped downloads (a selected GGUF quantization) name their exact
+  // repository file set instead of pulling the whole repository.
+  selected_files?: string[] | null
   depends_on_job_id?: string | null
   workflow_id?: string | null
   workflow_node_ids?: string[]

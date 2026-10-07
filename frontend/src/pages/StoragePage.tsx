@@ -349,7 +349,7 @@ export function StoragePage() {
         return [...current, ...(result.jobs ?? []).filter((job) => !currentIds.has(job.id))]
       })
       setNotice(result.resumed_files
-        ? `Resumed ${model.model_id} on ${node.name} for its ${result.resumed_files.length} selected file${result.resumed_files.length === 1 ? '' : 's'}. Selective downloads run directly on the node and never appear as queue jobs; watch the partial size grow below.`
+        ? `Resumed ${model.model_id} on ${node.name} for its ${result.resumed_files.length} selected file${result.resumed_files.length === 1 ? '' : 's'}. The transfer queue tracks its progress.`
         : `Queued ${model.model_id} to finish downloading on ${node.name}.`)
       resource.reload()
     } catch (reason) {

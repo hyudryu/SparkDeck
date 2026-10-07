@@ -3442,6 +3442,15 @@ class SparkDeckService:
                         f"existing local {artifact_kind} artifact"
                     ) from exc
                 if artifact_path.is_absolute():
+                    if runtime is RuntimeKind.NINFER:
+                        # NInfer launches always resolve the artifact through
+                        # the cluster cache, and there is no controller-local
+                        # NInfer launch path, so a local file could be saved
+                        # but never started. Reject it at creation instead.
+                        raise ValueError(
+                            "NInfer managed deployments require a repo-relative "
+                            "Hub .ninfer artifact"
+                        )
                     if not artifact_path.is_file():
                         raise ValueError(
                             f"{artifact_label} managed deployments require an "
@@ -3655,6 +3664,23 @@ class SparkDeckService:
                 return result
 
             adapter = self.registry.get(runtime)
+            if runtime is RuntimeKind.NINFER:
+                # The NInfer bridge launches through Manager's cluster
+                # container path, which resolves the artifact against the
+                # node's Hugging Face cache. Forward the prepared
+                # cache-relative reference instead of the raw repository
+                # filename so the launch can resolve it.
+                raw_artifact = _optional_string(body.get("artifact")) or ""
+                resolved_revision = await self._resolved_model_revision(
+                    model, identity.revision or "main",
+                )
+                settings = {
+                    **settings,
+                    "ninfer_artifact": self._hub_relative_llama_artifact(
+                        model, raw_artifact, resolved_revision,
+                        extensions=(".ninfer",),
+                    ),
+                }
             cleanup_name = safe_container_name(alias, deployment_id)
             # Persist ownership before Docker is mutated. If launch succeeds,
             # the record is filled with the discovered endpoint below. If
@@ -3759,12 +3785,16 @@ class SparkDeckService:
         if runtime is RuntimeKind.NINFER:
             # The cluster path carries a launch as argv, so NInfer's typed
             # settings have to become flags here too. Without this a saved
-            # context length is silently dropped at launch.
+            # context length or admission limit is silently dropped at launch.
             context_length = (
                 settings.get("context_length") or settings.get("context_window")
             )
             if context_length is not None:
                 extra_args += ["--max-context", str(context_length)]
+            if settings.get("max_concurrency") is not None:
+                extra_args += [
+                    "--max-concurrency", str(settings["max_concurrency"]),
+                ]
             if settings.get("thinking") is False:
                 extra_args += ["--no-thinking"]
         if identity.revision and runtime not in (
@@ -5829,12 +5859,16 @@ class SparkDeckService:
     def _llama_selective_artifact(
         self, deployment: dict[str, Any], model: str,
     ) -> list[str] | None:
-        """Return the selected GGUF files for a repo-relative llama bookmark.
+        """Return the selected artifact files for a repo-relative bookmark.
 
-        ``None`` means this deployment does not download a selected GGUF set
-        (a controller-local artifact, or a non-llama runtime).
+        Llama.cpp selects GGUF files and NInfer selects one compiled
+        ``.ninfer`` artifact. ``None`` means this deployment does not download
+        a selected file set (a controller-local artifact, or another runtime).
         """
-        if deployment.get("runtime") != RuntimeKind.LLAMA_CPP.value:
+        runtime = str(deployment.get("runtime") or "")
+        if runtime not in (
+            RuntimeKind.LLAMA_CPP.value, RuntimeKind.NINFER.value,
+        ):
             return None
         artifact = str(
             (deployment.get("model") or {}).get("artifact")
@@ -5843,7 +5877,11 @@ class SparkDeckService:
         )
         if not artifact or _artifact_is_controller_local(artifact):
             return None
-        relative = self._validate_public_gguf_artifact(model, artifact, None)
+        relative = self._validate_public_gguf_artifact(
+            model, artifact, None,
+            extensions=(".ninfer",) if runtime == RuntimeKind.NINFER.value
+            else (".gguf",),
+        )
         return self._expand_gguf_shard_files(relative)
 
     async def _selected_files_size(

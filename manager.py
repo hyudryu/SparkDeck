@@ -6625,7 +6625,7 @@ class Manager:
         retain their original quoting and variable expressions.
         """
         cmd = [str(value) for value in (cmd or [])]
-        engine = engine if engine == "sglang" else "vllm"
+        engine = engine if engine in {"sglang", "ninfer"} else "vllm"
         command_flags = ""
         analysis_cmd = cmd
         shell_wrapped = False
@@ -6754,6 +6754,69 @@ class Manager:
                 "tensor_parallel_size": self._cli_option(
                     analysis_cmd, {"--tp-size"}, int
                 ),
+                "thinking_mode": thinking_mode,
+                "extra_args": extra_args,
+                "command_flags": command_flags,
+            }
+
+        if engine == "ninfer":
+            # NInfer launches as ``ninfer-serve <artifact> --host ...``: the
+            # artifact is positional and the serve binary replaces the vLLM
+            # ``serve`` marker, so neither anchors the generic parser. Strip
+            # the engine-owned flags and the artifact path, and surface the
+            # structured controls from the remaining argv.
+            managed = {
+                "--host", "--port", "--max-context", "--max-concurrency",
+                "--kv-dtype", "--spec", "--draft-tokens",
+            }
+            skip_tokens = {"ninfer-serve"}
+            extra_args = []
+            artifact_seen = False
+            i = 0
+            while i < len(analysis_cmd):
+                token = analysis_cmd[i]
+                key = token.split("=", 1)[0]
+                if key in managed:
+                    if "=" not in token and i + 1 < len(analysis_cmd):
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                if token in skip_tokens:
+                    i += 1
+                    continue
+                if not token.startswith("-") and not artifact_seen:
+                    # The positional artifact path is not an editable flag.
+                    artifact_seen = True
+                    i += 1
+                    continue
+                if token in {"--no-thinking", "--preserve-thinking"}:
+                    # thinking_mode captures the switch; the apply path
+                    # re-emits it, so the pair must not survive as flags.
+                    i += 1
+                    continue
+                extra_args.append(token)
+                i += 1
+            if "--preserve-thinking" in analysis_cmd:
+                thinking_mode = "enabled"
+            elif "--no-thinking" in analysis_cmd:
+                thinking_mode = "disabled"
+            else:
+                thinking_mode = None
+            if not command_flags:
+                command_flags = shlex.join(extra_args)
+            return {
+                "editable": "ninfer-serve" in analysis_cmd,
+                "engine": engine,
+                "gpu_memory_utilization": None,
+                "max_concurrency": self._cli_option(
+                    analysis_cmd, {"--max-concurrency"}, int,
+                ),
+                "kv_cache_dtype": self._cli_option(analysis_cmd, {"--kv-dtype"}),
+                "context_window": self._cli_option(
+                    analysis_cmd, {"--max-context"}, int,
+                ),
+                "tensor_parallel_size": None,
                 "thinking_mode": thinking_mode,
                 "extra_args": extra_args,
                 "command_flags": command_flags,
@@ -17185,9 +17248,6 @@ class Manager:
                 "available on this node"
             )
         image = image or DEFAULT_NINFER_IMAGE
-        # NInfer takes the node's GPU for its CUDA context, so other chat
-        # engines must be evicted before the CUDA context is created.
-        await self.evict_other_backends(protect="ninfer")
         if port is None:
             port = await self._allocate_port()
         if name is None:
@@ -17198,7 +17258,7 @@ class Manager:
             model=model, cluster_member=cluster_member,
         )
 
-        def _create():
+        def _ensure_image():
             try:
                 self._cluster_launch_update(
                     name, "checking_image", f"Checking Docker image {image}",
@@ -17213,13 +17273,31 @@ class Manager:
                 )
                 print(f"[ninfer] pulling missing image: {image}")
                 self.client.images.pull(image)
+
+        try:
+            # Confirm the image is usable and the artifact is cached BEFORE
+            # evicting other engines: a missing image or artifact must fail
+            # without stopping healthy chat backends.
+            await asyncio.to_thread(_ensure_image)
             # Resolve the in-container artifact path only after the image is
             # present: a custom image declaring HF_HOME mounts the cache
             # somewhere else, so the pull decides where the artifact must
             # point.
-            model_path = self._resolve_ninfer_artifact(
-                model, ninfer_artifact, image,
+            model_path = await asyncio.to_thread(
+                self._resolve_ninfer_artifact, model, ninfer_artifact, image,
             )
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+        # NInfer takes the node's GPU for its CUDA context, so other chat
+        # engines must be evicted before the CUDA context is created.
+        await self.evict_other_backends(protect="ninfer")
+
+        def _create():
             command = [
                 "ninfer-serve", model_path,
                 "--host", "0.0.0.0",

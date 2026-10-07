@@ -295,6 +295,25 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, r"boom \[REDACTED\]"):
             await _launch(manager, name="ninfer-fail", ninfer_artifact=self.cache.artifact)
 
+        # A launch that fails before the container is created must not have
+        # stopped healthy chat backends.
+        manager.evict_other_backends.assert_not_awaited()
+
+    async def test_missing_image_is_rejected_before_eviction(self):
+        import docker
+
+        manager = _manager()
+        manager.client.images.get = Mock(
+            side_effect=docker.errors.ImageNotFound("missing")
+        )
+        manager.client.images.pull = Mock(side_effect=RuntimeError("pull failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "pull failed"):
+            await _launch(manager, ninfer_artifact=self.cache.artifact)
+
+        manager.evict_other_backends.assert_not_awaited()
+        manager._run_managed_container.assert_not_called()
+
     def test_ninfer_is_a_supported_engine(self):
         self.assertIn("ninfer", _SUPPORTED_ENGINES)
 
@@ -313,6 +332,61 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         # The credential guard still applies.
         with self.assertRaisesRegex(ValueError, "managed by SparkDeck"):
             normalize_runtime_environment({"HF_TOKEN": "x"}, "ninfer")
+
+
+class NinferContainerInspectionTests(unittest.TestCase):
+    """Discovered NInfer containers must parse through their own command shape."""
+
+    def test_container_load_settings_parses_the_ninfer_argv(self):
+        settings = Manager._container_load_settings(
+            Manager.__new__(Manager),
+            [
+                "ninfer-serve",
+                "/root/.cache/huggingface/hub/models--org--model/snapshots/"
+                + ("a" * 40) + "/model.ninfer",
+                "--host", "0.0.0.0", "--port", "8080",
+                "--max-context", "240000", "--max-concurrency", "2",
+                "--kv-dtype", "fp8", "--spec", "mtp", "--draft-tokens", "3",
+                "--no-thinking", "--model-id", "qwen3.8-27b",
+            ],
+            "ninfer",
+            "org/model",
+        )
+
+        self.assertTrue(settings["editable"])
+        self.assertEqual(settings["engine"], "ninfer")
+        self.assertEqual(settings["context_window"], 240000)
+        self.assertEqual(settings["max_concurrency"], 2)
+        self.assertEqual(settings["kv_cache_dtype"], "fp8")
+        self.assertEqual(settings["thinking_mode"], "disabled")
+        self.assertIsNone(settings["tensor_parallel_size"])
+        # Engine-owned flags and the positional artifact are stripped; the
+        # rest stays editable as flags.
+        self.assertEqual(
+            settings["extra_args"],
+            ["--model-id", "qwen3.8-27b"],
+        )
+
+
+class NinferSelectiveArtifactTests(unittest.TestCase):
+    """Preparation must download only the selected .ninfer artifact."""
+
+    def test_selective_artifact_recognizes_ninfer(self):
+        service = SparkDeckService.__new__(SparkDeckService)
+
+        files = service._llama_selective_artifact(
+            {"runtime": "ninfer", "model": {"artifact": "model.ninfer"}},
+            "org/model",
+        )
+        self.assertEqual(files, ["model.ninfer"])
+
+    def test_selective_artifact_ignores_other_runtimes(self):
+        service = SparkDeckService.__new__(SparkDeckService)
+
+        self.assertIsNone(service._llama_selective_artifact(
+            {"runtime": "vllm", "model": {"artifact": "model.ninfer"}},
+            "org/model",
+        ))
 
 
 class NinferEvictionTests(unittest.IsolatedAsyncioTestCase):
@@ -618,6 +692,36 @@ class NinferClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
             await service.close()
             temp.cleanup()
 
+    async def test_local_artifact_paths_are_rejected_at_creation(self):
+        """There is no controller-local NInfer launch path, so a local .ninfer
+        file must be rejected when the deployment is saved instead of
+        producing a bookmark that can never start."""
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        service = SparkDeckService(manager, Path(temp.name))
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "require a repo-relative Hub .ninfer artifact",
+            ):
+                await service.create_deployment({
+                    "model": "org/model",
+                    "alias": "ni-local",
+                    "runtime": "ninfer",
+                    "artifact": str(Path(temp.name) / "model.ninfer"),
+                    "node_ids": ["spark-2"],
+                    "deployment_mode": "single",
+                })
+            self.assertIsNone(
+                service.store.deployment("ni-local", include_private=True),
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
 
 class NinferProxyTests(unittest.IsolatedAsyncioTestCase):
     """Managed NInfer traffic must route through Manager's member-aware path."""
@@ -704,6 +808,12 @@ class NinferLaunchSettingsTests(unittest.TestCase):
         self.assertEqual(extra[extra.index("--max-context") + 1], "16384")
         self.assertIn("--no-thinking", extra)
         self.assertEqual(body["engine"], "ninfer")
+
+    def test_cluster_launch_translates_the_typed_concurrency_limit(self):
+        body = self._body({"max_concurrency": 4})
+
+        extra = body["extra_args"]
+        self.assertEqual(extra[extra.index("--max-concurrency") + 1], "4")
 
     def test_unset_settings_do_not_emit_flags(self):
         body = self._body({"context_length": None, "thinking": None})

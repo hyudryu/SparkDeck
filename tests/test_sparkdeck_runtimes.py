@@ -442,3 +442,16 @@ class NinferBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["--max-context", "4096", "--max-concurrency", "2", "--spec", "mtp"],
         )
         self.assertEqual(result["name"], "ninfer-model")
+
+    async def test_ninfer_bridge_forwards_the_artifact_reference(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(return_value={"name": "ninfer-model"})
+        artifact = "models--org--model/snapshots/x/model.ninfer"
+
+        await launch_managed_container(
+            manager, NinferAdapter(), "dep-1", "ni", "org/model",
+            {"ninfer_artifact": artifact},
+        )
+
+        kwargs = manager.create_container.await_args.kwargs
+        self.assertEqual(kwargs["ninfer_artifact"], artifact)

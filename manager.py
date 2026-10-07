@@ -2141,13 +2141,24 @@ class Manager:
                     total = max(0, int(job.get("bytes_total") or 0))
                     if job.get("selected_files"):
                         # File-scoped credit only counts when the cache's
-                        # selective marker recorded exactly this file set;
-                        # another cached quantization of the same revision
-                        # must not inflate the bar to done.
+                        # selective marker still records exactly this file
+                        # set. Otherwise (an additive pull whose marker
+                        # became the union of two selections) attribute the
+                        # cache growth since the job's queue-time baseline,
+                        # so the bar tracks this download instead of
+                        # pinning at zero or jumping to done.
                         live_bytes = selected_files_cache_bytes(
                             model, job.get("revision") or "main",
                             job.get("selected_files"),
                         )
+                        if live_bytes <= 0:
+                            baseline = job.get("download_cache_baseline_bytes")
+                            if baseline is not None:
+                                live_bytes = max(
+                                    0,
+                                    int(model.get("size_bytes") or 0)
+                                    - int(baseline or 0),
+                                )
                     else:
                         live_bytes = cached_download_bytes(
                             model,

@@ -3361,8 +3361,11 @@ class VirtualNAS:
                 # File-scoped credit only when the cache's selective marker
                 # recorded exactly the requested set; another quantization
                 # of the same revision must not pre-fill this download's
-                # progress or capacity credit.
-                baseline = None
+                # progress or capacity credit. The baseline pins the cache
+                # size at queue time so the live overlay can attribute this
+                # job's own byte growth even after the marker becomes the
+                # union of both selections.
+                baseline = _nonnegative_int((cached_model or {}).get("size_bytes"))
                 cached_bytes = min(
                     expected_bytes,
                     selected_files_cache_bytes(
@@ -3805,21 +3808,23 @@ class VirtualNAS:
         ))
         if not selected:
             raise ValueError("download job does not name any selected repository file")
+        revision = job.get("revision") or "main"
         if job.get("require_partial_cache"):
             # A queued or restart-recovered resume must fail as stale when
-            # its partial cache disappeared, instead of re-downloading the
-            # whole selection from scratch.
+            # its own selection vanished — even if another quantization of
+            # the same repository still holds a partial — instead of
+            # re-downloading the whole selection from scratch. Artifact
+            # pulls set require_partial_cache=False precisely because they
+            # may start with none of the selected bytes present.
             storage = await self._node_storage(job["target_node_id"])
             cached_model = next((
                 item for item in storage["models"]
                 if item.get("model_id") == job["model_id"]
             ), None)
-            if not (
-                cached_model
-                and (cached_model.get("partial") or cached_model.get("has_partial_download"))
-            ):
+            if selected_files_cache_bytes(
+                cached_model, revision, selected,
+            ) <= 0:
                 raise LookupError("partial model cache no longer exists")
-        revision = job.get("revision") or "main"
         requested_revision = job.get("requested_revision") or revision
         if job["target_node_id"] == LOCAL_NODE_ID:
             operation = self.download_model_files_checked(

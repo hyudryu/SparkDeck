@@ -3960,7 +3960,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         # bytes seed the progress bar and the capacity credit.
         self.assertEqual(job["bytes_transferred"], 97)
         self.assertEqual(job["bytes_total"], 100)
-        self.assertIsNone(job["download_cache_baseline_bytes"])
+        # The baseline pins the cache size at queue time so an additive
+        # pull's live progress can be attributed to byte growth.
+        self.assertEqual(job["download_cache_baseline_bytes"], 97)
 
         # A marker for a different quantization credits nothing: those bytes
         # are not the selected files' resume state, and the bar must not
@@ -3999,6 +4001,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             "models": [{
                 "model_id": "org/model", "size_bytes": 97,
                 "partial": True, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["UD/model-00001-of-00002.gguf"],
+                },
             }],
             "free_size": 10 * 1024 * 1024 * 1024,
         })
@@ -4039,7 +4045,20 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
         )
         nas.start = Mock()
-        nas._node_storage = AsyncMock(return_value={"models": [], "free_size": 1})
+        nas._node_storage = AsyncMock(return_value={
+            "models": [{
+                # Another quantization of the same revision still holds a
+                # partial: the model-level flags stay true, but the job's
+                # selection is gone and the resume must fail as stale.
+                "model_id": "org/model", "size_bytes": 900,
+                "partial": True, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 900},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["Q4_K_M/model.gguf"],
+                },
+            }],
+            "free_size": 1,
+        })
         nas.download_model_files_checked = AsyncMock()
         nas.jobs = [{
             "id": "selective-2", "kind": "download", "model_id": "org/model",
@@ -4889,6 +4908,8 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         }
         # The node caches a different quantization of the same revision:
         # 900 reusable revision bytes that none of the selected files own.
+        # Without the job's baseline there is no attributable growth, so
+        # the bar holds at zero instead of crediting unrelated bytes.
         manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "worker-a", "name": "Worker A", "online": True,
             "models": [{
@@ -4905,8 +4926,29 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mismatched["jobs"][0]["bytes_transferred"], 0)
         self.assertEqual(mismatched["jobs"][0]["progress"], 0.0)
 
+        # With the queue-time baseline, an additive pull's own growth is
+        # credited: the cache grew from 800 to 840 bytes, all of it this
+        # job's selection.
+        selected_job["download_cache_baseline_bytes"] = 800
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker A", "online": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 840,
+                "partial": True, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 840},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["Q4_K_M/model.gguf"],
+                },
+            }],
+        }])
+        manager._invalidate_virtual_nas_nodes()
+        additive = await manager.virtual_nas_inventory()
+        self.assertEqual(additive["jobs"][0]["bytes_transferred"], 40)
+        self.assertEqual(additive["jobs"][0]["progress"], 0.4)
+
         # Once the cache's marker records exactly the selected set, the
-        # revision bytes belong to the download and the bar moves.
+        # partial bytes belong to the download and the bar moves.
+        selected_job["download_cache_baseline_bytes"] = None
         manager.model_cache_inventory = AsyncMock(return_value=[{
             "id": "worker-a", "name": "Worker A", "online": True,
             "models": [{

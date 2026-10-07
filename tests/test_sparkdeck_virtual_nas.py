@@ -3933,6 +3933,12 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 "model_id": "org/model", "size_bytes": 97,
                 "partial": True, "revisions": [],
                 "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: [
+                        "UD/model-00001-of-00002.gguf",
+                        "UD/model-00002-of-00002.gguf",
+                    ],
+                },
             }],
             "free_size": 10 * 1024 * 1024 * 1024,
         })
@@ -3950,9 +3956,38 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             job["selected_files"],
             ["UD/model-00001-of-00002.gguf", "UD/model-00002-of-00002.gguf"],
         )
-        # The partial's reusable bytes seed the progress bar.
+        # The partial holds exactly the requested file set, so its reusable
+        # bytes seed the progress bar and the capacity credit.
         self.assertEqual(job["bytes_transferred"], 97)
         self.assertEqual(job["bytes_total"], 100)
+        self.assertIsNone(job["download_cache_baseline_bytes"])
+
+        # A marker for a different quantization credits nothing: those bytes
+        # are not the selected files' resume state, and the bar must not
+        # start at done.
+        nas2 = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas2.start = Mock()
+        # A fresh queue: the first nas persists into the shared temp file.
+        nas2.jobs = []
+        nas2._node_storage = AsyncMock(return_value={
+            "models": [{
+                "model_id": "org/model", "size_bytes": 97,
+                "partial": True, "revisions": [],
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["Q4_K_M/model.gguf"],
+                },
+            }],
+            "free_size": 10 * 1024 * 1024 * 1024,
+        })
+        other = await nas2.queue_download_and_transfer(
+            "org/model", RESOLVED_REVISION, "local", [], 100,
+            requested_revision="main", require_partial_cache=True,
+            files=["UD/model-00001-of-00002.gguf", "UD/model-00002-of-00002.gguf"],
+        )
+        self.assertEqual(other["jobs"][0]["bytes_transferred"], 0)
 
     async def test_selected_files_job_downloads_file_scoped_without_hub_sizing(self):
         nas = VirtualNAS(
@@ -3960,6 +3995,13 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         )
         nas.start = Mock()
         nas.estimate_download_size = AsyncMock()
+        nas._node_storage = AsyncMock(return_value={
+            "models": [{
+                "model_id": "org/model", "size_bytes": 97,
+                "partial": True, "has_partial_download": True,
+            }],
+            "free_size": 10 * 1024 * 1024 * 1024,
+        })
         nas.download_model_files_checked = AsyncMock(return_value={
             "ok": True, "model_id": "org/model", "revision": RESOLVED_REVISION,
         })
@@ -3991,6 +4033,36 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             ["UD/model-00001-of-00002.gguf"],
             explicit_token="", requested_revision="main",
         )
+
+    async def test_selected_files_resume_fails_when_partial_disappeared(self):
+        nas = VirtualNAS(
+            Path(self.temp.name), lambda: self.hub, FakeRegistry(), lambda: True,
+        )
+        nas.start = Mock()
+        nas._node_storage = AsyncMock(return_value={"models": [], "free_size": 1})
+        nas.download_model_files_checked = AsyncMock()
+        nas.jobs = [{
+            "id": "selective-2", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "local",
+            "revision": RESOLVED_REVISION, "requested_revision": "main",
+            "depends_on_job_id": None, "workflow_id": None,
+            "workflow_node_ids": [], "require_partial_cache": True,
+            "selected_files": ["UD/model-00001-of-00002.gguf"],
+            "download_cache_baseline_bytes": None,
+            "download_attempted_at": None, "download_attempt_start_bytes": None,
+            "legacy_download_attempt_tracking": False,
+            "status": "queued", "bytes_total": 100, "bytes_transferred": 10,
+            "created_at": 0, "started_at": None, "completed_at": None,
+            "error": None,
+        }]
+
+        await nas._run_download(nas.jobs[0])
+
+        # A queued resume whose partial was deleted fails as stale instead
+        # of silently re-downloading the whole selection.
+        self.assertEqual(nas.jobs[0]["status"], "failed")
+        self.assertIn("partial model cache no longer exists", nas.jobs[0]["error"])
+        nas.download_model_files_checked.assert_not_awaited()
 
     async def test_selected_files_job_survives_controller_reload(self):
         jobs_file = Path(self.temp.name) / "virtual_nas_transfers.json"
@@ -4794,6 +4866,62 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["nodes"][0]["total_size"], 1000)
         self.assertEqual(result["nodes"][0]["free_size"], 600)
+
+    async def test_public_inventory_credits_only_the_selected_file_set(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {
+            "virtual_nas_enabled": True, "cluster_node_name": "Coordinator",
+        }
+        manager.virtual_nas = Mock()
+        selected_job = {
+            "id": "selective-1", "kind": "download", "model_id": "org/model",
+            "source_node_id": "huggingface", "target_node_id": "worker-a",
+            "revision": RESOLVED_REVISION, "status": "running",
+            "selected_files": ["UD/model-00001-of-00002.gguf"],
+            "download_cache_baseline_bytes": None,
+            "bytes_total": 100, "bytes_transferred": 0,
+            "started_at": 99, "created_at": 1,
+        }
+        manager.virtual_nas.list_transfers.return_value = {"items": [selected_job]}
+        manager.node_registry = Mock()
+        manager.node_registry.get.return_value = {
+            "id": "worker-a", "name": "Worker A",
+        }
+        # The node caches a different quantization of the same revision:
+        # 900 reusable revision bytes that none of the selected files own.
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker A", "online": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 900,
+                "partial": True, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 900},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["Q4_K_M/model.gguf"],
+                },
+            }],
+        }])
+
+        mismatched = await manager.virtual_nas_inventory()
+        self.assertEqual(mismatched["jobs"][0]["bytes_transferred"], 0)
+        self.assertEqual(mismatched["jobs"][0]["progress"], 0.0)
+
+        # Once the cache's marker records exactly the selected set, the
+        # revision bytes belong to the download and the bar moves.
+        manager.model_cache_inventory = AsyncMock(return_value=[{
+            "id": "worker-a", "name": "Worker A", "online": True,
+            "models": [{
+                "model_id": "org/model", "size_bytes": 40,
+                "partial": True, "has_partial_download": True,
+                "partial_revision_size_bytes": {RESOLVED_REVISION: 40},
+                "selective_files_by_revision": {
+                    RESOLVED_REVISION: ["UD/model-00001-of-00002.gguf"],
+                },
+            }],
+        }])
+        manager._invalidate_virtual_nas_nodes()
+        matched = await manager.virtual_nas_inventory()
+        self.assertEqual(matched["jobs"][0]["bytes_transferred"], 40)
+        self.assertEqual(matched["jobs"][0]["progress"], 0.4)
 
     async def test_public_inventory_reports_live_overall_download_progress(self):
         manager = Manager.__new__(Manager)

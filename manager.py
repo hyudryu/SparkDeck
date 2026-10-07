@@ -65,6 +65,7 @@ from sparkdeck.virtual_nas import (
     download_required_free_bytes,
     holds_requested_revision,
     partial_download_size_bytes,
+    selected_files_cache_bytes,
     transfer_required_free_bytes,
     validate_model_id,
     validate_storage_model_id,
@@ -2138,11 +2139,21 @@ class Manager:
                 ).get(str(job.get("model_id")))
                 if model is not None:
                     total = max(0, int(job.get("bytes_total") or 0))
-                    live_bytes = cached_download_bytes(
-                        model,
-                        job.get("download_cache_baseline_bytes"),
-                        job.get("revision") or "main",
-                    )
+                    if job.get("selected_files"):
+                        # File-scoped credit only counts when the cache's
+                        # selective marker recorded exactly this file set;
+                        # another cached quantization of the same revision
+                        # must not inflate the bar to done.
+                        live_bytes = selected_files_cache_bytes(
+                            model, job.get("revision") or "main",
+                            job.get("selected_files"),
+                        )
+                    else:
+                        live_bytes = cached_download_bytes(
+                            model,
+                            job.get("download_cache_baseline_bytes"),
+                            job.get("revision") or "main",
+                        )
                     snapshot["bytes_transferred"] = max(
                         max(0, int(job.get("bytes_transferred") or 0)),
                         min(total, live_bytes),

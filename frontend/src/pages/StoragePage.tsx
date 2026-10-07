@@ -124,14 +124,22 @@ function isActive(job: StorageTransferJob) {
   return !['completed', 'failed', 'cancelled', 'canceled'].includes(job.status.toLowerCase())
 }
 
+// File-scoped downloads (a selected GGUF quantization) cannot be stopped
+// mid-flight by design: the node's file download endpoint has no cancel
+// admission. That is a property of the job, not an obsolete node agent.
+function isSelectiveDownload(job: StorageTransferJob) {
+  return (job.selected_files?.length ?? 0) > 0
+}
+
 function JobCancelButton({ job, stopping, busy, onCancel }: { job: StorageTransferJob; stopping: boolean; busy: boolean; onCancel: () => void }) {
   if (!isActive(job)) return null
   const download = job.kind === 'download'
-  const unsupported = download && job.status.toLowerCase() === 'running' && job.download_cancelable !== true && !stopping
+  const selective = download && isSelectiveDownload(job)
+  const blocked = download && job.status.toLowerCase() === 'running' && job.download_cancelable !== true && !stopping
   return <Button variant="tertiary" className={download ? 'storage-download-stop' : undefined}
     aria-label={download ? `Stop download of ${job.model_id} on ${job.target_node_name}` : `Cancel ${job.model_id} ${job.kind ?? 'transfer'}`}
-    title={unsupported ? 'Update this node agent to stop a running download safely.' : download ? 'Stop downloading and keep cached files for resuming later.' : undefined}
-    disabled={busy || stopping || unsupported}
+    title={!blocked ? (download ? 'Stop downloading and keep cached files for resuming later.' : undefined) : selective ? 'Selective downloads cannot be stopped mid-flight; cached files are kept for resuming.' : 'Update this node agent to stop a running download safely.'}
+    disabled={busy || stopping || blocked}
     onClick={onCancel}
   >{stopping ? 'Stopping...' : download ? job.phase === 'canceling' && job.error ? 'Retry stop' : 'Stop download' : 'Cancel'}</Button>
 }
@@ -525,7 +533,7 @@ export function StoragePage() {
                     style={{ '--storage-active-progress': `${progress}%` } as CSSProperties}
                   >
                     {downloading ? <DownloadCloud size={15} aria-hidden="true" /> : <ArrowLeftRight size={15} aria-hidden="true" />}
-                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</small>{downloading && <small>{running && job.download_cancelable !== true && !stopping ? 'Update node agent to stop' : 'Stop keeps cached files'}</small>}{job.error && <small role="alert" title={job.error}>{job.error}</small>}{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
+                    <div><strong>{job.model_id}</strong><small>{activity}{job.bytes_total > 0 ? ` · ${formatBytes(job.bytes_total)}` : ''}</small><SmoothProgress value={progress} label={`${activity} ${job.model_id} progress`} /><small>{formatProgress(progress)}% · {formatBytes(job.bytes_transferred)} of {formatBytes(job.bytes_total)}{transferRateText(job)}</small>{downloading && <small>{running && !stopping && (isSelectiveDownload(job) ? 'Non-stop; resumes from cached files' : job.download_cancelable !== true ? 'Update node agent to stop' : 'Stop keeps cached files')}</small>}{job.error && <small role="alert" title={job.error}>{job.error}</small>}{finalizing && <><small className="storage-finalization-label">{phaseLabel}</small><FinalizationProgress label={phaseLabel} /></>}</div>
                     <JobCancelButton job={job} stopping={isStopping(job)} busy={busy === job.id} onCancel={() => void cancel(job)} />
                   </li>
                 })}

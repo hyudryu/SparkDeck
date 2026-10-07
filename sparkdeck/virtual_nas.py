@@ -248,6 +248,30 @@ def cached_download_bytes(
     return max(0, current - _nonnegative_int(baseline_bytes))
 
 
+def has_selected_files_marker(
+    model: dict[str, Any] | None, revision: str | None,
+    selected: list[str] | None,
+) -> bool:
+    """Return whether the cache's selective marker recorded exactly ``selected``.
+
+    A failed selected-file download writes the marker before any blob
+    bytes, so marker presence — not byte count — proves the matching
+    partial cache exists.
+    """
+    if not selected or revision is None:
+        return False
+    selective = (model or {}).get("selective_files_by_revision")
+    if not isinstance(selective, dict):
+        return False
+    recorded = selective.get(revision)
+    if not isinstance(recorded, list):
+        return False
+    recorded_set = sorted({
+        str(item) for item in recorded if isinstance(item, str) and item
+    })
+    return recorded_set == sorted(set(selected))
+
+
 def selected_files_cache_bytes(
     model: dict[str, Any] | None, revision: str | None,
     selected: list[str] | None,
@@ -261,18 +285,7 @@ def selected_files_cache_bytes(
     that case credits zero and lets the file-scoped download account for
     its own resume state.
     """
-    if not selected:
-        return 0
-    selective = (model or {}).get("selective_files_by_revision")
-    if not isinstance(selective, dict) or revision is None:
-        return 0
-    recorded = selective.get(revision)
-    if not isinstance(recorded, list):
-        return 0
-    recorded_set = sorted({
-        str(item) for item in recorded if isinstance(item, str) and item
-    })
-    if recorded_set != sorted(set(selected)):
+    if not has_selected_files_marker(model, revision, selected):
         return 0
     return partial_download_size_bytes(model, revision)
 
@@ -3813,17 +3826,20 @@ class VirtualNAS:
             # A queued or restart-recovered resume must fail as stale when
             # its own selection vanished — even if another quantization of
             # the same repository still holds a partial — instead of
-            # re-downloading the whole selection from scratch. Artifact
-            # pulls set require_partial_cache=False precisely because they
-            # may start with none of the selected bytes present.
+            # re-downloading the whole selection from scratch. Marker
+            # presence, not byte count: a failed attempt writes the marker
+            # before any blob bytes and remains a valid resumable partial.
+            # Artifact pulls set require_partial_cache=False precisely
+            # because they may start with none of the selected bytes
+            # present.
             storage = await self._node_storage(job["target_node_id"])
             cached_model = next((
                 item for item in storage["models"]
                 if item.get("model_id") == job["model_id"]
             ), None)
-            if selected_files_cache_bytes(
+            if not has_selected_files_marker(
                 cached_model, revision, selected,
-            ) <= 0:
+            ):
                 raise LookupError("partial model cache no longer exists")
         requested_revision = job.get("requested_revision") or revision
         if job["target_node_id"] == LOCAL_NODE_ID:

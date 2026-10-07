@@ -655,6 +655,29 @@ describe('StoragePage', () => {
     expect(within(nodePanel).getByRole('button', { name: 'Stop download of org/download on Backup Spark' })).toHaveAttribute('title', 'Update this node agent to stop a running download safely.')
   })
 
+  it('labels non-cancelable selective downloads without blaming the node agent', async () => {
+    const gib = 1024 ** 3
+    const storage: StorageState = {
+      ...enabledStorage,
+      jobs: [{
+        id: 'selective-1', model_id: 'org/gguf', source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+        target_node_id: 'node-b', target_node_name: 'Backup Spark', status: 'running', kind: 'download',
+        download_cancelable: false, selected_files: ['Q4_K_M/model.gguf'],
+        bytes_total: 21 * gib, bytes_transferred: 4.1 * gib, progress: 0.195, created_at: '2026-10-06T12:00:00Z',
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const nodePanel = await screen.findByRole('region', { name: 'Storage on Backup Spark' })
+    const download = within(nodePanel).getByLabelText('Downloading from Hugging Face org/gguf on Backup Spark')
+    expect(within(download).getByText('Non-stop; resumes from cached files')).toBeInTheDocument()
+    expect(download).not.toHaveTextContent('Update node agent to stop')
+    const stop = within(nodePanel).getByRole('button', { name: 'Stop download of org/gguf on Backup Spark' })
+    expect(stop).toBeDisabled()
+    expect(stop).toHaveAttribute('title', 'Selective downloads cannot be stopped mid-flight; cached files are kept for resuming.')
+  })
+
   it('marks a running job as measuring its speed until the cluster reports one', async () => {
     const storage: StorageState = {
       ...enabledStorage,

@@ -3998,10 +3998,11 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         nas.start = Mock()
         nas.estimate_download_size = AsyncMock()
         nas._node_storage = AsyncMock(return_value={
+            # Marker-only partial: a failed attempt wrote the marker before
+            # any blob bytes, and the resume must still dispatch.
             "models": [{
-                "model_id": "org/model", "size_bytes": 97,
+                "model_id": "org/model", "size_bytes": 0,
                 "partial": True, "has_partial_download": True,
-                "partial_revision_size_bytes": {RESOLVED_REVISION: 97},
                 "selective_files_by_revision": {
                     RESOLVED_REVISION: ["UD/model-00001-of-00002.gguf"],
                 },

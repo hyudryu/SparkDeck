@@ -29,6 +29,7 @@ _GGUF_SHARD_PATTERN = re.compile(
 # published host port is allocated per deployment by Manager.
 LAYA_SERVE_PORT = 8080
 TENSORFOLD_SERVE_PORT = 8080
+NINFER_SERVE_PORT = 8080
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -253,11 +254,46 @@ class TensorfoldAdapter(RuntimeAdapter):
         )
 
 
+class NinferAdapter(RuntimeAdapter):
+    """Serve a NInfer artifact engine behind SparkDeck's /v1 surface.
+
+    NInfer loads one compiled v3 ``.ninfer`` artifact on one NVIDIA GPU and
+    exposes OpenAI-compatible HTTP endpoints, so the controller proxy, load
+    balancing, token accounting, and health checks all work unchanged. The
+    artifact resolves through the Hugging Face cache exactly like a llama.cpp
+    GGUF artifact; the model field stays the repository id.
+    """
+
+    kind = RuntimeKind.NINFER
+    default_image = "sparkdeck/ninfer:latest"
+
+    def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
+        artifact = str(settings.get("artifact") or model).strip()
+        command = [
+            "ninfer-serve", artifact,
+            "--host", "0.0.0.0",
+            "--port", str(NINFER_SERVE_PORT),
+        ]
+        context = settings.get("context_length") or settings.get("context_window")
+        if context:
+            command += ["--max-context", str(context)]
+        if settings.get("max_concurrency") is not None:
+            command += ["--max-concurrency", str(settings["max_concurrency"])]
+        if settings.get("thinking") is False:
+            command += ["--no-thinking"]
+        command.extend(str(item) for item in settings.get("extra_args", []))
+        # The upstream image sets no entrypoint, so the command is the full
+        # argv and ``ninfer-serve`` resolves from the image PATH.
+        return LaunchSpec(
+            settings.get("image") or self.default_image, command, NINFER_SERVE_PORT,
+        )
+
+
 class RuntimeRegistry:
     def __init__(self):
         adapters = (
             VllmAdapter(), LlamaCppAdapter(), SglangAdapter(), LayaAdapter(),
-            TensorfoldAdapter(),
+            TensorfoldAdapter(), NinferAdapter(),
         )
         self._adapters = {adapter.kind: adapter for adapter in adapters}
 
@@ -325,6 +361,38 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
         extra += [str(item) for item in settings.get("extra_args", [])]
         return await manager.create_container(
             model=model, engine="tensorfold", image=spec.image,
+            environment=settings.get("environment"),
+            extra_args=extra,
+            name=safe_container_name(alias, deployment_id),
+            hf_token=hf_token,
+            sparkdeck_deployment_id=deployment_id,
+        )
+    if adapter.kind is RuntimeKind.NINFER:
+        # NInfer resolves its artifact through the Hugging Face cache, so it
+        # must launch through Manager to get the shared cache mount, the HF
+        # credential, and the port/label handling the TensorFold bridge uses.
+        spec = adapter.launch_spec(model, settings)
+        # This bridge is the controller-local path (no node_ids), and
+        # ``create_container`` forwards the credential rather than resolving it.
+        # Without resolving it here a gated or private checkpoint fails to load
+        # on this supported standalone path, even though the clustered path
+        # injects credentials.
+        resolve_token = getattr(manager, "_resolved_hf_token", None)
+        hf_token = resolve_token() if callable(resolve_token) else None
+        # Manager builds the ninfer-serve/artifact/host/port argv itself, so
+        # only the option flags are forwarded, in the order launch_spec emits
+        # them.
+        extra: list[str] = []
+        context = settings.get("context_length") or settings.get("context_window")
+        if context:
+            extra += ["--max-context", str(context)]
+        if settings.get("max_concurrency") is not None:
+            extra += ["--max-concurrency", str(settings["max_concurrency"])]
+        if settings.get("thinking") is False:
+            extra += ["--no-thinking"]
+        extra += [str(item) for item in settings.get("extra_args", [])]
+        return await manager.create_container(
+            model=model, engine="ninfer", image=spec.image,
             environment=settings.get("environment"),
             extra_args=extra,
             name=safe_container_name(alias, deployment_id),

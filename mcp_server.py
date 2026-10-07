@@ -1111,7 +1111,12 @@ def build_server(
         ``launch_controls`` (for example ``context_window``,
         ``max_concurrency``, tensor/pipeline parallel size, KV cache dtype,
         thinking mode, or speculative decoding controls; TensorFold
-        deployments map ``context_window`` to its ``--context`` flag),
+        deployments map ``context_window`` to its ``--context`` flag, and
+        NInfer deployments map ``context_window``/``max_concurrency`` to
+        ``--max-context``/``--max-concurrency``, ``kv_cache_dtype`` to
+        ``--kv-dtype``, and speculative ``speculative_method`` plus
+        ``dspark_num_speculative_tokens`` to the ``--spec``/``--draft-tokens``
+        pair),
         supported vLLM
         or SGLang memory fields, and the weights repository via ``model``
         (a Hugging Face repo id; drop any pinned ``--revision`` flag from
@@ -1137,7 +1142,9 @@ def build_server(
         ``environment``. Put environment at the recipe top level or inside
         launch_settings. It must be an object of non-secret string NAME/value
         pairs, for example ``{"NCCL_DEBUG": "WARN"}``, and is applied to every
-        vLLM rank. Values outside these fields are ignored.
+        vLLM rank. Values outside these fields are ignored. Recipes cover the
+        vLLM and SGLang engines; other runtimes (llama.cpp, Laya, TensorFold,
+        NInfer) are deployed through the deployments API instead.
         """
         return await client.create_recipe(recipe)
 

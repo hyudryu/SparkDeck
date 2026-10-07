@@ -28,6 +28,8 @@ AGENT_FABRIC_PORT = 7878
 # agents reject the unknown engine at container creation, so a mixed-version
 # cluster must be caught in preflight rather than mid-launch.
 TENSORFOLD_CAPABILITY = "tensorfold-launch-v1"
+# Same contract as TENSORFOLD_CAPABILITY for the NInfer artifact engine.
+NINFER_CAPABILITY = "ninfer-launch-v1"
 
 
 class NodeAgentResponseError(RuntimeError):

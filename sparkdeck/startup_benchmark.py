@@ -319,12 +319,12 @@ class StartupBenchmarkMonitor:
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
             seen_key=self._seen_key(target.fingerprint),
-            # TensorFold direct launches route through Manager like vLLM and
-            # SGLang, so their synthetic probe is an expected Manager request
-            # rather than contamination.
+            # TensorFold and NInfer launches route through Manager like vLLM
+            # and SGLang, so their synthetic probe is an expected Manager
+            # request rather than contamination.
             manager_requests_expected=int(
                 bool(target.cluster) or deployment["runtime"] in {
-                    "vllm", "sglang", "tensorfold",
+                    "vllm", "sglang", "tensorfold", "ninfer",
                 }
             ),
         )

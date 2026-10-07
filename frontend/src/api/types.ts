@@ -1,4 +1,4 @@
-export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang' | 'laya' | 'tensorfold'
+export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang' | 'laya' | 'tensorfold' | 'ninfer'
 export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopping' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {

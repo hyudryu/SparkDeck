@@ -361,6 +361,12 @@ class HuggingFaceCatalog:
             .casefold().endswith(".gguf")
             for sibling in siblings
         )
+        has_ninfer_sibling = isinstance(siblings, list) and any(
+            isinstance(sibling, dict)
+            and str(sibling.get("rfilename") or sibling.get("path") or "")
+            .casefold().endswith(".ninfer")
+            for sibling in siblings
+        )
         formats = []
         gguf_metadata = item.get("gguf")
         if (
@@ -369,6 +375,8 @@ class HuggingFaceCatalog:
             or has_gguf_sibling
         ):
             formats.append("gguf")
+        if has_ninfer_sibling:
+            formats.append("ninfer")
         transformer_model = bool(folded_tags & {"transformers", "safetensors"})
         # A Laya-compatible checkpoint loads through the ``laya`` package, which
         # requires a decision head that only the publisher's System 1
@@ -394,6 +402,17 @@ class HuggingFaceCatalog:
                 "reason": (
                     "TensorFold supports a curated set of checkpoint families "
                     "that this listing cannot verify."
+                ),
+            },
+            # A NInfer deployment loads one compiled v3 .ninfer artifact from
+            # the repository, so a listing that actually ships one is
+            # servable; anything else cannot run on this engine.
+            {
+                "runtime": "ninfer",
+                "supported": "ninfer" in formats,
+                "reason": (
+                    "NInfer requires a repository that ships a compiled "
+                    ".ninfer artifact."
                 ),
             },
         ]

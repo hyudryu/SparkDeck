@@ -2006,7 +2006,9 @@ class SparkDeckService:
         # Runtimes whose saved launch settings an operator may repair or tune
         # once the deployment is stopped. Laya belongs here because its device,
         # concurrency, image, and extra flags are all persisted launch inputs.
-        _EDITABLE_RUNTIMES = {"vllm", "sglang", "llama.cpp", "laya", "tensorfold"}
+        _EDITABLE_RUNTIMES = {
+            "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer",
+        }
         discovered_editable = bool(
             discovered_settings is not None
             and discovered_settings.get("editable")
@@ -2832,6 +2834,7 @@ class SparkDeckService:
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) in (
             RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
+            RuntimeKind.NINFER.value,
         ) and (
             settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
         ):
@@ -2900,22 +2903,31 @@ class SparkDeckService:
 
     def _validate_public_gguf_artifact(
         self, repository: str, artifact: str, quantization: str | None,
+        extensions: tuple[str, ...] = (".gguf",),
     ) -> PurePosixPath:
-        """Validate one repo-relative GGUF reference without touching the cache."""
+        """Validate one repo-relative model artifact without touching the cache.
+
+        GGUF artifacts are the default contract; NInfer passes
+        ``extensions=(".ninfer",)`` for its compiled artifact files.
+        """
         if _public_model_id(repository) != repository:
             raise ValueError(
-                "repo-relative GGUF artifacts require a public Hugging Face repository"
+                "repo-relative model artifacts require a public Hugging Face "
+                "repository"
             )
         relative = PurePosixPath(artifact)
+        names = " or ".join(extensions)
         if (
             relative.is_absolute() or not relative.parts
             or any(part in {"", ".", ".."} for part in relative.parts)
             or artifact.startswith("~")
             or "\\" in artifact
             or re.match(r"^[A-Za-z]:", artifact)
-            or relative.suffix.casefold() != ".gguf"
+            or relative.suffix.casefold() not in extensions
         ):
-            raise ValueError("artifact must be a safe repo-relative .gguf filename")
+            raise ValueError(
+                f"artifact must be a safe repo-relative {names} filename"
+            )
         inferred = quantization_from_text(artifact)
         if quantization and inferred and quantization != inferred:
             raise ValueError("artifact quantization does not match the selected quantization")
@@ -2954,13 +2966,17 @@ class SparkDeckService:
 
     def _hub_relative_llama_artifact(
         self, repository: str, artifact: str, resolved_revision: str,
+        extensions: tuple[str, ...] = (".gguf",),
     ) -> str:
-        """Return the cache-relative snapshot path for one GGUF artifact.
+        """Return the cache-relative snapshot path for one model artifact.
 
         Llama.cpp cluster members resolve this reference against each node's
-        own Hugging Face cache, so one persisted value addresses every node.
+        own Hugging Face cache, so one persisted value addresses every node;
+        NInfer resolves the same form for its ``.ninfer`` artifact.
         """
-        relative = self._validate_public_gguf_artifact(repository, artifact, None)
+        relative = self._validate_public_gguf_artifact(
+            repository, artifact, None, extensions=extensions,
+        )
         encoded = "models--" + repository.replace("/", "--")
         first_file = self._expand_gguf_shard_files(relative)[0]
         return f"{encoded}/snapshots/{resolved_revision}/{first_file}"
@@ -3021,9 +3037,12 @@ class SparkDeckService:
         quantization: str | None,
         home_node_ids: list[str] | None = None,
         download_node_id: str | None = None,
+        extensions: tuple[str, ...] = (".gguf",),
     ) -> str:
-        """Prepare one repo-relative GGUF through the existing Virtual NAS cache."""
-        relative = self._validate_public_gguf_artifact(repository, artifact, quantization)
+        """Prepare one repo-relative model artifact through the existing Virtual NAS cache."""
+        relative = self._validate_public_gguf_artifact(
+            repository, artifact, quantization, extensions=extensions,
+        )
 
         resolved_revision = await self._resolved_model_revision(repository, revision)
         selected_files = self._expand_gguf_shard_files(relative)
@@ -3060,7 +3079,7 @@ class SparkDeckService:
 
         validate_artifact_path(
             candidate,
-            "model preparation completed without the selected GGUF artifact",
+            "model preparation completed without the selected model artifact",
         )
         if _PUBLIC_GGUF_SHARD_PATTERN.match(relative.name):
             for selected_file in selected_files:
@@ -3068,7 +3087,7 @@ class SparkDeckService:
                 logical_shard = snapshot_root.joinpath(*selected_relative.parts)
                 validate_artifact_path(
                     logical_shard,
-                    "model preparation completed without the complete selected GGUF shard set",
+                    "model preparation completed without the complete selected shard set",
                 )
         # Preserve the logical snapshot filename. Hugging Face cache entries
         # are normally symlinks into blobs/, whose content-addressed targets
@@ -3384,7 +3403,10 @@ class SparkDeckService:
             model_is_local_path = False
             artifact_homes: list[str] | None = None
             artifact_seed: str | None = None
-            if runtime is RuntimeKind.LLAMA_CPP and kind is DeploymentKind.MANAGED:
+            if (
+                runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.NINFER)
+                and kind is DeploymentKind.MANAGED
+            ):
                 artifact_homes, artifact_seed = self._llama_cpp_artifact_homes(
                     requested_node_ids, body,
                 )
@@ -3393,7 +3415,7 @@ class SparkDeckService:
                 resolve_local and resolve_local(model)
             )
             if (
-                runtime is RuntimeKind.LLAMA_CPP
+                runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.NINFER)
                 and kind is DeploymentKind.MANAGED
                 and artifact
             ):
@@ -3402,22 +3424,34 @@ class SparkDeckService:
                 # local merely because the same path exists under its home,
                 # while a genuine tilde reference is expanded and must name a
                 # real file to count as controller-local.
+                artifact_extensions = (
+                    (".ninfer",) if runtime is RuntimeKind.NINFER
+                    else (".gguf",)
+                )
+                artifact_label = (
+                    "NInfer" if runtime is RuntimeKind.NINFER else "llama.cpp"
+                )
+                artifact_kind = (
+                    ".ninfer" if runtime is RuntimeKind.NINFER else "GGUF"
+                )
                 try:
                     artifact_path = Path(artifact).expanduser()
                 except (OSError, ValueError, RuntimeError) as exc:
                     raise ValueError(
-                        "llama.cpp managed deployments require an existing local GGUF artifact"
+                        f"{artifact_label} managed deployments require an "
+                        f"existing local {artifact_kind} artifact"
                     ) from exc
                 if artifact_path.is_absolute():
                     if not artifact_path.is_file():
                         raise ValueError(
-                            "llama.cpp managed deployments require an existing local GGUF artifact"
+                            f"{artifact_label} managed deployments require an "
+                            f"existing local {artifact_kind} artifact"
                         )
                     if artifact_homes and any(
                         node_id != LOCAL_NODE_ID for node_id in artifact_homes
                     ):
                         raise ValueError(
-                            "local GGUF artifact files live outside the cluster cache "
+                            "local model artifact files live outside the cluster cache "
                             "and cannot be distributed; select the controller only or "
                             "use a repo-relative Hub artifact"
                         )
@@ -3428,9 +3462,13 @@ class SparkDeckService:
                     # reference instead of a tilde shorthand.
                     artifact = str(artifact_path)
                 else:
-                    # A saved deployment only records the reference; the GGUF
-                    # is resolved (and downloaded if needed) at launch time.
-                    self._validate_public_gguf_artifact(model, artifact, quantization)
+                    # A saved deployment only records the reference; the
+                    # artifact is resolved (and downloaded if needed) at
+                    # launch time.
+                    self._validate_public_gguf_artifact(
+                        model, artifact, quantization,
+                        extensions=artifact_extensions,
+                    )
                     if launch:
                         artifact = await self._prepare_public_gguf_artifact(
                             model, artifact,
@@ -3438,6 +3476,7 @@ class SparkDeckService:
                             quantization,
                             home_node_ids=artifact_homes,
                             download_node_id=artifact_seed,
+                            extensions=artifact_extensions,
                         )
                         settings["model_source"] = "public_repository"
                 if artifact_seed is not None:
@@ -3451,17 +3490,22 @@ class SparkDeckService:
                 quantization=quantization,
             )
             if (
-                runtime is RuntimeKind.TENSORFOLD
+                runtime in (RuntimeKind.TENSORFOLD, RuntimeKind.NINFER)
                 and kind is DeploymentKind.MANAGED
                 and identity.revision
             ):
                 # TensorFold resolves its own checkpoint snapshot and has no
-                # --revision flag; persisting a pin it cannot honour would
-                # make the deployment claim a revision it never loads. An
-                # external endpoint launches nothing here, so its metadata
-                # stays untouched.
+                # --revision flag; NInfer pins its snapshot inside the
+                # prepared artifact path. Persisting a pin either engine
+                # cannot honour would make the deployment claim a revision it
+                # never loads. An external endpoint launches nothing here, so
+                # its metadata stays untouched.
+                engine_label = (
+                    "TensorFold" if runtime is RuntimeKind.TENSORFOLD
+                    else "NInfer"
+                )
                 raise ValueError(
-                    "TensorFold deployments cannot pin a model revision"
+                    f"{engine_label} deployments cannot pin a model revision"
                 )
             deployment = Deployment(
                 id=deployment_id, alias=alias, runtime=runtime, kind=kind,
@@ -3506,7 +3550,10 @@ class SparkDeckService:
                 if mode == "single" and len(requested_node_ids) != 1:
                     raise ValueError("single deployment requires exactly one node")
                 if mode in {"sharded", "grouped_sharded"} and (
-                    runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD)
+                    runtime in (
+                        RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+                        RuntimeKind.NINFER,
+                    )
                 ):
                     raise ValueError(
                         f"{runtime.value} deployments support single and "
@@ -3669,7 +3716,7 @@ class SparkDeckService:
         self, runtime: RuntimeKind, model: str, alias: str, deployment_id: str,
         identity: ModelIdentity, settings: dict[str, Any],
         node_ids: list[str], mode: str, llama_artifact: str | None,
-        recipe_id: Any = None,
+        recipe_id: Any = None, ninfer_artifact: str | None = None,
     ) -> dict[str, Any]:
         """Translate saved launch settings into a Manager cluster launch."""
         extra_args = list(settings.get("extra_args") or [])
@@ -3709,13 +3756,25 @@ class SparkDeckService:
                 extra_args += ["--context", str(context_length)]
             if settings.get("thinking") is False:
                 extra_args += ["--no-thinking"]
+        if runtime is RuntimeKind.NINFER:
+            # The cluster path carries a launch as argv, so NInfer's typed
+            # settings have to become flags here too. Without this a saved
+            # context length is silently dropped at launch.
+            context_length = (
+                settings.get("context_length") or settings.get("context_window")
+            )
+            if context_length is not None:
+                extra_args += ["--max-context", str(context_length)]
+            if settings.get("thinking") is False:
+                extra_args += ["--no-thinking"]
         if identity.revision and runtime not in (
-            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
         ):
-            # Llama.cpp pins its revision inside the cache-relative artifact
-            # reference; an unknown --revision flag would break llama-server.
-            # TensorFold resolves the checkpoint itself and has no --revision
-            # flag, so a pinned revision cannot be forwarded either.
+            # Llama.cpp and NInfer pin their revisions inside the cache-
+            # relative artifact reference; an unknown --revision flag would
+            # break their servers. TensorFold resolves the checkpoint itself
+            # and has no --revision flag, so a pinned revision cannot be
+            # forwarded there either.
             extra_args += ["--revision", identity.revision]
         launch_body = {
             **settings,
@@ -3758,6 +3817,8 @@ class SparkDeckService:
                 "llama_parallel_slots": settings.get("parallel_slots"),
                 "llama_gpu_layers": settings.get("gpu_layers"),
             })
+        if runtime is RuntimeKind.NINFER:
+            launch_body["ninfer_artifact"] = ninfer_artifact
         return launch_body
 
     def _saved_deployment_controller_only(
@@ -3902,7 +3963,7 @@ class SparkDeckService:
         if mode == "single" and len(selected_ids) != 1:
             raise ValueError("single deployment requires exactly one node")
         if mode == "sharded" and record.runtime in (
-            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
         ):
             raise ValueError(
                 f"{record.runtime.value} deployments support single and "
@@ -3910,11 +3971,14 @@ class SparkDeckService:
             )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
-        if record.runtime not in (RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD):
+        if record.runtime not in (
+            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
+        ):
             # Llama.cpp readiness is per-file inside the resolved snapshot and
             # is verified by each node when its container is created; the
             # whole-repository inventory check would reject selective GGUF
-            # snapshots that are perfectly launchable.
+            # snapshots that are perfectly launchable. NInfer artifacts are
+            # selective the same way; TensorFold resolves its own checkpoint.
             cached_revision = await self._validate_start_selection(
                 deployment_dict, selected_ids, settings,
             )
@@ -3942,9 +4006,27 @@ class SparkDeckService:
             llama_artifact = self._hub_relative_llama_artifact(
                 model, artifact, resolved_revision,
             )
+        ninfer_artifact = None
+        if record.runtime is RuntimeKind.NINFER:
+            if not artifact:
+                raise ValueError("NInfer deployments require a .ninfer artifact")
+            prepared = _optional_string(settings.get("prepared_revision"))
+            if prepared and re.fullmatch(r"[0-9a-f]{40}", prepared):
+                # Reuse the exact snapshot the artifact preparation resolved
+                # so a repository update cannot invalidate a just-prepared
+                # launch.
+                resolved_revision = prepared
+            else:
+                resolved_revision = await self._resolved_model_revision(
+                    model, record.model.revision or "main",
+                )
+            ninfer_artifact = self._hub_relative_llama_artifact(
+                model, artifact, resolved_revision, extensions=(".ninfer",),
+            )
         launch_body = self._cluster_launch_body(
             record.runtime, model, record.alias, record.id, record.model,
             settings, selected_ids, mode, llama_artifact=llama_artifact,
+            ninfer_artifact=ninfer_artifact,
         )
         try:
             cluster = await self.manager.create_deployment(launch_body)
@@ -7430,7 +7512,7 @@ class SparkDeckService:
             deployment.get("kind") != DeploymentKind.MANAGED.value
             or deployment.get("runtime") not in {
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
-                RuntimeKind.TENSORFOLD.value,
+                RuntimeKind.TENSORFOLD.value, RuntimeKind.NINFER.value,
             }
         ):
             raise error_type(
@@ -7836,6 +7918,7 @@ class SparkDeckService:
             deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
                 RuntimeKind.LAYA.value, RuntimeKind.TENSORFOLD.value,
+                RuntimeKind.NINFER.value,
             )
             and deployment.get("kind") == DeploymentKind.MANAGED.value
         ):
@@ -7844,7 +7927,7 @@ class SparkDeckService:
             # managed record's stored endpoint is the controller's own port
             # mapping, so a deployment placed on a remote node is only
             # reachable through Manager's member-aware routing. TensorFold
-            # members carry the same stored-endpoint shape.
+            # and NInfer members carry the same stored-endpoint shape.
             return await factory(deployment)
         return await self._run_service_prompt_gate(
             ("deployment", deployment["id"]), factory, cancel=cancel,
@@ -7894,6 +7977,7 @@ class SparkDeckService:
             and deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
                 RuntimeKind.LAYA.value, RuntimeKind.TENSORFOLD.value,
+                RuntimeKind.NINFER.value,
             )
         ):
             route_kwargs = (

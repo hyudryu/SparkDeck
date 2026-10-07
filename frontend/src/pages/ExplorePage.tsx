@@ -24,10 +24,10 @@ const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
 // Runtimes that always run one complete copy on a single node, so a fit is
 // decided by the largest eligible node's memory rather than the cluster pool.
-// llama.cpp runs on the controller; Laya and TensorFold are single-engine
-// runtimes with no tensor or pipeline parallelism, so their replicas each
-// need a full copy.
-const SINGLE_NODE_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp', 'laya', 'tensorfold'])
+// llama.cpp runs on the controller; Laya, TensorFold, and NInfer are
+// single-engine runtimes with no tensor or pipeline parallelism, so their
+// replicas each need a full copy.
+const SINGLE_NODE_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp', 'laya', 'tensorfold', 'ninfer'])
 // `activeRuntime` is '' when the filter means "all runtimes", which is not a
 // single-node runtime and keeps the pooled-capacity behavior.
 const isSingleNodeRuntime = (runtime: RuntimeKind | ''): boolean =>
@@ -41,6 +41,7 @@ const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   'llama.cpp': 'Llama server',
   laya: 'Laya decisions',
   tensorfold: 'TensorFold',
+  ninfer: 'NInfer',
 }
 
 function formatParameters(value?: number | null) {
@@ -253,8 +254,9 @@ function deployHref(
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
   if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
   // Laya reports fit as an aggregate only for display; its decision engine is
-  // single-engine, so it is never launched as a sharded layout.
-  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && sharded) params.set('layout', 'sharded')
+  // single-engine, so it is never launched as a sharded layout. TensorFold and
+  // NInfer are single-engine the same way.
+  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && runtime !== 'ninfer' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
@@ -458,6 +460,7 @@ function ModelRow({
           <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
           <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
           <option value="tensorfold" disabled={compatibilityByRuntime.get('tensorfold') === false}>TensorFold</option>
+          <option value="ninfer" disabled={compatibilityByRuntime.get('ninfer') === false}>NInfer</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
@@ -692,6 +695,7 @@ export function ExplorePage() {
               <option value="sglang">SGLang</option>
               <option value="laya">Laya decisions</option>
               <option value="tensorfold">TensorFold</option>
+              <option value="ninfer">NInfer</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>

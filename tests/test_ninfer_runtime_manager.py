@@ -759,6 +759,60 @@ class NinferLaunchControlsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mtp, dflash, or dflash2"):
             Manager._validated_ninfer_speculation("eagle3", None)
 
+    def test_unsupported_kv_dtype_is_rejected(self):
+        manager = Manager.__new__(Manager)
+        with self.assertRaisesRegex(ValueError, "bf16, int8, fp8, nvfp4, or k8v4"):
+            manager._apply_deployment_launch_controls(
+                [], "ninfer", {"kv_cache_dtype": "fp8_e4m3"},
+            )
+
+    def test_discovered_environment_includes_ninfer(self):
+        from sparkdeck.runtime_environment import discovered_runtime_environment
+
+        discovered = discovered_runtime_environment(
+            {"HF_HUB_OFFLINE": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            "ninfer",
+        )
+        self.assertEqual(discovered, {
+            "HF_HUB_OFFLINE": "1",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        })
+
+    async def test_immediate_cluster_launch_carries_the_artifact(self):
+        """Creating with launch=true and explicit nodes must derive the same
+        cache-relative reference the saved-launch path computes."""
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        service = SparkDeckService(manager, Path(temp.name))
+        service._prepare_public_gguf_artifact = AsyncMock(
+            return_value="/cache/hub/models--org--model/snapshots/x/model.ninfer"
+        )
+        service._resolved_model_revision = AsyncMock(return_value="c" * 40)
+        service._link_cluster_record = Mock()
+
+        try:
+            await service.create_deployment({
+                "model": "org/model",
+                "alias": "ni-immediate",
+                "runtime": "ninfer",
+                "artifact": "model.ninfer",
+                "node_ids": ["spark-2"],
+                "deployment_mode": "single",
+                "launch": True,
+            })
+
+            body = manager.create_deployment.await_args.args[0]
+            self.assertEqual(
+                body["ninfer_artifact"],
+                "models--org--model/snapshots/{}/model.ninfer".format("c" * 40),
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
     def test_revision_pin_is_not_injected_for_ninfer(self):
         args = Manager._with_saved_launch_identity(
             ["--max-context", "8192"], "ninfer", model_revision="a" * 40,
@@ -1106,20 +1160,34 @@ class NinferPromotionTests(unittest.IsolatedAsyncioTestCase):
             {
                 "image": image,
                 "load_settings": {
-                    "command_flags": "--max-context 240000",
-                    "extra_args": [],
+                    "command_flags": "--spec mtp --draft-tokens 3",
+                    "extra_args": ["--spec", "mtp", "--draft-tokens", "3"],
                     "artifact_path": (
                         f"{cache_root}/hub/models--org--model/snapshots/"
-                        + ("a" * 40) + "/model.ninfer"
+                        + ("a" * 40) + "/compiled/model.ninfer"
                     ),
+                    # Structured controls the parser stripped from the flags.
+                    "context_window": 240000,
+                    "max_concurrency": 2,
+                    "kv_cache_dtype": "fp8",
+                    "thinking_mode": "disabled",
                 },
             },
         )
 
         self.assertEqual(
             recovered.get("ninfer_artifact"),
-            "models--org--model/snapshots/{}/model.ninfer".format("a" * 40),
+            "models--org--model/snapshots/{}/compiled/model.ninfer".format("a" * 40),
         )
+        # The stripped structured controls must return as flags so promotion
+        # does not silently start with NInfer defaults.
+        extra = recovered.get("extra_args") or []
+        self.assertEqual(extra[extra.index("--max-context") + 1], "240000")
+        self.assertEqual(extra[extra.index("--max-concurrency") + 1], "2")
+        self.assertEqual(extra[extra.index("--kv-dtype") + 1], "fp8")
+        self.assertIn("--no-thinking", extra)
+        self.assertEqual(extra[extra.index("--spec") + 1], "mtp")
+        self.assertEqual(extra[extra.index("--draft-tokens") + 1], "3")
 
     def test_updated_command_rebuilds_the_ninfer_argv(self):
         manager = Manager.__new__(Manager)

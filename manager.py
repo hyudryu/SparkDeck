@@ -5326,6 +5326,12 @@ class Manager:
             )
             kv_dtype = controls.get("kv_cache_dtype")
             kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
+            if kv_dtype is not None and kv_dtype not in (
+                "bf16", "int8", "fp8", "nvfp4", "k8v4",
+            ):
+                raise ValueError(
+                    "kv_cache_dtype must be bf16, int8, fp8, nvfp4, or k8v4"
+                )
             flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
             # Thinking is on by default: "enabled" and "default" just remove
             # the --no-thinking override. --preserve-thinking is an
@@ -5873,6 +5879,29 @@ class Manager:
                 else ""
             )
             recovered["ninfer_artifact"] = reference or None
+            # The inspection parser strips the engine-owned options from
+            # command_flags into structured keys; rebuild them into the argv
+            # so promotion keeps the runtime controls instead of silently
+            # starting with NInfer defaults.
+            structured: list[str] = []
+            if load_settings.get("context_window"):
+                structured += [
+                    "--max-context", str(load_settings["context_window"]),
+                ]
+            if load_settings.get("max_concurrency"):
+                structured += [
+                    "--max-concurrency", str(load_settings["max_concurrency"]),
+                ]
+            if load_settings.get("kv_cache_dtype"):
+                structured += [
+                    "--kv-dtype", str(load_settings["kv_cache_dtype"]),
+                ]
+            if load_settings.get("thinking_mode") == "disabled":
+                structured += ["--no-thinking"]
+            if structured:
+                recovered["extra_args"] = [
+                    *structured, *(recovered.get("extra_args") or []),
+                ]
         if engine == "sglang":
             # SGLang's managed container builder removes these flags from
             # extra_args and regenerates them from the structured fields.
@@ -18075,6 +18104,12 @@ class Manager:
             flags = self._replace_command_option(
                 flags, {"--max-concurrency"}, concurrency,
             )
+            if kv_dtype is not None and kv_dtype not in (
+                "bf16", "int8", "fp8", "nvfp4", "k8v4",
+            ):
+                raise ValueError(
+                    "kv_cache_dtype must be bf16, int8, fp8, nvfp4, or k8v4"
+                )
             flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
             # Thinking is on by default: "enabled" and "default" just remove
             # the --no-thinking override; --preserve-thinking is an

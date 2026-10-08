@@ -417,13 +417,10 @@ class HuggingFaceCatalog:
             },
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
-        ninfer_size = _ninfer_artifact_size(item)
-        if ninfer_size is not None:
-            # The compiled artifact is what NInfer actually loads, so its
-            # size outranks source-format estimates even when the repository
-            # also ships safetensors or GGUF weights.
-            weight_size_bytes = ninfer_size
-            weight_size_source = "ninfer"
+        # NInfer loads the compiled artifact, not the source-format weights,
+        # so its size travels in a dedicated field; replacing the generic
+        # weight metadata would misstate fit for every other runtime.
+        ninfer_weight_size_bytes = _ninfer_artifact_size(item)
         return {
             "id": repository,
             "author": str(item.get("author") or repository.partition("/")[0] or "")[:200] or None,
@@ -436,6 +433,7 @@ class HuggingFaceCatalog:
             "parameter_count": parameter_count,
             "weight_size_bytes": weight_size_bytes,
             "weight_size_source": weight_size_source,
+            "ninfer_weight_size_bytes": ninfer_weight_size_bytes,
             "pipeline_tag": str(item.get("pipeline_tag") or "")[:100] or None,
             "last_modified": str(item.get("lastModified") or "")[:100] or None,
             "private": False,
@@ -494,16 +492,16 @@ def _positive_int(value: Any) -> int | None:
 
 
 def _ninfer_artifact_size(item: dict[str, Any]) -> int | None:
-    """Sum the compiled .ninfer artifact sizes a repository ships.
+    """Return the largest compiled .ninfer artifact size a repository ships.
 
-    NInfer-only repositories publish no safetensors or GGUF metadata, so the
-    artifact files are the only weight-size signal; without them fit
-    filtering would report an unknown size and hide servable models.
+    Multiple artifacts are alternative quantizations and a deployment loads
+    exactly one, so the model-level fit signal is the largest single
+    artifact rather than their sum.
     """
     siblings = item.get("siblings")
     if not isinstance(siblings, list):
         return None
-    total = 0
+    largest: int | None = None
     for sibling in siblings:
         if not isinstance(sibling, dict):
             continue
@@ -518,8 +516,8 @@ def _ninfer_artifact_size(item: dict[str, Any]) -> int | None:
             size = _positive_int(lfs.get("size"))
         if size is None:
             return None
-        total += size
-    return total or None
+        largest = size if largest is None else max(largest, size)
+    return largest
 
 
 def quantization_from_text(*values: Any) -> str | None:

@@ -415,9 +415,14 @@ function ModelRow({
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
+  // NInfer loads the compiled artifact, so its fit uses the artifact size
+  // rather than the source-format estimate.
+  const ninferArtifactSize = isSingleGpuRuntime(deploymentRuntime)
+    ? model.ninfer_weight_size_bytes ?? weightSize
+    : undefined
   const fitWeightSize = isControllerOnlyRuntime(deploymentRuntime)
     || isSingleCopyRuntime(deploymentRuntime)
-    ? selectedArtifact?.weightSize ?? weightSize
+    ? selectedArtifact?.weightSize ?? ninferArtifactSize ?? weightSize
     : weightSize
   // Controller-only runtimes fit against the controller's own memory;
   // single-copy runtimes may target any selected node, so their fit is
@@ -642,7 +647,9 @@ export function ExplorePage() {
       }
       const applicableWeightSize = usesControllerCapacity
         ? defaultGgufWeightSize(model, tab === 'community')
-        : model.weight_size_bytes
+        : isSingleGpuRuntime(activeRuntime)
+          ? model.ninfer_weight_size_bytes ?? model.weight_size_bytes
+          : model.weight_size_bytes
       return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity)) ? [model] : []
     })
     if (fitsOnly) {

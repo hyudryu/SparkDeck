@@ -98,7 +98,7 @@ def discovered_runtime_environment(
     value: Any, engine: str = "vllm",
 ) -> dict[str, str]:
     """Return only allowlisted tuning values found through Docker inspection."""
-    if engine != "vllm" or not isinstance(value, dict):
+    if engine not in ("vllm", "ninfer") or not isinstance(value, dict):
         return {}
     result: dict[str, str] = {}
     for name, raw_value in value.items():

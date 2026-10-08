@@ -148,6 +148,23 @@ def _container_last_deployed_at(container: dict[str, Any]) -> str | float | None
     return None
 
 
+def _repo_relative_ninfer_artifact(artifact_path: Any) -> str:
+    """Return the repo-relative path from an in-container artifact path.
+
+    The inspected command holds
+    ``<cache>/hub/models--owner--repo/snapshots/<rev>/<repo-relative>``, so
+    everything after the snapshot directory is the durable reference —
+    including artifacts that live below a repository subdirectory.
+    """
+    text = str(artifact_path or "").replace("\\", "/")
+    _, marker, tail = text.partition("/snapshots/")
+    if marker and tail:
+        _, _, relative = tail.partition("/")
+        if relative:
+            return relative
+    return PurePosixPath(text).name
+
+
 def _discovered_launch_controls(
     manager: Any, engine: str, settings: dict[str, Any], extra_args: list[str],
 ) -> dict[str, Any]:
@@ -3535,7 +3552,7 @@ class SparkDeckService:
                         extensions=artifact_extensions,
                     )
                     if launch:
-                        artifact = await self._prepare_public_gguf_artifact(
+                        prepared = await self._prepare_public_gguf_artifact(
                             model, artifact,
                             _optional_string(body.get("revision")) or "main",
                             quantization,
@@ -3543,6 +3560,12 @@ class SparkDeckService:
                             download_node_id=artifact_seed,
                             extensions=artifact_extensions,
                         )
+                        if runtime is not RuntimeKind.NINFER:
+                            # NInfer keeps the repo-relative reference
+                            # persisted: the prepared cache path is only
+                            # meaningful on the node that downloaded it, and
+                            # later launches must re-resolve the reference.
+                            artifact = prepared
                         settings["model_source"] = "public_repository"
                 if artifact_seed is not None:
                     settings["download_node_id"] = artifact_seed
@@ -3657,10 +3680,23 @@ class SparkDeckService:
                         ],
                     })
                     return result
+                ninfer_artifact = None
+                if runtime is RuntimeKind.NINFER:
+                    # Cluster members resolve the artifact from their own
+                    # caches, so the immediate cluster launch carries the same
+                    # cache-relative reference the saved-launch path derives.
+                    resolved_revision = await self._resolved_model_revision(
+                        model, identity.revision or "main",
+                    )
+                    ninfer_artifact = self._hub_relative_llama_artifact(
+                        model, artifact, resolved_revision,
+                        extensions=(".ninfer",),
+                    )
                 launch_body = self._cluster_launch_body(
                     runtime, model, alias, deployment_id, identity, settings,
                     requested_node_ids, mode, llama_artifact=None,
                     recipe_id=body.get("recipe_id"),
+                    ninfer_artifact=ninfer_artifact,
                 )
                 if background:
                     return await self._begin_cluster_deployment(
@@ -6654,12 +6690,12 @@ class SparkDeckService:
                         "revision": None,
                         # The inspection result records NInfer's positional
                         # artifact as an in-container cache path; the clone
-                        # bookmark needs the repo-relative filename so its
-                        # first launch can re-resolve the reference.
+                        # bookmark needs the repo-relative path (subdirectories
+                        # included) so its first launch can re-resolve it.
                         "artifact": (
-                            PurePosixPath(
-                                str(load_settings.get("artifact_path"))
-                            ).name
+                            _repo_relative_ninfer_artifact(
+                                load_settings.get("artifact_path")
+                            )
                             if runtime is RuntimeKind.NINFER
                             and load_settings.get("artifact_path")
                             else load_settings.get("artifact")

@@ -5038,6 +5038,46 @@ class Manager:
         )
         return shlex.split(flags)
 
+    @staticmethod
+    def _validated_ninfer_speculation(method: Any, draft: Any) -> tuple[str | None, int | None]:
+        """Validate NInfer speculative controls into the (--spec, --draft-tokens) pair.
+
+        Returns ``(None, None)`` when speculation is cleared. The draft count
+        may stay ``None`` with a live method, leaving the server's backend
+        default in place.
+        """
+        method = str(method).strip() if method not in (None, "") else None
+        if method is not None and method not in ("mtp", "dflash", "dflash2"):
+            raise ValueError("speculative_method must be mtp, dflash, or dflash2")
+        if draft in (None, ""):
+            draft_int = None
+        else:
+            if isinstance(draft, bool) or (
+                isinstance(draft, float) and not draft.is_integer()
+            ):
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                )
+            try:
+                draft_int = int(draft)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                ) from exc
+            if draft_int <= 0:
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                )
+        if method == "mtp" and draft_int is not None and draft_int > 5:
+            # NInfer's MTP backend accepts 1..5 draft tokens; the wider
+            # 1..15 range belongs to DFlash and DFlash2.
+            raise ValueError("MTP draft tokens must be between 1 and 5")
+        if method in ("dflash", "dflash2") and (
+            draft_int is not None and draft_int > 15
+        ):
+            raise ValueError("DFlash draft tokens must be between 1 and 15")
+        return method, draft_int
+
     @classmethod
     def _deployment_launch_controls(cls, settings: dict) -> dict:
         """Parse common cluster controls without removing image-specific args."""
@@ -5306,27 +5346,10 @@ class Manager:
             if "speculative_method" in controls or (
                 "dspark_num_speculative_tokens" in controls
             ):
-                method = controls.get("speculative_method")
-                method = str(method).strip() if method not in (None, "") else None
-                if method is not None and method not in (
-                    "mtp", "dflash", "dflash2",
-                ):
-                    raise ValueError(
-                        "speculative_method must be mtp, dflash, or dflash2"
-                    )
-                draft = positive_int("dspark_num_speculative_tokens")
-                if method == "mtp" and draft is not None and draft > 5:
-                    # NInfer's MTP backend accepts 1..5 draft tokens; the
-                    # wider 1..15 range belongs to DFlash and DFlash2.
-                    raise ValueError(
-                        "MTP draft tokens must be between 1 and 5"
-                    )
-                if method in ("dflash", "dflash2") and (
-                    draft is not None and draft > 15
-                ):
-                    raise ValueError(
-                        "DFlash draft tokens must be between 1 and 15"
-                    )
+                method, draft = self._validated_ninfer_speculation(
+                    controls.get("speculative_method"),
+                    controls.get("dspark_num_speculative_tokens"),
+                )
                 flags = self._replace_command_option(flags, {"--spec"}, method)
                 flags = self._replace_command_option(
                     flags, {"--draft-tokens"},
@@ -18064,6 +18087,20 @@ class Manager:
                 flags = f"{flags} --no-thinking".strip()
             elif thinking not in ("default", "enabled"):
                 raise ValueError("thinking_mode must be default, enabled, or disabled")
+            # Speculative edits submitted through the settings form override
+            # the flags; a form that omits the keys keeps the parsed pair.
+            if "speculative_method" in settings or (
+                "dspark_num_speculative_tokens" in settings
+            ):
+                method, draft = self._validated_ninfer_speculation(
+                    settings.get("speculative_method"),
+                    settings.get("dspark_num_speculative_tokens"),
+                )
+                flags = self._replace_command_option(flags, {"--spec"}, method)
+                flags = self._replace_command_option(
+                    flags, {"--draft-tokens"},
+                    draft if method else None,
+                )
         elif engine == "sglang":
             flags = self._replace_command_option(
                 flags, {"--mem-fraction-static"}, gpu

@@ -30,14 +30,30 @@ const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
 // any selected node, not just the controller.
 const CONTROLLER_ONLY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp'])
 const SINGLE_COPY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['laya', 'tensorfold', 'ninfer'])
+// Single-GPU engines load their whole artifact onto one card, so their fit
+// is bounded by the largest individual GPU, not a node's summed VRAM.
+const SINGLE_GPU_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['ninfer'])
 const isControllerOnlyRuntime = (runtime: RuntimeKind | ''): boolean =>
   runtime !== '' && CONTROLLER_ONLY_RUNTIMES.has(runtime)
 const isSingleCopyRuntime = (runtime: RuntimeKind | ''): boolean =>
   runtime !== '' && SINGLE_COPY_RUNTIMES.has(runtime)
+const isSingleGpuRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && SINGLE_GPU_RUNTIMES.has(runtime)
 // `activeRuntime` is '' when the filter means "all runtimes", which is not a
 // single-node runtime and keeps the pooled-capacity behavior.
 const singleNodeRuntimeLabel = (runtime: RuntimeKind | ''): string =>
   runtime === '' ? 'This runtime' : RUNTIME_LABELS[runtime]
+// Single-copy runtimes fit against the largest eligible node; single-GPU
+// engines are further bounded by the largest individual GPU on it (falling
+// back to the per-node total when GPU telemetry is unavailable).
+const singleCopyCapacity = (
+  runtime: RuntimeKind | '',
+  memory: { maxCapacity: number; maxGpuCapacity: number },
+): number => (
+  isSingleGpuRuntime(runtime) && memory.maxGpuCapacity > 0
+    ? memory.maxGpuCapacity
+    : memory.maxCapacity
+)
 // One label source for every runtime picker and summary on this page.
 const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   vllm: 'vLLM',
@@ -70,7 +86,10 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
     .map((node) => ({ node, capacity: nodeMemoryBytes(node) }))
     .filter((item): item is { node: NodeInventoryItem; capacity: number } => item.capacity !== undefined)
   if (measured.length === 0) {
-    return { capacity: 0, maxCapacity: 0, localCapacity: 0, measuredNodes: 0, aggregate: false, workerCapacities: [] as number[] }
+    return {
+      capacity: 0, maxCapacity: 0, maxGpuCapacity: 0, localCapacity: 0,
+      measuredNodes: 0, aggregate: false, workerCapacities: [] as number[],
+    }
   }
   const isLocal = (node: NodeInventoryItem) => node.local === true || node.id === 'local'
   const localCapacity = measured.find(({ node }) => node.local === true)?.capacity
@@ -82,6 +101,13 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
       ? measured.reduce((sum, item) => sum + item.capacity, 0)
       : Math.max(...measured.map((item) => item.capacity)),
     maxCapacity: Math.max(...measured.map((item) => item.capacity)),
+    maxGpuCapacity: Math.max(0, ...measured.map(({ node }) => (
+      (node.stats?.gpus ?? []).reduce((best, gpu) => (
+        !gpu.error && Number.isFinite(gpu.mem_total_mib) && Number(gpu.mem_total_mib) > 0
+          ? Math.max(best, Number(gpu.mem_total_mib) * MIB)
+          : best
+      ), 0)
+    ))),
     measuredNodes: measured.length,
     aggregate,
     localCapacity,
@@ -269,6 +295,7 @@ function ModelRow({
   model,
   capacity,
   maxCapacity,
+  maxGpuCapacity,
   localCapacity,
   measuredNodes,
   aggregate,
@@ -283,6 +310,7 @@ function ModelRow({
   model: DisplayCatalogModel
   capacity: number
   maxCapacity: number
+  maxGpuCapacity: number
   localCapacity: number
   measuredNodes: number
   aggregate: boolean
@@ -393,10 +421,15 @@ function ModelRow({
     : weightSize
   // Controller-only runtimes fit against the controller's own memory;
   // single-copy runtimes may target any selected node, so their fit is
-  // decided by the largest eligible node rather than the controller.
+  // decided by the largest eligible node — and single-GPU engines by the
+  // largest individual GPU on it.
   const fitCapacity = isControllerOnlyRuntime(deploymentRuntime)
     ? localCapacity
-    : isSingleCopyRuntime(deploymentRuntime) ? maxCapacity : capacity
+    : isSingleCopyRuntime(deploymentRuntime)
+      ? singleCopyCapacity(
+          deploymentRuntime, { maxCapacity, maxGpuCapacity },
+        )
+      : capacity
   const fitAggregate = !isControllerOnlyRuntime(deploymentRuntime)
     && !isSingleCopyRuntime(deploymentRuntime) && aggregate
   const fitMeasuredNodes = isControllerOnlyRuntime(deploymentRuntime)
@@ -528,7 +561,7 @@ export function ExplorePage() {
   const catalogFitCapacity = isControllerOnlyRuntime(activeRuntime)
     ? memory.localCapacity
     : isSingleCopyRuntime(activeRuntime)
-      ? memory.maxCapacity
+      ? singleCopyCapacity(activeRuntime, memory)
       : memory.capacity
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
@@ -590,7 +623,7 @@ export function ExplorePage() {
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
         : isSingleCopyRuntime(activeRuntime)
-          ? memory.maxCapacity
+          ? singleCopyCapacity(activeRuntime, memory)
           : memory.capacity
       if (tab === 'community') {
         const weightEstimates = communityWeightEstimates(model, usesControllerCapacity)
@@ -726,7 +759,7 @@ export function ExplorePage() {
           </select>
         </label>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isControllerOnlyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleCopyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest per-node memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isControllerOnlyRuntime(activeRuntime) ? 'Controller memory unavailable' : isSingleCopyRuntime(activeRuntime) ? 'Node memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isControllerOnlyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleGpuRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest single-GPU memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleCopyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest per-node memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isControllerOnlyRuntime(activeRuntime) ? 'Controller memory unavailable' : isSingleCopyRuntime(activeRuntime) ? 'Node memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>
@@ -752,7 +785,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max contributors</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = `${tab}:${model.id}:${hardwareKey(model.community ?? {})}`
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} maxCapacity={memory.maxCapacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} maxCapacity={memory.maxCapacity} maxGpuCapacity={memory.maxGpuCapacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

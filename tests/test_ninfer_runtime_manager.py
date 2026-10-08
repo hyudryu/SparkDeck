@@ -708,6 +708,57 @@ class NinferLaunchControlsTests(unittest.TestCase):
                 },
             )
 
+    def test_unsupported_speculative_method_is_rejected(self):
+        manager = Manager.__new__(Manager)
+        with self.assertRaisesRegex(ValueError, "mtp, dflash, or dflash2"):
+            manager._apply_deployment_launch_controls(
+                [], "ninfer",
+                {"speculative_method": "eagle3"},
+            )
+
+    def test_rebuild_applies_submitted_speculative_controls(self):
+        """A discovered-container edit that changes the speculative pair must
+        rewrite the flags instead of preserving the old backend."""
+        manager = Manager.__new__(Manager)
+        original = [
+            "ninfer-serve", "/cache/hub/models--org--model/snapshots/"
+            + ("a" * 40) + "/model.ninfer",
+            "--host", "0.0.0.0", "--port", "8080",
+            "--spec", "mtp", "--draft-tokens", "3",
+        ]
+
+        argv = manager._updated_container_command(
+            original, "ninfer", "org/model",
+            {
+                "speculative_method": "dflash2",
+                "dspark_num_speculative_tokens": 7,
+            },
+        )
+
+        self.assertEqual(argv[argv.index("--spec") + 1], "dflash2")
+        self.assertEqual(argv[argv.index("--draft-tokens") + 1], "7")
+
+    def test_rebuild_clears_speculation_when_the_method_is_removed(self):
+        manager = Manager.__new__(Manager)
+        original = [
+            "ninfer-serve", "/cache/hub/models--org--model/snapshots/"
+            + ("a" * 40) + "/model.ninfer",
+            "--host", "0.0.0.0", "--port", "8080",
+            "--spec", "mtp", "--draft-tokens", "3",
+        ]
+
+        argv = manager._updated_container_command(
+            original, "ninfer", "org/model",
+            {"speculative_method": None, "dspark_num_speculative_tokens": None},
+        )
+
+        self.assertNotIn("--spec", argv)
+        self.assertNotIn("--draft-tokens", argv)
+
+    def test_validator_rejects_foreign_methods(self):
+        with self.assertRaisesRegex(ValueError, "mtp, dflash, or dflash2"):
+            Manager._validated_ninfer_speculation("eagle3", None)
+
     def test_revision_pin_is_not_injected_for_ninfer(self):
         args = Manager._with_saved_launch_identity(
             ["--max-context", "8192"], "ninfer", model_revision="a" * 40,

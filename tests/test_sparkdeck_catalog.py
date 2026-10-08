@@ -1069,3 +1069,23 @@ class NinferArtifactSizeTests(unittest.TestCase):
         }
         public = HuggingFaceCatalog._public_item(item)
         self.assertIsNone(public["weight_size_bytes"])
+
+    def test_ninfer_size_outranks_source_format_metadata(self):
+        """The compiled artifact is what NInfer loads, so its size wins even
+        when the repository also ships safetensors or GGUF metadata."""
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/mixed-model", "name": "mixed-model",
+            "safetensors": {
+                "total": 27000000000,
+                "parameters": {"BF16": 27000000000},
+            },
+            "siblings": [
+                {"rfilename": "model.safetensors", "size": 57000000000},
+                {"rfilename": "qwen3_8_27b_nvfp4.ninfer", "size": 16106127360},
+            ],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertEqual(public["weight_size_bytes"], 16106127360)
+        self.assertEqual(public["weight_size_source"], "ninfer")

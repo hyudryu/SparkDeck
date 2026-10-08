@@ -417,13 +417,13 @@ class HuggingFaceCatalog:
             },
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
-        if weight_size_bytes is None:
-            # NInfer-only repositories carry no safetensors/GGUF metadata;
-            # the compiled artifacts are the weight signal.
-            ninfer_size = _ninfer_artifact_size(item)
-            if ninfer_size is not None:
-                weight_size_bytes = ninfer_size
-                weight_size_source = "ninfer"
+        ninfer_size = _ninfer_artifact_size(item)
+        if ninfer_size is not None:
+            # The compiled artifact is what NInfer actually loads, so its
+            # size outranks source-format estimates even when the repository
+            # also ships safetensors or GGUF weights.
+            weight_size_bytes = ninfer_size
+            weight_size_source = "ninfer"
         return {
             "id": repository,
             "author": str(item.get("author") or repository.partition("/")[0] or "")[:200] or None,

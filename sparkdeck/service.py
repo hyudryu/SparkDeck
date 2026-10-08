@@ -2425,11 +2425,35 @@ class SparkDeckService:
                             "sg_tp_size", changes.get("sg_tp_size")
                         ),
                     )
+            if engine == "ninfer":
+                option_controls = (
+                    ("context_window", {"--max-context"}),
+                    ("max_concurrency", {"--max-concurrency"}),
+                    ("kv_cache_dtype", {"--kv-dtype"}),
+                )
             for key, names in option_controls:
                 if key in submitted and submitted.get(key) != current_controls.get(key):
                     command_flags = self.manager._replace_command_option(
                         command_flags, names, controls.get(key),
                     )
+            if engine == "ninfer" and any(
+                key in submitted
+                for key in ("speculative_method", "dspark_num_speculative_tokens")
+            ):
+                # The speculative pair has no vLLM/sglang patch above, so the
+                # raw flags must be rewritten here or a structured edit would
+                # silently keep the previous backend and draft count.
+                method, draft = self.manager._validated_ninfer_speculation(
+                    controls.get("speculative_method"),
+                    controls.get("dspark_num_speculative_tokens"),
+                )
+                command_flags = self.manager._replace_command_option(
+                    command_flags, {"--spec"}, method,
+                )
+                command_flags = self.manager._replace_command_option(
+                    command_flags, {"--draft-tokens"},
+                    draft if method else None,
+                )
             speculative_keys = {
                 "speculative_method", "draft_sample_method",
                 "dspark_num_speculative_tokens",
@@ -2460,6 +2484,13 @@ class SparkDeckService:
             "kv_cache_dtype": controls.get("kv_cache_dtype"),
             "thinking_mode": controls.get("thinking_mode"),
             "gpu_memory_utilization": utilization,
+            # NInfer's command rebuild applies this pair on top of the flags
+            # so a structured speculative edit cannot be lost; other engines
+            # ignore the keys.
+            "speculative_method": controls.get("speculative_method"),
+            "dspark_num_speculative_tokens": controls.get(
+                "dspark_num_speculative_tokens"
+            ),
         }
         if "environment" in changes or environment != original_environment:
             replacement["environment"] = environment
@@ -6621,7 +6652,18 @@ class SparkDeckService:
                     "model": {
                         "repository": model,
                         "revision": None,
-                        "artifact": load_settings.get("artifact"),
+                        # The inspection result records NInfer's positional
+                        # artifact as an in-container cache path; the clone
+                        # bookmark needs the repo-relative filename so its
+                        # first launch can re-resolve the reference.
+                        "artifact": (
+                            PurePosixPath(
+                                str(load_settings.get("artifact_path"))
+                            ).name
+                            if runtime is RuntimeKind.NINFER
+                            and load_settings.get("artifact_path")
+                            else load_settings.get("artifact")
+                        ),
                         "quantization": (
                             load_settings.get("quantization")
                             or container.get("variant")

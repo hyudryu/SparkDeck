@@ -2696,6 +2696,8 @@ class SparkDeckService:
             )
         if "artifact" in changes:
             artifact = _optional_string(changes.get("artifact"))
+            if runtime_is_ninfer and not artifact:
+                raise ValueError("NInfer deployments require a .ninfer artifact")
             if artifact and runtime_is_llama:
                 try:
                     artifact_path = Path(artifact).expanduser()
@@ -3153,6 +3155,8 @@ class SparkDeckService:
             "max_concurrency": (
                 saved_settings.get("parallel_slots")
                 if runtime == RuntimeKind.LLAMA_CPP.value
+                else saved_settings.get("max_concurrency")
+                if runtime == RuntimeKind.NINFER.value
                 else saved_settings.get("max_running_requests")
             ),
         }
@@ -3420,6 +3424,16 @@ class SparkDeckService:
             ):
                 artifact_homes, artifact_seed = self._llama_cpp_artifact_homes(
                     requested_node_ids, body,
+                )
+            if (
+                runtime is RuntimeKind.NINFER
+                and kind is DeploymentKind.MANAGED
+                and not artifact
+            ):
+                # A bookmark without one is permanently unlaunchable: every
+                # NInfer launch path requires the artifact reference.
+                raise ValueError(
+                    "NInfer managed deployments require a .ninfer artifact"
                 )
             resolve_local = getattr(self.manager, "_resolve_local_path", None)
             model_is_local_path = bool(

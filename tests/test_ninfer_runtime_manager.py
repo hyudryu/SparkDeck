@@ -207,6 +207,29 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._run_managed_container.assert_not_called()
 
+    async def test_artifact_from_another_repository_is_rejected(self):
+        """A retargeted model must never silently serve the old repository's
+        compiled artifact."""
+        manager = _manager()
+        manager.settings["hf_cache"] = self.cache.root
+
+        # The artifact/containment check runs inside the container-creation
+        # thread, so the launch wrapper reports it as a RuntimeError — the
+        # same contract llama.cpp artifact launches use.
+        with self.assertRaisesRegex(
+            RuntimeError, "does not belong to org/model",
+        ):
+            await _launch(
+                manager,
+                ninfer_artifact=(
+                    "models--other--repo/snapshots/"
+                    + ("a" * 40) + "/model.ninfer"
+                ),
+            )
+
+        manager.evict_other_backends.assert_not_awaited()
+        manager._run_managed_container.assert_not_called()
+
     async def test_extra_args_extend_the_served_configuration(self):
         manager = _manager()
         manager.settings["hf_cache"] = self.cache.root
@@ -381,7 +404,7 @@ class NinferContainerInspectionTests(unittest.TestCase):
                 "--host", "0.0.0.0", "--port", "8080",
                 "--max-context", "240000", "--max-concurrency", "2",
                 "--kv-dtype", "fp8", "--spec", "mtp", "--draft-tokens", "3",
-                "--no-thinking", "--model-id", "qwen3.8-27b",
+                "--no-thinking", "--model-id", "org/model",
             ],
             "ninfer",
             "org/model",
@@ -399,8 +422,31 @@ class NinferContainerInspectionTests(unittest.TestCase):
         # in extra_args for the launch-controls parser.
         self.assertEqual(
             settings["extra_args"],
-            ["--spec", "mtp", "--draft-tokens", "3", "--model-id", "qwen3.8-27b"],
+            ["--spec", "mtp", "--draft-tokens", "3", "--model-id", "org/model"],
         )
+        self.assertEqual(
+            settings["artifact_path"],
+            "/root/.cache/huggingface/hub/models--org--model/snapshots/"
+            + ("a" * 40) + "/model.ninfer",
+        )
+
+    def test_container_load_settings_keeps_preserve_thinking(self):
+        """--preserve-thinking is an independent extra flag, so inspection
+        must retain it instead of folding it into thinking_mode."""
+        settings = Manager._container_load_settings(
+            Manager.__new__(Manager),
+            [
+                "ninfer-serve", "/cache/hub/models--org--model/snapshots/"
+                + ("a" * 40) + "/model.ninfer",
+                "--host", "0.0.0.0", "--port", "8080",
+                "--preserve-thinking",
+            ],
+            "ninfer",
+            "org/model",
+        )
+
+        self.assertIn("--preserve-thinking", settings["extra_args"])
+        self.assertIsNone(settings["thinking_mode"])
 
 
 class NinferSelectiveArtifactTests(unittest.TestCase):
@@ -561,7 +607,7 @@ class NinferLaunchControlsTests(unittest.TestCase):
             "extra_args": [
                 "--max-context", "240000", "--max-concurrency", "2",
                 "--kv-dtype", "fp8", "--spec", "mtp", "--draft-tokens", "3",
-                "--preserve-thinking",
+                "--no-thinking",
             ],
         })
         self.assertEqual(controls["context_window"], 240000)
@@ -569,8 +615,17 @@ class NinferLaunchControlsTests(unittest.TestCase):
         self.assertEqual(controls["kv_cache_dtype"], "fp8")
         self.assertEqual(controls["speculative_method"], "mtp")
         self.assertEqual(controls["dspark_num_speculative_tokens"], 3)
-        self.assertEqual(controls["thinking_mode"], "enabled")
+        self.assertEqual(controls["thinking_mode"], "disabled")
         self.assertIsNone(controls["tensor_parallel_size"])
+
+    def test_preserve_thinking_is_not_the_thinking_switch(self):
+        """NInfer thinks by default; --preserve-thinking is an independent
+        assistant-reasoning switch, so it must not read as 'enabled'."""
+        controls = Manager._deployment_launch_controls({
+            "engine": "ninfer",
+            "extra_args": ["--preserve-thinking"],
+        })
+        self.assertIsNone(controls["thinking_mode"])
 
     def test_apply_maps_scalars_spec_and_thinking_back_to_flags(self):
         manager = Manager.__new__(Manager)
@@ -591,6 +646,17 @@ class NinferLaunchControlsTests(unittest.TestCase):
                 "--spec", "dflash2", "--draft-tokens", "7",
             ],
         )
+
+    def test_enabled_thinking_emits_no_flag(self):
+        """NInfer thinks by default: 'enabled' only clears --no-thinking and
+        must not emit the independent --preserve-thinking switch."""
+        manager = Manager.__new__(Manager)
+        args = manager._apply_deployment_launch_controls(
+            ["--no-thinking", "--preserve-thinking"], "ninfer",
+            {"thinking_mode": "enabled"},
+        )
+        self.assertNotIn("--no-thinking", args)
+        self.assertIn("--preserve-thinking", args)
 
     def test_default_thinking_clears_the_override(self):
         manager = Manager.__new__(Manager)
@@ -687,6 +753,7 @@ class NinferClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
                     "model": "org/model",
                     "alias": "ni-pinned",
                     "runtime": "ninfer",
+                    "artifact": "model.ninfer",
                     "revision": "a" * 40,
                     "node_ids": ["spark-2"],
                     "deployment_mode": "single",
@@ -784,6 +851,34 @@ class NinferClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
                 })
             self.assertIsNone(
                 service.store.deployment("ni-local", include_private=True),
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_creation_without_an_artifact_is_rejected(self):
+        """A REST bookmark without an artifact can never launch, so creation
+        must reject it instead of persisting the record."""
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        service = SparkDeckService(manager, Path(temp.name))
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "require a .ninfer artifact",
+            ):
+                await service.create_deployment({
+                    "model": "org/model",
+                    "alias": "ni-bare",
+                    "runtime": "ninfer",
+                    "node_ids": ["spark-2"],
+                    "deployment_mode": "single",
+                })
+            self.assertIsNone(
+                service.store.deployment("ni-bare", include_private=True),
             )
         finally:
             await manager.http.aclose()
@@ -928,6 +1023,18 @@ class NinferLaunchSettingsTests(unittest.TestCase):
 class NinferPromotionTests(unittest.IsolatedAsyncioTestCase):
     """Promoting a discovered NInfer container must recover the artifact."""
 
+    def test_saved_bookmark_editor_seeds_the_typed_concurrency(self):
+        """An unchanged editor save must not null out a concurrency limit
+        that was saved in settings.max_concurrency."""
+        from sparkdeck.service import SparkDeckService
+
+        service = SparkDeckService.__new__(SparkDeckService)
+        service.manager = Manager
+        controls = service._saved_bookmark_launch_controls(
+            "ninfer", ["--spec", "mtp"], {"max_concurrency": 4},
+        )
+        self.assertEqual(controls["max_concurrency"], 4)
+
     def test_recovery_rebuilds_the_artifact_reference(self):
         manager = Manager.__new__(Manager)
         cache_root = "/host/cache"
@@ -990,6 +1097,10 @@ class NinferPromotionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--max-concurrency") + 1], "4")
         self.assertEqual(argv[argv.index("--kv-dtype") + 1], "fp8")
         self.assertIn("--no-thinking", argv)
+        # The vLLM spellings must not leak into the rebuilt NInfer argv.
+        self.assertNotIn("--kv-cache-dtype", argv)
+        self.assertNotIn("--max-num-seqs", argv)
+        self.assertNotIn("--max-model-len", argv)
         # Speculation rides in the flags and survives the rebuild.
         self.assertEqual(argv[argv.index("--spec") + 1], "mtp")
         self.assertEqual(argv[argv.index("--draft-tokens") + 1], "3")

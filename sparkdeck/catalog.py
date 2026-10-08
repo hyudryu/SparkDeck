@@ -417,6 +417,13 @@ class HuggingFaceCatalog:
             },
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
+        if weight_size_bytes is None:
+            # NInfer-only repositories carry no safetensors/GGUF metadata;
+            # the compiled artifacts are the weight signal.
+            ninfer_size = _ninfer_artifact_size(item)
+            if ninfer_size is not None:
+                weight_size_bytes = ninfer_size
+                weight_size_source = "ninfer"
         return {
             "id": repository,
             "author": str(item.get("author") or repository.partition("/")[0] or "")[:200] or None,
@@ -484,6 +491,35 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number > 0 else None
+
+
+def _ninfer_artifact_size(item: dict[str, Any]) -> int | None:
+    """Sum the compiled .ninfer artifact sizes a repository ships.
+
+    NInfer-only repositories publish no safetensors or GGUF metadata, so the
+    artifact files are the only weight-size signal; without them fit
+    filtering would report an unknown size and hide servable models.
+    """
+    siblings = item.get("siblings")
+    if not isinstance(siblings, list):
+        return None
+    total = 0
+    for sibling in siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(
+            sibling.get("rfilename") or sibling.get("path") or ""
+        ).strip()
+        if not filename.casefold().endswith(".ninfer"):
+            continue
+        size = _positive_int(sibling.get("size"))
+        lfs = sibling.get("lfs")
+        if size is None and isinstance(lfs, dict):
+            size = _positive_int(lfs.get("size"))
+        if size is None:
+            return None
+        total += size
+    return total or None
 
 
 def quantization_from_text(*values: Any) -> str | None:

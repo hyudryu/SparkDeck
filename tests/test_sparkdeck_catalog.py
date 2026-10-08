@@ -1040,3 +1040,32 @@ class CatalogFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NinferArtifactSizeTests(unittest.TestCase):
+    """NInfer-only repositories must still report a weight size for fit."""
+
+    def test_ninfer_siblings_supply_the_weight_size(self):
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": [
+                {"rfilename": "README.md"},
+                {"rfilename": "qwen3_8_27b_nvfp4.ninfer",
+                 "size": 15 * 1024 ** 3},
+            ],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertEqual(public["weight_size_bytes"], 15 * 1024 ** 3)
+        self.assertEqual(public["weight_size_source"], "ninfer")
+
+    def test_partial_ninfer_sizes_do_not_invent_a_total(self):
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": [{"rfilename": "qwen3_8_27b_nvfp4.ninfer"}],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertIsNone(public["weight_size_bytes"])

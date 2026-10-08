@@ -2180,6 +2180,7 @@ async def create_container(req: Request):
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
             sg_cpu_affinity=body.get("sg_cpu_affinity"),
+            ninfer_artifact=body.get("ninfer_artifact"),
         )
     except Exception as e:
         raise HTTPException(500, str(e))

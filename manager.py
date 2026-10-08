@@ -5115,11 +5115,10 @@ class Manager:
         if engine == "ninfer":
             # NInfer caps each sequence with --max-context, gates admission
             # with --max-concurrency, stores KV with --kv-dtype, and speculates
-            # with the --spec/--draft-tokens pair. Thinking is a bare flag pair
-            # like TensorFold's. Everything else stays in extra_args.
-            if "--preserve-thinking" in args:
-                thinking = "enabled"
-            elif "--no-thinking" in args:
+            # with the --spec/--draft-tokens pair. Thinking is on by default
+            # and only --no-thinking disables it; --preserve-thinking is an
+            # independent assistant-reasoning switch and stays an extra flag.
+            if "--no-thinking" in args:
                 thinking = "disabled"
             else:
                 thinking = None
@@ -5288,19 +5287,17 @@ class Manager:
             kv_dtype = controls.get("kv_cache_dtype")
             kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
             flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
-            # NInfer's thinking switch is a bare flag pair like TensorFold's;
-            # "default" removes the override and leaves the template-driven
-            # default in place.
+            # Thinking is on by default: "enabled" and "default" just remove
+            # the --no-thinking override. --preserve-thinking is an
+            # independent assistant-reasoning switch that operators pass as
+            # an extra flag, so it is never stripped or generated here.
             flags = re.sub(
-                r"(?<!\S)(?:--no-thinking|--preserve-thinking)(?:=\S+)?", "",
-                flags,
+                r"(?<!\S)--no-thinking(?:=\S+)?", "", flags,
             ).strip()
             thinking = str(controls.get("thinking_mode") or "default")
-            if thinking == "enabled":
-                flags = f"{flags} --preserve-thinking".strip()
-            elif thinking == "disabled":
+            if thinking == "disabled":
                 flags = f"{flags} --no-thinking".strip()
-            elif thinking != "default":
+            elif thinking not in ("default", "enabled"):
                 raise ValueError("thinking_mode must be default, enabled, or disabled")
             # The speculative pair is rebuilt together: --draft-tokens without
             # a --spec backend is not a valid launch, so clearing the method
@@ -5311,6 +5308,12 @@ class Manager:
             ):
                 method = controls.get("speculative_method")
                 method = str(method).strip() if method not in (None, "") else None
+                if method is not None and method not in (
+                    "mtp", "dflash", "dflash2",
+                ):
+                    raise ValueError(
+                        "speculative_method must be mtp, dflash, or dflash2"
+                    )
                 draft = positive_int("dspark_num_speculative_tokens")
                 if method == "mtp" and draft is not None and draft > 5:
                     # NInfer's MTP backend accepts 1..5 draft tokens; the
@@ -6827,16 +6830,16 @@ class Manager:
                     artifact_path = token
                     i += 1
                     continue
-                if token in {"--no-thinking", "--preserve-thinking"}:
-                    # thinking_mode captures the switch; the apply path
-                    # re-emits it, so the pair must not survive as flags.
+                if token == "--no-thinking":
+                    # thinking_mode captures the disable switch; the apply
+                    # path re-emits it, so it must not survive as a flag.
+                    # --preserve-thinking is an independent switch and stays
+                    # in extra_args.
                     i += 1
                     continue
                 extra_args.append(token)
                 i += 1
-            if "--preserve-thinking" in analysis_cmd:
-                thinking_mode = "enabled"
-            elif "--no-thinking" in analysis_cmd:
+            if "--no-thinking" in analysis_cmd:
                 thinking_mode = "disabled"
             else:
                 thinking_mode = None
@@ -16843,6 +16846,15 @@ class Manager:
             )
         if not relative.casefold().endswith(".ninfer"):
             raise ValueError("NInfer deployments require a .ninfer artifact")
+        # The reference must belong to the model being launched. A stale
+        # artifact from another repository would otherwise resolve fine and
+        # silently serve the wrong compiled weights.
+        expected_prefix = "models--" + model.replace("/", "--") + "/"
+        if not relative.startswith(expected_prefix):
+            raise ValueError(
+                f"NInfer artifact does not belong to {model}; prepare the "
+                "selected repository and launch again"
+            )
         hub = Path(self.settings["hf_cache"]).expanduser() / "hub"
         artifact_path = hub / relative
         if not artifact_path.is_file():
@@ -18041,16 +18053,16 @@ class Manager:
                 flags, {"--max-concurrency"}, concurrency,
             )
             flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
+            # Thinking is on by default: "enabled" and "default" just remove
+            # the --no-thinking override; --preserve-thinking is an
+            # independent switch that stays in the flags.
             flags = re.sub(
-                r"(?<!\S)(?:--no-thinking|--preserve-thinking)(?:=\S+)?", "",
-                flags,
+                r"(?<!\S)--no-thinking(?:=\S+)?", "", flags,
             ).strip()
             thinking = str(thinking_mode or "default")
-            if thinking == "enabled":
-                flags = f"{flags} --preserve-thinking".strip()
-            elif thinking == "disabled":
+            if thinking == "disabled":
                 flags = f"{flags} --no-thinking".strip()
-            elif thinking != "default":
+            elif thinking not in ("default", "enabled"):
                 raise ValueError("thinking_mode must be default, enabled, or disabled")
         elif engine == "sglang":
             flags = self._replace_command_option(
@@ -18074,8 +18086,14 @@ class Manager:
             flags = self._replace_command_option(
                 flags, {"--max-model-len", "--max-model-length"}, context_window
             )
-        flags = self._replace_command_option(flags, {"--kv-cache-dtype"}, kv_dtype)
-        flags = self._replace_thinking_config(flags, str(thinking_mode))
+        if engine != "ninfer":
+            # NInfer exposes neither flag: its KV dtype and thinking switch
+            # were already applied on its own branch above, and appending
+            # the vLLM spellings would fail its argument parser.
+            flags = self._replace_command_option(
+                flags, {"--kv-cache-dtype"}, kv_dtype
+            )
+            flags = self._replace_thinking_config(flags, str(thinking_mode))
 
         original = [str(value) for value in (cmd or [])]
         # Preserve host/port because Docker's network bindings and controller

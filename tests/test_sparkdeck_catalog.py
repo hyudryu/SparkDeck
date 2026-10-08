@@ -1093,9 +1093,10 @@ class NinferArtifactSizeTests(unittest.TestCase):
         self.assertEqual(public["weight_size_source"], "safetensors")
         self.assertEqual(public["ninfer_weight_size_bytes"], 16106127360)
 
-    def test_alternative_ninfer_artifacts_are_not_summed(self):
-        """A deployment loads one artifact, so the fit signal is the largest
-        single artifact rather than the repository total."""
+    def test_alternative_ninfer_artifacts_use_the_smallest_deployable(self):
+        """A deployment loads one artifact, so the model-level fit signal is
+        the smallest deployable option: the model stays visible whenever at
+        least one artifact fits the target GPU."""
         from sparkdeck.catalog import HuggingFaceCatalog
 
         item = {
@@ -1108,5 +1109,29 @@ class NinferArtifactSizeTests(unittest.TestCase):
         }
         public = HuggingFaceCatalog._public_item(item)
         self.assertEqual(
-            public["ninfer_weight_size_bytes"], 20 * 1024 ** 3,
+            public["ninfer_weight_size_bytes"], 15 * 1024 ** 3,
+        )
+
+    def test_missing_ninfer_sibling_sizes_are_enriched_from_the_tree(self):
+        """A listing that names .ninfer files without sizes must still end up
+        with a fit signal once the details tree is available."""
+        from sparkdeck.catalog import (
+            HuggingFaceCatalog, _ninfer_sizes_from_tree,
+        )
+
+        raw_siblings = [
+            {"rfilename": "README.md"},
+            {"rfilename": "qwen3_8_27b_nvfp4.ninfer"},
+        ]
+        tree = [
+            {"path": "README.md", "size": 1200, "type": "file"},
+            {"path": "qwen3_8_27b_nvfp4.ninfer",
+             "size": 15 * 1024 ** 3, "type": "file"},
+        ]
+        self.assertTrue(HuggingFaceCatalog._public_item({
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": raw_siblings,
+        })["ninfer_weight_size_bytes"] is None)
+        self.assertEqual(
+            _ninfer_sizes_from_tree(raw_siblings, tree), 15 * 1024 ** 3,
         )

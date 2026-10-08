@@ -344,7 +344,9 @@ class StartupBenchmarkMonitor:
                         "content": "Write a detailed description of a peaceful garden in spring.",
                     }],
                     "max_tokens": 200, "temperature": 0, "stream": True,
-                    "stream_options": {"include_usage": True}, "ignore_eos": True,
+                    # NInfer rejects unknown top-level fields, so the vLLM-only
+                    # ignore_eos hint stays out of its probe.
+                    "stream_options": {"include_usage": True},
                 }
             else:
                 body = {

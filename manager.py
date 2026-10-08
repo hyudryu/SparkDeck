@@ -5318,11 +5318,15 @@ class Manager:
                 raise ValueError("launch arguments have invalid shell quoting") from exc
 
         if engine == "ninfer":
+            concurrency = positive_int("max_concurrency")
+            if concurrency is not None and concurrency > 8:
+                # NInfer's documented admission range is 1..8.
+                raise ValueError("max_concurrency must be between 1 and 8")
             flags = self._replace_command_option(
                 flags, {"--max-context"}, positive_int("context_window"),
             )
             flags = self._replace_command_option(
-                flags, {"--max-concurrency"}, positive_int("max_concurrency"),
+                flags, {"--max-concurrency"}, concurrency,
             )
             kv_dtype = controls.get("kv_cache_dtype")
             kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
@@ -18098,6 +18102,9 @@ class Manager:
             # NInfer exposes different flag names and no vLLM-style
             # memory controls; map the shared scalars onto its argv and
             # leave the remaining flags untouched.
+            if concurrency is not None and concurrency > 8:
+                # NInfer's documented admission range is 1..8.
+                raise ValueError("max_concurrency must be between 1 and 8")
             flags = self._replace_command_option(
                 flags, {"--max-context"}, context_window,
             )

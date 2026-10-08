@@ -766,6 +766,26 @@ class NinferLaunchControlsTests(unittest.TestCase):
                 [], "ninfer", {"kv_cache_dtype": "fp8_e4m3"},
             )
 
+    def test_max_concurrency_above_eight_is_rejected(self):
+        """NInfer's documented admission range is 1..8, enforced on both the
+        structured apply path and the discovered-container rebuild."""
+        manager = Manager.__new__(Manager)
+        command = [
+            "ninfer-serve", "/cache/hub/models--org--model/snapshots/"
+            + ("a" * 40) + "/model.ninfer",
+            "--host", "0.0.0.0", "--port", "8080",
+            "--max-concurrency", "4",
+        ]
+        with self.assertRaisesRegex(ValueError, "between 1 and 8"):
+            manager._apply_deployment_launch_controls(
+                ["--max-context", "8192"], "ninfer",
+                {"context_window": 8192, "max_concurrency": 9},
+            )
+        with self.assertRaisesRegex(ValueError, "between 1 and 8"):
+            manager._updated_container_command(
+                command, "ninfer", "org/model", {"max_concurrency": 12},
+            )
+
     def test_discovered_environment_includes_ninfer(self):
         from sparkdeck.runtime_environment import discovered_runtime_environment
 

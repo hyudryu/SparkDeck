@@ -31,7 +31,8 @@ const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
 const CONTROLLER_ONLY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp'])
 const SINGLE_COPY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['laya', 'tensorfold', 'ninfer'])
 // Single-GPU engines load their whole artifact onto one card, so their fit
-// is bounded by the largest individual GPU, not a node's summed VRAM.
+// is bounded by the device-0 GPU the engine will actually use, not a node's
+// summed VRAM or its largest optional card.
 const SINGLE_GPU_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['ninfer'])
 const isControllerOnlyRuntime = (runtime: RuntimeKind | ''): boolean =>
   runtime !== '' && CONTROLLER_ONLY_RUNTIMES.has(runtime)
@@ -101,13 +102,16 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
       ? measured.reduce((sum, item) => sum + item.capacity, 0)
       : Math.max(...measured.map((item) => item.capacity)),
     maxCapacity: Math.max(...measured.map((item) => item.capacity)),
-    maxGpuCapacity: Math.max(0, ...measured.map(({ node }) => (
-      (node.stats?.gpus ?? []).reduce((best, gpu) => (
+    maxGpuCapacity: Math.max(0, ...measured.map(({ node }) => {
+      // NInfer launches on device 0 (upstream default; SparkDeck adds no
+      // --device override), so the fit is bounded by the device-0 GPU on
+      // each node, not by the largest card it may also carry.
+      const gpus = (node.stats?.gpus ?? []).filter((gpu) => (
         !gpu.error && Number.isFinite(gpu.mem_total_mib) && Number(gpu.mem_total_mib) > 0
-          ? Math.max(best, Number(gpu.mem_total_mib) * MIB)
-          : best
-      ), 0)
-    ))),
+      ))
+      const device0 = gpus.find((gpu) => gpu.index === 0) ?? gpus[0]
+      return device0 ? Number(device0.mem_total_mib) * MIB : 0
+    })),
     measuredNodes: measured.length,
     aggregate,
     localCapacity,
@@ -415,14 +419,14 @@ function ModelRow({
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
-  // NInfer loads the compiled artifact, so its fit uses the artifact size
-  // rather than the source-format estimate.
+  // NInfer loads the compiled artifact, so its fit uses the artifact size —
+  // even when the repository also ships GGUF quantizations.
   const ninferArtifactSize = isSingleGpuRuntime(deploymentRuntime)
-    ? model.ninfer_weight_size_bytes ?? weightSize
+    ? model.ninfer_weight_size_bytes ?? undefined
     : undefined
   const fitWeightSize = isControllerOnlyRuntime(deploymentRuntime)
     || isSingleCopyRuntime(deploymentRuntime)
-    ? selectedArtifact?.weightSize ?? ninferArtifactSize ?? weightSize
+    ? ninferArtifactSize ?? selectedArtifact?.weightSize ?? weightSize
     : weightSize
   // Controller-only runtimes fit against the controller's own memory;
   // single-copy runtimes may target any selected node, so their fit is
@@ -766,7 +770,7 @@ export function ExplorePage() {
           </select>
         </label>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isControllerOnlyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleGpuRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest single-GPU memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleCopyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest per-node memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isControllerOnlyRuntime(activeRuntime) ? 'Controller memory unavailable' : isSingleCopyRuntime(activeRuntime) ? 'Node memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isControllerOnlyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleGpuRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} device-0 GPU memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleCopyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest per-node memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isControllerOnlyRuntime(activeRuntime) ? 'Controller memory unavailable' : isSingleCopyRuntime(activeRuntime) ? 'Node memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>

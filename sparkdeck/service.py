@@ -148,21 +148,23 @@ def _container_last_deployed_at(container: dict[str, Any]) -> str | float | None
     return None
 
 
-def _repo_relative_ninfer_artifact(artifact_path: Any) -> str:
+def _repo_relative_ninfer_artifact(artifact_path: Any) -> str | None:
     """Return the repo-relative path from an in-container artifact path.
 
     The inspected command holds
     ``<cache>/hub/models--owner--repo/snapshots/<rev>/<repo-relative>``, so
     everything after the snapshot directory is the durable reference —
-    including artifacts that live below a repository subdirectory.
+    including artifacts that live below a repository subdirectory. ``None``
+    means the path is not a Hugging Face cache snapshot (an arbitrary mount)
+    and cannot be turned into a launchable reference.
     """
     text = str(artifact_path or "").replace("\\", "/")
     _, marker, tail = text.partition("/snapshots/")
     if marker and tail:
         _, _, relative = tail.partition("/")
-        if relative:
+        if relative and relative.startswith("models--"):
             return relative
-    return PurePosixPath(text).name
+    return None
 
 
 def _discovered_launch_controls(
@@ -3099,13 +3101,15 @@ class SparkDeckService:
         home_node_ids: list[str] | None = None,
         download_node_id: str | None = None,
         extensions: tuple[str, ...] = (".gguf",),
+        resolved_revision: str | None = None,
     ) -> str:
         """Prepare one repo-relative model artifact through the existing Virtual NAS cache."""
         relative = self._validate_public_gguf_artifact(
             repository, artifact, quantization, extensions=extensions,
         )
 
-        resolved_revision = await self._resolved_model_revision(repository, revision)
+        if resolved_revision is None:
+            resolved_revision = await self._resolved_model_revision(repository, revision)
         selected_files = self._expand_gguf_shard_files(relative)
         virtual_nas = self.manager.virtual_nas
         if home_node_ids and set(home_node_ids) - {LOCAL_NODE_ID}:
@@ -3466,6 +3470,7 @@ class SparkDeckService:
             model_is_local_path = False
             artifact_homes: list[str] | None = None
             artifact_seed: str | None = None
+            prepared_revision: str | None = None
             if (
                 runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.NINFER)
                 and kind is DeploymentKind.MANAGED
@@ -3552,6 +3557,15 @@ class SparkDeckService:
                         extensions=artifact_extensions,
                     )
                     if launch:
+                        # Resolve the revision once: the hub-relative launch
+                        # reference below must point at the exact snapshot
+                        # this preparation downloads, even if the repository
+                        # advances during the transfer.
+                        if runtime is RuntimeKind.NINFER:
+                            prepared_revision = await self._resolved_model_revision(
+                                model,
+                                _optional_string(body.get("revision")) or "main",
+                            )
                         prepared = await self._prepare_public_gguf_artifact(
                             model, artifact,
                             _optional_string(body.get("revision")) or "main",
@@ -3559,6 +3573,7 @@ class SparkDeckService:
                             home_node_ids=artifact_homes,
                             download_node_id=artifact_seed,
                             extensions=artifact_extensions,
+                            resolved_revision=prepared_revision,
                         )
                         if runtime is not RuntimeKind.NINFER:
                             # NInfer keeps the repo-relative reference
@@ -3684,9 +3699,12 @@ class SparkDeckService:
                 if runtime is RuntimeKind.NINFER:
                     # Cluster members resolve the artifact from their own
                     # caches, so the immediate cluster launch carries the same
-                    # cache-relative reference the saved-launch path derives.
-                    resolved_revision = await self._resolved_model_revision(
-                        model, identity.revision or "main",
+                    # cache-relative reference the saved-launch path derives —
+                    # pinned to the revision preparation downloaded.
+                    resolved_revision = prepared_revision or (
+                        await self._resolved_model_revision(
+                            model, identity.revision or "main",
+                        )
                     )
                     ninfer_artifact = self._hub_relative_llama_artifact(
                         model, artifact, resolved_revision,
@@ -3763,8 +3781,10 @@ class SparkDeckService:
                 # cache-relative reference instead of the raw repository
                 # filename so the launch can resolve it.
                 raw_artifact = _optional_string(body.get("artifact")) or ""
-                resolved_revision = await self._resolved_model_revision(
-                    model, identity.revision or "main",
+                resolved_revision = prepared_revision or (
+                    await self._resolved_model_revision(
+                        model, identity.revision or "main",
+                    )
                 )
                 settings = {
                     **settings,
@@ -4463,6 +4483,43 @@ class SparkDeckService:
             # GGUF selection owns its cache-relative artifact revision and
             # llama-server has no --revision flag. Preserve that contract.
             revision = revision or "main"
+        if deployment.get("runtime") == RuntimeKind.NINFER.value and artifact:
+            # A selective .ninfer download leaves the repository snapshot
+            # deliberately partial, so whole-repository completeness is the
+            # wrong readiness signal: the selected artifact file is what the
+            # launch resolves, and each node must hold it at the resolved
+            # revision.
+            relative = self._validate_public_gguf_artifact(
+                repository, artifact, None, extensions=(".ninfer",),
+            )
+            resolved = await self._resolved_model_revision(
+                repository, revision or "main",
+            )
+            presence = getattr(self.manager, "node_has_model_files", None)
+            if not callable(presence):
+                # Without the per-file presence endpoint the inventory check
+                # below cannot see a selective snapshot; fail with the same
+                # contract instead of silently starting without weights.
+                raise ValueError(
+                    "selected node(s) cannot verify the cached .ninfer "
+                    "artifact; update their SparkDeck agent"
+                )
+            missing = []
+            for node_id in node_ids:
+                try:
+                    has_files = await presence(
+                        node_id, repository, resolved, [relative.as_posix()],
+                    )
+                except Exception:
+                    has_files = False
+                if not has_files:
+                    missing.append(node_id)
+            if missing:
+                raise ValueError(
+                    "model weights are not available on selected node(s): "
+                    + ", ".join(missing)
+                )
+            return resolved
         inventory = await self.manager.model_cache_inventory()
         cached = {
             node.get("id"): next((
@@ -6691,7 +6748,9 @@ class SparkDeckService:
                         # The inspection result records NInfer's positional
                         # artifact as an in-container cache path; the clone
                         # bookmark needs the repo-relative path (subdirectories
-                        # included) so its first launch can re-resolve it.
+                        # included) so its first launch can re-resolve it. An
+                        # arbitrary mount is not a Hub snapshot, so such
+                        # containers cannot be cloned into a bookmark.
                         "artifact": (
                             _repo_relative_ninfer_artifact(
                                 load_settings.get("artifact_path")
@@ -6708,6 +6767,13 @@ class SparkDeckService:
                     "settings": settings,
                     "desired_state": "stopped",
                 }
+                if runtime is RuntimeKind.NINFER and not stored["model"]["artifact"]:
+                    raise ValueError(
+                        "cannot clone this NInfer container: its artifact is "
+                        "not a Hugging Face cache snapshot, so no repo-relative "
+                        "reference can be derived; deploy the artifact from the "
+                        "Models page instead"
+                    )
             else:
                 stored = self.store.deployment(deployment_id, include_private=True)
             if not stored:

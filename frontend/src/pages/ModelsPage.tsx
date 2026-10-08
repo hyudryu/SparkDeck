@@ -1537,6 +1537,15 @@ export function ModelsPage() {
     if (isControllerArtifact(deployment)) {
       return new Set(localNodeId ? [localNodeId] : [])
     }
+    if (deployment.runtime === 'ninfer') {
+      // A selective .ninfer download leaves the repository snapshot marked
+      // partial; the artifact file itself is the readiness signal the
+      // backend re-checks when the start is confirmed.
+      return new Set((modelCache.data?.nodes ?? [])
+        .filter((node) => node.models.some((model) => model.model_id === deployment.model_id
+          && model.revisions?.includes(deployment.model_revision ?? 'main')))
+        .map((node) => node.id))
+    }
     return new Set((modelCache.data?.nodes ?? [])
       .filter((node) => node.models.some((model) => !model.partial && model.model_id === deployment.model_id
         && model.revisions?.includes(deployment.model_revision ?? 'main')))
@@ -2162,11 +2171,17 @@ export function ModelsPage() {
               ? {
                 // Single-engine runtimes: no tensor parallelism. NInfer's
                 // context cap maps to its --max-context flag at launch, and
-                // its .ninfer artifact travels with the launch. The runtime's
-                // own default image applies unless the operator set one
-                // deliberately.
+                // its .ninfer artifact travels with the launch — but a GGUF
+                // artifact carried over from llama.cpp is not one, so it is
+                // cleared and the operator picks a compatible file. The
+                // runtime's own default image applies unless the operator
+                // set one deliberately.
                 context_length: current.settings.context_length,
-                artifact: runtime === 'ninfer' ? current.settings.artifact : undefined,
+                artifact: runtime === 'ninfer'
+                  ? (current.settings.artifact?.toLowerCase().endsWith('.ninfer')
+                      ? current.settings.artifact
+                      : undefined)
+                  : undefined,
                 image: current.runtime === runtime ? current.settings.image : undefined,
               }
               : {

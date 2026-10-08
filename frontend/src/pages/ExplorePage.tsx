@@ -228,6 +228,20 @@ function requiresControllerCapacity(model: DisplayCatalogModel) {
   return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
 }
 
+// NInfer-only repositories ship no GGUF/safetensors weights, so in the
+// all-runtimes view their fit is the compiled artifact size against the
+// device-0 GPU — mirroring the NInfer runtime filter's behavior.
+function requiresSingleGpuCapacity(model: DisplayCatalogModel) {
+  const compatibility = model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const hasNonNinferRuntime = compatibility.some((item) => item.runtime !== 'ninfer' && item.supported)
+  const hasNinferRuntime = compatibility.some((item) => item.runtime === 'ninfer' && item.supported)
+  return !hasNonNinferRuntime && hasNinferRuntime
+}
+
+function ninferFitWeightSize(model: DisplayCatalogModel) {
+  return model.ninfer_weight_size_bytes ?? model.weight_size_bytes
+}
+
 function preferredGgufArtifact(
   artifactOptions: GgufArtifactOption[],
   communityQuantization?: string,
@@ -629,11 +643,15 @@ export function ExplorePage() {
     if (fitsOnly) visible = visible.flatMap((model) => {
       const usesControllerCapacity = isControllerOnlyRuntime(activeRuntime)
         || (activeRuntime === '' && requiresControllerCapacity(model))
+      const usesSingleGpuCapacity = isSingleGpuRuntime(activeRuntime)
+        || (activeRuntime === '' && requiresSingleGpuCapacity(model))
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
-        : isSingleCopyRuntime(activeRuntime)
-          ? singleCopyCapacity(activeRuntime, memory)
-          : memory.capacity
+        : usesSingleGpuCapacity
+          ? singleCopyCapacity('ninfer', memory)
+          : isSingleCopyRuntime(activeRuntime)
+            ? singleCopyCapacity(activeRuntime, memory)
+            : memory.capacity
       if (tab === 'community') {
         const weightEstimates = communityWeightEstimates(model, usesControllerCapacity)
         const fittingEstimate = largestFittingCommunityEstimate(
@@ -651,8 +669,8 @@ export function ExplorePage() {
       }
       const applicableWeightSize = usesControllerCapacity
         ? defaultGgufWeightSize(model, tab === 'community')
-        : isSingleGpuRuntime(activeRuntime)
-          ? model.ninfer_weight_size_bytes ?? model.weight_size_bytes
+        : usesSingleGpuCapacity
+          ? ninferFitWeightSize(model)
           : model.weight_size_bytes
       return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity)) ? [model] : []
     })

@@ -30,6 +30,8 @@ AGENT_FABRIC_PORT = 7878
 TENSORFOLD_CAPABILITY = "tensorfold-launch-v1"
 # Same contract as TENSORFOLD_CAPABILITY for the NInfer artifact engine.
 NINFER_CAPABILITY = "ninfer-launch-v1"
+# Same contract as TENSORFOLD_CAPABILITY for the Strata expert-offload engine.
+STRATA_CAPABILITY = "strata-launch-v1"
 
 
 class NodeAgentResponseError(RuntimeError):

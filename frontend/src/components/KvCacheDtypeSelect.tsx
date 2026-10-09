@@ -41,11 +41,19 @@ const NINFER_KV_CACHE_DTYPES = [
   'k8v4',
 ] as const
 
+// Strata's KV storage is the KV variable its entrypoint reads.
+const STRATA_KV_CACHE_DTYPES = [
+  'int8',
+  'q4_0',
+  'k8v4',
+] as const
+
 const optionsFor = (runtime: RuntimeKind): readonly string[] => (
   runtime === 'sglang' ? SGLANG_KV_CACHE_DTYPES
     : runtime === 'vllm' ? VLLM_KV_CACHE_DTYPES
       : runtime === 'ninfer' ? NINFER_KV_CACHE_DTYPES
-        : []
+        : runtime === 'strata' ? STRATA_KV_CACHE_DTYPES
+          : []
 )
 
 interface KvCacheDtypeSelectProps {

@@ -30,7 +30,7 @@ const initialForm: CreateDeploymentInput = {
 }
 
 const isRuntimeKind = (value: unknown): value is RuntimeKind =>
-  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya' || value === 'tensorfold' || value === 'ninfer'
+  value === 'vllm' || value === 'llama.cpp' || value === 'sglang' || value === 'laya' || value === 'tensorfold' || value === 'ninfer' || value === 'strata'
 
 const EMPTY_QUANTIZATIONS: GgufQuantization[] = []
 const EMPTY_FILE_SETS: ReadonlyArray<ReadonlySet<string>> = []
@@ -69,7 +69,7 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
     runtime,
     settings: runtime === 'llama.cpp'
       ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-      : runtime === 'tensorfold' || runtime === 'ninfer'
+      : runtime === 'tensorfold' || runtime === 'ninfer' || runtime === 'strata'
         ? { context_length: contextLength }
         : {
           context_length: contextLength,
@@ -692,7 +692,7 @@ export function ModelsPage() {
         // arguments.
         deployment_mode: ggufArtifact
           ? 'single'
-          : sharded && linkedRuntime !== 'laya' && linkedRuntime !== 'tensorfold' && linkedRuntime !== 'ninfer' ? 'sharded' : current.deployment_mode,
+          : sharded && linkedRuntime !== 'laya' && linkedRuntime !== 'tensorfold' && linkedRuntime !== 'ninfer' && linkedRuntime !== 'strata' ? 'sharded' : current.deployment_mode,
         settings: ggufArtifact
           ? {
             context_length: current.settings.context_length,
@@ -708,7 +708,7 @@ export function ModelsPage() {
               served_model: current.settings.served_model,
               image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
-            : linkedRuntime === 'tensorfold' || linkedRuntime === 'ninfer'
+            : linkedRuntime === 'tensorfold' || linkedRuntime === 'ninfer' || linkedRuntime === 'strata'
               ? {
                 // A linked single-engine runtime keeps the form's initial
                 // vLLM image out of the launch; Manager applies the runtime's
@@ -1240,7 +1240,7 @@ export function ModelsPage() {
               : undefined)
           : undefined,
         extra_args: form.managed ? shellSplit(extraFlags) : [],
-        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer')
+        environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer' || form.runtime === 'strata')
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
               : undefined)
@@ -1251,7 +1251,7 @@ export function ModelsPage() {
         throw new Error('Each runtime file mount needs a host file path and a container file path.')
       }
       const utilization = Number(gpuMemoryUtil)
-      if (form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
+      if (form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && form.runtime !== 'strata' && gpuMemoryUtil.trim() && Number.isFinite(utilization)) {
         settings.gpu_memory_utilization = utilization
       }
       if (form.deployment_mode === 'grouped_sharded') {
@@ -1266,7 +1266,7 @@ export function ModelsPage() {
         // same request so settings + rename succeed or fail as one save.
         await api.deployments.update(editing.id, {
           alias: form.alias,
-          image: form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'ninfer'
+          image: form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'ninfer' || form.runtime === 'strata'
             ? settings.image ?? null
             : undefined,
           context_length: settings.context_length ?? null,
@@ -1274,7 +1274,7 @@ export function ModelsPage() {
           instances: form.deployment_mode === 'grouped_sharded' ? settings.instances ?? null : null,
           parallel_slots: settings.parallel_slots ?? null,
           gpu_layers: settings.gpu_layers ?? null,
-          quantization: (form.runtime === 'tensorfold' || form.runtime === 'ninfer') && form.managed
+          quantization: (form.runtime === 'tensorfold' || form.runtime === 'ninfer' || form.runtime === 'strata') && form.managed
             ? null
             : settings.quantization ?? null,
           artifact: settings.artifact ?? null,
@@ -2138,6 +2138,7 @@ export function ModelsPage() {
         && runtime !== 'laya'
         && runtime !== 'tensorfold'
         && runtime !== 'ninfer'
+        && runtime !== 'strata'
         && current.deployment_mode === 'sharded'
         && (nodeIds?.length ?? 0) > 1
       const deploymentMode = sharded ? 'sharded' : (nodeIds?.length ?? 0) > 1 ? 'replicated' : 'single'
@@ -2167,7 +2168,7 @@ export function ModelsPage() {
               // applies unless the operator set one for Laya deliberately.
               image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
-            : runtime === 'tensorfold' || runtime === 'ninfer'
+            : runtime === 'tensorfold' || runtime === 'ninfer' || runtime === 'strata'
               ? {
                 // Single-engine runtimes: no tensor parallelism. NInfer's
                 // context cap maps to its --max-context flag at launch, and
@@ -2811,12 +2812,13 @@ export function ModelsPage() {
               {formError && <p className="form-error" role="alert">{formError}</p>}
               <div className="field-grid">
                 <label className="field"><span>Display name</span><input autoFocus required value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} /></label>
-                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option><option value="tensorfold">TensorFold</option><option value="ninfer">NInfer</option></select></label>
+                <label className="field"><span>Runtime</span><select value={form.runtime} disabled={Boolean(editingDeployment)} onChange={(event) => updateRuntime(event.target.value as RuntimeKind)}><option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="llama.cpp">Llama server</option><option value="laya">Laya decisions</option><option value="tensorfold">TensorFold</option><option value="ninfer">NInfer</option><option value="strata">Strata</option></select></label>
               </div>
               <label className="field"><span>Model repository or GGUF artifact</span><input required readOnly={Boolean(editingDeployment)} value={form.model_id} onChange={(event) => setForm({ ...form, model_id: event.target.value })} placeholder="org/model-name" /></label>
               {form.runtime === 'laya' && <p className="field-note">Laya is a non-autoregressive decision model: it returns calibrated answers to typed questions instead of generating text. Send <code>state</code> and <code>questions</code> to <code>/v1/chat/completions</code>. Single and replicated layouts are supported; it has no tensor parallelism. Laya can share nodes with other models; available memory still limits what can run together.</p>}
               {form.runtime === 'tensorfold' && <p className="field-note">TensorFold is an OpenAI-compatible serving engine with exact speculative decoding for NVIDIA GPUs. Single and replicated layouts are supported; it has no tensor parallelism. Weights resolve from the cluster's Hugging Face cache, and the container image must provide the <code>tensorfold</code> CLI as its entrypoint.</p>}
               {form.runtime === 'ninfer' && <p className="field-note">NInfer is a single-GPU OpenAI-compatible engine that loads one compiled <code>.ninfer</code> artifact (for example <code>neroued/Qwen3.8-27B-nvfp4-NInfer</code>). Single and replicated layouts are supported; it has no tensor parallelism. The artifact is pulled through the cluster's shared Hugging Face cache, and the container image must provide the <code>ninfer-serve</code> binary.</p>}
+              {form.runtime === 'strata' && <p className="field-note">Strata is an OpenAI-compatible expert-offload engine: hot experts live on the GPU, the rest in host RAM, and a lookup table on the SSD, so one 125B-class model fits a single workstation. Single and replicated layouts are supported; it has no tensor parallelism. The container downloads its checkpoint on first start, and every launch setting is an environment variable (MODEL, CONTEXT, KV, ...) read by the upstream entrypoint.</p>}
               {form.managed && form.runtime === 'ninfer' && <label className="field"><span>.ninfer artifact</span><input required value={form.settings.artifact ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, artifact: event.target.value || undefined } })} placeholder="qwen3_8_27b_nvfp4.ninfer" /><small>Repo-relative name of the compiled artifact file inside the model repository. SparkDeck downloads it to every selected node through the cluster cache before launch.</small></label>}
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {form.managed && form.runtime === 'tensorfold' && <label className="field"><span>TensorFold image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/tensorfold:latest" /><small>The container image pulled on every selected node. TensorFold has no upstream image; build {`sparkdeck/tensorfold:latest`} from <code>tensorfold/Dockerfile</code> or point this at a registry tag whose entrypoint is the <code>tensorfold</code> CLI.</small></label>}
@@ -2854,7 +2856,7 @@ export function ModelsPage() {
                   ))}
                 </select>
                 <small>Quantizations published in the {form.model_id} repository, with their download size; ✓ Downloaded means the files are already in the cluster cache.</small>
-              </label> : (form.runtime === 'tensorfold' || form.runtime === 'ninfer') && form.managed ? null : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
+              </label> : (form.runtime === 'tensorfold' || form.runtime === 'ninfer' || form.runtime === 'strata') && form.managed ? null : <label className="field"><span>Quantization (optional)</span><input value={form.settings.quantization ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, quantization: event.target.value || undefined } })} placeholder="NVFP4, AWQ, Q4_K_M…" /></label>}
               {form.runtime === 'llama.cpp' && createArtifactOptions.length > 0 && !isLocalArtifact(form.settings.artifact) && !artifactManualEntry ? <label className="field"><span>GGUF artifact</span>
                 <select
                   required
@@ -2908,7 +2910,7 @@ export function ModelsPage() {
                 help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && form.runtime !== 'strata' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
               {form.managed && form.deployment_mode === 'grouped_sharded' && <label className="field"><span>Instances (independent engine groups)</span><input type="number" min="1" value={form.settings.instances ?? 1} onChange={(event) => setForm({ ...form, settings: { ...form.settings, instances: Math.max(1, Number(event.target.value) || 1) } })} />{(form.settings.tensor_parallel_size ?? 1) * (form.settings.instances ?? 1) !== (form.node_ids?.length ?? 0) && <small className="form-error" role="status">{form.node_ids?.length ?? 0} selected nodes cannot split into {form.settings.instances ?? 1} TP{form.settings.tensor_parallel_size ?? 1} group(s); pick {form.settings.instances ?? 1} × {form.settings.tensor_parallel_size ?? 1} nodes or adjust the counts.</small>}<small>Each instance runs on {form.settings.tensor_parallel_size ?? 2} of the selected nodes; the selection must equal instances × tensor parallel size.</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {
@@ -2917,7 +2919,7 @@ export function ModelsPage() {
                 }} /></label>
                 {form.runtime === 'llama.cpp' ? (
                   <label className="field"><span>Parallel slots</span><input type="number" min="1" value={form.settings.parallel_slots} onChange={(event) => setForm({ ...form, settings: { ...form.settings, parallel_slots: Number(event.target.value) } })} /></label>
-                ) : form.runtime === 'tensorfold' || form.runtime === 'ninfer' ? null : (
+                ) : form.runtime === 'tensorfold' || form.runtime === 'ninfer' || form.runtime === 'strata' ? null : (
                   <label className="field"><span>Tensor parallel size</span><input type="number" min="1" readOnly={form.deployment_mode === 'sharded'} value={form.settings.tensor_parallel_size} onChange={(event) => setForm((current) => {
                     const tensor = Number(event.target.value)
                     return { ...current, settings: {
@@ -2934,8 +2936,8 @@ export function ModelsPage() {
               {form.managed && <>
                 <Button type="button" variant="tertiary" aria-expanded={launchArgsOpen} onClick={() => setLaunchArgsOpen((open) => !open)}><Settings2 size={15} /> Launch arguments</Button>
                 {launchArgsOpen && <div className="args-editor">
-                  {form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
-                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
+                  {form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && form.runtime !== 'strata' && <label className="field"><span>GPU memory util</span><input type="number" step="0.05" min="0.1" max="0.98" placeholder="default" value={gpuMemoryUtil} onChange={(event) => setGpuMemoryUtil(event.target.value)} /></label>}
+                  {(form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer' || form.runtime === 'strata') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : form.runtime === 'strata' ? "MODEL=IQ2_XS&#10;CONTEXT=32768" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
                   {form.runtime === 'sglang' && <label className="field"><span>CPU affinity</span><input aria-label="CPU affinity" placeholder="5-9,15-19" value={form.settings.sg_cpu_affinity ?? ''} onChange={(event) => setForm((current) => ({ ...current, settings: { ...current.settings, sg_cpu_affinity: event.target.value } }))} /><small>Optional CPU IDs or ranges for each container. Leave blank to use all available CPUs.</small></label>}
                   {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
                   <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>

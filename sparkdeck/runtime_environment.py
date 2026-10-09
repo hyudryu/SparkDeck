@@ -14,8 +14,11 @@ _SECRET_NAME = re.compile(
 _PROTECTED_NAMES = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
 # Engines whose launcher reads configuration from the container environment.
+# Strata's whole launch configuration is environment-driven (the upstream
+# entrypoint reads MODEL/CONTEXT/KV and friends), so operator variables are
+# its primary settings surface.
 _ENVIRONMENT_CAPABLE_ENGINES = frozenset(
-    {"vllm", "sglang", "laya", "tensorfold", "ninfer"}
+    {"vllm", "sglang", "laya", "tensorfold", "ninfer", "strata"}
 )
 
 # Docker inspection may expose arbitrary application credentials. Only these
@@ -44,6 +47,30 @@ _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES = frozenset({
     "VLLM_WORKER_MULTIPROC_METHOD",
 })
 
+# The entrypoint-driven setup choices a Strata container carries. Host, port,
+# and credential variables are SparkDeck-managed and never recovered.
+_DISCOVERED_STRATA_ENVIRONMENT_NAMES = frozenset({
+    "CONTEXT",
+    "FAMILY",
+    "GGUF_DIR",
+    "GPU",
+    "GPUS",
+    "KV",
+    "KV_STREAMING",
+    "LAYER_SPLIT",
+    "LOW_RAM",
+    "MODEL",
+    "RESIDENT_BUDGET_GIB",
+    "VISION",
+})
+
+_DISCOVERED_ENVIRONMENT_NAMES = {
+    "vllm": _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES,
+    # NInfer images may declare vLLM-style tuning defaults in the image.
+    "ninfer": _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES,
+    "strata": _DISCOVERED_STRATA_ENVIRONMENT_NAMES,
+}
+
 
 def normalize_runtime_environment(
     value: Any, engine: str = "vllm",
@@ -51,9 +78,10 @@ def normalize_runtime_environment(
     """Return a bounded, credential-free environment map for a managed runtime.
 
     Engines that read their launch configuration from the environment (vLLM,
-    SGLang, the Laya decision server, TensorFold, and NInfer, which take
-    things like ``HF_HUB_OFFLINE`` or ``PYTORCH_CUDA_ALLOC_CONF``) accept
-    operator variables. Everything else has no
+    SGLang, the Laya decision server, TensorFold, NInfer, and Strata, which
+    takes things like ``HF_HUB_OFFLINE`` or its own ``MODEL``/``CONTEXT``
+    setup variables) accept operator
+    variables. Everything else has no
     environment-driven configuration, so a non-empty map is a caller mistake
     worth reporting rather than silently dropping.
     """
@@ -62,7 +90,7 @@ def normalize_runtime_environment(
     if engine not in _ENVIRONMENT_CAPABLE_ENGINES and value:
         raise ValueError(
             "runtime environment variables are only supported for "
-            "vLLM, SGLang, Laya, TensorFold, and NInfer"
+            "vLLM, SGLang, Laya, TensorFold, NInfer, and Strata"
         )
     if not isinstance(value, dict):
         raise ValueError("environment must be an object of string values")
@@ -98,11 +126,12 @@ def discovered_runtime_environment(
     value: Any, engine: str = "vllm",
 ) -> dict[str, str]:
     """Return only allowlisted tuning values found through Docker inspection."""
-    if engine not in ("vllm", "ninfer") or not isinstance(value, dict):
+    allowed = _DISCOVERED_ENVIRONMENT_NAMES.get(engine)
+    if allowed is None or not isinstance(value, dict):
         return {}
     result: dict[str, str] = {}
     for name, raw_value in value.items():
-        if name not in _DISCOVERED_RUNTIME_ENVIRONMENT_NAMES:
+        if name not in allowed:
             continue
         try:
             result = normalize_runtime_environment(

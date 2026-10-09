@@ -16,7 +16,8 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_registry_supports_every_shipped_runtime(self):
         self.assertEqual(
             set(RuntimeRegistry().kinds),
-            {"vllm", "llama.cpp", "sglang", "laya", "tensorfold", "ninfer"},
+            {"vllm", "llama.cpp", "sglang", "laya", "tensorfold", "ninfer",
+             "strata"},
         )
 
     def test_vllm_launch_settings(self):

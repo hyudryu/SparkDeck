@@ -56,6 +56,8 @@ from .live_metrics import (
 )
 from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
+    apply_strata_launch_controls,
+    strata_launch_environment,
     RuntimeRegistry,
     launch_managed_container,
     normalize_openai_base_url,
@@ -2027,6 +2029,7 @@ class SparkDeckService:
         # concurrency, image, and extra flags are all persisted launch inputs.
         _EDITABLE_RUNTIMES = {
             "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer",
+            "strata",
         }
         discovered_editable = bool(
             discovered_settings is not None
@@ -2369,6 +2372,13 @@ class SparkDeckService:
         environment = normalize_runtime_environment(
             changes.get("environment", original_environment), engine,
         )
+        if engine == "strata":
+            # Strata's structured controls are projections of the CONTEXT/KV
+            # environment variables, so a submitted edit rewrites those
+            # variables instead of argv flags.
+            environment = apply_strata_launch_controls(
+                environment, submitted_controls or {},
+            )
         merged_args = self.manager._apply_deployment_launch_controls(
             list(args), engine, controls, environment,
         )
@@ -2897,7 +2907,7 @@ class SparkDeckService:
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) in (
             RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
-            RuntimeKind.NINFER.value,
+            RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
         ) and (
             settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
         ):
@@ -3610,6 +3620,16 @@ class SparkDeckService:
                 raise ValueError(
                     f"{engine_label} deployments cannot pin a model revision"
                 )
+            if (
+                runtime is RuntimeKind.STRATA
+                and kind is DeploymentKind.MANAGED
+                and identity.revision
+            ):
+                # Strata downloads its own pinned checkpoints inside the
+                # container, so a SparkDeck revision pin cannot be honoured.
+                raise ValueError(
+                    "Strata deployments cannot pin a model revision"
+                )
             deployment = Deployment(
                 id=deployment_id, alias=alias, runtime=runtime, kind=kind,
                 model=identity, settings=self._local_configuration(settings),
@@ -3655,7 +3675,7 @@ class SparkDeckService:
                 if mode in {"sharded", "grouped_sharded"} and (
                     runtime in (
                         RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
-                        RuntimeKind.NINFER,
+                        RuntimeKind.NINFER, RuntimeKind.STRATA,
                     )
                 ):
                     raise ValueError(
@@ -3911,6 +3931,7 @@ class SparkDeckService:
                 extra_args += ["--no-thinking"]
         if identity.revision and runtime not in (
             RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
+            RuntimeKind.STRATA,
         ):
             # Llama.cpp and NInfer pin their revisions inside the cache-
             # relative artifact reference; an unknown --revision flag would
@@ -3961,6 +3982,16 @@ class SparkDeckService:
             })
         if runtime is RuntimeKind.NINFER:
             launch_body["ninfer_artifact"] = ninfer_artifact
+        if runtime is RuntimeKind.STRATA:
+            # Strata's cluster launch configures the engine through the
+            # container environment, so the typed context length has to
+            # become the CONTEXT variable here; without this a saved context
+            # window would be silently dropped at launch.
+            launch_body["environment"] = strata_launch_environment(
+                settings.get("environment"),
+                settings.get("context_length") or settings.get("context_window"),
+                settings.get("kv_cache_dtype"),
+            )
         return launch_body
 
     def _saved_deployment_controller_only(
@@ -4106,6 +4137,7 @@ class SparkDeckService:
             raise ValueError("single deployment requires exactly one node")
         if mode == "sharded" and record.runtime in (
             RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
+            RuntimeKind.STRATA,
         ):
             raise ValueError(
                 f"{record.runtime.value} deployments support single and "
@@ -4115,12 +4147,15 @@ class SparkDeckService:
         deployment_dict["settings"] = settings
         if record.runtime not in (
             RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
+            RuntimeKind.STRATA,
         ):
             # Llama.cpp readiness is per-file inside the resolved snapshot and
             # is verified by each node when its container is created; the
             # whole-repository inventory check would reject selective GGUF
             # snapshots that are perfectly launchable. NInfer artifacts are
-            # selective the same way; TensorFold resolves its own checkpoint.
+            # selective the same way; TensorFold resolves its own checkpoint,
+            # and Strata downloads its own pinned checkpoints inside the
+            # container.
             cached_revision = await self._validate_start_selection(
                 deployment_dict, selected_ids, settings,
             )

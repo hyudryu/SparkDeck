@@ -319,22 +319,22 @@ class StartupBenchmarkMonitor:
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
             seen_key=self._seen_key(target.fingerprint),
-            # TensorFold and NInfer launches route through Manager like vLLM
-            # and SGLang, so their synthetic probe is an expected Manager
-            # request rather than contamination.
+            # TensorFold, NInfer, and Strata launches route through Manager
+            # like vLLM and SGLang, so their synthetic probe is an expected
+            # Manager request rather than contamination.
             manager_requests_expected=int(
                 bool(target.cluster) or deployment["runtime"] in {
-                    "vllm", "sglang", "tensorfold", "ninfer",
+                    "vllm", "sglang", "tensorfold", "ninfer", "strata",
                 }
             ),
         )
         token = self.service._community_observation.set(observation)
         stream = None
         try:
-            # NInfer exposes Chat Completions and Responses, not the legacy
-            # /v1/completions route, so its probe uses the chat surface with
-            # a message payload.
-            is_ninfer = deployment["runtime"] == "ninfer"
+            # NInfer and Strata expose Chat Completions and Responses, not
+            # the legacy /v1/completions route, so their probes use the chat
+            # surface with a message payload.
+            is_ninfer = deployment["runtime"] in {"ninfer", "strata"}
             endpoint = "chat/completions" if is_ninfer else "completions"
             if is_ninfer:
                 body = {

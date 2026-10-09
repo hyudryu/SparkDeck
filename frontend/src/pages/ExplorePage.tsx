@@ -29,7 +29,7 @@ const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
 // decided by the largest eligible node's memory; the deployment can target
 // any selected node, not just the controller.
 const CONTROLLER_ONLY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp'])
-const SINGLE_COPY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['laya', 'tensorfold', 'ninfer'])
+const SINGLE_COPY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['laya', 'tensorfold', 'ninfer', 'strata'])
 // Single-GPU engines load their whole artifact onto one card, so their fit
 // is bounded by the device-0 GPU the engine will actually use, not a node's
 // summed VRAM or its largest optional card.
@@ -303,9 +303,9 @@ function deployHref(
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
   if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
   // Laya reports fit as an aggregate only for display; its decision engine is
-  // single-engine, so it is never launched as a sharded layout. TensorFold and
-  // NInfer are single-engine the same way.
-  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && runtime !== 'ninfer' && sharded) params.set('layout', 'sharded')
+  // single-engine, so it is never launched as a sharded layout. TensorFold,
+  // NInfer, and Strata are single-engine the same way.
+  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && runtime !== 'ninfer' && runtime !== 'strata' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
@@ -531,6 +531,7 @@ function ModelRow({
           <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
           <option value="tensorfold" disabled={compatibilityByRuntime.get('tensorfold') === false}>TensorFold</option>
           <option value="ninfer" disabled={compatibilityByRuntime.get('ninfer') === false}>NInfer</option>
+          <option value="strata">Strata</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
@@ -776,6 +777,7 @@ export function ExplorePage() {
               <option value="laya">Laya decisions</option>
               <option value="tensorfold">TensorFold</option>
               <option value="ninfer">NInfer</option>
+              <option value="strata">Strata</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>

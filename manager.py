@@ -44,9 +44,11 @@ from cluster import (
 )
 from sparkdeck.onboarding import resolve_agent_connection
 from sparkdeck.runtimes import (
+    STRATA_SERVED_MODEL_VARIABLE,
     apply_strata_launch_controls,
     strata_launch_environment,
     validate_strata_model,
+    validate_strata_served_model_name,
 )
 from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.prefix_affinity import PrefixAffinity
@@ -456,6 +458,7 @@ DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
 NODE_LABEL = "io.sparkdeck.node"
 RANK_LABEL = "io.sparkdeck.rank"
 STRATA_VOLUME_LABEL = "io.sparkdeck.strata-deployment"
+SERVED_MODEL_LABEL = "io.sparkdeck.served-model"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
 NNODES_LABEL = "io.sparkdeck.nnodes"
@@ -5224,9 +5227,10 @@ class Manager:
         if engine == "strata":
             # Strata's container configures itself from environment variables,
             # so the structured controls are projections of the CONTEXT/KV
-            # variables rather than argv flags. Everything else is either the
-            # upstream default or an operator variable without a dedicated
-            # field.
+            # variables rather than argv flags. The served model name is the
+            # SERVED_MODEL_NAME variable: the public id SparkDeck's proxy
+            # routes on. Everything else is either the upstream default or an
+            # operator variable without a dedicated field.
             environment = settings.get("environment") or {}
             context = str(environment.get("CONTEXT") or "").strip()
             kv_dtype = str(environment.get("KV") or "").strip()
@@ -5236,6 +5240,9 @@ class Manager:
                 "tensor_parallel_size": None,
                 "pipeline_parallel_size": None,
                 "kv_cache_dtype": kv_dtype or None,
+                "served_model_name": validate_strata_served_model_name(
+                    environment.get(STRATA_SERVED_MODEL_VARIABLE)
+                ) or None,
                 "thinking_mode": None,
                 "speculative_method": None,
                 "draft_sample_method": None,
@@ -12693,6 +12700,16 @@ class Manager:
             if live:
                 return list(dict.fromkeys(str(value) for value in live if value))
         settings = deployment.get("launch_settings") or {}
+        if settings.get("engine") == "strata":
+            # Strata has no argv surface: its public id is the saved
+            # SERVED_MODEL_NAME variable, falling back to the model id.
+            served = validate_strata_served_model_name(
+                (settings.get("environment") or {}).get(
+                    STRATA_SERVED_MODEL_VARIABLE
+                )
+            )
+            if served:
+                return [served]
         return cls._served_models_from_cmd(
             list(settings.get("extra_args") or []),
             str(deployment.get("model") or ""),
@@ -16242,6 +16259,12 @@ class Manager:
         # served at different precisions (e.g. Q4 vs bf16).
         variant = self._variant_from_cmd(cmd)
         served_models = self._served_models_from_cmd(cmd, model)
+        # A Strata launch has no argv to scan, so its public id is stamped on
+        # this label by the launcher; a saved name overrides the model-id
+        # fallback. (Plain get: the label is new, so it has no legacy alias.)
+        label_served = labels.get(SERVED_MODEL_LABEL)
+        if label_served:
+            served_models = [label_served]
 
         host_port = None
         ports = c.ports or {}
@@ -17598,12 +17621,17 @@ class Manager:
         config is absent (or REINSTALL=1), so a config-affecting edit such as
         CONTEXT or KV must land in a fresh data volume to take effect, while
         an unchanged relaunch reuses the prepared pack. Credential variables
-        are excluded: rotating the HF token must not re-prepare the pack.
+        are excluded: rotating the HF token must not re-prepare the pack. The
+        served model name is excluded too: it is SparkDeck routing metadata
+        carried on the container label, and the entrypoint never reads it.
         """
         relevant = {
             str(name): str(value)
             for name, value in (environment or {}).items()
-            if name not in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+            if name not in (
+                "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN",
+                STRATA_SERVED_MODEL_VARIABLE,
+            )
         }
         payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
@@ -17703,6 +17731,13 @@ class Manager:
         validate_strata_model(
             (environment or {}).get("MODEL"), (environment or {}).get("FAMILY"),
         )
+        # The public model id OpenAI clients send lives on the container
+        # label so discovery publishes it without re-reading the command
+        # (Strata launches have no argv). Validate before eviction, like the
+        # catalogue above.
+        served_model = validate_strata_served_model_name(
+            (environment or {}).get(STRATA_SERVED_MODEL_VARIABLE)
+        )
         # Strata's CUDA backend cannot start without an NVIDIA driver. Reject
         # here — before evicting healthy backends — rather than leaving an
         # unusable deployment crash-looping on a CPU-only node.
@@ -17772,6 +17807,8 @@ class Manager:
                 CONTROLLER_LABEL: "1", MODEL_LABEL: model,
                 ENGINE_LABEL: "strata",
             }
+            if served_model:
+                labels[SERVED_MODEL_LABEL] = served_model
             if sparkdeck_deployment_id:
                 labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
             if cluster_member:

@@ -117,6 +117,7 @@ const editorFrom = (detail: DeploymentDetail): Editor => ({
   pipeline_parallel_size: detail.launch_controls.pipeline_parallel_size?.toString()
     ?? flagValue(detail.extra_args, ['--pipeline-parallel-size', '-pp']) ?? '',
   kv_cache_dtype: detail.launch_controls.kv_cache_dtype ?? '',
+  served_model_name: detail.launch_controls.served_model_name ?? '',
   thinking_mode: detail.launch_controls.thinking_mode ?? 'default',
   speculative_method: detail.launch_controls.speculative_method ?? '',
   draft_sample_method: detail.launch_controls.draft_sample_method ?? '',
@@ -316,6 +317,7 @@ function updateInput(editor: Editor, preserveCommandFlags = false, includeAlias 
       tensor_parallel_size: optionalNumber(editor.tensor_parallel_size),
       pipeline_parallel_size: optionalNumber(editor.pipeline_parallel_size),
       kv_cache_dtype: editor.kv_cache_dtype.trim() || null,
+      served_model_name: editor.served_model_name.trim() || null,
       thinking_mode: editor.thinking_mode || 'default',
       speculative_method: editor.speculative_method || null,
       draft_sample_method: editor.draft_sample_method || null,
@@ -687,6 +689,7 @@ export function DeploymentPage() {
         {envFileMode && <label className="field"><span>Served model name</span><input disabled={disabled} value={servedName} onChange={(event) => setServedName(event.target.value)} /></label>}
         {!envFileMode && canEditModel(detail) && <label className="field wide-field"><span>Model weights</span><input required disabled={disabled} value={editor.model} onChange={(event) => setModel(event.target.value)} /><small>Hugging Face repository id. Changing it drops the previous repository's pinned --revision so the new repository resolves its default; add a new pin in the flags editor if needed, and adjust the served model name if clients depend on it.</small></label>}
         <label className="field"><span>Context window</span><input disabled={envControlDisabled('context_window')} type="number" min="1" value={editor.context_window} onChange={(event) => set('context_window', event.target.value)} />{envControlHint('context_window')}</label>
+        {detail.runtime === 'strata' && !envFileMode && <label className="field"><span>Served model name</span><input disabled={disabled} value={editor.served_model_name} onChange={(event) => set('served_model_name', event.target.value)} /><small>Public id clients send in the model field; blank uses the Model weights id. Applies when the container is recreated.</small></label>}
         {detail.runtime !== 'tensorfold' && detail.runtime !== 'strata' && <label className="field"><span>Max concurrency</span><input disabled={envControlDisabled('max_concurrency')} type="number" min="1" max={detail.runtime === 'ninfer' ? 8 : undefined} value={editor.max_concurrency} onChange={(event) => set('max_concurrency', event.target.value)} />{detail.runtime === 'ninfer' && <small>NInfer admits 1-8 concurrent requests.</small>}{envControlHint('max_concurrency')}</label>}
         {detail.runtime !== 'llama.cpp' && detail.runtime !== 'tensorfold' && <label className="field"><span>KV cache dtype</span><KvCacheDtypeSelect runtime={detail.runtime} disabled={envControlDisabled('kv_cache_dtype')} value={editor.kv_cache_dtype} onChange={(value) => set('kv_cache_dtype', value)} />{envControlHint('kv_cache_dtype')}</label>}
         {!envFileMode && detail.runtime !== 'strata' && <label className="field"><span>Thinking mode</span><select disabled={disabled} value={editor.thinking_mode} onChange={(event) => set('thinking_mode', event.target.value)}><option value="default">Default</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>}

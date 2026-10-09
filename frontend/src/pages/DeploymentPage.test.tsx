@@ -97,6 +97,63 @@ const sglangDetail = {
   environment: { NCCL_DEBUG: 'WARN' },
 }
 
+const strataDetail = {
+  ...detail,
+  runtime: 'strata', kind: 'managed', deployment_mode: 'single', node_ids: ['local'],
+  extra_args: [],
+  launch_controls: {
+    context_window: 32768, kv_cache_dtype: 'int8', served_model_name: 'qwen3.8-flash-next',
+  },
+  environment: { MODEL: 'UD-Q4_K_XL', FAMILY: 'unsloth' },
+  gpu_memory_utilization: null,
+}
+
+describe('strata deployment page', () => {
+  it('edits the served model name and saves it as a launch control', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify(strataDetail), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+
+    const servedName = await screen.findByLabelText(/Served model name/)
+    expect(servedName).toHaveValue('qwen3.8-flash-next')
+    await user.clear(servedName)
+    await user.type(servedName, 'strata-local')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(request).toBeDefined()
+      const body = JSON.parse(String(request?.[1]?.body))
+      expect(body.launch_controls.served_model_name).toBe('strata-local')
+      expect(body.launch_controls.context_window).toBe(32768)
+      expect(body.launch_controls.kv_cache_dtype).toBe('int8')
+    })
+  })
+
+  it('clearing the served model name submits a null so the backend unsets the variable', async () => {
+    const user = userEvent.setup()
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => String(input) === '/api/v1/deployments/dep-1'
+      ? new Response(JSON.stringify(strataDetail), { headers: { 'Content-Type': 'application/json' } })
+      : fallback(input, init))
+    renderPage()
+
+    const servedName = await screen.findByLabelText(/Served model name/)
+    await user.clear(servedName)
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith('/dep-1/settings') && init?.method === 'PUT')
+      expect(request).toBeDefined()
+      const body = JSON.parse(String(request?.[1]?.body))
+      expect(body.launch_controls.served_model_name).toBeNull()
+    })
+  })
+})
+
 describe('deployment object page', () => {
   it('shows occupied nodes disabled in Run while allowing the inactive peer group nodes', async () => {
     const user = userEvent.setup()

@@ -52,6 +52,32 @@ _STRATA_SIZE_FAMILIES = {
 STRATA_FAMILIES = ("qwen", "swift", "coder", "unsloth")
 
 
+STRATA_SERVED_MODEL_VARIABLE = "SERVED_MODEL_NAME"
+_MAX_SERVED_MODEL_NAME = 256
+
+
+def validate_strata_served_model_name(value: Any) -> str:
+    """Return the validated public model id for a Strata deployment, or "".
+
+    SparkDeck proxies every request, so the id OpenAI clients send is
+    routing metadata rather than an engine setting: the launcher records the
+    name on the container label and the proxy rewrites requests to it. An
+    empty value means "use the Model weights id", which is also the default
+    for deployments saved before this existed.
+    """
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    if len(name) > _MAX_SERVED_MODEL_NAME or any(
+        character.isspace() for character in name
+    ):
+        raise ValueError(
+            "the Strata served model name must be a single token of at most "
+            f"{_MAX_SERVED_MODEL_NAME} characters without whitespace"
+        )
+    return name
+
+
 def validate_strata_model(size: Any, family: Any) -> tuple[str, str]:
     """Return the validated (MODEL, FAMILY) pair for a Strata launch."""
     size = str(size or "").strip() or "IQ2_XS"
@@ -100,6 +126,18 @@ def strata_launch_environment(
         merged["KV"] = kv
     if kv and kv not in ("int8", "q4_0", "k8v4"):
         raise ValueError("the Strata KV variable must be int8, q4_0, or k8v4")
+    # The served model name is not an entrypoint setting: the launcher lifts
+    # it onto a container label, and the proxy uses that label to route and
+    # rewrite requests. It stays in the environment as the durable setting,
+    # validated here so a malformed value fails the launch up front; the
+    # upstream entrypoint ignores variables it does not read.
+    served = validate_strata_served_model_name(
+        merged.get(STRATA_SERVED_MODEL_VARIABLE)
+    )
+    if served:
+        merged[STRATA_SERVED_MODEL_VARIABLE] = served
+    else:
+        merged.pop(STRATA_SERVED_MODEL_VARIABLE, None)
     for managed in ("PORT", "HOST"):
         if managed in merged:
             # The entrypoint reads the server port and bind address from
@@ -153,6 +191,14 @@ def apply_strata_launch_controls(
             if dtype not in ("int8", "q4_0", "k8v4"):
                 raise ValueError("kv_cache_dtype must be int8, q4_0, or k8v4")
             merged["KV"] = dtype
+    if "served_model_name" in controls:
+        name = validate_strata_served_model_name(
+            controls.get("served_model_name")
+        )
+        if name:
+            merged[STRATA_SERVED_MODEL_VARIABLE] = name
+        else:
+            merged.pop(STRATA_SERVED_MODEL_VARIABLE, None)
     return merged
 
 

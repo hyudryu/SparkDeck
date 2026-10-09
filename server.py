@@ -3054,11 +3054,12 @@ async def v1_update_settings(req: Request):
     default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
     if default_runtime not in (
         "vllm", "llama.cpp", "sglang", "laya", "tensorfold", "ninfer",
+        "strata",
     ):
         raise HTTPException(
             400,
             "default_runtime must be vllm, llama.cpp, sglang, laya, "
-            "tensorfold, or ninfer",
+            "tensorfold, ninfer, or strata",
         )
     raw_context_length = body.get(
         "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]

@@ -26,6 +26,13 @@ class RuntimeKind(StrEnum):
     # so it follows the same single-engine shape and resolves its weights
     # from the cluster's Hugging Face cache like llama.cpp GGUF artifacts.
     NINFER = "ninfer"
+    # Strata (https://github.com/Niko1221/Strata) is an OpenAI-compatible
+    # engine for expert-offload MoE checkpoints: hot experts on the GPU, the
+    # rest in host RAM, with an SSD lookup table. One server holds the whole
+    # model, so it follows the single-engine shape, and its container
+    # configures itself from environment variables read by the upstream
+    # entrypoint instead of launch flags.
+    STRATA = "strata"
 
 
 class DeploymentKind(StrEnum):

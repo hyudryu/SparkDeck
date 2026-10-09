@@ -39,9 +39,15 @@ from cluster import (
     NINFER_CAPABILITY,
     NodeAgentResponseError,
     NodeRegistry,
+    STRATA_CAPABILITY,
     TENSORFOLD_CAPABILITY,
 )
 from sparkdeck.onboarding import resolve_agent_connection
+from sparkdeck.runtimes import (
+    apply_strata_launch_controls,
+    strata_launch_environment,
+    validate_strata_model,
+)
 from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.prefix_affinity import PrefixAffinity
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
@@ -360,12 +366,23 @@ _TENSORFOLD_SERVE_PORT = 8080
 # artifact, so only single and replicated layouts are supported.
 DEFAULT_NINFER_IMAGE = "sparkdeck/ninfer:latest"
 _NINFER_SERVE_PORT = 8080
+
+# Strata (https://github.com/Niko1221/Strata) is an OpenAI-compatible
+# expert-offload engine: hot experts on the GPU, the rest in host RAM, a
+# lookup table on the SSD. There is no upstream registry image, so the
+# default expects a locally prepared image built from the Strata repository
+# Dockerfile. The container configures itself through the upstream
+# entrypoint's environment variables, and one server holds the whole model,
+# so only single and replicated layouts are supported.
+DEFAULT_STRATA_IMAGE = "sparkdeck/strata:latest"
+_STRATA_SERVE_PORT = 8080
 _SUPPORTED_ENGINES = (
-    "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer",
+    "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer", "strata",
 )
 # The Laya decision server and TensorFold expose no /health route; their
-# readiness signal is the OpenAI surface itself answering 200. NInfer does
-# expose GET /health, so it keeps the strict readiness probe.
+# readiness signal is the OpenAI surface itself answering 200. NInfer and
+# Strata do expose GET /health (Strata answers it before its API-key gate),
+# so they keep the strict readiness probe.
 _ENGINES_WITHOUT_HEALTH_ROUTE = frozenset({"laya", "tensorfold"})
 
 
@@ -412,12 +429,33 @@ def _node_has_nvidia_driver() -> bool:
         return False
     return probe.returncode == 0 and bool(probe.stdout.strip())
 
+
+def _node_nvidia_driver_version() -> int | None:
+    """The node's major NVIDIA driver version, or ``None`` when unknown.
+
+    Some engines gate on a minimum driver (the default Strata image is built
+    against CUDA 13 and needs 580+); a ``None`` result means nvidia-smi did
+    not answer, so callers decide whether the launch can proceed.
+    """
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return None
+    match = re.search(r"(\d+)\.", probe.stdout.strip().splitlines()[0])
+    return int(match.group(1)) if match else None
+
 CONTROLLER_LABEL = "io.sparkdeck.managed"
 MODEL_LABEL = "io.sparkdeck.model"
 ENGINE_LABEL = "io.sparkdeck.runtime"
 DEPLOYMENT_LABEL = "io.sparkdeck.deployment"
 NODE_LABEL = "io.sparkdeck.node"
 RANK_LABEL = "io.sparkdeck.rank"
+STRATA_VOLUME_LABEL = "io.sparkdeck.strata-deployment"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
 NNODES_LABEL = "io.sparkdeck.nnodes"
@@ -1355,6 +1393,7 @@ class Manager:
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
     TENSORFOLD_CAPABILITY,
     NINFER_CAPABILITY,
+    STRATA_CAPABILITY,
     "patched-images-v1",
                 EMBEDDINGS_CAPABILITY,
             ],
@@ -2555,7 +2594,7 @@ class Manager:
             tag = str(raw or "").strip()
             if tag and tag not in candidates:
                 candidates.append(tag)
-        markers = ("vllm", "sglang", "llama", "laya", "tensorfold", "ninfer")
+        markers = ("vllm", "sglang", "llama", "laya", "tensorfold", "ninfer", "strata")
         local: list[str] = []
         try:
             for image in self.client.images.list():
@@ -5182,6 +5221,31 @@ class Manager:
                 "sg_cuda_graph_max_bs": None,
                 "sg_chunked_prefill_size": None,
             }
+        if engine == "strata":
+            # Strata's container configures itself from environment variables,
+            # so the structured controls are projections of the CONTEXT/KV
+            # variables rather than argv flags. Everything else is either the
+            # upstream default or an operator variable without a dedicated
+            # field.
+            environment = settings.get("environment") or {}
+            context = str(environment.get("CONTEXT") or "").strip()
+            kv_dtype = str(environment.get("KV") or "").strip()
+            return {
+                "context_window": int(context) if context.isdigit() else None,
+                "max_concurrency": None,
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
+                "kv_cache_dtype": kv_dtype or None,
+                "thinking_mode": None,
+                "speculative_method": None,
+                "draft_sample_method": None,
+                "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
+            }
         return {
             "context_window": context_window,
             "max_concurrency": max_concurrency,
@@ -5369,6 +5433,13 @@ class Manager:
                 return shlex.split(flags)
             except ValueError as exc:
                 raise ValueError("launch arguments have invalid shell quoting") from exc
+
+        if engine == "strata":
+            # Strata's launch configuration lives in the container environment
+            # (MODEL/CONTEXT/KV and friends), not in argv; the service update
+            # path rewrites those variables, so the flags pass through
+            # untouched.
+            return list(args)
 
         flags = self._replace_command_option(
             flags,
@@ -5716,6 +5787,13 @@ class Manager:
                 settings["extra_args"], settings["engine"], controls,
                 settings["environment"],
             )
+            if settings["engine"] == "strata":
+                # Strata's structured controls are projections of the
+                # CONTEXT/KV environment variables, so a submitted edit
+                # rewrites those instead of flags it has no surface for.
+                settings["environment"] = apply_strata_launch_controls(
+                    settings.get("environment"), controls,
+                )
         if not settings["model"]:
             raise ValueError("model is required")
         if settings["engine"] not in _SUPPORTED_ENGINES:
@@ -8096,6 +8174,13 @@ class Manager:
                 "NInfer deployments support single and replicated layouts, "
                 "not sharded"
             )
+        if engine == "strata" and mode in {"sharded", "grouped_sharded"}:
+            # One Strata server holds the whole expert-offload model; replicas
+            # are the only way to use more than one node.
+            raise ValueError(
+                "Strata deployments support single and replicated layouts, "
+                "not sharded"
+            )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
         if mode == "grouped_sharded":
             grouped_tp, grouped_instances = _grouped_sharded_topology(
@@ -8131,6 +8216,7 @@ class Manager:
         single_gpu_engine = {
             "tensorfold": (TENSORFOLD_CAPABILITY, "TensorFold"),
             "ninfer": (NINFER_CAPABILITY, "NInfer"),
+            "strata": (STRATA_CAPABILITY, "Strata"),
         }.get(engine)
         if single_gpu_engine is not None:
             capability, engine_label = single_gpu_engine
@@ -15503,6 +15589,7 @@ class Manager:
                 # preserves the chat engine in the opposite start order.
                 if runtime == "laya" and protect in {
                     "vllm", "sglang", "llama.cpp", "tensorfold", "ninfer",
+                    "strata",
                 }:
                     continue
                 if (
@@ -17499,6 +17586,275 @@ class Manager:
             )
             raise RuntimeError(safe_error) from exc
 
+    @staticmethod
+    def _strata_volume_prefix(deployment_key: str) -> str:
+        return f"sparkdeck-strata-{deployment_key}"
+
+    @staticmethod
+    def _strata_setup_fingerprint(environment: dict[str, str] | None) -> str:
+        """Fingerprint the launch environment that invalidates a prepared pack.
+
+        The upstream entrypoint reruns its setup pass only when the saved
+        config is absent (or REINSTALL=1), so a config-affecting edit such as
+        CONTEXT or KV must land in a fresh data volume to take effect, while
+        an unchanged relaunch reuses the prepared pack. Credential variables
+        are excluded: rotating the HF token must not re-prepare the pack.
+        """
+        relevant = {
+            str(name): str(value)
+            for name, value in (environment or {}).items()
+            if name not in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+        }
+        payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+    def _strata_data_volume(self, deployment_key: str, environment) -> str:
+        """Return (creating if needed) the /data volume for this launch."""
+        name = (
+            f"{self._strata_volume_prefix(deployment_key)}-"
+            f"{self._strata_setup_fingerprint(environment)}"
+        )
+        try:
+            self.client.volumes.get(name)
+        except docker.errors.NotFound:
+            self.client.volumes.create(
+                name,
+                labels={
+                    CONTROLLER_LABEL: "1",
+                    STRATA_VOLUME_LABEL: deployment_key,
+                },
+            )
+        return name
+
+    def _prune_strata_data_volumes(self, deployment_key: str, keep: str) -> None:
+        """Delete this deployment's other /data volumes after a relaunch.
+
+        A previous fingerprint's volume is unreachable once the container was
+        recreated with the new one; keeping it would pin tens of gigabytes of
+        disk. A volume still attached to a live replica fails the removal and
+        stays.
+        """
+        prefix = self._strata_volume_prefix(deployment_key)
+        try:
+            candidates = self.client.volumes.list(filters={"name": prefix})
+        except docker.errors.DockerException:
+            return
+        for volume in candidates:
+            if volume.name == keep or not volume.name.startswith(prefix):
+                continue
+            try:
+                volume.remove(force=True)
+            except docker.errors.DockerException:
+                continue
+
+    def _remove_strata_data_volumes(self, labels: dict) -> None:
+        """Delete every /data volume of a permanently removed Strata member.
+
+        Stopping and starting recreates containers, so the volume must
+        survive a plain remove; the deployment's teardown is what deletes
+        it, including any volume left behind by an earlier configuration.
+        """
+        if _label_value(labels, ENGINE_LABEL) != "strata":
+            return
+        deployment = _label_value(labels, DEPLOYMENT_LABEL)
+        if not deployment:
+            return
+        node = _label_value(labels, NODE_LABEL)
+        key = (
+            f"{deployment}-r{_label_value(labels, RANK_LABEL) or 0}"
+            if node else deployment
+        )
+        self._prune_strata_data_volumes(key, keep="")
+
+    async def _create_strata_container(
+        self,
+        model: str,
+        port: int | None,
+        image: str | None,
+        environment: dict[str, str] | None,
+        extra_args: list[str] | None,
+        name: str | None,
+        cluster_member: dict | None,
+        hf_token: str | None,
+        sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
+    ) -> dict:
+        """Launch one Strata expert-offload server, mirroring TensorFold's shape.
+
+        Strata configures itself through the upstream entrypoint's environment
+        variables (MODEL/CONTEXT/KV and friends), and downloads the selected
+        checkpoint into the container's own data volume on first start, so no
+        artifact resolution happens here. One server holds the whole model,
+        so sharded layouts are rejected rather than silently degraded.
+        """
+        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
+            raise ValueError("Strata deployments cannot run sharded")
+        if extra_args:
+            # The upstream entrypoint has no flag surface: its setup reads
+            # environment variables only, so extra argv would be silently
+            # dropped and never reach the engine.
+            raise ValueError(
+                "Strata deployments do not accept extra flags; configure the "
+                "engine through its environment variables instead"
+            )
+        # An unknown size or family would only fail inside the container's
+        # setup pass, long after healthy backends were evicted; mirror the
+        # upstream catalogue here instead.
+        validate_strata_model(
+            (environment or {}).get("MODEL"), (environment or {}).get("FAMILY"),
+        )
+        # Strata's CUDA backend cannot start without an NVIDIA driver. Reject
+        # here — before evicting healthy backends — rather than leaving an
+        # unusable deployment crash-looping on a CPU-only node.
+        if not _node_has_nvidia_driver():
+            raise ValueError(
+                "Strata requires an NVIDIA GPU, and no NVIDIA driver is "
+                "available on this node"
+            )
+        image = image or DEFAULT_STRATA_IMAGE
+        # The default upstream image is built against CUDA 13, which needs
+        # driver 580 or newer; on an older driver the container can never
+        # start, so reject before evicting healthy backends. A custom image
+        # may target an older toolkit, so the floor applies to the default
+        # only, and an unknown version (nvidia-smi unavailable) defers to the
+        # driver-presence check above.
+        if image == DEFAULT_STRATA_IMAGE:
+            version = _node_nvidia_driver_version()
+            if version is not None and version < 580:
+                raise ValueError(
+                    "the default Strata image requires NVIDIA driver 580 or "
+                    f"newer; this node reports {version}"
+                )
+        # Strata takes the node's GPU for its CUDA context, so other chat
+        # engines must be evicted before the CUDA context is created.
+        await self.evict_other_backends(protect="strata")
+        if port is None:
+            port = await self._allocate_port()
+        if name is None:
+            safe = model.replace("/", "-").replace("_", "-").lower()
+            name = f"strata-{safe}-{port}"
+        # The data volume key must be stable across relaunches even though a
+        # cluster member's container name carries its per-launch port.
+        if cluster_member:
+            deployment_key = (
+                f"{cluster_member['deployment_id']}"
+                f"-r{cluster_member.get('rank', 0)}"
+            )
+        elif sparkdeck_deployment_id:
+            deployment_key = sparkdeck_deployment_id
+        else:
+            deployment_key = name
+        self._cluster_launch_update(
+            name, "preparing", "Preparing Strata launch",
+            model=model, cluster_member=cluster_member,
+        )
+
+        def _create():
+            try:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+                self.client.images.get(image)
+            except docker.errors.ImageNotFound:
+                self._cluster_launch_update(
+                    name, "pulling_image",
+                    f"Downloading Docker image {image}; this can take several minutes",
+                    model=model, cluster_member=cluster_member,
+                )
+                print(f"[strata] pulling missing image: {image}")
+                self.client.images.pull(image)
+            self._cluster_launch_update(
+                name, "creating_container", "Creating Docker container",
+                model=model, cluster_member=cluster_member,
+            )
+            labels = {
+                CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                ENGINE_LABEL: "strata",
+            }
+            if sparkdeck_deployment_id:
+                labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
+            if cluster_member:
+                labels.update({
+                    DEPLOYMENT_LABEL: cluster_member["deployment_id"],
+                    NODE_LABEL: cluster_member["node_id"],
+                    RANK_LABEL: str(cluster_member["rank"]),
+                    MODE_LABEL: cluster_member.get("mode", "single"),
+                    NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
+                })
+            volumes = self._build_volumes(model, self.settings["hf_cache"], image)
+            # The entrypoint prepares the model pack, MTP layer, and install
+            # config under /data, and a restart skips that setup when the
+            # files are still there, so the volume must outlive the
+            # container. The volume name carries the setup fingerprint: the
+            # upstream entrypoint ignores new CONTEXT/KV/... values while a
+            # saved config exists, so a config-affecting edit lands in a
+            # fresh volume whose setup runs with the new settings, while an
+            # unchanged relaunch reuses the prepared pack.
+            data_volume = self._strata_data_volume(deployment_key, environment)
+            volumes[data_volume] = {"bind": "/data", "mode": "rw"}
+            run_options = {
+                "image": image,
+                # The image's entrypoint builds and starts the server, so the
+                # command stays unset and every setting travels as
+                # environment.
+                "name": name,
+                "detach": True,
+                "volumes": volumes,
+                "ipc_mode": "host",
+                "shm_size": shm_size or self.settings["shm_size"],
+                # The engine locks part of host RAM for the expert residency;
+                # the upstream launch instructions lift Docker's default
+                # memlock cap for exactly this reason.
+                "ulimits": [
+                    docker.types.Ulimit(name="memlock", soft=-1, hard=-1)
+                ],
+                "labels": labels,
+                "restart_policy": {"Name": "unless-stopped"},
+                "ports": {f"{_STRATA_SERVE_PORT}/tcp": port},
+            }
+            # The bridges seed MODEL/FAMILY/CONTEXT from the typed settings,
+            # but the agent path can be reached directly, so the launcher
+            # applies the upstream defaults itself rather than trusting every
+            # caller.
+            container_environment = strata_launch_environment(environment)
+            # A gated checkpoint download inside the container must
+            # authenticate, exactly as the vLLM and SGLang paths do.
+            container_environment.update(self._container_hf_environment(hf_token))
+            if container_environment:
+                run_options["environment"] = container_environment
+            # The driver check above guarantees the CUDA backend can start, so
+            # the container always receives the node's GPUs.
+            try:
+                run_options["device_requests"] = [
+                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                ]
+            except Exception:
+                pass
+            container = self._run_managed_container(run_options)
+            container.reload()
+            self._cluster_launch_update(
+                name, "starting", "Container created; preparing the model",
+                model=model, cluster_member=cluster_member,
+            )
+            # The old fingerprint's volume is now unreachable; reclaim its
+            # disk once the replacement container is live.
+            self._prune_strata_data_volumes(deployment_key, data_volume)
+            summary = self._container_summary(container)
+            if summary is not None:
+                summary["model_source"] = "public_repository"
+            return summary
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+
     async def _create_container_with_port(
         self,
         model: str,
@@ -17606,6 +17962,16 @@ class Manager:
                 environment=runtime_environment,
                 extra_args=extra_args, name=name,
                 ninfer_artifact=ninfer_artifact,
+                cluster_member=cluster_member,
+                hf_token=hf_token,
+                sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
+            )
+        if engine == "strata":
+            return await self._create_strata_container(
+                model=model, port=port, image=image,
+                environment=runtime_environment,
+                extra_args=extra_args, name=name,
                 cluster_member=cluster_member,
                 hf_token=hf_token,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
@@ -18605,28 +18971,35 @@ class Manager:
             ledger = getattr(self, "managed_workload_ledger", None)
             if ledger is None:
                 container = self.client.containers.get(name)
+                removed_labels = container.labels or {}
                 removed_deployment.append(
-                    _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                    _label_value(removed_labels, DEPLOYMENT_LABEL)
                 )
                 removed_models.append(
-                    _label_value(container.labels or {}, MODEL_LABEL)
+                    _label_value(removed_labels, MODEL_LABEL)
                 )
                 container.remove(force=True)
+                # A removed Strata member's /data volume holds a prepared
+                # checkpoint pack; the deployment teardown is the only point
+                # where it can be reclaimed.
+                self._remove_strata_data_volumes(removed_labels)
                 return
             with ledger.locked():
                 try:
                     container = self.client.containers.get(name)
+                    removed_labels = container.labels or {}
                     removed_deployment.append(
-                        _label_value(container.labels or {}, DEPLOYMENT_LABEL)
+                        _label_value(removed_labels, DEPLOYMENT_LABEL)
                     )
                     removed_models.append(
-                        _label_value(container.labels or {}, MODEL_LABEL)
+                        _label_value(removed_labels, MODEL_LABEL)
                     )
                     container.remove(force=True)
                 except docker.errors.NotFound:
                     ledger.release(name)
                     raise
                 ledger.release(name)
+                self._remove_strata_data_volumes(removed_labels)
         await asyncio.to_thread(_do)
         try:
             await self._reap_container_admission(

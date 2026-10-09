@@ -30,6 +30,130 @@ _GGUF_SHARD_PATTERN = re.compile(
 LAYA_SERVE_PORT = 8080
 TENSORFOLD_SERVE_PORT = 8080
 NINFER_SERVE_PORT = 8080
+STRATA_SERVE_PORT = 8080
+
+# Strata's container configures itself through the upstream entrypoint's
+# environment variables, so the model size and family are validated here and
+# carried as MODEL/FAMILY. The size tags and their allowed families mirror the
+# upstream installer's catalogue; an unknown tag would only fail later, inside
+# the container's setup pass.
+STRATA_MODEL_SIZES = (
+    "Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ1_M", "UD-IQ4_XS", "UD-Q4_K_XL",
+)
+_STRATA_SIZE_FAMILIES = {
+    # The original and Coder releases pin their quant to one family; IQ2_XS
+    # and IQ3_XXS exist for every family.
+    "Q2_0": ("qwen",),
+    "IQ3_S": ("qwen",),
+    "IQ1_M": ("coder",),
+    "UD-IQ4_XS": ("unsloth",),
+    "UD-Q4_K_XL": ("unsloth",),
+}
+STRATA_FAMILIES = ("qwen", "swift", "coder", "unsloth")
+
+
+def validate_strata_model(size: Any, family: Any) -> tuple[str, str]:
+    """Return the validated (MODEL, FAMILY) pair for a Strata launch."""
+    size = str(size or "").strip() or "IQ2_XS"
+    if size not in STRATA_MODEL_SIZES:
+        raise ValueError(
+            "strata model size must be one of: " + ", ".join(STRATA_MODEL_SIZES)
+        )
+    family = str(family or "").strip() or "qwen"
+    if family not in STRATA_FAMILIES:
+        raise ValueError(
+            "strata family must be one of: " + ", ".join(STRATA_FAMILIES)
+        )
+    allowed = _STRATA_SIZE_FAMILIES.get(size)
+    if allowed and family not in allowed:
+        raise ValueError(f"strata model size {size} requires family {allowed[0]}")
+    return size, family
+
+
+def strata_launch_environment(
+    environment: dict[str, str] | None, context_length: Any = None,
+    kv_cache_dtype: Any = None,
+) -> dict[str, str]:
+    """Return the effective container environment for a Strata launch.
+
+    The upstream entrypoint reads every setup choice (model size, context,
+    KV storage, memory policy) from environment variables, so this map is the
+    engine's whole configuration surface. CONTEXT/KV variables set explicitly
+    in the operator environment win; the typed context window and KV cache
+    dtype only seed the variables when the environment does not carry one.
+    Both are validated here so a malformed value fails the launch instead of
+    the container's setup pass, long after healthy backends were evicted.
+    """
+    merged = {
+        str(name): str(value)
+        for name, value in (environment or {}).items()
+    }
+    context = str(merged.get("CONTEXT") or "").strip()
+    if not context and context_length not in (None, ""):
+        context = str(int(context_length))
+        merged["CONTEXT"] = context
+    if context and not context.isdigit():
+        raise ValueError("the Strata CONTEXT variable must be a positive integer")
+    kv = str(merged.get("KV") or "").strip()
+    if not kv and kv_cache_dtype not in (None, ""):
+        kv = str(kv_cache_dtype).strip()
+        merged["KV"] = kv
+    if kv and kv not in ("int8", "q4_0", "k8v4"):
+        raise ValueError("the Strata KV variable must be int8, q4_0, or k8v4")
+    for managed in ("PORT", "HOST"):
+        if managed in merged:
+            # The entrypoint reads the server port and bind address from
+            # these variables, but SparkDeck publishes the allocated host
+            # port against the fixed container port and builds the readiness
+            # route from it, so an override would break every request while
+            # the container still reports healthy.
+            raise ValueError(
+                f"the Strata {managed} variable is managed by SparkDeck"
+            )
+    merged.setdefault("MODEL", "IQ2_XS")
+    merged.setdefault("FAMILY", "qwen")
+    return merged
+
+
+def apply_strata_launch_controls(
+    environment: dict[str, str] | None, controls: dict[str, Any],
+) -> dict[str, str]:
+    """Rewrite the CONTEXT/KV variables for submitted structured controls.
+
+    Strata has no argv surface, so the editor's structured controls are
+    projections of those environment variables. Only explicitly submitted
+    keys change: an absent key leaves the saved variable untouched, and an
+    explicit null clears it.
+    """
+    merged = dict(environment or {})
+    if "context_window" in controls:
+        value = controls.get("context_window")
+        if value in (None, ""):
+            merged.pop("CONTEXT", None)
+        else:
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not value.is_integer()
+            ):
+                raise ValueError("context_window must be a positive integer")
+            try:
+                context = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "context_window must be a positive integer"
+                ) from exc
+            if context <= 0:
+                raise ValueError("context_window must be a positive integer")
+            merged["CONTEXT"] = str(context)
+    if "kv_cache_dtype" in controls:
+        value = controls.get("kv_cache_dtype")
+        if value in (None, ""):
+            merged.pop("KV", None)
+        else:
+            dtype = str(value).strip()
+            if dtype not in ("int8", "q4_0", "k8v4"):
+                raise ValueError("kv_cache_dtype must be int8, q4_0, or k8v4")
+            merged["KV"] = dtype
+    return merged
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -289,11 +413,40 @@ class NinferAdapter(RuntimeAdapter):
         )
 
 
+class StrataAdapter(RuntimeAdapter):
+    """Serve a Strata expert-offload engine behind SparkDeck's /v1 surface.
+
+    Strata runs one expert-offload MoE checkpoint per server: hot experts on
+    the GPU, the rest in host RAM, a lookup table on the SSD. The server
+    exposes OpenAI-compatible HTTP endpoints, so the controller proxy, load
+    balancing, token accounting, and health checks all work unchanged. The
+    container configures itself through the upstream entrypoint's environment
+    variables (MODEL, CONTEXT, KV, ...), not launch flags, and downloads the
+    selected checkpoint into its own data volume on first start.
+    """
+
+    kind = RuntimeKind.STRATA
+    default_image = "sparkdeck/strata:latest"
+
+    def launch_spec(self, model: str, settings: dict[str, Any]) -> LaunchSpec:
+        environment = strata_launch_environment(
+            settings.get("environment"),
+            settings.get("context_length") or settings.get("context_window"),
+            settings.get("kv_cache_dtype"),
+        )
+        # The image's entrypoint builds and starts the server, so the command
+        # stays empty and every setting travels as environment.
+        return LaunchSpec(
+            settings.get("image") or self.default_image, [],
+            STRATA_SERVE_PORT, environment=environment,
+        )
+
+
 class RuntimeRegistry:
     def __init__(self):
         adapters = (
             VllmAdapter(), LlamaCppAdapter(), SglangAdapter(), LayaAdapter(),
-            TensorfoldAdapter(), NinferAdapter(),
+            TensorfoldAdapter(), NinferAdapter(), StrataAdapter(),
         )
         self._adapters = {adapter.kind: adapter for adapter in adapters}
 
@@ -396,6 +549,26 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
             environment=settings.get("environment"),
             extra_args=extra,
             ninfer_artifact=settings.get("ninfer_artifact"),
+            name=safe_container_name(alias, deployment_id),
+            hf_token=hf_token,
+            sparkdeck_deployment_id=deployment_id,
+        )
+    if adapter.kind is RuntimeKind.STRATA:
+        # Strata downloads its checkpoint into the container's own data
+        # volume, so it must launch through Manager for the HF credential,
+        # the cache mount, and the port/label handling the NInfer bridge
+        # uses. The entrypoint configures itself from environment, so only
+        # the effective environment is forwarded.
+        resolve_token = getattr(manager, "_resolved_hf_token", None)
+        hf_token = resolve_token() if callable(resolve_token) else None
+        return await manager.create_container(
+            model=model, engine="strata", image=settings.get("image"),
+            environment=strata_launch_environment(
+                settings.get("environment"),
+                settings.get("context_length") or settings.get("context_window"),
+                settings.get("kv_cache_dtype"),
+            ),
+            extra_args=settings.get("extra_args") or [],
             name=safe_container_name(alias, deployment_id),
             hf_token=hf_token,
             sparkdeck_deployment_id=deployment_id,

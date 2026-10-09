@@ -5902,6 +5902,77 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("unknown cluster node", instance.deployments[0]["error"])
             instance._wait_for_interrupted_launch_retry.assert_not_awaited()
 
+    async def test_resume_reclaims_preserved_strata_volumes_on_terminal_failure(self) -> None:
+        """Recovery preserves the prepared Strata volumes for its retry; a
+        terminal failure must reclaim them because the surviving metadata
+        no longer addresses them."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "old-strata", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "sparkdeck_record_id": "record-7",
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": {
+                    "model": "org/model", "engine": "strata",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [], "sparkdeck_record_id": "record-7",
+                },
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock(
+                side_effect=ValueError("replacement rejected"),
+            )
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+            instance.prune_strata_record_volumes = prune
+
+            await instance._resume_interrupted_deployments()
+
+            prune.assert_awaited_once_with("record-7", ["local"])
+            self.assertEqual(instance.deployments[0]["status"], "error")
+
+    async def test_resume_keeps_strata_volumes_while_reconnecting(self) -> None:
+        """A reconnect failure stays deferred, so its preserved volumes must
+        survive for the retry."""
+        from manager import _InterruptedLaunchDeferred
+
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "old-strata", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local"],
+                "sparkdeck_record_id": "record-7",
+                "members": [{
+                    "node_id": "local", "container_name": "old-r0", "rank": 0,
+                }],
+                "launch_settings": {
+                    "model": "org/model", "engine": "strata",
+                    "deployment_mode": "single", "node_ids": ["local"],
+                    "extra_args": [], "sparkdeck_record_id": "record-7",
+                },
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[{
+                "id": "local", "online": True, "docker_ready": True,
+            }])
+            instance._member_action = mock.AsyncMock(return_value={"ok": True})
+            instance.create_deployment = mock.AsyncMock(
+                side_effect=RuntimeError("Worker agent is unreachable"),
+            )
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+            instance.prune_strata_record_volumes = prune
+
+            with self.assertRaises(_InterruptedLaunchDeferred):
+                await instance._resume_interrupted_deployment("old-strata")
+
+            prune.assert_not_awaited()
+
     async def test_relaunch_fixed_port_collision_preserves_old_rank(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

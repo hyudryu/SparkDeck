@@ -363,6 +363,40 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first, second)
         self.assertTrue(second.startswith("sparkdeck-strata-record-7-r0-"))
 
+    async def test_an_image_change_lands_in_a_fresh_volume(self):
+        """/data holds the prepared install configuration, so a replacement
+        image must not skip its setup pass over artifacts prepared by the
+        previous image."""
+        manager = _manager()
+
+        await _launch(manager, image="sparkdeck/strata:v2")
+        first = _data_volume(manager)
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+        await _launch(manager, image="sparkdeck/strata:v3")
+        second = _data_volume(manager)
+
+        self.assertNotEqual(first, second)
+
+    def test_the_image_is_part_of_the_volume_fingerprint(self):
+        self.assertNotEqual(
+            Manager._strata_setup_fingerprint(
+                {"MODEL": "IQ2_XS"}, "sparkdeck/strata:v2",
+            ),
+            Manager._strata_setup_fingerprint(
+                {"MODEL": "IQ2_XS"}, "sparkdeck/strata:v3",
+            ),
+        )
+        # The default image is the implicit identity of a launch without an
+        # explicit override.
+        self.assertEqual(
+            Manager._strata_setup_fingerprint({"MODEL": "IQ2_XS"}),
+            Manager._strata_setup_fingerprint(
+                {"MODEL": "IQ2_XS"}, DEFAULT_STRATA_IMAGE,
+            ),
+        )
+
     async def test_relocation_removal_preserves_the_prepared_volume(self):
         """A relocation removes the old member before creating its
         replacement; that removal must not reclaim the volume the

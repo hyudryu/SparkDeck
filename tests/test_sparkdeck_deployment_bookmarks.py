@@ -907,6 +907,42 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager.model_cache_inventory.assert_not_awaited()
 
+    async def test_llama_relaunch_verifies_the_persisted_snapshot_reference(self):
+        """Relaunch resolves the snapshot pinned in launch_settings, not the
+        current head of a mutable main, so validation must check that exact
+        reference or it can pass for a snapshot the replacement never
+        loads."""
+        import re as _re
+
+        virtual_nas = Mock()
+
+        async def resolve(_repository, revision):
+            return {
+                "resolved_revision": (
+                    revision if _re.fullmatch(r"[0-9a-f]{40}", revision)
+                    else "c" * 40
+                ),
+            }
+
+        virtual_nas.resolve_download_revision = AsyncMock(side_effect=resolve)
+        self.manager.virtual_nas = virtual_nas
+        self.manager.node_has_model_files = AsyncMock(return_value=True)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+        self._stopped_llama_member()
+
+        await self.service.deployment_action("llama-live", "start", ["remote-1"])
+
+        args = self.manager.node_has_model_files.await_args.args
+        self.assertEqual(args[0], "remote-1")
+        self.assertEqual(args[1], "org/model")
+        self.assertEqual(args[2], "a" * 40)
+        self.assertEqual(args[3], ["FP16/model-F16.gguf"])
+        self.manager.deployment_action.assert_awaited_once_with(
+            "cluster-old", "start", ["remote-1"],
+        )
+
     async def test_llama_selection_rejects_remote_nodes_for_a_controller_local_artifact(self):
         """A worker selected for a controller-local GGUF is rejected by the
         selection revalidation itself, so no destructive relaunch can start

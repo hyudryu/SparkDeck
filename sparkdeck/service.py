@@ -4599,9 +4599,14 @@ class SparkDeckService:
             # keeps llama-server's artifact reference authoritative (it
             # embeds the resolved snapshot path and has no --revision flag).
             # A controller-local artifact has nothing to verify here; remote
-            # selections of one are already rejected above.
+            # selections of one are already rejected above. The persisted
+            # launch reference (``llama_artifact``) is what Manager actually
+            # relaunches with, so it wins over the record's bookmark value:
+            # a mutable ``main`` advancing must not validate a snapshot the
+            # replacement will never load.
             stored = str(
-                (deployment.get("model") or {}).get("artifact")
+                (launch_settings or {}).get("llama_artifact")
+                or (deployment.get("model") or {}).get("artifact")
                 or (deployment.get("settings") or {}).get("artifact")
                 or ""
             )

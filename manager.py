@@ -10243,6 +10243,15 @@ class Manager:
                 None,
             )
             reconnecting = self._interrupted_launch_reconnect_error(exc)
+            if not reconnecting and str(launch_body.get("engine") or "") == "strata":
+                # Recovery is over and the surviving metadata no longer
+                # addresses the prepared volumes; reclaim the keys preserved
+                # for the aborted relaunch. A reconnect failure stays
+                # deferred so the retry can still reuse them.
+                await self.prune_strata_record_volumes(
+                    str(launch_body.get("sparkdeck_record_id") or ""),
+                    list(reused),
+                )
             if replacement is not None and reconnecting:
                 replacement["status"] = "recovering"
                 replacement["error"] = None
@@ -17759,16 +17768,22 @@ class Manager:
         return {"ok": not errors, "errors": errors}
 
     @staticmethod
-    def _strata_setup_fingerprint(environment: dict[str, str] | None) -> str:
-        """Fingerprint the launch environment that invalidates a prepared pack.
+    def _strata_setup_fingerprint(
+        environment: dict[str, str] | None, image: str | None = None,
+    ) -> str:
+        """Fingerprint the launch identity that invalidates a prepared pack.
 
         The upstream entrypoint reruns its setup pass only when the saved
         config is absent (or REINSTALL=1), so a config-affecting edit such as
         CONTEXT or KV must land in a fresh data volume to take effect, while
-        an unchanged relaunch reuses the prepared pack. Credential variables
-        are excluded: rotating the HF token must not re-prepare the pack. The
-        served model name is excluded too: it is SparkDeck routing metadata
-        carried on the container label, and the entrypoint never reads it.
+        an unchanged relaunch reuses the prepared pack. The effective image
+        is part of the identity: /data holds the prepared install
+        configuration, and a replacement image's entrypoint would skip its
+        own setup pass over artifacts prepared by the previous image.
+        Credential variables are excluded: rotating the HF token must not
+        re-prepare the pack. The served model name is excluded too: it is
+        SparkDeck routing metadata carried on the container label, and the
+        entrypoint never reads it.
         """
         relevant = {
             str(name): str(value)
@@ -17778,14 +17793,22 @@ class Manager:
                 STRATA_SERVED_MODEL_VARIABLE,
             )
         }
-        payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            {
+                "environment": relevant,
+                "image": str(image or DEFAULT_STRATA_IMAGE),
+            },
+            sort_keys=True, separators=(",", ":"),
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
-    def _strata_data_volume(self, deployment_key: str, environment) -> str:
+    def _strata_data_volume(
+        self, deployment_key: str, environment, image: str | None = None,
+    ) -> str:
         """Return (creating if needed) the /data volume for this launch."""
         name = (
             f"{self._strata_volume_prefix(deployment_key)}-"
-            f"{self._strata_setup_fingerprint(environment)}"
+            f"{self._strata_setup_fingerprint(environment, image)}"
         )
         try:
             self.client.volumes.get(name)
@@ -17991,7 +18014,7 @@ class Manager:
             # saved config exists, so a config-affecting edit lands in a
             # fresh volume whose setup runs with the new settings, while an
             # unchanged relaunch reuses the prepared pack.
-            data_volume = self._strata_data_volume(deployment_key, environment)
+            data_volume = self._strata_data_volume(deployment_key, environment, image)
             volumes[data_volume] = {"bind": "/data", "mode": "rw"}
             run_options = {
                 "image": image,

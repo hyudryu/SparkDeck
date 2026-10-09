@@ -598,7 +598,7 @@ class NinferPreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["node_ids"], ["spark-2"])
 
 
-class NinferLaunchControlsTests(unittest.TestCase):
+class NinferLaunchControlsTests(unittest.IsolatedAsyncioTestCase):
     """The structured editor's controls must round-trip through NInfer argv."""
 
     def test_launch_controls_parse_scalars_spec_and_thinking(self):
@@ -820,8 +820,7 @@ class NinferLaunchControlsTests(unittest.TestCase):
                 "artifact": "model.ninfer",
                 "node_ids": ["spark-2"],
                 "deployment_mode": "single",
-                "launch": True,
-            })
+            }, launch=True)
 
             body = manager.create_deployment.await_args.args[0]
             self.assertEqual(
@@ -853,7 +852,8 @@ class FakeClusterManager:
         )
         self.create_deployment = AsyncMock(return_value={
             "id": "cluster-ni", "status": "starting", "api_port": 8123,
-            "members": [], "model_source": "public_repository",
+            "members": [{"container_name": "ninfer-org-model-8123"}],
+            "model_source": "public_repository",
         })
         self.public_target_node = Mock(side_effect=lambda node: node)
 

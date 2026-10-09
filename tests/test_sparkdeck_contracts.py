@@ -206,6 +206,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         prepare.assert_awaited_once_with(
             "org/model", "model.gguf", "release-1", None,
             home_node_ids=None, download_node_id=None,
+            extensions=(".gguf",), resolved_revision=None,
         )
         self.assertEqual(created["model"]["artifact"], prepared)
         self.assertEqual(created["settings"]["model_source"], "public_repository")
@@ -324,7 +325,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
         outside.write_bytes(b"outside")
         second_artifact.unlink()
         second_artifact.symlink_to(outside)
-        with self.assertRaisesRegex(RuntimeError, "complete selected GGUF shard set"):
+        with self.assertRaisesRegex(RuntimeError, "complete selected shard set"):
             await self.service._prepare_public_gguf_artifact(
                 "org/model", "model-00001-of-00002.gguf", "main", None,
             )

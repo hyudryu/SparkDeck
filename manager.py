@@ -12730,13 +12730,25 @@ class Manager:
             if live:
                 return list(dict.fromkeys(str(value) for value in live if value))
         settings = deployment.get("launch_settings") or {}
-        if settings.get("engine") == "strata":
+        # Store records carry the runtime at the top level; Manager's own
+        # records carry it inside launch_settings. Both shapes reach this
+        # resolver — the service synthesizes bookmark-shaped inputs from
+        # store settings when reserving selectors before a first launch.
+        engine = settings.get("engine") or str(
+            deployment.get("runtime") or ""
+        )
+        if engine == "strata":
             # Strata has no argv surface: its public id is the saved
-            # SERVED_MODEL_NAME variable, falling back to the model id.
-            # Read-side: tolerate legacy values instead of failing state.
+            # SERVED_MODEL_NAME variable — or, on a never-started bookmark,
+            # the launch control the editor persists until the launch body
+            # projects it. Read-side: tolerate legacy values instead of
+            # failing state.
             served = strata_served_model_name(
                 (settings.get("environment") or {}).get(
                     STRATA_SERVED_MODEL_VARIABLE
+                )
+                or (settings.get("launch_controls") or {}).get(
+                    "served_model_name"
                 )
             )
             if served:

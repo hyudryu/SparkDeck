@@ -283,6 +283,22 @@ class StrataServedModelNameTests(unittest.IsolatedAsyncioTestCase):
             Manager._deployment_served_models(deployment), [STRATA_SERVED],
         )
 
+    def test_saved_strata_bookmark_reads_the_launch_control(self) -> None:
+        """A never-started bookmark persists the served name under
+        launch_controls with the runtime at the top level — the shape the
+        service synthesizes when reserving selectors before a first launch."""
+        deployment = {
+            "model": STRATA_MODEL,
+            "runtime": "strata",
+            "launch_settings": {
+                "launch_controls": {"served_model_name": STRATA_SERVED},
+            },
+        }
+
+        self.assertEqual(
+            Manager._deployment_served_models(deployment), [STRATA_SERVED],
+        )
+
     def test_saved_strata_deployment_without_the_variable_keeps_model_id(self) -> None:
         deployment = {
             "model": STRATA_MODEL,

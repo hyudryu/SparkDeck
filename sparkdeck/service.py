@@ -6920,13 +6920,20 @@ class SparkDeckService:
 
     def _managed_deployment_reserved_selectors(
         self, model: str, settings: dict[str, Any],
+        runtime: str = "",
     ) -> list[str]:
-        """Return the selectors a saved managed launch will publish."""
+        """Return the selectors a saved managed launch will publish.
+
+        ``runtime`` is the store record's runtime: runtimes whose public id
+        lives in saved settings rather than argv (Strata's launch control)
+        need it to resolve a bookmark's future served name.
+        """
         selectors = [model] if model else []
         resolver = getattr(self.manager, "_deployment_served_models", None)
         if callable(resolver):
             selectors.extend(resolver({
                 "model": model,
+                "runtime": runtime,
                 "launch_settings": {**settings, "model": model},
             }))
         return selectors
@@ -7008,6 +7015,7 @@ class SparkDeckService:
                 for item in self._managed_deployment_reserved_selectors(
                     str((deployment.get("model") or {}).get("repository") or ""),
                     dict(deployment.get("settings") or {}),
+                    str(deployment.get("runtime") or ""),
                 )
             ),
         ]
@@ -7411,6 +7419,7 @@ class SparkDeckService:
                 model = deployment.get("model") or {}
                 configured = resolver({
                     "model": str(model.get("repository") or ""),
+                    "runtime": str(deployment.get("runtime") or ""),
                     "launch_settings": dict(deployment.get("settings") or {}),
                 })
         normalized = list(dict.fromkeys(

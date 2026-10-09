@@ -924,6 +924,35 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.close()
             temp.cleanup()
 
+    async def test_reserved_selectors_read_the_saved_served_name_control(self):
+        """Start-time collision arbitration must see a bookmark's future
+        public id, or a live deployment could already own the name."""
+        manager, service, temp = self._service()
+        try:
+            manager._deployment_served_models = lambda deployment: (
+                Manager._deployment_served_models(deployment)
+            )
+            reserved = service._managed_deployment_reserved_selectors(
+                "org/model",
+                {"launch_controls": {"served_model_name": "my-qwen"}},
+                "strata",
+            )
+            self.assertEqual(reserved, ["org/model", "my-qwen"])
+            # Without the runtime the bookmark shape cannot resolve a Strata
+            # control, so only the repository id is reserved (duplicated by
+            # the base selector; start arbitration deduplicates).
+            unscoped = service._managed_deployment_reserved_selectors(
+                "org/model",
+                {"launch_controls": {"served_model_name": "my-qwen"}},
+                "",
+            )
+            self.assertNotIn("my-qwen", unscoped)
+            self.assertEqual(set(unscoped), {"org/model"})
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
     async def test_cluster_launch_body_seeds_the_environment(self):
         manager, service, temp = self._service()
         try:

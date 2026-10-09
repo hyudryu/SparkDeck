@@ -4556,13 +4556,27 @@ class SparkDeckService:
             # deliberately partial, so whole-repository completeness is the
             # wrong readiness signal: the selected artifact file is what the
             # launch resolves, and each node must hold it at the resolved
-            # revision.
-            relative = self._validate_public_gguf_artifact(
-                repository, artifact, None, extensions=(".ninfer",),
+            # revision. The persisted launch reference is what Manager
+            # relaunches with, so a mutable bookmark revision must not
+            # validate a snapshot the replacement will never load.
+            stored = str(
+                (launch_settings or {}).get("ninfer_artifact") or artifact
             )
-            resolved = await self._resolved_model_revision(
-                repository, revision or "main",
+            relative, pinned = self._clone_llama_artifact_identity(
+                repository, stored, extensions=(".ninfer",),
             )
+            if relative is None:
+                return None
+            relative_path = self._validate_public_gguf_artifact(
+                repository, relative, None, extensions=(".ninfer",),
+            )
+            if pinned and re.fullmatch(r"[0-9a-fA-F]{40}", pinned):
+                # An already-pinned snapshot needs no Hub round-trip.
+                resolved = pinned.lower()
+            else:
+                resolved = await self._resolved_model_revision(
+                    repository, revision or "main",
+                )
             presence = getattr(self.manager, "node_has_model_files", None)
             if not callable(presence):
                 # Without the per-file presence endpoint the inventory check
@@ -4576,7 +4590,8 @@ class SparkDeckService:
             for node_id in node_ids:
                 try:
                     has_files = await presence(
-                        node_id, repository, resolved, [relative.as_posix()],
+                        node_id, repository, resolved,
+                        [relative_path.as_posix()],
                     )
                 except Exception:
                     has_files = False
@@ -6405,6 +6420,26 @@ class SparkDeckService:
             stored.get("_base_url"),
         )
 
+    async def _validated_strata_preparation_nodes(
+        self, node_ids: list[str],
+    ) -> list[str]:
+        """Deduplicate and validate a Strata preparation selection.
+
+        The Strata fast path fabricates its ready plan, so it must reject
+        unknown node ids exactly like the generic planner: otherwise a
+        stale client selection succeeds here and only the launch rejects it.
+        """
+        selected = list(dict.fromkeys(
+            str(item).strip() for item in node_ids if str(item).strip()
+        ))
+        available = {
+            str(node.get("id")) for node in await self.manager.cluster_nodes()
+        }
+        unknown = [node_id for node_id in selected if node_id not in available]
+        if unknown:
+            raise ValueError(f"unknown cluster node(s): {', '.join(unknown)}")
+        return selected
+
     async def deployment_preparation_preflight(
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
@@ -6420,9 +6455,7 @@ class SparkDeckService:
             # data volume on first start, so the cluster cache never holds the
             # weights and sizing the whole repository would demand a
             # preparation no launch ever needs.
-            selected_ids = [
-                str(item).strip() for item in node_ids if str(item).strip()
-            ]
+            selected_ids = await self._validated_strata_preparation_nodes(node_ids)
             return {
                 "enabled": True, "model_id": model, "revision": revision,
                 "sources": [],
@@ -6455,9 +6488,7 @@ class SparkDeckService:
         if deployment.get("runtime") == RuntimeKind.STRATA.value:
             # Nothing to transfer: the container fetches its own pinned
             # checkpoint inside its data volume on first start.
-            selected_ids = [
-                str(item).strip() for item in node_ids if str(item).strip()
-            ]
+            selected_ids = await self._validated_strata_preparation_nodes(node_ids)
             return {
                 "workflow_id": None, "job_ids": [], "jobs": [],
                 "node_ids": selected_ids, "action": "ready", "plan": None,
@@ -6827,6 +6858,7 @@ class SparkDeckService:
 
     def _clone_llama_artifact_identity(
         self, repository: str, artifact: Any,
+        extensions: tuple[str, ...] = (".gguf",),
     ) -> tuple[str | None, str | None]:
         """Restore a Manager cache reference and its pinned snapshot revision."""
         value = _optional_string(artifact)
@@ -6844,7 +6876,7 @@ class SparkDeckService:
             relative = "/".join(parts[3:])
             return (
                 self._validate_public_gguf_artifact(
-                    repository, relative, None,
+                    repository, relative, None, extensions=extensions,
                 ).as_posix(),
                 parts[2],
             )

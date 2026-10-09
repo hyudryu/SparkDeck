@@ -24,7 +24,10 @@ from manager import (
     SERVED_MODEL_LABEL, STRATA_VOLUME_KEY_LABEL, STRATA_VOLUME_LABEL,
     _STRATA_SERVE_PORT, _SUPPORTED_ENGINES, _node_nvidia_driver_version,
 )
-from cluster import STRATA_CAPABILITY, STRATA_SERVED_NAME_CAPABILITY
+from cluster import (
+    STRATA_CAPABILITY, STRATA_DRIVER_CAPABILITY_PREFIX,
+    STRATA_SERVED_NAME_CAPABILITY,
+)
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
@@ -924,6 +927,91 @@ class StrataPreflightTests(unittest.IsolatedAsyncioTestCase):
                 "environment": {"SERVED_MODEL_NAME": "two words"},
             })
 
+    async def test_preflight_rejects_the_default_image_on_an_old_driver(self):
+        """The node-side launcher floor would otherwise reject the target
+        only after a relocation removed the serving ranks."""
+        manager = self._preflight_nodes([
+            STRATA_CAPABILITY, STRATA_DRIVER_CAPABILITY_PREFIX + "550",
+        ])
+
+        with patch("manager._node_nvidia_driver_version", return_value=None):
+            with self.assertRaisesRegex(ValueError, "driver 580 or newer"):
+                await manager._preflight_deployment_launch({
+                    "model": "org/model",
+                    "engine": "strata",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["local", "old-node"],
+                })
+
+    async def test_preflight_accepts_a_current_driver_advertisement(self):
+        manager = self._preflight_nodes([
+            STRATA_CAPABILITY, STRATA_DRIVER_CAPABILITY_PREFIX + "580",
+        ])
+
+        with patch("manager._node_nvidia_driver_version", return_value=None):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "strata",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+            })
+
+    async def test_preflight_skips_the_driver_floor_for_a_custom_image(self):
+        """A custom image may target an older toolkit, exactly like the
+        node-side check."""
+        manager = self._preflight_nodes([
+            STRATA_CAPABILITY, STRATA_DRIVER_CAPABILITY_PREFIX + "550",
+        ])
+
+        with patch("manager._node_nvidia_driver_version", return_value=None):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "strata",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+                "image": "sparkdeck/strata:cuda12",
+            })
+
+    async def test_preflight_defers_when_no_driver_is_reported(self):
+        """An agent that does not advertise a driver version (older build, or
+        nvidia-smi unavailable) defers to the node-side check."""
+        manager = self._preflight_nodes([STRATA_CAPABILITY])
+
+        with patch("manager._node_nvidia_driver_version", return_value=None):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "strata",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+            })
+
+    def test_agent_health_advertises_the_strata_driver(self):
+        """The controller can only preflight the floor if the agent reports
+        its driver major in the capability list."""
+        manager = Manager.__new__(Manager)
+        manager.agent_credentials = Mock(node_id="spark-2")
+        manager.settings = {}
+
+        with patch("manager._node_nvidia_driver_version", return_value=580):
+            health = manager.agent_health()
+
+        self.assertIn(
+            "strata-nvidia-driver:580", health["capabilities"],
+        )
+
+    def test_agent_health_omits_the_driver_capability_when_unknown(self):
+        manager = Manager.__new__(Manager)
+        manager.agent_credentials = Mock(node_id="spark-2")
+        manager.settings = {}
+
+        with patch("manager._node_nvidia_driver_version", return_value=None):
+            health = manager.agent_health()
+
+        self.assertFalse([
+            capability for capability in health["capabilities"]
+            if capability.startswith(STRATA_DRIVER_CAPABILITY_PREFIX)
+        ])
+
 
 class StrataContractTests(unittest.TestCase):
     def test_strata_is_a_supported_engine(self):
@@ -1146,6 +1234,9 @@ class _FakeClusterManager:
         self.http = httpx.AsyncClient()
         self.deployments = []
         self.selected_cluster_nodes = AsyncMock(
+            return_value=[{"id": "spark-2", "name": "Spark 2"}],
+        )
+        self.cluster_nodes = AsyncMock(
             return_value=[{"id": "spark-2", "name": "Spark 2"}],
         )
         self.create_deployment = AsyncMock(return_value={
@@ -1481,6 +1572,32 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prepared["jobs"], [])
             self.assertIsNone(prepared["workflow_id"])
             manager.queue_recipe_model_preparation.assert_not_awaited()
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_strata_preparation_rejects_unknown_nodes(self):
+        """The fabricated ready plan must still validate its selection, or a
+        stale client node id succeeds here and only the launch rejects it."""
+        manager, service, temp = self._service()
+        try:
+            result = await service.create_deployment({
+                "model": "org/model",
+                "alias": "strata-saved",
+                "runtime": "strata",
+                "node_ids": ["spark-2"],
+                "deployment_mode": "single",
+            })
+
+            with self.assertRaisesRegex(ValueError, "unknown cluster node"):
+                await service.deployment_preparation_preflight(
+                    result["id"], ["spark-2", "ghost-node"],
+                )
+            with self.assertRaisesRegex(ValueError, "unknown cluster node"):
+                await service.deployment_prepare(
+                    result["id"], ["spark-2", "ghost-node"],
+                )
         finally:
             await manager.http.aclose()
             await service.close()

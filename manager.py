@@ -40,6 +40,7 @@ from cluster import (
     NodeAgentResponseError,
     NodeRegistry,
     STRATA_CAPABILITY,
+    STRATA_DRIVER_CAPABILITY_PREFIX,
     STRATA_SERVED_NAME_CAPABILITY,
     TENSORFOLD_CAPABILITY,
 )
@@ -379,6 +380,9 @@ _NINFER_SERVE_PORT = 8080
 # entrypoint's environment variables, and one server holds the whole model,
 # so only single and replicated layouts are supported.
 DEFAULT_STRATA_IMAGE = "sparkdeck/strata:latest"
+# The default image is built against CUDA 13, which needs driver 580 or
+# newer; a custom image may target an older toolkit.
+_STRATA_DEFAULT_IMAGE_MIN_DRIVER = 580
 _STRATA_SERVE_PORT = 8080
 _SUPPORTED_ENGINES = (
     "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer", "strata",
@@ -1406,10 +1410,30 @@ class Manager:
     STRATA_SERVED_NAME_CAPABILITY,
     "patched-images-v1",
                 EMBEDDINGS_CAPABILITY,
+                *self._strata_driver_capabilities(),
             ],
             "app_revision": getattr(self, "app_revision", None),
             "online": True,
         }
+
+    def _strata_driver_capabilities(self) -> list[str]:
+        """Advertise the local NVIDIA driver major to the controller.
+
+        The default Strata image has a driver floor, and the node-side
+        launcher check would otherwise reject a target only after a
+        relocation removed the serving ranks. Cached: the driver cannot
+        change under a running agent without a restart, and the health
+        endpoint must stay cheap.
+        """
+        cached = getattr(self, "_strata_driver_capability_cache", None)
+        if cached is None:
+            version = _node_nvidia_driver_version()
+            cached = (
+                [f"{STRATA_DRIVER_CAPABILITY_PREFIX}{version}"]
+                if version is not None else []
+            )
+            self._strata_driver_capability_cache = cached
+        return list(cached)
 
     async def agent_status(
         self, stats: dict | None = None, containers: list[dict] | None = None,
@@ -8111,6 +8135,24 @@ class Manager:
                 + ". Update these nodes in Settings before starting this deployment."
             )
 
+    @staticmethod
+    def _reported_strata_driver(node_id: str, node: dict) -> int | None:
+        """The driver major this node reports, or ``None`` when unknown."""
+        if node_id == LOCAL_NODE_ID:
+            return _node_nvidia_driver_version()
+        for capability in node.get("capabilities") or []:
+            if (
+                isinstance(capability, str)
+                and capability.startswith(STRATA_DRIVER_CAPABILITY_PREFIX)
+            ):
+                try:
+                    return int(
+                        capability[len(STRATA_DRIVER_CAPABILITY_PREFIX):]
+                    )
+                except ValueError:
+                    return None
+        return None
+
     async def _preflight_deployment_launch(
         self, body: dict, *, exclude_deployment_id: str | None = None,
     ) -> dict:
@@ -8298,6 +8340,34 @@ class Manager:
                     + ". Update these nodes in Settings, or clear the served "
                     "model name for this deployment."
                 )
+            # The default image is built against CUDA 13 and needs driver
+            # 580+; the node-side launcher check would otherwise reject a
+            # replacement only after a relocation removed the serving ranks.
+            # Agents that advertise their driver are validated here; a node
+            # that reports none (older build, or nvidia-smi unavailable)
+            # defers to the node-side check.
+            if (
+                str(body.get("image") or DEFAULT_STRATA_IMAGE)
+                == DEFAULT_STRATA_IMAGE
+            ):
+                stale_drivers = [
+                    f"{available.get(nid, {}).get('name') or nid} "
+                    f"(driver {version})"
+                    for nid in node_ids
+                    for version in (
+                        self._reported_strata_driver(nid, available.get(nid, {})),
+                    )
+                    if version is not None
+                    and version < _STRATA_DEFAULT_IMAGE_MIN_DRIVER
+                ]
+                if stale_drivers:
+                    raise ValueError(
+                        "the default Strata image requires NVIDIA driver "
+                        f"{_STRATA_DEFAULT_IMAGE_MIN_DRIVER} or newer; "
+                        + ", ".join(stale_drivers)
+                        + " report older drivers. Use a Strata image built "
+                        "for this driver, or update the driver."
+                    )
         vllm_parallel_layout: tuple[int, int] | None = None
         if mode in {"single", "sharded"} and engine == "vllm":
             requested_args = list(body.get("extra_args") or [])
@@ -18013,9 +18083,10 @@ class Manager:
         # driver-presence check above.
         if image == DEFAULT_STRATA_IMAGE:
             version = _node_nvidia_driver_version()
-            if version is not None and version < 580:
+            if version is not None and version < _STRATA_DEFAULT_IMAGE_MIN_DRIVER:
                 raise ValueError(
-                    "the default Strata image requires NVIDIA driver 580 or "
+                    "the default Strata image requires NVIDIA driver "
+                    f"{_STRATA_DEFAULT_IMAGE_MIN_DRIVER} or "
                     f"newer; this node reports {version}"
                 )
         # Strata takes the node's GPU for its CUDA context, so other chat

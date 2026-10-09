@@ -37,6 +37,12 @@ STRATA_CAPABILITY = "strata-launch-v1"
 # custom public id, so a launch that sets one must fail in preflight on a
 # mixed-version cluster.
 STRATA_SERVED_NAME_CAPABILITY = "strata-served-name-v1"
+# Advertised by agents that can report their local NVIDIA driver major
+# version as "strata-nvidia-driver:<major>". The default Strata image has a
+# driver floor, and without the advertisement the controller can only learn
+# about a too-old driver from the node-side launcher, i.e. after a
+# relocation already removed the serving ranks.
+STRATA_DRIVER_CAPABILITY_PREFIX = "strata-nvidia-driver:"
 
 
 class NodeAgentResponseError(RuntimeError):

@@ -78,6 +78,17 @@ def validate_strata_served_model_name(value: Any) -> str:
     return name
 
 
+def strata_served_model_name(value: Any) -> str:
+    """Return the saved served name for display, tolerating legacy values.
+
+    State serialization reads deployments saved before the single-token
+    restriction existed; one malformed persisted value must not fail
+    get_state for every deployment. The strict validator runs on edits and
+    launches instead.
+    """
+    return str(value or "").strip()
+
+
 def validate_strata_model(size: Any, family: Any) -> tuple[str, str]:
     """Return the validated (MODEL, FAMILY) pair for a Strata launch."""
     size = str(size or "").strip() or "IQ2_XS"

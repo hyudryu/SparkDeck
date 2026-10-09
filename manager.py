@@ -40,6 +40,7 @@ from cluster import (
     NodeAgentResponseError,
     NodeRegistry,
     STRATA_CAPABILITY,
+    STRATA_SERVED_NAME_CAPABILITY,
     TENSORFOLD_CAPABILITY,
 )
 from sparkdeck.onboarding import resolve_agent_connection
@@ -47,6 +48,7 @@ from sparkdeck.runtimes import (
     STRATA_SERVED_MODEL_VARIABLE,
     apply_strata_launch_controls,
     strata_launch_environment,
+    strata_served_model_name,
     validate_strata_model,
     validate_strata_served_model_name,
 )
@@ -1397,6 +1399,7 @@ class Manager:
     TENSORFOLD_CAPABILITY,
     NINFER_CAPABILITY,
     STRATA_CAPABILITY,
+    STRATA_SERVED_NAME_CAPABILITY,
     "patched-images-v1",
                 EMBEDDINGS_CAPABILITY,
             ],
@@ -5240,7 +5243,9 @@ class Manager:
                 "tensor_parallel_size": None,
                 "pipeline_parallel_size": None,
                 "kv_cache_dtype": kv_dtype or None,
-                "served_model_name": validate_strata_served_model_name(
+                # Read-side tolerance: a deployment saved before the
+                # single-token restriction existed must still serialize.
+                "served_model_name": strata_served_model_name(
                     environment.get(STRATA_SERVED_MODEL_VARIABLE)
                 ) or None,
                 "thinking_mode": None,
@@ -8263,6 +8268,31 @@ class Manager:
                 raise ValueError(
                     f"{engine_label} requires an NVIDIA GPU, and none is "
                     "reported on: " + ", ".join(gpu_short)
+                )
+        if engine == "strata":
+            # A strict gate for a launch input: an invalid name fails before
+            # any replica evicts healthy backends.
+            served = validate_strata_served_model_name(
+                (body.get("environment") or {}).get(
+                    STRATA_SERVED_MODEL_VARIABLE
+                )
+            )
+            # strata-launch-v1 agents predate the served-name label, so a
+            # replica on one of them would silently serve the repository id
+            # instead of the configured public id.
+            unsupported = [
+                available.get(nid, {}).get("name") or nid for nid in node_ids
+                if served and nid != LOCAL_NODE_ID
+                and STRATA_SERVED_NAME_CAPABILITY
+                not in (available.get(nid, {}).get("capabilities") or [])
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"The Strata served model name '{served}' requires "
+                    "updated SparkDeck agents on: "
+                    + ", ".join(unsupported)
+                    + ". Update these nodes in Settings, or clear the served "
+                    "model name for this deployment."
                 )
         vllm_parallel_layout: tuple[int, int] | None = None
         if mode in {"single", "sharded"} and engine == "vllm":
@@ -12703,7 +12733,8 @@ class Manager:
         if settings.get("engine") == "strata":
             # Strata has no argv surface: its public id is the saved
             # SERVED_MODEL_NAME variable, falling back to the model id.
-            served = validate_strata_served_model_name(
+            # Read-side: tolerate legacy values instead of failing state.
+            served = strata_served_model_name(
                 (settings.get("environment") or {}).get(
                     STRATA_SERVED_MODEL_VARIABLE
                 )

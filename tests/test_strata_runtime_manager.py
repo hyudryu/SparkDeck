@@ -23,7 +23,7 @@ from manager import (
     SERVED_MODEL_LABEL, STRATA_VOLUME_LABEL, _STRATA_SERVE_PORT,
     _SUPPORTED_ENGINES, _node_nvidia_driver_version,
 )
-from cluster import STRATA_CAPABILITY
+from cluster import STRATA_CAPABILITY, STRATA_SERVED_NAME_CAPABILITY
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
 from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
@@ -553,6 +553,86 @@ class StrataPreflightTests(unittest.IsolatedAsyncioTestCase):
                 "node_ids": ["local", "old-node"],
             })
 
+    def _preflight_nodes(self, remote_capabilities):
+        manager = Manager.__new__(Manager)
+        manager._reject_hf_cli_credentials = Mock()
+        manager._validate_runtime_file_mount_nodes = Mock()
+
+        async def cluster_nodes():
+            return [
+                {"id": "local", "name": "Coordinator", "online": True,
+                 "docker_ready": True,
+                 "capabilities": [STRATA_CAPABILITY,
+                                  STRATA_SERVED_NAME_CAPABILITY],
+                 "stats": {"gpus": [{"name": "RTX 5090", "memory_total_gb": 32}]}},
+                {"id": "old-node", "name": "Old Node", "online": True,
+                 "docker_ready": True,
+                 "capabilities": remote_capabilities,
+                 "stats": {"gpus": [{"name": "RTX 5090", "memory_total_gb": 32}]}},
+            ]
+
+        manager.cluster_nodes = cluster_nodes
+        # A fully passing preflight continues into the eviction preview,
+        # which only needs a Docker client, the port range, and no local
+        # containers.
+        manager.client = Mock()
+        manager.client.containers.list = Mock(return_value=[])
+        manager.settings = {"port_range_start": 18000, "port_range_end": 18010}
+        return manager
+
+    async def test_preflight_rejects_agents_without_served_name_support(self):
+        """strata-launch-v1 agents predate the served-name label: a replica
+        on one would silently serve the repository id instead."""
+        manager = self._preflight_nodes([STRATA_CAPABILITY])
+
+        with self.assertRaisesRegex(
+            ValueError, "served model name 'my-qwen' requires updated",
+        ):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "strata",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+                "environment": {"SERVED_MODEL_NAME": "my-qwen"},
+            })
+
+    async def test_preflight_accepts_a_served_name_on_updated_agents(self):
+        manager = self._preflight_nodes(
+            [STRATA_CAPABILITY, STRATA_SERVED_NAME_CAPABILITY],
+        )
+
+        await manager._preflight_deployment_launch({
+            "model": "org/model",
+            "engine": "strata",
+            "deployment_mode": "replicated",
+            "node_ids": ["local", "old-node"],
+            "environment": {"SERVED_MODEL_NAME": "my-qwen"},
+        })
+
+    async def test_preflight_ignores_the_capability_without_a_served_name(self):
+        """A repository-id deployment still launches on strata-launch-v1
+        agents; the new gate only applies when a custom name is set."""
+        manager = self._preflight_nodes([STRATA_CAPABILITY])
+
+        await manager._preflight_deployment_launch({
+            "model": "org/model",
+            "engine": "strata",
+            "deployment_mode": "replicated",
+            "node_ids": ["local", "old-node"],
+        })
+
+    async def test_preflight_rejects_a_malformed_served_name(self):
+        manager = self._preflight_nodes([STRATA_CAPABILITY])
+
+        with self.assertRaisesRegex(ValueError, "served model name"):
+            await manager._preflight_deployment_launch({
+                "model": "org/model",
+                "engine": "strata",
+                "deployment_mode": "replicated",
+                "node_ids": ["local", "old-node"],
+                "environment": {"SERVED_MODEL_NAME": "two words"},
+            })
+
 
 class StrataContractTests(unittest.TestCase):
     def test_strata_is_a_supported_engine(self):
@@ -650,6 +730,28 @@ class StrataContractTests(unittest.TestCase):
             "environment": {STRATA_SERVED_MODEL_VARIABLE: " my-qwen "},
         })
         self.assertEqual(controls["served_model_name"], "my-qwen")
+
+    def test_launch_controls_tolerate_legacy_served_name_values(self):
+        """A deployment saved before the single-token restriction existed
+        must still serialize instead of failing get_state."""
+        legacy = "x" * 300
+        controls = Manager._deployment_launch_controls({
+            "engine": "strata",
+            "extra_args": [],
+            "environment": {STRATA_SERVED_MODEL_VARIABLE: f"  {legacy} "},
+        })
+        self.assertEqual(controls["served_model_name"], legacy)
+        deployment = {
+            "model": "org/model",
+            "launch_settings": {
+                "engine": "strata",
+                "extra_args": [],
+                "environment": {STRATA_SERVED_MODEL_VARIABLE: "two words"},
+            },
+        }
+        self.assertEqual(
+            Manager._deployment_served_models(deployment), ["two words"],
+        )
 
     def test_the_served_name_variable_is_validated_and_normalized(self):
         environment = strata_launch_environment(
@@ -787,6 +889,36 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
                 ["spark-2"], "single", None,
             )
             self.assertEqual(body["environment"]["KV"], "k8v4")
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_cluster_launch_body_projects_the_served_name_control(self):
+        """A never-started bookmark persists the served name under
+        launch_controls; the launch must project it into the environment or
+        the container never gets the routing label."""
+        manager, service, temp = self._service()
+        try:
+            body = service._cluster_launch_body(
+                RuntimeKind.STRATA, "org/model", "alias", "dep-1",
+                ModelIdentity("org/model"),
+                {"launch_controls": {"served_model_name": "my-qwen"}},
+                ["spark-2"], "single", None,
+            )
+            self.assertEqual(
+                body["environment"][STRATA_SERVED_MODEL_VARIABLE], "my-qwen",
+            )
+
+            cleared = service._cluster_launch_body(
+                RuntimeKind.STRATA, "org/model", "alias", "dep-2",
+                ModelIdentity("org/model"),
+                {"launch_controls": {"served_model_name": None}},
+                ["spark-2"], "single", None,
+            )
+            self.assertNotIn(
+                STRATA_SERVED_MODEL_VARIABLE, cleared["environment"],
+            )
         finally:
             await manager.http.aclose()
             await service.close()

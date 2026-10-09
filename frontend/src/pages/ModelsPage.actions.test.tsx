@@ -685,6 +685,49 @@ describe('models page running actions', () => {
     })
   })
 
+  it('grows a Strata deployment without waiting for the model cache', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [{
+          ...runningDeployment, alias: 'Strata model', runtime: 'strata',
+          model: { repository: 'unsloth/Qwen3.8-Flash-Next-GGUF' },
+        }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        // A stalled cache-inventory request must not hold a Strata
+        // deployment's scale-out picker in its loading state: the container
+        // fetches its own checkpoint and never reads this cache.
+        return new Promise<Response>(() => {})
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Strata model')
+    await user.click(screen.getByRole('button', { name: 'More actions for Strata model' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Launch on additional nodes…' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add nodes to Strata model' })
+    expect(within(dialog).queryByText('Loading available nodes…')).not.toBeInTheDocument()
+    expect(within(dialog).queryByText('Model weights not cached')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 3/ })).toBeEnabled()
+    expect(dialog).toHaveTextContent('each container fetches its own checkpoint')
+  })
+
   it('stops the deployment from the split-button main action', async () => {
     const user = userEvent.setup()
     renderPage()

@@ -4731,6 +4731,124 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 [d["id"] for d in instance.deployments], ["deployment-new"],
             )
 
+    async def test_relocation_preserves_only_reused_strata_volume_pairs(self) -> None:
+        """A Strata volume is keyed by (record id, rank). A relocation must
+        preserve it only for the (node, rank) pairs the replacement
+        recreates; unmatched pairs are unreachable afterwards and their
+        volumes must be reclaimed instead of leaked."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Strata cluster",
+                "model": "org/model",
+                "engine": "strata",
+                "mode": "replicated",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "sparkdeck_record_id": "record-7",
+                "members": [
+                    {"node_id": "local", "rank": 0, "container_name": "old-r0"},
+                    {"node_id": "remote-1", "rank": 1, "container_name": "old-r1"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Strata cluster",
+                    "model": "org/model",
+                    "engine": "strata",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": [],
+                    "sparkdeck_record_id": "record-7",
+                },
+            }
+            instance.deployments = [old]
+            removed = []
+
+            async def member_action(member, action, **kwargs):
+                removed.append((
+                    member["container_name"], action,
+                    kwargs.get("preserve_strata_volumes"),
+                ))
+                return {"ok": True}
+
+            async def create_deployment(body):
+                replacement = {
+                    "id": "deployment-new", "status": "starting", "members": [],
+                }
+                instance.deployments.append(replacement)
+                return replacement
+
+            instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
+            instance.create_deployment = create_deployment
+
+            result = await instance.deployment_action(
+                "deployment-old", "start", ["local", "remote-2"],
+            )
+
+            self.assertTrue(result["ok"])
+            # Rank 0 still lands on the local node and reuses its prepared
+            # volume; rank 1 moves to remote-2, so remote-1's pack is
+            # unreachable and is reclaimed with the removal.
+            self.assertEqual(
+                removed,
+                [("old-r0", "remove", True), ("old-r1", "remove", False)],
+            )
+
+    async def test_failed_strata_replacement_reclaims_the_preserved_volumes(self) -> None:
+        """After the old members are removed and before the replacement
+        creates any container, a launch failure leaves the preserved volumes
+        with nothing left to address them; the intended placement must
+        reclaim them."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Strata cluster",
+                "model": "org/model",
+                "engine": "strata",
+                "mode": "single",
+                "node_ids": ["local"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "sparkdeck_record_id": "record-7",
+                "members": [
+                    {"node_id": "local", "rank": 0, "container_name": "old-r0"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Strata cluster",
+                    "model": "org/model",
+                    "engine": "strata",
+                    "deployment_mode": "single",
+                    "node_ids": ["local"],
+                    "extra_args": [],
+                    "sparkdeck_record_id": "record-7",
+                },
+            }
+            instance.deployments = [old]
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+
+            async def member_action(member, action, **kwargs):
+                return {"ok": True}
+
+            async def create_deployment(body):
+                raise RuntimeError("node rejected the replacement")
+
+            instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
+            instance.create_deployment = create_deployment
+            instance.prune_strata_record_volumes = prune
+
+            with self.assertRaisesRegex(RuntimeError, "node rejected"):
+                await instance.deployment_action(
+                    "deployment-old", "start", ["local"],
+                )
+
+            prune.assert_awaited_once_with("record-7", ["local"])
+
     async def test_starting_deployment_skips_recreation_when_environment_matches(
         self,
     ) -> None:

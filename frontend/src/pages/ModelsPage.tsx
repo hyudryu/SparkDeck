@@ -2741,6 +2741,7 @@ export function ModelsPage() {
         const { deployment, currentIds, additionalIds } = additionalLaunch
         const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
         const weighted = deploymentWeightedNodes(deployment)
+        const selfManagedWeights = runtimeSelfManagesWeights(deployment)
         // Gate on the cache predicate only: cached nodes that are offline or
         // Docker-unready stay in allowedIds so the selector reports their
         // real status ("Offline", "Docker unavailable") instead of a
@@ -2755,12 +2756,12 @@ export function ModelsPage() {
             <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">Currently running on {selectedNodeLabel(nodes.data ?? [], currentIds, localLabel)}. Choose the nodes that should also run {deployment.model_id}; the running nodes stay selected. SparkDeck relaunches the deployment, so existing replicas restart briefly.</p>
             {additionalError && <p className="form-error" role="alert">{additionalError}</p>}
-            {modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!selfManagedWeights && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={[...currentIds, ...additionalIds]}
               onChange={(next) => setAdditionalLaunch({ deployment, currentIds, additionalIds: next.filter((id) => !currentIds.includes(id)) })}
-              loading={nodes.loading || modelCache.loading}
+              loading={nodes.loading || (!selfManagedWeights && modelCache.loading)}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload() }}
               multiple
@@ -2771,7 +2772,7 @@ export function ModelsPage() {
               localLabel={localLabel}
               primaryId={currentIds[0]}
               legend="Additional nodes · parallel instances"
-              help={`Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
+              help={selfManagedWeights ? `Additional nodes run their own complete copy of ${deployment.model_id}; each container fetches its own checkpoint into its data volume on first start.` : `Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
             />
             <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>

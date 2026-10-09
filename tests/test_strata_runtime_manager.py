@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import docker
+import httpx
 
 from manager import (
     DEFAULT_STRATA_IMAGE, DEPLOYMENT_LABEL, ENGINE_LABEL,
@@ -423,6 +424,78 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
             filters={"name": "sparkdeck-strata-record-7-r1"},
         )
         volume.remove.assert_called_once()
+
+    def test_replacement_ranks_require_a_stable_record_owner(self):
+        """Only a SparkDeck record id gives the replacement the same volume
+        key; a direct Manager cluster can never re-find a preserved volume."""
+        self.assertEqual(
+            Manager._strata_replacement_ranks({
+                "sparkdeck_record_id": "record-7", "node_ids": ["b", "a"],
+            }),
+            {"b": 0, "a": 1},
+        )
+        self.assertEqual(
+            Manager._strata_replacement_ranks({"node_ids": ["b", "a"]}), {},
+        )
+        self.assertEqual(
+            Manager._strata_replacement_ranks({
+                "sparkdeck_record_id": "record-7", "node_ids": [],
+            }),
+            {},
+        )
+
+    async def test_prune_record_volumes_addresses_local_and_remote_nodes(self):
+        """A failed replacement leaves no container to carry the volume key,
+        so the record's intended placement must reach the volumes directly."""
+        manager = _manager()
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        prune = Mock()
+        manager._prune_strata_data_volumes = prune
+
+        result = await manager.prune_strata_record_volumes(
+            "record-7", ["local", "spark-2"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [call.args[0] for call in prune.call_args_list],
+            ["record-7-r0", "record-7-r1"],
+        )
+        request = manager.node_registry.request.await_args
+        self.assertEqual(request.args[0], "spark-2")
+        self.assertEqual(request.args[2], "/api/agent/volumes/strata/prune")
+        self.assertEqual(
+            request.kwargs["json_body"],
+            {"deployment_keys": ["record-7-r0", "record-7-r1"]},
+        )
+
+    async def test_prune_record_volumes_is_best_effort(self):
+        manager = _manager()
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock(
+            side_effect=RuntimeError("node offline"),
+        )
+
+        result = await manager.prune_strata_record_volumes(
+            "record-7", ["spark-2"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(result["errors"]), 1)
+
+    async def test_prune_record_volumes_skips_direct_cluster_records(self):
+        manager = _manager()
+        manager.node_registry = Mock()
+        manager.node_registry.request = AsyncMock()
+        prune = Mock()
+        manager._prune_strata_data_volumes = prune
+
+        result = await manager.prune_strata_record_volumes("", ["spark-2"])
+
+        self.assertTrue(result["ok"])
+        prune.assert_not_called()
+        manager.node_registry.request.assert_not_awaited()
 
     async def test_stale_volumes_are_pruned_after_a_relaunch(self):
         manager = _manager()
@@ -1328,6 +1401,7 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
                 all(target["has_required_weights"] for target in plan["targets"]),
             )
             self.assertEqual(plan["transfer_target_node_ids"], [])
+            self.assertEqual(plan["staging_reserve_bytes"], 0)
             manager.recipe_model_preparation_preflight.assert_not_awaited()
         finally:
             await manager.http.aclose()
@@ -1355,6 +1429,68 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
             temp.cleanup()
+
+
+class StrataAgentEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import server
+
+        self.server = server
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    async def test_agent_create_forwards_the_sparkdeck_deployment_id(self):
+        """A remote Strata member keys its prepared volume by the SparkDeck
+        record, so the agent create handler must forward the field the
+        controller sends or the volume key falls back to the transient
+        Manager deployment id."""
+        with patch.object(self.server, "_require_agent"), patch.object(
+            self.server.manager, "create_container",
+            AsyncMock(return_value={"name": "strata-x", "status": "running"}),
+        ) as create:
+            response = await self.client.post("/api/agent/containers", json={
+                "model": "org/model",
+                "engine": "strata",
+                "cluster_member": {
+                    "deployment_id": "cluster-1", "node_id": "spark-2",
+                    "rank": 0,
+                },
+                "sparkdeck_deployment_id": "record-7",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            create.await_args.kwargs["sparkdeck_deployment_id"], "record-7",
+        )
+
+    async def test_agent_prunes_strata_volumes_by_key(self):
+        with patch.object(self.server, "_require_agent"), patch.object(
+            self.server.manager, "_drop_strata_data_volumes", Mock(),
+        ) as drop:
+            response = await self.client.post(
+                "/api/agent/volumes/strata/prune",
+                json={"deployment_keys": ["record-7-r0", "record-7-r1"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True})
+        drop.assert_called_once_with(["record-7-r0", "record-7-r1"])
+
+    async def test_agent_prune_rejects_empty_keys(self):
+        with patch.object(self.server, "_require_agent"), patch.object(
+            self.server.manager, "_drop_strata_data_volumes", Mock(),
+        ) as drop:
+            response = await self.client.post(
+                "/api/agent/volumes/strata/prune",
+                json={"deployment_keys": ["  ", ""]},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        drop.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -9523,13 +9523,18 @@ class Manager:
             # The stopped containers still contain the old argv. Remove them,
             # then use the normal fully validated launch path with the saved
             # settings so every node/rank receives a coherent replacement.
-            # Strata's prepared /data volume is keyed by the SparkDeck record
-            # and the replacement reuses it, so the removal must not reclaim
-            # it.
+            # A Strata member's prepared /data volume is reused by the
+            # replacement only when its (node, rank) pair is recreated there:
+            # an unmatched pair is unreachable afterwards, so its removal
+            # must reclaim the volume instead of leaking it.
+            reused = self._strata_replacement_ranks(launch_body)
             removed = await asyncio.gather(
                 *[
                     self._member_action(
-                        member, "remove", preserve_strata_volumes=True,
+                        member, "remove",
+                        preserve_strata_volumes=reused.get(
+                            str(member.get("node_id")),
+                        ) == int(member.get("rank") or 0),
                     )
                     for member in deployment.get("members", [])
                 ],
@@ -9553,6 +9558,14 @@ class Manager:
                 # Keep the saved card so its settings can be corrected and
                 # retried. create_deployment also leaves its failed attempt
                 # visible with the node-specific diagnostic.
+                if str(launch_body.get("engine") or "") == "strata":
+                    # The preserved packs' member containers are gone and the
+                    # replacement never materialized, so nothing else can
+                    # address those volumes again.
+                    await self.prune_strata_record_volumes(
+                        str(launch_body.get("sparkdeck_record_id") or ""),
+                        list(reused),
+                    )
                 deployment["status"] = "stopped"
                 if environment_drift:
                     deployment["status_message"] = None
@@ -10190,9 +10203,13 @@ class Manager:
                     f"Waiting for selected nodes to reconnect: {exc}"
                 ) from exc
             raise
+        reused = self._strata_replacement_ranks(launch_body)
         removed = await asyncio.gather(*(
             self._member_action(
-                member, "remove", preserve_strata_volumes=True,
+                member, "remove",
+                preserve_strata_volumes=reused.get(
+                    str(member.get("node_id")),
+                ) == int(member.get("rank") or 0),
             )
             for member in deployment.get("members") or []
         ), return_exceptions=True)
@@ -17684,6 +17701,62 @@ class Manager:
     @staticmethod
     def _strata_volume_prefix(deployment_key: str) -> str:
         return f"sparkdeck-strata-{deployment_key}"
+
+    @staticmethod
+    def _strata_replacement_ranks(launch_body: dict) -> dict[str, int]:
+        """Map each node a relaunch uses to the rank the replacement assigns.
+
+        A Strata volume is keyed by the SparkDeck record id, and non-grouped
+        clusters rank members by their position in ``node_ids``, so this is
+        the placement a preserved volume can be reused on. A direct Manager
+        cluster has no stable owner key and its replacement can never
+        re-find a preserved volume, so nothing is preserved there.
+        """
+        if not str(launch_body.get("sparkdeck_record_id") or "").strip():
+            return {}
+        return {
+            str(node_id): rank
+            for rank, node_id in enumerate(launch_body.get("node_ids") or [])
+        }
+
+    def _drop_strata_data_volumes(self, deployment_keys: list[str]) -> None:
+        for key in deployment_keys:
+            self._prune_strata_data_volumes(key, keep="")
+
+    async def prune_strata_record_volumes(
+        self, record_id: str, node_ids: list[str],
+    ) -> dict:
+        """Reclaim every prepared /data volume of a SparkDeck Strata record.
+
+        A relaunch preserves the prepared volume of each (node, rank) pair
+        its replacement will reuse. When the replacement fails instead, no
+        member container is left to carry the volume key, so the intended
+        placement is the only breadcrumb that still addresses those volumes;
+        callers use this to reclaim them. Best effort: a stale volume must
+        never fail the surrounding recovery.
+        """
+        record = str(record_id or "").strip()
+        selected = [
+            str(item).strip() for item in node_ids if str(item).strip()
+        ]
+        if not record or not selected:
+            return {"ok": True, "errors": []}
+        keys = [f"{record}-r{rank}" for rank in range(len(selected))]
+        errors = []
+        for node_id in dict.fromkeys(selected):
+            try:
+                if node_id == LOCAL_NODE_ID:
+                    await asyncio.to_thread(
+                        self._drop_strata_data_volumes, keys,
+                    )
+                else:
+                    await self.node_registry.request(
+                        node_id, "POST", "/api/agent/volumes/strata/prune",
+                        json_body={"deployment_keys": keys}, timeout=120,
+                    )
+            except Exception as exc:
+                errors.append(f"{node_id}: {exc}")
+        return {"ok": not errors, "errors": errors}
 
     @staticmethod
     def _strata_setup_fingerprint(environment: dict[str, str] | None) -> str:

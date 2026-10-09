@@ -86,11 +86,19 @@ _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded
 # NInfer resolves a selective .ninfer artifact the same way, and TensorFold
 # and Strata download their own pinned checkpoints inside the container. The
 # whole-repository cache inventory is the wrong readiness signal for all of
-# them, at first launch and on every relaunch.
+# them at first launch.
 _CACHE_EXTERNAL_RUNTIMES = frozenset((
     RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
     RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
 ))
+
+# The subset above whose relaunch needs no selection revalidation. NInfer is
+# excluded on purpose: its per-file .ninfer presence check is selective-aware
+# and must gate a relocation before Manager removes the existing ranks,
+# because the per-node verification only runs when each container is created.
+_RELAUNCH_UNVALIDATED_RUNTIMES = _CACHE_EXTERNAL_RUNTIMES - {
+    RuntimeKind.NINFER.value,
+}
 
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
@@ -5561,10 +5569,10 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching. Cache-external runtimes resolve
-            # their weights elsewhere (or verify per node at container
-            # create), so the whole-repo inventory check does not apply.
-            if str(deployment.get("runtime") or "") not in _CACHE_EXTERNAL_RUNTIMES:
+            # revalidate before relaunching. Runtimes without a cache-shaped
+            # readiness check skip this: their weights resolve elsewhere (or
+            # are verified per node when each container is created).
+            if str(deployment.get("runtime") or "") not in _RELAUNCH_UNVALIDATED_RUNTIMES:
                 cached_start_revision = await self._validate_start_selection(
                     deployment, merged, launch_settings,
                 )
@@ -5582,10 +5590,10 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching. Cache-external runtimes resolve
-            # their weights elsewhere (or verify per node at container
-            # create), so the whole-repo inventory check does not apply.
-            if str(deployment.get("runtime") or "") not in _CACHE_EXTERNAL_RUNTIMES:
+            # revalidate before relaunching. Runtimes without a cache-shaped
+            # readiness check skip this: their weights resolve elsewhere (or
+            # are verified per node when each container is created).
+            if str(deployment.get("runtime") or "") not in _RELAUNCH_UNVALIDATED_RUNTIMES:
                 cached_start_revision = await self._validate_start_selection(
                     deployment, node_ids, launch_settings,
                 )
@@ -6365,6 +6373,7 @@ class SparkDeckService:
                 "action": "ready", "download_node_id": None,
                 "download_node_ids": [],
                 "transfer_target_node_ids": [], "reason": None,
+                "staging_reserve_bytes": 0,
             }
         return await self.manager.recipe_model_preparation_preflight(
             model, revision, node_ids,

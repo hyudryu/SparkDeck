@@ -4848,6 +4848,58 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ok"])
             prune.assert_awaited_once_with("record-7", [("local", 0)])
 
+    async def test_aborted_relocation_reclaims_an_already_absent_members_volume(self) -> None:
+        """A 404 removal is a completed removal: the container's labels are
+        gone, so an abort must reclaim that member's volume too."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Strata cluster",
+                "model": "org/model",
+                "engine": "strata",
+                "mode": "replicated",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "sparkdeck_record_id": "record-7",
+                "members": [
+                    {"node_id": "local", "rank": 0, "container_name": "old-r0"},
+                    {"node_id": "remote-1", "rank": 1, "container_name": "old-r1"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Strata cluster",
+                    "model": "org/model",
+                    "engine": "strata",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": [],
+                    "sparkdeck_record_id": "record-7",
+                },
+            }
+            instance.deployments = [old]
+
+            async def member_action(member, action, **kwargs):
+                if member["container_name"] == "old-r0":
+                    # The container was removed outside SparkDeck; its
+                    # prepared volume is still on the node with no labels
+                    # left to address it.
+                    raise ValueError("cluster member not found")
+                raise RuntimeError("member removal was rejected")
+
+            instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+            instance.prune_strata_member_volumes = prune
+
+            result = await instance.deployment_action(
+                "deployment-old", "start", ["local", "remote-2"],
+            )
+
+            self.assertFalse(result["ok"])
+            prune.assert_awaited_once_with("record-7", [("local", 0)])
+
     async def test_failed_strata_replacement_reclaims_the_preserved_volumes(self) -> None:
         """After the old members are removed and before the replacement
         creates any container, a launch failure leaves the preserved volumes

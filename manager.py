@@ -17828,7 +17828,13 @@ class Manager:
             for member, preserve, result in zip(
                 members, preserve_flags, results,
             )
-            if preserve and not isinstance(result, Exception)
+            # An already-absent removal is a completed removal (the 404 is
+            # idempotent): its container labels are gone too, so its volume
+            # is just as unreachable as a removed member's.
+            if preserve and (
+                not isinstance(result, Exception)
+                or Manager._member_action_already_absent(str(result))
+            )
         ]
         if not record or not placements:
             return

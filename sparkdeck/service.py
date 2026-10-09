@@ -92,13 +92,16 @@ _CACHE_EXTERNAL_RUNTIMES = frozenset((
     RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
 ))
 
-# The subset above whose relaunch needs no selection revalidation. NInfer is
-# excluded on purpose: its per-file .ninfer presence check is selective-aware
-# and must gate a relocation before Manager removes the existing ranks,
-# because the per-node verification only runs when each container is created.
-_RELAUNCH_UNVALIDATED_RUNTIMES = _CACHE_EXTERNAL_RUNTIMES - {
-    RuntimeKind.NINFER.value,
-}
+# The subset above whose relaunch needs no selection revalidation: only the
+# runtimes that resolve their weights entirely inside the container, so no
+# cluster-cache readiness check exists to run. NInfer and llama.cpp are
+# excluded on purpose: their selective per-file artifact checks are
+# selective-aware and must gate a relocation before Manager removes the
+# existing ranks, because the per-node verification only runs when each
+# container is created.
+_RELAUNCH_UNVALIDATED_RUNTIMES = frozenset((
+    RuntimeKind.TENSORFOLD.value, RuntimeKind.STRATA.value,
+))
 
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
@@ -4585,6 +4588,56 @@ class SparkDeckService:
                     + ", ".join(missing)
                 )
             return resolved
+        if deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value:
+            # A selective GGUF download leaves the repository snapshot
+            # deliberately partial, so whole-repository completeness is the
+            # wrong readiness signal: the selected shard set is what the
+            # launch resolves, and each node must hold every file. The
+            # persisted artifact is a repo-relative bookmark before the first
+            # launch and a hub-relative cache reference afterwards, so both
+            # forms normalize to the same file set. Returning no revision
+            # keeps llama-server's artifact reference authoritative (it
+            # embeds the resolved snapshot path and has no --revision flag).
+            # A controller-local artifact has nothing to verify here; remote
+            # selections of one are already rejected above.
+            stored = str(
+                (deployment.get("model") or {}).get("artifact")
+                or (deployment.get("settings") or {}).get("artifact")
+                or ""
+            )
+            relative, pinned = self._clone_llama_artifact_identity(
+                repository, stored,
+            )
+            if relative is None:
+                return None
+            files = self._expand_gguf_shard_files(
+                self._validate_public_gguf_artifact(repository, relative, None),
+            )
+            resolved = await self._resolved_model_revision(
+                repository, pinned or revision or "main",
+            )
+            presence = getattr(self.manager, "node_has_model_files", None)
+            if not callable(presence):
+                raise ValueError(
+                    "selected node(s) cannot verify the cached GGUF "
+                    "artifact; update their SparkDeck agent"
+                )
+            missing = []
+            for node_id in node_ids:
+                try:
+                    has_files = await presence(
+                        node_id, repository, resolved, files,
+                    )
+                except Exception:
+                    has_files = False
+                if not has_files:
+                    missing.append(node_id)
+            if missing:
+                raise ValueError(
+                    "model weights are not available on selected node(s): "
+                    + ", ".join(missing)
+                )
+            return None
         inventory = await self.manager.model_cache_inventory()
         cached = {
             node.get("id"): next((

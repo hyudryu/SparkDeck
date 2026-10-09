@@ -829,6 +829,103 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(launch["llama_context_length"], 4096)
         self.assertNotIn("--revision", launch["extra_args"])
 
+    def _stopped_llama_member(self, artifact: str = "FP16/model-F16.gguf") -> None:
+        """A launched-then-stopped llama.cpp member linked to its cluster."""
+        self.service.store.add_deployment(Deployment(
+            id="llama-live", alias="llama-live", runtime=RuntimeKind.LLAMA_CPP,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model", artifact=artifact),
+            container_name="cluster-old-r0-model",
+            settings={
+                "manager_deployment_id": "cluster-old",
+                "node_ids": ["remote-1"], "deployment_mode": "single",
+                "artifact": artifact,
+            },
+        ), "http://127.0.0.1:8123")
+        self.manager.deployments = [{
+            "id": "cluster-old", "status": "stopped", "engine": "llama.cpp",
+            "mode": "single", "node_ids": ["remote-1"],
+            "sparkdeck_record_id": "llama-live",
+            "launch_settings": {
+                "engine": "llama.cpp", "deployment_mode": "single",
+                "node_ids": ["remote-1"], "extra_args": [],
+                "llama_artifact": (
+                    f"models--org--model/snapshots/{'a' * 40}/{artifact}"
+                ),
+            },
+            "members": [{
+                "node_id": "remote-1", "rank": 0,
+                "container_name": "cluster-old-r0-model",
+            }],
+        }]
+
+    def _resolvable_revision(self) -> None:
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": "a" * 40,
+        })
+        self.manager.virtual_nas = virtual_nas
+
+    async def test_llama_relaunch_verifies_the_selected_shard_set_before_removing_ranks(self):
+        """A relocation onto a node missing the selected GGUF shard must fail
+        before Manager removes the serving ranks, and the check must be
+        per-file: a selective snapshot never populates the whole-repo
+        inventory."""
+        self._resolvable_revision()
+        self.manager.node_has_model_files = AsyncMock(return_value=False)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+        self._stopped_llama_member()
+
+        with self.assertRaisesRegex(ValueError, "model weights are not available"):
+            await self.service.deployment_action("llama-live", "start", ["remote-1"])
+
+        self.manager.deployment_action.assert_not_awaited()
+        self.manager.model_cache_inventory.assert_not_awaited()
+        self.manager.node_has_model_files.assert_awaited_once()
+
+    async def test_llama_relaunch_accepts_a_partial_snapshot_when_the_selected_shards_are_cached(self):
+        """The selected files are the readiness signal: a deliberately
+        partial repository snapshot must not block a relocation."""
+        self._resolvable_revision()
+        self.manager.node_has_model_files = AsyncMock(return_value=True)
+        self.manager.model_cache_inventory.return_value = [{
+            "id": "remote-1", "models": [{
+                "model_id": "org/model", "partial": True, "revisions": [],
+            }],
+        }]
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+        self._stopped_llama_member()
+
+        await self.service.deployment_action("llama-live", "start", ["remote-1"])
+
+        self.manager.deployment_action.assert_awaited_once_with(
+            "cluster-old", "start", ["remote-1"],
+        )
+        self.manager.model_cache_inventory.assert_not_awaited()
+
+    async def test_llama_selection_rejects_remote_nodes_for_a_controller_local_artifact(self):
+        """A worker selected for a controller-local GGUF is rejected by the
+        selection revalidation itself, so no destructive relaunch can start
+        against a placement that could never load the file."""
+        with self.assertRaisesRegex(
+            ValueError, "can only run on the controller node",
+        ):
+            await self.service._validate_start_selection(
+                {
+                    "runtime": "llama.cpp",
+                    "model": {
+                        "repository": "org/model",
+                        "artifact": str(Path(self.temp.name) / "local.gguf"),
+                    },
+                    "settings": {},
+                },
+                ["remote-1"], {},
+            )
+
     async def test_llama_bookmark_without_nodes_prepares_controller_gguf_at_start(self):
         revision = "b" * 40
         model_root = Path(self.temp.name) / "models--org--model"

@@ -45,6 +45,40 @@ class HuggingFaceCatalogTests(unittest.IsolatedAsyncioTestCase):
         # vLLM and SGLang remain available for the general case.
         self.assertTrue(support["org/chat-model"]["vllm"])
 
+    async def test_strata_compatibility_tracks_the_upstream_families(self):
+        """The engine's own catalogue pins the checkpoint families, so the
+        catalog reports other listings as unsupported instead of offering a
+        launch that cannot start."""
+        async def handler(request):
+            return httpx.Response(200, json=[
+                # The upstream installer's original quant family.
+                {
+                    "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+                    "siblings": [{"rfilename": "x.gguf", "size": 1}],
+                },
+                # A GGUF repository outside the pinned families.
+                {
+                    "id": "org/other-gguf",
+                    "siblings": [{"rfilename": "x.gguf", "size": 1}],
+                },
+            ])
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        items = await HuggingFaceCatalog(http).search("gguf", 10)
+        await http.aclose()
+
+        support = {
+            item["id"]: {
+                entry["runtime"]: entry["supported"]
+                for entry in item["runtime_compatibility"]
+            }
+            for item in items
+        }
+        self.assertTrue(
+            support["ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"]["strata"],
+        )
+        self.assertFalse(support["org/other-gguf"]["strata"])
+
     async def test_search_forwards_query_limit_sort_and_private_token(self):
         captured = []
 

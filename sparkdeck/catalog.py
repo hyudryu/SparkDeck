@@ -53,6 +53,18 @@ async def _keyed_lock(pool: dict[Any, dict[str, Any]], key: Any):
             pool.pop(key, None)
 
 
+# The upstream Strata installer's pinned checkpoint families. The engine's
+# own catalogue rejects anything outside these repositories, so the catalog
+# reports other listings as unsupported instead of offering a launch that
+# cannot start.
+STRATA_FAMILY_REPOSITORIES = frozenset({
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    "unsloth/Qwen3.8-Flash-Next-GGUF",
+})
+
+
 class HuggingFaceCatalog:
     def __init__(
         self,
@@ -434,6 +446,17 @@ class HuggingFaceCatalog:
                 "reason": (
                     "NInfer requires a repository that ships a compiled "
                     ".ninfer artifact."
+                ),
+            },
+            # A Strata deployment runs one of the upstream installer's pinned
+            # Qwen3.8-Flash-Next checkpoint families; the engine's own
+            # catalogue rejects anything else.
+            {
+                "runtime": "strata",
+                "supported": repository in STRATA_FAMILY_REPOSITORIES,
+                "reason": (
+                    "Strata runs the upstream-pinned Qwen3.8-Flash-Next "
+                    "checkpoint families."
                 ),
             },
         ]

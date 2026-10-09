@@ -15,10 +15,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
+import docker
+
 from manager import (
     DEFAULT_STRATA_IMAGE, DEPLOYMENT_LABEL, ENGINE_LABEL,
     Manager, MODE_LABEL, NNODES_LABEL, NODE_LABEL, RANK_LABEL,
-    _STRATA_SERVE_PORT, _SUPPORTED_ENGINES,
+    STRATA_VOLUME_LABEL, _STRATA_SERVE_PORT, _SUPPORTED_ENGINES,
+    _node_nvidia_driver_version,
 )
 from cluster import STRATA_CAPABILITY
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
@@ -44,8 +47,12 @@ def _manager() -> Manager:
     image = Mock()
     image.attrs = {"Config": {"Env": []}}
     manager.client.images.get = Mock(return_value=image)
+    manager.client.volumes = Mock()
+    manager.client.volumes.get = Mock(side_effect=docker.errors.NotFound("x"))
+    manager.client.volumes.create = Mock()
+    manager.client.volumes.list = Mock(return_value=[])
     manager._allocate_port = AsyncMock(return_value=8123)
-    manager._build_volumes = Mock(return_value={
+    manager._build_volumes = Mock(side_effect=lambda *a, **k: {
         "/host/cache": {"bind": "/root/.cache/huggingface", "mode": "rw"},
     })
     manager._run_managed_container = Mock(return_value=container)
@@ -56,6 +63,14 @@ def _manager() -> Manager:
     manager.cluster_member_launches = {}
     manager.evict_other_backends = AsyncMock()
     return manager
+
+
+def _data_volume(manager) -> str:
+    options = manager._run_managed_container.call_args.args[0]
+    return next(
+        name for name in options["volumes"]
+        if name.startswith("sparkdeck-strata-")
+    )
 
 
 async def _launch(manager, **overrides):
@@ -150,13 +165,106 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
         container."""
         manager = _manager()
 
-        await _launch(manager, name="strata-replica")
+        await _launch(manager, sparkdeck_deployment_id="dep-1")
 
         volumes = manager._run_managed_container.call_args.args[0]["volumes"]
+        data_volumes = [
+            name for name in volumes if name.startswith("sparkdeck-strata-")
+        ]
+        self.assertEqual(len(data_volumes), 1)
+        self.assertTrue(data_volumes[0].startswith("sparkdeck-strata-dep-1-"))
         self.assertEqual(
-            volumes["sparkdeck-strata-strata-replica"],
-            {"bind": "/data", "mode": "rw"},
+            volumes[data_volumes[0]], {"bind": "/data", "mode": "rw"},
         )
+        created = manager.client.volumes.create.call_args
+        self.assertEqual(created.args[0], data_volumes[0])
+        self.assertEqual(
+            created.kwargs["labels"][STRATA_VOLUME_LABEL], "dep-1",
+        )
+
+    async def test_a_config_change_lands_in_a_fresh_volume(self):
+        """The upstream entrypoint ignores new CONTEXT/KV values while a
+        saved config exists, so a config-affecting edit must target a fresh
+        volume whose setup runs with the new settings."""
+        manager = _manager()
+
+        await _launch(manager, environment={"CONTEXT": "8192"})
+        first = _data_volume(manager)
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+        await _launch(manager, environment={"CONTEXT": "16384"})
+        second = _data_volume(manager)
+
+        self.assertNotEqual(first, second)
+
+        # An unchanged relaunch reuses the prepared pack.
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+        await _launch(manager, environment={"CONTEXT": "16384"})
+        self.assertEqual(_data_volume(manager), second)
+
+    async def test_the_hf_credential_is_not_part_of_the_volume_fingerprint(self):
+        """Rotating the HF token must not re-prepare the pack."""
+        first = Manager._strata_setup_fingerprint(
+            {"MODEL": "IQ2_XS", "HF_TOKEN": "a"},
+        )
+        second = Manager._strata_setup_fingerprint(
+            {"MODEL": "IQ2_XS", "HF_TOKEN": "b"},
+        )
+        self.assertEqual(first, second)
+
+    async def test_stale_volumes_are_pruned_after_a_relaunch(self):
+        manager = _manager()
+        stale = Mock()
+        stale.name = "sparkdeck-strata-dep-1-deadbeef0000"
+        stale.remove = Mock()
+        current = Mock()
+        current.name = "sparkdeck-strata-dep-1-cafebabbeef1"
+        foreign = Mock()
+        foreign.name = "sparkdeck-strata-other-000000000000"
+        manager.client.volumes.list = Mock(
+            return_value=[stale, current, foreign],
+        )
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+
+        await _launch(manager, sparkdeck_deployment_id="dep-1")
+
+        manager.client.volumes.create.assert_called_once()
+        stale.remove.assert_called_once()
+        foreign.remove.assert_not_called()
+
+    async def test_delete_removes_every_data_volume_of_the_deployment(self):
+        manager = _manager()
+        volume = Mock()
+        volume.name = "sparkdeck-strata-dep-9-r1-deadbeef0000"
+        volume.remove = Mock()
+        manager.client.volumes.list = Mock(return_value=[volume])
+        labels = {
+            ENGINE_LABEL: "strata", DEPLOYMENT_LABEL: "dep-9",
+            NODE_LABEL: "spark-2", RANK_LABEL: "1",
+        }
+
+        manager._remove_strata_data_volumes(labels)
+
+        volume.remove.assert_called_once()
+        manager.client.volumes.list.assert_called_once_with(
+            filters={"name": "sparkdeck-strata-dep-9-r1"},
+        )
+
+    async def test_delete_keeps_non_strata_volumes(self):
+        manager = _manager()
+        volume = Mock()
+        volume.remove = Mock()
+        manager.client.volumes.list = Mock(return_value=[volume])
+
+        manager._remove_strata_data_volumes({ENGINE_LABEL: "vllm"})
+
+        manager.client.volumes.list.assert_not_called()
+        volume.remove.assert_not_called()
 
     async def test_memlock_ulimit_is_lifted(self):
         """The engine locks part of host RAM for the expert residency; the
@@ -216,6 +324,54 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
                 await _launch(manager)
         manager.evict_other_backends.assert_not_awaited()
         manager._run_managed_container.assert_not_called()
+
+    async def test_an_old_driver_is_rejected_before_eviction(self):
+        """The default upstream image needs driver 580+; on an older driver
+        the container can never start, so the rejection must happen before
+        healthy backends are evicted."""
+        manager = _manager()
+
+        with patch(
+            "manager._node_nvidia_driver_version", return_value=570,
+        ):
+            with self.assertRaisesRegex(ValueError, "driver 580"):
+                await _launch(manager)
+        manager.evict_other_backends.assert_not_awaited()
+
+    async def test_a_current_driver_launches(self):
+        manager = _manager()
+
+        with patch(
+            "manager._node_nvidia_driver_version", return_value=580,
+        ):
+            await _launch(manager)
+        manager._run_managed_container.assert_called_once()
+
+    async def test_an_unknown_driver_version_defers_to_the_presence_check(self):
+        manager = _manager()
+
+        with patch(
+            "manager._node_nvidia_driver_version", return_value=None,
+        ):
+            await _launch(manager)
+        manager._run_managed_container.assert_called_once()
+
+    async def test_a_custom_image_is_not_gated_on_the_driver_floor(self):
+        manager = _manager()
+
+        with patch(
+            "manager._node_nvidia_driver_version", return_value=570,
+        ):
+            await _launch(manager, image="registry.example/strata:cuda12")
+        manager._run_managed_container.assert_called_once()
+
+    def test_the_driver_version_helper_parses_the_major(self):
+        with patch("subprocess.run") as run:
+            run.return_value = Mock(returncode=0, stdout="566.36\r\n")
+            self.assertEqual(_node_nvidia_driver_version(), 566)
+        with patch("subprocess.run") as run:
+            run.return_value = Mock(returncode=1, stdout="")
+            self.assertIsNone(_node_nvidia_driver_version())
 
     async def test_a_chat_engine_launch_evicts_other_backends(self):
         manager = _manager()
@@ -384,6 +540,16 @@ class StrataContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KV"):
             strata_launch_environment({"KV": "fp8"})
 
+    def test_managed_port_and_host_variables_are_rejected(self):
+        """SparkDeck publishes the allocated host port against the fixed
+        container port and builds the readiness route from it, so an
+        override would break every request while the container still
+        reports healthy."""
+        with self.assertRaisesRegex(ValueError, "PORT"):
+            strata_launch_environment({"PORT": "9090"})
+        with self.assertRaisesRegex(ValueError, "HOST"):
+            strata_launch_environment({"HOST": "127.0.0.1"})
+
     def test_validate_strata_model_defaults_and_matrix(self):
         self.assertEqual(validate_strata_model("", ""), ("IQ2_XS", "qwen"))
         self.assertEqual(
@@ -497,6 +663,23 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
         manager = _FakeClusterManager()
         service = SparkDeckService(manager, Path(temp.name))
         return manager, service, temp
+
+    async def test_cluster_launch_body_reads_the_bookmarked_kv_control(self):
+        """A never-started bookmark persists the KV dropdown under
+        launch_controls rather than a top-level settings key."""
+        manager, service, temp = self._service()
+        try:
+            body = service._cluster_launch_body(
+                RuntimeKind.STRATA, "org/model", "alias", "dep-1",
+                ModelIdentity("org/model"),
+                {"launch_controls": {"kv_cache_dtype": "k8v4"}},
+                ["spark-2"], "single", None,
+            )
+            self.assertEqual(body["environment"]["KV"], "k8v4")
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
 
     async def test_cluster_launch_body_seeds_the_environment(self):
         manager, service, temp = self._service()

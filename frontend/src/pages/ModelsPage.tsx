@@ -1239,7 +1239,10 @@ export function ModelsPage() {
               ? runtimeFileMounts.map(({ source, target }) => ({ source: source.trim(), target: target.trim() }))
               : undefined)
           : undefined,
-        extra_args: form.managed ? shellSplit(extraFlags) : [],
+        // Strata's entrypoint has no flag surface: Manager rejects any
+        // extra argv, so flags typed for a previous runtime are dropped
+        // instead of saving a deployment that cannot launch.
+        extra_args: form.managed && form.runtime !== 'strata' ? shellSplit(extraFlags) : [],
         environment: form.managed && (form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer' || form.runtime === 'strata')
           ? (runtimeEnvironment.trim() || editing
               ? parseEnvironment(runtimeEnvironment)
@@ -2823,6 +2826,7 @@ export function ModelsPage() {
               {form.managed && form.runtime === 'vllm' && <label className="field"><span>vLLM image</span><input required value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="nvcr.io/nvidia/vllm:26.03.post1-py3" /><small>The container image pulled on every selected node. Change it to pin a different vLLM build or private registry tag.</small></label>}
               {form.managed && form.runtime === 'tensorfold' && <label className="field"><span>TensorFold image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/tensorfold:latest" /><small>The container image pulled on every selected node. TensorFold has no upstream image; build {`sparkdeck/tensorfold:latest`} from <code>tensorfold/Dockerfile</code> or point this at a registry tag whose entrypoint is the <code>tensorfold</code> CLI.</small></label>}
               {form.managed && form.runtime === 'ninfer' && <label className="field"><span>NInfer image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/ninfer:latest" /><small>The container image pulled on every selected node. NInfer has no upstream registry image; build {`sparkdeck/ninfer:latest`} from the NInfer repository Dockerfile or point this at a registry tag that ships the <code>ninfer-serve</code> binary.</small></label>}
+              {form.managed && form.runtime === 'strata' && <label className="field"><span>Strata image</span><input value={form.settings.image ?? ''} onChange={(event) => setForm({ ...form, settings: { ...form.settings, image: event.target.value } })} placeholder="sparkdeck/strata:latest" /><small>The container image pulled on every selected node. Strata has no upstream registry image; build {`sparkdeck/strata:latest`} from the Strata repository Dockerfile or point this at a registry tag carrying the upstream entrypoint.</small></label>}
               {!editingDeployment && cachedModels.length > 0 && <label className="field"><span>Or pick a model already on the cluster</span>                <select
                   value={cachedModels.some((entry) => entry.modelId === form.model_id) ? form.model_id : ''}
                   onChange={(event) => {
@@ -2940,7 +2944,7 @@ export function ModelsPage() {
                   {(form.runtime === 'vllm' || form.runtime === 'tensorfold' || form.runtime === 'sglang' || form.runtime === 'ninfer' || form.runtime === 'strata') && <label className="field"><span>Runtime environment variables</span><textarea rows={8} spellCheck={false} placeholder={form.runtime === 'vllm' ? "HF_HUB_OFFLINE=1&#10;VLLM_CACHE_ROOT=/cache/clusterops-runtime/vllm" : form.runtime === 'strata' ? "MODEL=IQ2_XS&#10;CONTEXT=32768" : "HF_HUB_OFFLINE=1&#10;PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"} value={runtimeEnvironment} onChange={(event) => setRuntimeEnvironment(event.target.value)} /><small>One NAME=value per line. Stored as plain text and applied to the container; do not enter secrets.</small></label>}
                   {form.runtime === 'sglang' && <label className="field"><span>CPU affinity</span><input aria-label="CPU affinity" placeholder="5-9,15-19" value={form.settings.sg_cpu_affinity ?? ''} onChange={(event) => setForm((current) => ({ ...current, settings: { ...current.settings, sg_cpu_affinity: event.target.value } }))} /><small>Optional CPU IDs or ranges for each container. Leave blank to use all available CPUs.</small></label>}
                   {form.runtime === 'vllm' && <RuntimeFileMountsEditor mounts={runtimeFileMounts} onChange={setRuntimeFileMounts} />}
-                  <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>
+                  {!(form.managed && form.runtime === 'strata') && <label className="field"><span>Extra flags</span><textarea rows={3} spellCheck={false} placeholder="--kv-cache-dtype fp8 --max-num-seqs 32 --enable-prefix-caching" value={extraFlags} onChange={(event) => setExtraFlags(event.target.value)} /></label>}
                   <p className="field-note">Passed to the runtime as-is. Context length and tensor parallel size above take precedence over duplicate flags here.</p>
                 </div>}
               </>}

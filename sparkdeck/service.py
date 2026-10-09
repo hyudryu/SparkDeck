@@ -3990,7 +3990,10 @@ class SparkDeckService:
             launch_body["environment"] = strata_launch_environment(
                 settings.get("environment"),
                 settings.get("context_length") or settings.get("context_window"),
-                settings.get("kv_cache_dtype"),
+                # A never-started bookmark persists the KV dropdown under
+                # launch_controls rather than a top-level settings key.
+                settings.get("kv_cache_dtype")
+                or (settings.get("launch_controls") or {}).get("kv_cache_dtype"),
             )
         return launch_body
 
@@ -8219,7 +8222,7 @@ class SparkDeckService:
             and deployment.get("runtime") in (
                 RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
                 RuntimeKind.LAYA.value, RuntimeKind.TENSORFOLD.value,
-                RuntimeKind.NINFER.value,
+                RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
             )
         ):
             route_kwargs = (

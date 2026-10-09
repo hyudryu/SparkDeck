@@ -532,7 +532,7 @@ function ModelRow({
           <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
           <option value="tensorfold" disabled={compatibilityByRuntime.get('tensorfold') === false}>TensorFold</option>
           <option value="ninfer" disabled={compatibilityByRuntime.get('ninfer') === false}>NInfer</option>
-          <option value="strata">Strata</option>
+          <option value="strata" disabled={compatibilityByRuntime.get('strata') === false}>Strata</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}

@@ -100,6 +100,16 @@ def strata_launch_environment(
         merged["KV"] = kv
     if kv and kv not in ("int8", "q4_0", "k8v4"):
         raise ValueError("the Strata KV variable must be int8, q4_0, or k8v4")
+    for managed in ("PORT", "HOST"):
+        if managed in merged:
+            # The entrypoint reads the server port and bind address from
+            # these variables, but SparkDeck publishes the allocated host
+            # port against the fixed container port and builds the readiness
+            # route from it, so an override would break every request while
+            # the container still reports healthy.
+            raise ValueError(
+                f"the Strata {managed} variable is managed by SparkDeck"
+            )
     merged.setdefault("MODEL", "IQ2_XS")
     merged.setdefault("FAMILY", "qwen")
     return merged

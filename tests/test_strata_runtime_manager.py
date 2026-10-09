@@ -20,8 +20,8 @@ import docker
 from manager import (
     DEFAULT_STRATA_IMAGE, DEPLOYMENT_LABEL, ENGINE_LABEL,
     Manager, MODE_LABEL, NNODES_LABEL, NODE_LABEL, RANK_LABEL,
-    SERVED_MODEL_LABEL, STRATA_VOLUME_LABEL, _STRATA_SERVE_PORT,
-    _SUPPORTED_ENGINES, _node_nvidia_driver_version,
+    SERVED_MODEL_LABEL, STRATA_VOLUME_KEY_LABEL, STRATA_VOLUME_LABEL,
+    _STRATA_SERVE_PORT, _SUPPORTED_ENGINES, _node_nvidia_driver_version,
 )
 from cluster import STRATA_CAPABILITY, STRATA_SERVED_NAME_CAPABILITY
 from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
@@ -261,6 +261,168 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
             {"MODEL": "IQ2_XS", STRATA_SERVED_MODEL_VARIABLE: "new-name"},
         )
         self.assertEqual(first, second)
+
+    async def test_a_cluster_member_keys_its_volume_by_the_sparkdeck_record(self):
+        """A relocation relaunch issues a fresh Manager deployment id; the
+        prepared pack must be keyed by the stable SparkDeck record so the
+        replacement reuses it instead of re-downloading."""
+        manager = _manager()
+        member = {
+            "deployment_id": "cluster-1", "node_id": "spark-2", "rank": 1,
+            "mode": "replicated", "nnodes": 2,
+        }
+
+        await _launch(
+            manager, name="strata-replica", cluster_member=member,
+            sparkdeck_deployment_id="record-7",
+        )
+
+        options = manager._run_managed_container.call_args.args[0]
+        volume = _data_volume(manager)
+        self.assertTrue(volume.startswith("sparkdeck-strata-record-7-r1-"))
+        self.assertEqual(
+            options["labels"][STRATA_VOLUME_KEY_LABEL], "record-7-r1",
+        )
+        created = manager.client.volumes.create.call_args
+        self.assertEqual(
+            created.kwargs["labels"][STRATA_VOLUME_LABEL], "record-7-r1",
+        )
+
+    async def test_a_cluster_member_without_a_record_keeps_the_cluster_key(self):
+        """Direct Manager launches carry no SparkDeck record; the cluster
+        member identity remains the volume key there."""
+        manager = _manager()
+        member = {
+            "deployment_id": "cluster-1", "node_id": "spark-2", "rank": 0,
+            "mode": "single", "nnodes": 1,
+        }
+
+        await _launch(manager, name="strata-direct", cluster_member=member)
+
+        volume = _data_volume(manager)
+        self.assertTrue(volume.startswith("sparkdeck-strata-cluster-1-r0-"))
+        labels = manager._run_managed_container.call_args.args[0]["labels"]
+        self.assertEqual(labels[STRATA_VOLUME_KEY_LABEL], "cluster-1-r0")
+
+    async def test_a_renamed_member_reuses_the_prepared_volume_across_cluster_ids(self):
+        """Rename-only edits relaunch under a new Manager deployment id but
+        keep the fingerprint: the same prepared volume must be reused."""
+        manager = _manager()
+
+        await _launch(
+            manager, sparkdeck_deployment_id="record-7",
+            environment={"CONTEXT": "8192"},
+            cluster_member={
+                "deployment_id": "cluster-1", "node_id": "spark-2",
+                "rank": 0, "mode": "single", "nnodes": 1,
+            },
+        )
+        first = _data_volume(manager)
+        # The prepared volume now exists on the daemon, so the relaunch
+        # finds it instead of creating a fresh one.
+        manager.client.volumes.get = Mock(return_value=Mock())
+        await _launch(
+            manager, sparkdeck_deployment_id="record-7",
+            environment={"CONTEXT": "8192"},
+            cluster_member={
+                "deployment_id": "cluster-2", "node_id": "spark-2",
+                "rank": 0, "mode": "single", "nnodes": 1,
+            },
+        )
+
+        self.assertEqual(_data_volume(manager), first)
+
+    async def test_a_context_change_under_a_new_cluster_id_prepares_fresh(self):
+        """A config-affecting edit must land in a fresh volume even though
+        the SparkDeck record id (and therefore the key prefix) is stable."""
+        manager = _manager()
+
+        await _launch(
+            manager, sparkdeck_deployment_id="record-7",
+            environment={"CONTEXT": "8192"},
+            cluster_member={
+                "deployment_id": "cluster-1", "node_id": "spark-2",
+                "rank": 0, "mode": "single", "nnodes": 1,
+            },
+        )
+        first = _data_volume(manager)
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+        await _launch(
+            manager, sparkdeck_deployment_id="record-7",
+            environment={"CONTEXT": "16384"},
+            cluster_member={
+                "deployment_id": "cluster-2", "node_id": "spark-2",
+                "rank": 0, "mode": "single", "nnodes": 1,
+            },
+        )
+
+        second = _data_volume(manager)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.startswith("sparkdeck-strata-record-7-r0-"))
+
+    async def test_relocation_removal_preserves_the_prepared_volume(self):
+        """A relocation removes the old member before creating its
+        replacement; that removal must not reclaim the volume the
+        replacement is about to reuse."""
+        manager = _manager()
+        volume = Mock()
+        volume.remove = Mock()
+        manager.client.volumes.list = Mock(return_value=[volume])
+        labels = {
+            ENGINE_LABEL: "strata", DEPLOYMENT_LABEL: "cluster-1",
+            NODE_LABEL: "spark-2", RANK_LABEL: "1",
+            STRATA_VOLUME_KEY_LABEL: "record-7-r1",
+        }
+
+        manager._remove_strata_data_volumes(labels, preserve=True)
+
+        manager.client.volumes.list.assert_not_called()
+        volume.remove.assert_not_called()
+
+    async def test_relocation_removal_still_reclaims_legacy_volumes(self):
+        """Containers created before the volume-key label existed keyed
+        their volumes by the per-launch cluster id, which a relaunch can
+        never re-derive; they keep the legacy reclaim-on-removal behavior."""
+        manager = _manager()
+        volume = Mock()
+        volume.name = "sparkdeck-strata-cluster-1-r1-deadbeef0000"
+        volume.remove = Mock()
+        manager.client.volumes.list = Mock(return_value=[volume])
+        labels = {
+            ENGINE_LABEL: "strata", DEPLOYMENT_LABEL: "cluster-1",
+            NODE_LABEL: "spark-2", RANK_LABEL: "1",
+        }
+
+        manager._remove_strata_data_volumes(labels, preserve=True)
+
+        manager.client.volumes.list.assert_called_once_with(
+            filters={"name": "sparkdeck-strata-cluster-1-r1"},
+        )
+        volume.remove.assert_called_once()
+
+    async def test_delete_prunes_by_the_stamped_volume_key(self):
+        """Real deployment deletion removes the volumes under the key the
+        container was created with, even though its DEPLOYMENT_LABEL is the
+        per-launch cluster id."""
+        manager = _manager()
+        volume = Mock()
+        volume.name = "sparkdeck-strata-record-7-r1-deadbeef0000"
+        volume.remove = Mock()
+        manager.client.volumes.list = Mock(return_value=[volume])
+        labels = {
+            ENGINE_LABEL: "strata", DEPLOYMENT_LABEL: "cluster-1",
+            NODE_LABEL: "spark-2", RANK_LABEL: "1",
+            STRATA_VOLUME_KEY_LABEL: "record-7-r1",
+        }
+
+        manager._remove_strata_data_volumes(labels)
+
+        manager.client.volumes.list.assert_called_once_with(
+            filters={"name": "sparkdeck-strata-record-7-r1"},
+        )
+        volume.remove.assert_called_once()
 
     async def test_stale_volumes_are_pruned_after_a_relaunch(self):
         manager = _manager()
@@ -1025,6 +1187,170 @@ class StrataServiceTests(unittest.IsolatedAsyncioTestCase):
             record = service.store.deployment(result["id"], include_private=True)
             self.assertIsNotNone(record)
             self.assertEqual(record["runtime"], "strata")
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    def _stopped_member_fixture(self, service, runtime: RuntimeKind) -> None:
+        """A launched-then-stopped member whose Manager cluster still exists.
+
+        This is the shape that must reach deployment_action's relaunch branch
+        (not the first-launch path): the cluster record is linked, so the
+        start with an explicit node selection revalidates before Manager
+        replaces the ranks.
+        """
+        service.store.add_deployment(Deployment(
+            id="strata-live", alias="strata-live", runtime=runtime,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            container_name="strata-org-model-8123",
+            settings={
+                "manager_deployment_id": "cluster-strata",
+                "node_ids": ["spark-2"], "deployment_mode": "single",
+            },
+        ), "http://127.0.0.1:8123")
+
+    def _linked_cluster(self, **overrides):
+        cluster = {
+            "id": "cluster-strata", "status": "stopped", "engine": "strata",
+            "mode": "single", "node_ids": ["spark-2"],
+            "sparkdeck_record_id": "strata-live",
+            "launch_settings": {
+                "engine": "strata", "deployment_mode": "single",
+                "node_ids": ["spark-2"], "extra_args": [],
+            },
+            "members": [{
+                "node_id": "spark-2", "container_name": "strata-org-model-8123",
+            }],
+        }
+        cluster.update(overrides)
+        return cluster
+
+    async def test_a_stopped_strata_member_restarts_on_selected_nodes_without_cached_weights(self):
+        """Strata downloads its pinned checkpoint inside the container, so a
+        restart with an explicit node selection must not demand the model in
+        the cluster's Hugging Face cache."""
+        manager, service, temp = self._service()
+        try:
+            manager.deployment_action = AsyncMock(
+                return_value={"ok": True, "errors": []},
+            )
+            manager.model_cache_inventory = AsyncMock(return_value=[
+                {"id": "spark-2", "models": []},
+            ])
+            self._stopped_member_fixture(service, RuntimeKind.STRATA)
+            manager.deployments = [self._linked_cluster()]
+
+            await service.deployment_action("strata-live", "start", ["spark-2"])
+
+            manager.deployment_action.assert_awaited_once_with(
+                "cluster-strata", "start", ["spark-2"],
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_a_stopped_strata_member_grows_onto_uncached_additional_nodes(self):
+        manager, service, temp = self._service()
+        try:
+            manager.deployment_action = AsyncMock(
+                return_value={"ok": True, "errors": []},
+            )
+            manager.model_cache_inventory = AsyncMock(return_value=[
+                {"id": "spark-2", "models": []},
+                {"id": "spark-3", "models": []},
+            ])
+            manager.selected_cluster_nodes = AsyncMock(return_value=[
+                {"id": "spark-2"}, {"id": "spark-3"},
+            ])
+            self._stopped_member_fixture(service, RuntimeKind.STRATA)
+            manager.deployments = [self._linked_cluster()]
+
+            await service.deployment_action(
+                "strata-live", "start", additional_node_ids=["spark-3"],
+            )
+
+            manager.deployment_action.assert_awaited_once_with(
+                "cluster-strata", "start", ["spark-2", "spark-3"], "replicated",
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_a_stopped_cache_resolved_member_still_revalidates_its_selection(self):
+        """The exemption is Strata-shaped only: a vLLM member restarted with
+        a node selection still requires the weights in the cluster cache."""
+        manager, service, temp = self._service()
+        try:
+            manager.deployment_action = AsyncMock(
+                return_value={"ok": True, "errors": []},
+            )
+            manager.model_cache_inventory = AsyncMock(return_value=[
+                {"id": "spark-2", "models": []},
+            ])
+            self._stopped_member_fixture(service, RuntimeKind.VLLM)
+            manager.deployments = [self._linked_cluster(engine="vllm")]
+
+            with self.assertRaisesRegex(ValueError, "model weights are not available"):
+                await service.deployment_action("strata-live", "start", ["spark-2"])
+            manager.deployment_action.assert_not_awaited()
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_strata_preparation_preflight_reports_a_ready_plan(self):
+        """The container fetches its own pinned checkpoint, so no plan may
+        ever size the whole repository as a required download."""
+        manager, service, temp = self._service()
+        try:
+            manager.recipe_model_preparation_preflight = AsyncMock()
+            result = await service.create_deployment({
+                "model": "org/model",
+                "alias": "strata-saved",
+                "runtime": "strata",
+                "node_ids": ["spark-2"],
+                "deployment_mode": "single",
+            })
+
+            plan = await service.deployment_preparation_preflight(
+                result["id"], ["spark-2"],
+            )
+
+            self.assertTrue(plan["eligible"])
+            self.assertEqual(plan["action"], "ready")
+            self.assertEqual(
+                [target["node_id"] for target in plan["targets"]], ["spark-2"],
+            )
+            self.assertTrue(
+                all(target["has_required_weights"] for target in plan["targets"]),
+            )
+            self.assertEqual(plan["transfer_target_node_ids"], [])
+            manager.recipe_model_preparation_preflight.assert_not_awaited()
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_strata_preparation_queues_nothing(self):
+        manager, service, temp = self._service()
+        try:
+            manager.queue_recipe_model_preparation = AsyncMock()
+            result = await service.create_deployment({
+                "model": "org/model",
+                "alias": "strata-saved",
+                "runtime": "strata",
+                "node_ids": ["spark-2"],
+                "deployment_mode": "single",
+            })
+
+            prepared = await service.deployment_prepare(result["id"], ["spark-2"])
+
+            self.assertEqual(prepared["jobs"], [])
+            self.assertIsNone(prepared["workflow_id"])
+            manager.queue_recipe_model_preparation.assert_not_awaited()
         finally:
             await manager.http.aclose()
             await service.close()

@@ -93,6 +93,13 @@ const isControllerArtifact = (deployment: Deployment) => (
   || (deployment.runtime === 'llama.cpp' && isLocalArtifact(deployment.settings.artifact))
 )
 
+// Strata downloads its own pinned checkpoint into the container's data
+// volume on first start, so no node ever needs the model cached and no
+// weight-transfer preparation step applies to it.
+const runtimeSelfManagesWeights = (deployment: Deployment) => (
+  deployment.runtime === 'strata'
+)
+
 // "Target nodes" alone is ambiguous: a selection can mean one model split
 // across the nodes (tensor parallelism) or one complete model per node
 // (parallel instances). Every picker states which one it means.
@@ -480,6 +487,7 @@ export function ModelsPage() {
         || (startSelection.deployment.direct_start && canPromoteDiscovered(startSelection.deployment))
       )
       && !isControllerArtifact(startSelection.deployment)
+      && !runtimeSelfManagesWeights(startSelection.deployment)
       && nodes.data?.length,
     ),
   )
@@ -1473,6 +1481,7 @@ export function ModelsPage() {
       deployment.status === 'saved'
       || Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
     ) && !isControllerArtifact(deployment)
+      && !runtimeSelfManagesWeights(deployment)
     setBusy(deployment.id)
     setStartError(undefined)
     setStartNotice(undefined)
@@ -1539,6 +1548,11 @@ export function ModelsPage() {
   const deploymentWeightedNodes = (deployment: Deployment) => {
     if (isControllerArtifact(deployment)) {
       return new Set(localNodeId ? [localNodeId] : [])
+    }
+    if (runtimeSelfManagesWeights(deployment)) {
+      // Every node is launchable: the container fetches its own pinned
+      // checkpoint into its data volume on first start.
+      return new Set((nodes.data ?? []).map((node) => node.id))
     }
     if (deployment.runtime === 'ninfer') {
       // A selective .ninfer download leaves the repository snapshot marked
@@ -2597,8 +2611,9 @@ export function ModelsPage() {
         const preparableLaunch = savedLaunch || adoptingDirect
         const converting = canPromoteDiscovered(deployment) && !adoptingDirect
         const controllerArtifact = isControllerArtifact(deployment)
+        const selfManagedWeights = runtimeSelfManagesWeights(deployment)
         const weighted = deploymentWeightedNodes(deployment)
-        const plan = preparableLaunch && !controllerArtifact ? startPreflight.data : undefined
+        const plan = preparableLaunch && !controllerArtifact && !selfManagedWeights ? startPreflight.data : undefined
         const planTargets = new Map((plan?.targets ?? []).map((target) => [target.node_id, target]))
         // Nodes without weights stay launchable whenever any of their own
         // preparation paths (transfer, Hugging Face download, or transfer
@@ -2646,7 +2661,8 @@ export function ModelsPage() {
           ? validDirectParallelSelection(deployment, selectedNodes)
           : nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-        const planReady = !preparableLaunch || controllerArtifact || (!startPreflight.loading && !startPreflight.error)
+        const planReady = !preparableLaunch || controllerArtifact || selfManagedWeights
+          || (!startPreflight.loading && !startPreflight.error)
         const ready = directLifecycle || (!nodes.loading && !nodes.error && planReady && exactCount && allEligible)
         const needsPrep = preparableLaunch && !controllerArtifact && nodeIds.some((id) => (
           !(planTargets.get(id)?.has_required_weights ?? weighted.has(id))
@@ -2682,13 +2698,13 @@ export function ModelsPage() {
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
             {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
-            {!directLifecycle && !controllerArtifact && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
-            {!directLifecycle && preparableLaunch && !controllerArtifact && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
+            {!directLifecycle && !controllerArtifact && !selfManagedWeights && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!directLifecycle && preparableLaunch && !controllerArtifact && !selfManagedWeights && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= (flexibleParallel ? deployment.parallel_rank_count ?? required : required) ? next : nodeIds })}
-              loading={nodes.loading || (!controllerArtifact && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
+              loading={nodes.loading || (!controllerArtifact && !selfManagedWeights && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
               error={nodes.error}
               onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}
               multiple={flexibleParallel || required > 1}

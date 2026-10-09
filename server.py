@@ -1778,10 +1778,14 @@ async def agent_check_container_environment(name: str, req: Request):
 
 
 @app.delete("/api/agent/containers/{name}")
-async def agent_remove_container(name: str, req: Request):
+async def agent_remove_container(
+    name: str, req: Request, preserve_strata_volumes: bool = False,
+):
     _require_agent(req)
     try:
-        return await manager.remove_cluster_member(name)
+        return await manager.remove_cluster_member(
+            name, preserve_strata_volumes=preserve_strata_volumes,
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 

@@ -81,6 +81,17 @@ logger = logging.getLogger(__name__)
 # bookmark validation dependency-free from Manager's import graph.
 _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
 
+# Runtimes whose weights never resolve from the cluster Hugging Face cache:
+# llama.cpp verifies a selective GGUF snapshot per node at container create,
+# NInfer resolves a selective .ninfer artifact the same way, and TensorFold
+# and Strata download their own pinned checkpoints inside the container. The
+# whole-repository cache inventory is the wrong readiness signal for all of
+# them, at first launch and on every relaunch.
+_CACHE_EXTERNAL_RUNTIMES = frozenset((
+    RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
+    RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
+))
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -4166,17 +4177,7 @@ class SparkDeckService:
             )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
-        if record.runtime not in (
-            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
-            RuntimeKind.STRATA,
-        ):
-            # Llama.cpp readiness is per-file inside the resolved snapshot and
-            # is verified by each node when its container is created; the
-            # whole-repository inventory check would reject selective GGUF
-            # snapshots that are perfectly launchable. NInfer artifacts are
-            # selective the same way; TensorFold resolves its own checkpoint,
-            # and Strata downloads its own pinned checkpoints inside the
-            # container.
+        if record.runtime.value not in _CACHE_EXTERNAL_RUNTIMES:
             cached_revision = await self._validate_start_selection(
                 deployment_dict, selected_ids, settings,
             )
@@ -5560,10 +5561,13 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching.
-            cached_start_revision = await self._validate_start_selection(
-                deployment, merged, launch_settings,
-            )
+            # revalidate before relaunching. Cache-external runtimes resolve
+            # their weights elsewhere (or verify per node at container
+            # create), so the whole-repo inventory check does not apply.
+            if str(deployment.get("runtime") or "") not in _CACHE_EXTERNAL_RUNTIMES:
+                cached_start_revision = await self._validate_start_selection(
+                    deployment, merged, launch_settings,
+                )
             if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
                 relaunch_mode = "replicated"
             node_ids = merged
@@ -5578,10 +5582,13 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching.
-            cached_start_revision = await self._validate_start_selection(
-                deployment, node_ids, launch_settings,
-            )
+            # revalidate before relaunching. Cache-external runtimes resolve
+            # their weights elsewhere (or verify per node at container
+            # create), so the whole-repo inventory check does not apply.
+            if str(deployment.get("runtime") or "") not in _CACHE_EXTERNAL_RUNTIMES:
+                cached_start_revision = await self._validate_start_selection(
+                    deployment, node_ids, launch_settings,
+                )
         if instance is not None and (node_ids is not None or additional_node_ids):
             # A per-instance grouped-sharded action addresses one engine
             # group; a node selection relocates the whole deployment. The
@@ -6336,6 +6343,29 @@ class SparkDeckService:
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
+        if deployment.get("runtime") == RuntimeKind.STRATA.value:
+            # Strata downloads its own pinned checkpoint into the container's
+            # data volume on first start, so the cluster cache never holds the
+            # weights and sizing the whole repository would demand a
+            # preparation no launch ever needs.
+            selected_ids = [
+                str(item).strip() for item in node_ids if str(item).strip()
+            ]
+            return {
+                "enabled": True, "model_id": model, "revision": revision,
+                "sources": [],
+                "targets": [
+                    {
+                        "node_id": node_id, "node_name": node_id,
+                        "eligible": True, "has_required_weights": True,
+                    }
+                    for node_id in selected_ids
+                ],
+                "node_ids": selected_ids, "eligible": True,
+                "action": "ready", "download_node_id": None,
+                "download_node_ids": [],
+                "transfer_target_node_ids": [], "reason": None,
+            }
         return await self.manager.recipe_model_preparation_preflight(
             model, revision, node_ids,
         )
@@ -6349,6 +6379,16 @@ class SparkDeckService:
             deployment_id,
         )
         files = self._llama_selective_artifact(deployment, model)
+        if deployment.get("runtime") == RuntimeKind.STRATA.value:
+            # Nothing to transfer: the container fetches its own pinned
+            # checkpoint inside its data volume on first start.
+            selected_ids = [
+                str(item).strip() for item in node_ids if str(item).strip()
+            ]
+            return {
+                "workflow_id": None, "job_ids": [], "jobs": [],
+                "node_ids": selected_ids, "action": "ready", "plan": None,
+            }
         if files is not None:
             result = await self._prepare_llama_files(
                 deployment, model, revision, files, node_ids, download_node_id,

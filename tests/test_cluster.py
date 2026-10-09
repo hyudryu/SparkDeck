@@ -4644,7 +4644,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             removed = []
             launched = []
 
-            async def member_action(member, action):
+            async def member_action(member, action, **kwargs):
                 removed.append((member["container_name"], action))
                 return {"ok": True}
 
@@ -4696,7 +4696,7 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             removed = []
             launched = []
 
-            async def member_action(member, action):
+            async def member_action(member, action, **kwargs):
                 removed.append((member["container_name"], action))
                 return {"ok": True}
 

@@ -9528,20 +9528,27 @@ class Manager:
             # an unmatched pair is unreachable afterwards, so its removal
             # must reclaim the volume instead of leaking it.
             reused = self._strata_replacement_ranks(launch_body)
+            members = list(deployment.get("members", []))
+            preserve_flags = [
+                reused.get(str(member.get("node_id")))
+                == int(member.get("rank") or 0)
+                for member in members
+            ]
             removed = await asyncio.gather(
                 *[
                     self._member_action(
                         member, "remove",
-                        preserve_strata_volumes=reused.get(
-                            str(member.get("node_id")),
-                        ) == int(member.get("rank") or 0),
+                        preserve_strata_volumes=preserve,
                     )
-                    for member in deployment.get("members", [])
+                    for member, preserve in zip(members, preserve_flags)
                 ],
                 return_exceptions=True,
             )
             remove_errors = self._member_action_errors(removed, "remove")
             if remove_errors:
+                await self._reclaim_aborted_strata_removals(
+                    launch_body, members, preserve_flags, removed,
+                )
                 deployment["status"] = "stopped"
                 deployment["error"] = "; ".join(remove_errors)
                 if environment_drift:
@@ -10204,23 +10211,33 @@ class Manager:
                 ) from exc
             raise
         reused = self._strata_replacement_ranks(launch_body)
+        members = list(deployment.get("members") or [])
+        preserve_flags = [
+            reused.get(str(member.get("node_id")))
+            == int(member.get("rank") or 0)
+            for member in members
+        ]
         removed = await asyncio.gather(*(
             self._member_action(
                 member, "remove",
-                preserve_strata_volumes=reused.get(
-                    str(member.get("node_id")),
-                ) == int(member.get("rank") or 0),
+                preserve_strata_volumes=preserve,
             )
-            for member in deployment.get("members") or []
+            for member, preserve in zip(members, preserve_flags)
         ), return_exceptions=True)
         remove_errors = self._member_action_errors(removed, "remove")
         if remove_errors:
             error = RuntimeError("; ".join(remove_errors))
-            if self._interrupted_launch_reconnect_error(error):
-                raise _InterruptedLaunchDeferred(
-                    f"Waiting for selected nodes to reconnect: {error}"
-                ) from error
-            raise error
+            reconnecting = self._interrupted_launch_reconnect_error(error)
+            if not reconnecting:
+                # Recovery is terminal here: the already-removed members'
+                # preserved volumes have no container left to address them.
+                await self._reclaim_aborted_strata_removals(
+                    launch_body, members, preserve_flags, removed,
+                )
+                raise error
+            raise _InterruptedLaunchDeferred(
+                f"Waiting for selected nodes to reconnect: {error}"
+            ) from error
 
         # Remove the stale reservation only after its old member names have
         # been cleaned up. create_deployment then atomically accepts a fresh
@@ -17750,9 +17767,32 @@ class Manager:
         ]
         if not record or not selected:
             return {"ok": True, "errors": []}
-        keys = [f"{record}-r{rank}" for rank in range(len(selected))]
+        return await self.prune_strata_member_volumes(record, [
+            (node_id, rank)
+            for node_id in selected
+            for rank in range(len(selected))
+        ])
+
+    async def prune_strata_member_volumes(
+        self, record_id: str, placements: list[tuple[str, int]],
+    ) -> dict:
+        """Reclaim the prepared volumes of the given (node, rank) placements.
+
+        Used when a preserved member's container is already gone and no
+        label remains to address its volume. Best effort: a stale volume
+        must never fail the surrounding recovery.
+        """
+        record = str(record_id or "").strip()
+        keys_by_node: dict[str, list[str]] = {}
+        for node_id, rank in placements:
+            node = str(node_id or "").strip()
+            if not node:
+                continue
+            keys_by_node.setdefault(node, []).append(f"{record}-r{rank}")
+        if not record or not keys_by_node:
+            return {"ok": True, "errors": []}
         errors = []
-        for node_id in dict.fromkeys(selected):
+        for node_id, keys in keys_by_node.items():
             try:
                 if node_id == LOCAL_NODE_ID:
                     await asyncio.to_thread(
@@ -17767,6 +17807,36 @@ class Manager:
                 errors.append(f"{node_id}: {exc}")
         return {"ok": not errors, "errors": errors}
 
+    async def _reclaim_aborted_strata_removals(
+        self, launch_body: dict, members: list[dict],
+        preserve_flags: list[bool], results: list,
+    ) -> None:
+        """Reclaim the volumes of Strata members removed before an abort.
+
+        A relocation preserves the volume of each member whose (node, rank)
+        pair the replacement will reuse. When a later member's removal fails,
+        the relaunch aborts and the already-removed members' containers no
+        longer carry the labels that address their volumes, so their
+        preserved keys must be reclaimed here or they can never be found
+        again. Best effort: the deploy error path must not fail on cleanup.
+        """
+        if str(launch_body.get("engine") or "") != "strata":
+            return
+        record = str(launch_body.get("sparkdeck_record_id") or "").strip()
+        placements = [
+            (str(member.get("node_id")), int(member.get("rank") or 0))
+            for member, preserve, result in zip(
+                members, preserve_flags, results,
+            )
+            if preserve and not isinstance(result, Exception)
+        ]
+        if not record or not placements:
+            return
+        try:
+            await self.prune_strata_member_volumes(record, placements)
+        except Exception:
+            logger.exception("strata volume reclaim after aborted removal failed")
+
     @staticmethod
     def _strata_setup_fingerprint(
         environment: dict[str, str] | None, image: str | None = None,
@@ -17777,9 +17847,11 @@ class Manager:
         config is absent (or REINSTALL=1), so a config-affecting edit such as
         CONTEXT or KV must land in a fresh data volume to take effect, while
         an unchanged relaunch reuses the prepared pack. The effective image
-        is part of the identity: /data holds the prepared install
-        configuration, and a replacement image's entrypoint would skip its
-        own setup pass over artifacts prepared by the previous image.
+        is part of the identity — the daemon-resolved image ID when the
+        caller has one, so a refreshed mutable tag invalidates the pack:
+        /data holds the prepared install configuration, and a replacement
+        image's entrypoint would skip its own setup pass over artifacts
+        prepared by the previous image.
         Credential variables are excluded: rotating the HF token must not
         re-prepare the pack. The served model name is excluded too: it is
         SparkDeck routing metadata carried on the container label, and the
@@ -17972,7 +18044,7 @@ class Manager:
                     name, "checking_image", f"Checking Docker image {image}",
                     model=model, cluster_member=cluster_member,
                 )
-                self.client.images.get(image)
+                image_info = self.client.images.get(image)
             except docker.errors.ImageNotFound:
                 self._cluster_launch_update(
                     name, "pulling_image",
@@ -17980,7 +18052,14 @@ class Manager:
                     model=model, cluster_member=cluster_member,
                 )
                 print(f"[strata] pulling missing image: {image}")
-                self.client.images.pull(image)
+                image_info = self.client.images.pull(image)
+            # The daemon-resolved image ID is the pack's real identity: a
+            # refreshed mutable tag (notably the default :latest) must
+            # invalidate a prepared volume even though its name is unchanged.
+            image_id = getattr(image_info, "id", None)
+            image_identity = (
+                image_id if isinstance(image_id, str) and image_id else image
+            )
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",
                 model=model, cluster_member=cluster_member,
@@ -18014,7 +18093,9 @@ class Manager:
             # saved config exists, so a config-affecting edit lands in a
             # fresh volume whose setup runs with the new settings, while an
             # unchanged relaunch reuses the prepared pack.
-            data_volume = self._strata_data_volume(deployment_key, environment, image)
+            data_volume = self._strata_data_volume(
+                deployment_key, environment, image_identity,
+            )
             volumes[data_volume] = {"bind": "/data", "mode": "rw"}
             run_options = {
                 "image": image,

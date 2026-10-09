@@ -4797,6 +4797,57 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 [("old-r0", "remove", True), ("old-r1", "remove", False)],
             )
 
+    async def test_aborted_relocation_reclaims_the_removed_members_volume(self) -> None:
+        """When one member is removed and preserved but another removal
+        fails, the relaunch aborts; the removed member's container no longer
+        carries its volume key, so the preserved volume must be reclaimed
+        now or it is unreachable forever."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            old = {
+                "id": "deployment-old",
+                "name": "Strata cluster",
+                "model": "org/model",
+                "engine": "strata",
+                "mode": "replicated",
+                "node_ids": ["local", "remote-1"],
+                "status": "stopped",
+                "settings_dirty": False,
+                "sparkdeck_record_id": "record-7",
+                "members": [
+                    {"node_id": "local", "rank": 0, "container_name": "old-r0"},
+                    {"node_id": "remote-1", "rank": 1, "container_name": "old-r1"},
+                ],
+                "launch_settings": {
+                    "deployment_name": "Strata cluster",
+                    "model": "org/model",
+                    "engine": "strata",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["local", "remote-1"],
+                    "extra_args": [],
+                    "sparkdeck_record_id": "record-7",
+                },
+            }
+            instance.deployments = [old]
+
+            async def member_action(member, action, **kwargs):
+                if member["container_name"] == "old-r1":
+                    raise RuntimeError("Worker agent is offline")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            instance._preflight_deployment_launch = mock.AsyncMock(return_value={})
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+            instance.prune_strata_member_volumes = prune
+
+            result = await instance.deployment_action(
+                "deployment-old", "start", ["local", "remote-2"],
+            )
+
+            self.assertFalse(result["ok"])
+            prune.assert_awaited_once_with("record-7", [("local", 0)])
+
     async def test_failed_strata_replacement_reclaims_the_preserved_volumes(self) -> None:
         """After the old members are removed and before the replacement
         creates any container, a launch failure leaves the preserved volumes
@@ -5936,6 +5987,45 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
             prune.assert_awaited_once_with("record-7", ["local"])
             self.assertEqual(instance.deployments[0]["status"], "error")
+
+    async def test_resume_abort_reclaims_the_removed_members_volume(self) -> None:
+        """A terminal failure while removing stale members must reclaim the
+        volumes preserved for the members that were already removed."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.deployments_path = Path(directory) / "deployments.json"
+            instance.deployments = [{
+                "id": "old-strata", "status": "recovering",
+                "desired_state": "running", "node_ids": ["local", "remote-2"],
+                "sparkdeck_record_id": "record-7",
+                "members": [
+                    {"node_id": "local", "container_name": "old-r0", "rank": 0},
+                    {"node_id": "remote-1", "container_name": "old-r1", "rank": 1},
+                ],
+                "launch_settings": {
+                    "model": "org/model", "engine": "strata",
+                    "deployment_mode": "replicated",
+                    "node_ids": ["local", "remote-2"],
+                    "extra_args": [], "sparkdeck_record_id": "record-7",
+                },
+            }]
+            instance.selected_cluster_nodes = mock.AsyncMock(return_value=[
+                {"id": "local", "online": True, "docker_ready": True},
+            ])
+
+            async def member_action(member, action, **kwargs):
+                if member["container_name"] == "old-r1":
+                    raise ValueError("member removal was rejected")
+                return {"ok": True}
+
+            instance._member_action = member_action
+            prune = mock.AsyncMock(return_value={"ok": True, "errors": []})
+            instance.prune_strata_member_volumes = prune
+
+            with self.assertRaisesRegex(RuntimeError, "member removal was rejected"):
+                await instance._resume_interrupted_deployment("old-strata")
+
+            prune.assert_awaited_once_with("record-7", [("local", 0)])
 
     async def test_resume_keeps_strata_volumes_while_reconnecting(self) -> None:
         """A reconnect failure stays deferred, so its preserved volumes must

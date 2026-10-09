@@ -4618,9 +4618,15 @@ class SparkDeckService:
             files = self._expand_gguf_shard_files(
                 self._validate_public_gguf_artifact(repository, relative, None),
             )
-            resolved = await self._resolved_model_revision(
-                repository, pinned or revision or "main",
-            )
+            # A reference that already names an immutable snapshot needs no
+            # Hub round-trip: an offline controller must still be able to
+            # relaunch from the exact cached artifact.
+            if pinned and re.fullmatch(r"[0-9a-fA-F]{40}", pinned):
+                resolved = pinned.lower()
+            else:
+                resolved = await self._resolved_model_revision(
+                    repository, revision or "main",
+                )
             presence = getattr(self.manager, "node_has_model_files", None)
             if not callable(presence):
                 raise ValueError(

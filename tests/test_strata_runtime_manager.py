@@ -379,6 +379,28 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
+    async def test_a_refreshed_mutable_tag_lands_in_a_fresh_volume(self):
+        """The daemon-resolved image ID is the pack identity: a repointed
+        mutable tag must not skip setup over the previous image's
+        artifacts."""
+        manager = _manager()
+        first_image = Mock()
+        first_image.id = "sha256:" + "a" * 64
+        manager.client.images.get = Mock(return_value=first_image)
+
+        await _launch(manager, image="sparkdeck/strata:mutable")
+        first = _data_volume(manager)
+        manager.client.volumes.get = Mock(
+            side_effect=docker.errors.NotFound("x"),
+        )
+        second_image = Mock()
+        second_image.id = "sha256:" + "b" * 64
+        manager.client.images.get = Mock(return_value=second_image)
+        await _launch(manager, image="sparkdeck/strata:mutable")
+        second = _data_volume(manager)
+
+        self.assertNotEqual(first, second)
+
     def test_the_image_is_part_of_the_volume_fingerprint(self):
         self.assertNotEqual(
             Manager._strata_setup_fingerprint(

@@ -939,6 +939,9 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[1], "org/model")
         self.assertEqual(args[2], "a" * 40)
         self.assertEqual(args[3], ["FP16/model-F16.gguf"])
+        # A reference that already pins an immutable snapshot must not need
+        # the Hub: the relaunch has to work with an offline controller.
+        virtual_nas.resolve_download_revision.assert_not_awaited()
         self.manager.deployment_action.assert_awaited_once_with(
             "cluster-old", "start", ["remote-1"],
         )

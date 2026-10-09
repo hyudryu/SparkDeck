@@ -37,6 +37,7 @@ from cluster import (
     LOCAL_NODE_ID,
     AgentCredentials,
     NINFER_CAPABILITY,
+    NodeAgentResponseError,
     NodeRegistry,
     STRATA_CAPABILITY,
     TENSORFOLD_CAPABILITY,

@@ -63,6 +63,7 @@ const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   laya: 'Laya decisions',
   tensorfold: 'TensorFold',
   ninfer: 'NInfer',
+  strata: 'Strata',
 }
 
 function formatParameters(value?: number | null) {

@@ -319,27 +319,45 @@ class StartupBenchmarkMonitor:
         observation.update(
             startup_benchmark=True, generation=snapshot.get("generation"),
             seen_key=self._seen_key(target.fingerprint),
-            # TensorFold direct launches route through Manager like vLLM and
-            # SGLang, so their synthetic probe is an expected Manager request
-            # rather than contamination.
+            # TensorFold and NInfer launches route through Manager like vLLM
+            # and SGLang, so their synthetic probe is an expected Manager
+            # request rather than contamination.
             manager_requests_expected=int(
                 bool(target.cluster) or deployment["runtime"] in {
-                    "vllm", "sglang", "tensorfold",
+                    "vllm", "sglang", "tensorfold", "ninfer",
                 }
             ),
         )
         token = self.service._community_observation.set(observation)
         stream = None
         try:
-            body = {
-                "model": model, "prompt": "Write a detailed description of a peaceful garden in spring.",
-                "max_tokens": 200, "temperature": 0, "stream": True,
-                "stream_options": {"include_usage": True}, "ignore_eos": True,
-            }
+            # NInfer exposes Chat Completions and Responses, not the legacy
+            # /v1/completions route, so its probe uses the chat surface with
+            # a message payload.
+            is_ninfer = deployment["runtime"] == "ninfer"
+            endpoint = "chat/completions" if is_ninfer else "completions"
+            if is_ninfer:
+                body = {
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": "Write a detailed description of a peaceful garden in spring.",
+                    }],
+                    "max_tokens": 200, "temperature": 0, "stream": True,
+                    # NInfer rejects unknown top-level fields, so the vLLM-only
+                    # ignore_eos hint stays out of its probe.
+                    "stream_options": {"include_usage": True},
+                }
+            else:
+                body = {
+                    "model": model, "prompt": "Write a detailed description of a peaceful garden in spring.",
+                    "max_tokens": 200, "temperature": 0, "stream": True,
+                    "stream_options": {"include_usage": True}, "ignore_eos": True,
+                }
             started = time.monotonic()
             if target.cluster:
                 upstream = await self.manager._proxy_cluster_member(
-                    target.cluster, target.member, model, body, "completions", None,
+                    target.cluster, target.member, model, body, endpoint, None,
                     startup_benchmark=True,
                 )
                 async def hardware():
@@ -353,7 +371,7 @@ class StartupBenchmarkMonitor:
                 )
             else:
                 stream = await self.service._proxy_registered(
-                    deployment, body, "completions", None, startup_benchmark=True,
+                    deployment, body, endpoint, None, startup_benchmark=True,
                 )
                 if deployment["runtime"] == "llama.cpp" and hasattr(stream, "__aiter__"):
                     # The normal HTTP relay deliberately treats arbitrary

@@ -1727,6 +1727,7 @@ async def agent_create_container(req: Request):
             llama_context_length=body.get("llama_context_length"),
             llama_parallel_slots=body.get("llama_parallel_slots"),
             llama_gpu_layers=body.get("llama_gpu_layers"),
+            ninfer_artifact=body.get("ninfer_artifact"),
             shm_size=body.get("shm_size"),
             infiniband_device=body.get("infiniband_device"),
         )
@@ -2179,6 +2180,7 @@ async def create_container(req: Request):
             sg_mem_fraction=body.get("sg_mem_fraction"),
             sg_image=body.get("sg_image"),
             sg_cpu_affinity=body.get("sg_cpu_affinity"),
+            ninfer_artifact=body.get("ninfer_artifact"),
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -3050,8 +3052,14 @@ async def v1_update_settings(req: Request):
     if theme not in ("system", "light", "dark"):
         raise HTTPException(400, "theme must be system, light, or dark")
     default_runtime = str(body.get("default_runtime", _APP_SETTING_DEFAULTS["default_runtime"]))
-    if default_runtime not in ("vllm", "llama.cpp", "sglang", "laya", "tensorfold"):
-        raise HTTPException(400, "default_runtime must be vllm, llama.cpp, sglang, laya, or tensorfold")
+    if default_runtime not in (
+        "vllm", "llama.cpp", "sglang", "laya", "tensorfold", "ninfer",
+    ):
+        raise HTTPException(
+            400,
+            "default_runtime must be vllm, llama.cpp, sglang, laya, "
+            "tensorfold, or ninfer",
+        )
     raw_context_length = body.get(
         "default_context_length", _APP_SETTING_DEFAULTS["default_context_length"]
     )

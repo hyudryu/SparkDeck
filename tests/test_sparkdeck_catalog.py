@@ -1040,3 +1040,98 @@ class CatalogFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NinferArtifactSizeTests(unittest.TestCase):
+    """NInfer-only repositories must still report a weight size for fit."""
+
+    def test_ninfer_siblings_supply_the_artifact_size(self):
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": [
+                {"rfilename": "README.md"},
+                {"rfilename": "qwen3_8_27b_nvfp4.ninfer",
+                 "size": 15 * 1024 ** 3},
+            ],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertEqual(
+            public["ninfer_weight_size_bytes"], 15 * 1024 ** 3,
+        )
+        # NInfer-only repositories keep no generic weight estimate.
+        self.assertIsNone(public["weight_size_bytes"])
+
+    def test_partial_ninfer_sizes_do_not_invent_a_total(self):
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": [{"rfilename": "qwen3_8_27b_nvfp4.ninfer"}],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertIsNone(public["weight_size_bytes"])
+
+    def test_ninfer_size_travels_in_a_dedicated_field(self):
+        """The compiled artifact size must not replace the source-format
+        weights other runtimes estimate for the same repository."""
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/mixed-model", "name": "mixed-model",
+            "safetensors": {
+                "total": 27000000000,
+                "parameters": {"BF16": 27000000000},
+            },
+            "siblings": [
+                {"rfilename": "model.safetensors", "size": 57000000000},
+                {"rfilename": "qwen3_8_27b_nvfp4.ninfer", "size": 16106127360},
+            ],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertEqual(public["weight_size_source"], "safetensors")
+        self.assertEqual(public["ninfer_weight_size_bytes"], 16106127360)
+
+    def test_alternative_ninfer_artifacts_use_the_smallest_deployable(self):
+        """A deployment loads one artifact, so the model-level fit signal is
+        the smallest deployable option: the model stays visible whenever at
+        least one artifact fits the target GPU."""
+        from sparkdeck.catalog import HuggingFaceCatalog
+
+        item = {
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": [
+                {"rfilename": "qwen3_8_27b_fp8.ninfer", "size": 20 * 1024 ** 3},
+                {"rfilename": "qwen3_8_27b_nvfp4.ninfer",
+                 "size": 15 * 1024 ** 3},
+            ],
+        }
+        public = HuggingFaceCatalog._public_item(item)
+        self.assertEqual(
+            public["ninfer_weight_size_bytes"], 15 * 1024 ** 3,
+        )
+
+    def test_missing_ninfer_sibling_sizes_are_enriched_from_the_tree(self):
+        """A listing that names .ninfer files without sizes must still end up
+        with a fit signal once the details tree is available."""
+        from sparkdeck.catalog import (
+            HuggingFaceCatalog, _ninfer_sizes_from_tree,
+        )
+
+        raw_siblings = [
+            {"rfilename": "README.md"},
+            {"rfilename": "qwen3_8_27b_nvfp4.ninfer"},
+        ]
+        tree = [
+            {"path": "README.md", "size": 1200, "type": "file"},
+            {"path": "qwen3_8_27b_nvfp4.ninfer",
+             "size": 15 * 1024 ** 3, "type": "file"},
+        ]
+        self.assertTrue(HuggingFaceCatalog._public_item({
+            "id": "org/ninfer-model", "name": "ninfer-model",
+            "siblings": raw_siblings,
+        })["ninfer_weight_size_bytes"] is None)
+        self.assertEqual(
+            _ninfer_sizes_from_tree(raw_siblings, tree), 15 * 1024 ** 3,
+        )

@@ -36,6 +36,7 @@ from cluster import (
     AGENT_PROTOCOL_VERSION,
     LOCAL_NODE_ID,
     AgentCredentials,
+    NINFER_CAPABILITY,
     NodeAgentResponseError,
     NodeRegistry,
     TENSORFOLD_CAPABILITY,
@@ -349,9 +350,22 @@ _LAYA_SERVE_PORT = 8080
 # holds the full model, so only single and replicated layouts are supported.
 DEFAULT_TENSORFOLD_IMAGE = "sparkdeck/tensorfold:latest"
 _TENSORFOLD_SERVE_PORT = 8080
-_SUPPORTED_ENGINES = ("vllm", "sglang", "llama.cpp", "laya", "tensorfold")
+
+# NInfer (https://github.com/Neroued/ninfer) is a single-GPU OpenAI-compatible
+# engine that loads one compiled v3 ``.ninfer`` artifact. There is no upstream
+# registry image, so the default expects a locally prepared image built from
+# the NInfer repository Dockerfile (no entrypoint; the launch command is the
+# full argv). The artifact resolves from the node's shared Hugging Face cache
+# exactly like a llama.cpp GGUF artifact, and a single server holds the whole
+# artifact, so only single and replicated layouts are supported.
+DEFAULT_NINFER_IMAGE = "sparkdeck/ninfer:latest"
+_NINFER_SERVE_PORT = 8080
+_SUPPORTED_ENGINES = (
+    "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer",
+)
 # The Laya decision server and TensorFold expose no /health route; their
-# readiness signal is the OpenAI surface itself answering 200.
+# readiness signal is the OpenAI surface itself answering 200. NInfer does
+# expose GET /health, so it keeps the strict readiness probe.
 _ENGINES_WITHOUT_HEALTH_ROUTE = frozenset({"laya", "tensorfold"})
 
 
@@ -1339,8 +1353,9 @@ class Manager:
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
                 RUNTIME_FILE_MOUNTS_CAPABILITY,
-                TENSORFOLD_CAPABILITY,
-                "patched-images-v1",
+    TENSORFOLD_CAPABILITY,
+    NINFER_CAPABILITY,
+    "patched-images-v1",
                 EMBEDDINGS_CAPABILITY,
             ],
             "app_revision": getattr(self, "app_revision", None),
@@ -2540,7 +2555,7 @@ class Manager:
             tag = str(raw or "").strip()
             if tag and tag not in candidates:
                 candidates.append(tag)
-        markers = ("vllm", "sglang", "llama", "laya", "tensorfold")
+        markers = ("vllm", "sglang", "llama", "laya", "tensorfold", "ninfer")
         local: list[str] = []
         try:
             for image in self.client.images.list():
@@ -4883,6 +4898,7 @@ class Manager:
             "sg_image": body.get("sg_image") or None,
             "sg_cpu_affinity": affinity,
             "llama_artifact": body.get("llama_artifact") or None,
+            "ninfer_artifact": body.get("ninfer_artifact") or None,
             "llama_context_length": body.get("llama_context_length"),
             "llama_parallel_slots": body.get("llama_parallel_slots"),
             "llama_gpu_layers": body.get("llama_gpu_layers"),
@@ -5022,6 +5038,46 @@ class Manager:
         )
         return shlex.split(flags)
 
+    @staticmethod
+    def _validated_ninfer_speculation(method: Any, draft: Any) -> tuple[str | None, int | None]:
+        """Validate NInfer speculative controls into the (--spec, --draft-tokens) pair.
+
+        Returns ``(None, None)`` when speculation is cleared. The draft count
+        may stay ``None`` with a live method, leaving the server's backend
+        default in place.
+        """
+        method = str(method).strip() if method not in (None, "") else None
+        if method is not None and method not in ("mtp", "dflash", "dflash2"):
+            raise ValueError("speculative_method must be mtp, dflash, or dflash2")
+        if draft in (None, ""):
+            draft_int = None
+        else:
+            if isinstance(draft, bool) or (
+                isinstance(draft, float) and not draft.is_integer()
+            ):
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                )
+            try:
+                draft_int = int(draft)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                ) from exc
+            if draft_int <= 0:
+                raise ValueError(
+                    "dspark_num_speculative_tokens must be a positive integer"
+                )
+        if method == "mtp" and draft_int is not None and draft_int > 5:
+            # NInfer's MTP backend accepts 1..5 draft tokens; the wider
+            # 1..15 range belongs to DFlash and DFlash2.
+            raise ValueError("MTP draft tokens must be between 1 and 5")
+        if method in ("dflash", "dflash2") and (
+            draft_int is not None and draft_int > 15
+        ):
+            raise ValueError("DFlash draft tokens must be between 1 and 15")
+        return method, draft_int
+
     @classmethod
     def _deployment_launch_controls(cls, settings: dict) -> dict:
         """Parse common cluster controls without removing image-specific args."""
@@ -5090,6 +5146,36 @@ class Manager:
                 "speculative_method": None,
                 "draft_sample_method": None,
                 "dspark_num_speculative_tokens": None,
+                "max_cudagraph_capture_size": None,
+                "max_num_batched_tokens": None,
+                "sg_speculative_num_draft_tokens": None,
+                "sg_cuda_graph_max_bs": None,
+                "sg_chunked_prefill_size": None,
+            }
+        if engine == "ninfer":
+            # NInfer caps each sequence with --max-context, gates admission
+            # with --max-concurrency, stores KV with --kv-dtype, and speculates
+            # with the --spec/--draft-tokens pair. Thinking is on by default
+            # and only --no-thinking disables it; --preserve-thinking is an
+            # independent assistant-reasoning switch and stays an extra flag.
+            if "--no-thinking" in args:
+                thinking = "disabled"
+            else:
+                thinking = None
+            return {
+                "context_window": cls._cli_option(args, {"--max-context"}, int),
+                "max_concurrency": cls._cli_option(
+                    args, {"--max-concurrency"}, int,
+                ),
+                "tensor_parallel_size": None,
+                "pipeline_parallel_size": None,
+                "kv_cache_dtype": cls._cli_option(args, {"--kv-dtype"}),
+                "thinking_mode": thinking,
+                "speculative_method": cls._cli_option(args, {"--spec"}),
+                "draft_sample_method": None,
+                "dspark_num_speculative_tokens": cls._cli_option(
+                    args, {"--draft-tokens"}, int,
+                ),
                 "max_cudagraph_capture_size": None,
                 "max_num_batched_tokens": None,
                 "sg_speculative_num_draft_tokens": None,
@@ -5226,6 +5312,59 @@ class Manager:
                 flags = f"{flags} --no-thinking".strip()
             elif thinking != "default":
                 raise ValueError("thinking_mode must be default, enabled, or disabled")
+            try:
+                return shlex.split(flags)
+            except ValueError as exc:
+                raise ValueError("launch arguments have invalid shell quoting") from exc
+
+        if engine == "ninfer":
+            concurrency = positive_int("max_concurrency")
+            if concurrency is not None and concurrency > 8:
+                # NInfer's documented admission range is 1..8.
+                raise ValueError("max_concurrency must be between 1 and 8")
+            flags = self._replace_command_option(
+                flags, {"--max-context"}, positive_int("context_window"),
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-concurrency"}, concurrency,
+            )
+            kv_dtype = controls.get("kv_cache_dtype")
+            kv_dtype = str(kv_dtype).strip() if kv_dtype not in (None, "") else None
+            if kv_dtype is not None and kv_dtype not in (
+                "bf16", "int8", "fp8", "nvfp4", "k8v4",
+            ):
+                raise ValueError(
+                    "kv_cache_dtype must be bf16, int8, fp8, nvfp4, or k8v4"
+                )
+            flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
+            # Thinking is on by default: "enabled" and "default" just remove
+            # the --no-thinking override. --preserve-thinking is an
+            # independent assistant-reasoning switch that operators pass as
+            # an extra flag, so it is never stripped or generated here.
+            flags = re.sub(
+                r"(?<!\S)--no-thinking(?:=\S+)?", "", flags,
+            ).strip()
+            thinking = str(controls.get("thinking_mode") or "default")
+            if thinking == "disabled":
+                flags = f"{flags} --no-thinking".strip()
+            elif thinking not in ("default", "enabled"):
+                raise ValueError("thinking_mode must be default, enabled, or disabled")
+            # The speculative pair is rebuilt together: --draft-tokens without
+            # a --spec backend is not a valid launch, so clearing the method
+            # clears both, and a null tokens value with a live method leaves
+            # the server's backend default in place.
+            if "speculative_method" in controls or (
+                "dspark_num_speculative_tokens" in controls
+            ):
+                method, draft = self._validated_ninfer_speculation(
+                    controls.get("speculative_method"),
+                    controls.get("dspark_num_speculative_tokens"),
+                )
+                flags = self._replace_command_option(flags, {"--spec"}, method)
+                flags = self._replace_command_option(
+                    flags, {"--draft-tokens"},
+                    draft if method else None,
+                )
             try:
                 return shlex.split(flags)
             except ValueError as exc:
@@ -5460,9 +5599,10 @@ class Manager:
             if model_revision not in (None, "") else None
         )
         # llama.cpp pins its revision inside the cache-relative artifact path,
-        # and TensorFold resolves the checkpoint itself with no --revision
-        # flag, so neither can honour a pinned model revision.
-        if revision and engine not in ("llama.cpp", "tensorfold"):
+        # TensorFold resolves the checkpoint itself with no --revision flag,
+        # and NInfer pins its revision inside the cache-relative artifact path,
+        # so none of them can honour a pinned model revision.
+        if revision and engine not in ("llama.cpp", "tensorfold", "ninfer"):
             final_args += ["--revision", revision]
         if engine == "sglang" and quantization not in (None, ""):
             final_args += ["--quantization", str(quantization).strip()]
@@ -5724,6 +5864,48 @@ class Manager:
             "node_ids": deployment.get("node_ids") or [LOCAL_NODE_ID],
             "port": deployment.get("api_port"),
         }
+        if engine == "ninfer":
+            # Promotion must carry the artifact reference the launcher
+            # requires. The discovered command holds the in-container cache
+            # path; strip the image's cache mount so the hub-relative form
+            # is recovered.
+            artifact_path = str(load_settings.get("artifact_path") or "")
+            try:
+                cache_prefix = (
+                    f"{self._image_hf_cache_target((primary_container or {}).get('image'))}"
+                    "/hub/"
+                )
+            except Exception:
+                cache_prefix = None
+            reference = (
+                artifact_path[len(cache_prefix):]
+                if cache_prefix and artifact_path.startswith(cache_prefix)
+                else ""
+            )
+            recovered["ninfer_artifact"] = reference or None
+            # The inspection parser strips the engine-owned options from
+            # command_flags into structured keys; rebuild them into the argv
+            # so promotion keeps the runtime controls instead of silently
+            # starting with NInfer defaults.
+            structured: list[str] = []
+            if load_settings.get("context_window"):
+                structured += [
+                    "--max-context", str(load_settings["context_window"]),
+                ]
+            if load_settings.get("max_concurrency"):
+                structured += [
+                    "--max-concurrency", str(load_settings["max_concurrency"]),
+                ]
+            if load_settings.get("kv_cache_dtype"):
+                structured += [
+                    "--kv-dtype", str(load_settings["kv_cache_dtype"]),
+                ]
+            if load_settings.get("thinking_mode") == "disabled":
+                structured += ["--no-thinking"]
+            if structured:
+                recovered["extra_args"] = [
+                    *structured, *(recovered.get("extra_args") or []),
+                ]
         if engine == "sglang":
             # SGLang's managed container builder removes these flags from
             # extra_args and regenerates them from the structured fields.
@@ -6533,7 +6715,7 @@ class Manager:
         retain their original quoting and variable expressions.
         """
         cmd = [str(value) for value in (cmd or [])]
-        engine = engine if engine == "sglang" else "vllm"
+        engine = engine if engine in {"sglang", "ninfer"} else "vllm"
         command_flags = ""
         analysis_cmd = cmd
         shell_wrapped = False
@@ -6665,6 +6847,79 @@ class Manager:
                 "thinking_mode": thinking_mode,
                 "extra_args": extra_args,
                 "command_flags": command_flags,
+            }
+
+        if engine == "ninfer":
+            # NInfer launches as ``ninfer-serve <artifact> --host ...``: the
+            # artifact is positional and the serve binary replaces the vLLM
+            # ``serve`` marker, so neither anchors the generic parser. Strip
+            # the flags the structured settings keys above capture (--spec/
+            # --draft-tokens have no dedicated keys here, so they stay in
+            # extra_args for the launch-controls parser) and drop the
+            # artifact path and the thinking pair, which thinking_mode
+            # captures.
+            managed = {
+                "--host", "--port", "--max-context", "--max-concurrency",
+                "--kv-dtype",
+            }
+            skip_tokens = {"ninfer-serve"}
+            extra_args = []
+            artifact_path = None
+            artifact_seen = False
+            i = 0
+            while i < len(analysis_cmd):
+                token = analysis_cmd[i]
+                key = token.split("=", 1)[0]
+                if key in managed:
+                    if "=" not in token and i + 1 < len(analysis_cmd):
+                        i += 2
+                    else:
+                        i += 1
+                    continue
+                if token in skip_tokens:
+                    i += 1
+                    continue
+                if not token.startswith("-") and not artifact_seen:
+                    # The positional artifact path is not an editable flag,
+                    # but promotion needs it to rebuild ninfer_artifact.
+                    artifact_seen = True
+                    artifact_path = token
+                    i += 1
+                    continue
+                if token == "--no-thinking":
+                    # thinking_mode captures the disable switch; the apply
+                    # path re-emits it, so it must not survive as a flag.
+                    # --preserve-thinking is an independent switch and stays
+                    # in extra_args.
+                    i += 1
+                    continue
+                extra_args.append(token)
+                i += 1
+            if "--no-thinking" in analysis_cmd:
+                thinking_mode = "disabled"
+            else:
+                thinking_mode = None
+            if not command_flags:
+                command_flags = shlex.join(extra_args)
+            return {
+                "editable": "ninfer-serve" in analysis_cmd,
+                "engine": engine,
+                "gpu_memory_utilization": None,
+                "max_concurrency": self._cli_option(
+                    analysis_cmd, {"--max-concurrency"}, int,
+                ),
+                "kv_cache_dtype": self._cli_option(analysis_cmd, {"--kv-dtype"}),
+                "context_window": self._cli_option(
+                    analysis_cmd, {"--max-context"}, int,
+                ),
+                "tensor_parallel_size": None,
+                "thinking_mode": thinking_mode,
+                "extra_args": extra_args,
+                "command_flags": command_flags,
+                # Promotion maps this back to a hub-relative
+                # ninfer_artifact reference; the in-container path itself is
+                # not a durable launch input.
+                "artifact_path": artifact_path,
             }
 
         managed = {
@@ -7834,6 +8089,13 @@ class Manager:
                 "TensorFold deployments support single and replicated layouts, "
                 "not sharded"
             )
+        if engine == "ninfer" and mode in {"sharded", "grouped_sharded"}:
+            # One NInfer server loads one artifact on one NVIDIA GPU; replicas
+            # are the only way to use more than one node.
+            raise ValueError(
+                "NInfer deployments support single and replicated layouts, "
+                "not sharded"
+            )
         node_ids = list(dict.fromkeys(body.get("node_ids") or [LOCAL_NODE_ID]))
         if mode == "grouped_sharded":
             grouped_tp, grouped_instances = _grouped_sharded_topology(
@@ -7866,27 +8128,33 @@ class Manager:
         model = body.get("model") or ""
         if not model:
             raise ValueError("model is required")
-        if engine == "tensorfold":
-            # Agents older than the TensorFold runtime reject the unknown
-            # engine at container creation, which a concurrent replicated
-            # launch would only surface after updated nodes have evicted
-            # their healthy backends.
+        single_gpu_engine = {
+            "tensorfold": (TENSORFOLD_CAPABILITY, "TensorFold"),
+            "ninfer": (NINFER_CAPABILITY, "NInfer"),
+        }.get(engine)
+        if single_gpu_engine is not None:
+            capability, engine_label = single_gpu_engine
+            # Agents older than this runtime reject the unknown engine at
+            # container creation, which a concurrent replicated launch would
+            # only surface after updated nodes have evicted their healthy
+            # backends.
             unsupported = [
                 available.get(nid, {}).get("name") or nid for nid in node_ids
-                if nid != LOCAL_NODE_ID and TENSORFOLD_CAPABILITY
+                if nid != LOCAL_NODE_ID and capability
                 not in (available.get(nid, {}).get("capabilities") or [])
             ]
             if unsupported:
                 raise ValueError(
-                    "TensorFold requires updated SparkDeck agents on: "
+                    f"{engine_label} requires updated SparkDeck agents on: "
                     + ", ".join(unsupported)
                     + ". Update these nodes in Settings before starting this "
                     "deployment."
                 )
-            # TensorFold cannot start without an NVIDIA GPU, so a node that
-            # explicitly reports none must fail before any replica evicts
-            # healthy chat backends. Nodes without GPU telemetry are not
-            # judged here; the per-node launcher check remains authoritative.
+            # These engines cannot start without an NVIDIA GPU, so a node
+            # that explicitly reports none must fail before any replica
+            # evicts healthy chat backends. Nodes without GPU telemetry are
+            # not judged here; the per-node launcher check remains
+            # authoritative.
             gpu_short = []
             for nid in node_ids:
                 gpus = (available[nid].get("stats") or {}).get("gpus")
@@ -7900,8 +8168,8 @@ class Manager:
                     gpu_short.append(available[nid].get("name", nid))
             if gpu_short:
                 raise ValueError(
-                    "TensorFold requires an NVIDIA GPU, and none is reported "
-                    "on: " + ", ".join(gpu_short)
+                    f"{engine_label} requires an NVIDIA GPU, and none is "
+                    "reported on: " + ", ".join(gpu_short)
                 )
         vllm_parallel_layout: tuple[int, int] | None = None
         if mode in {"single", "sharded"} and engine == "vllm":
@@ -8289,6 +8557,7 @@ class Manager:
             "llama_context_length": body.get("llama_context_length"),
             "llama_parallel_slots": body.get("llama_parallel_slots"),
             "llama_gpu_layers": body.get("llama_gpu_layers"),
+            "ninfer_artifact": body.get("ninfer_artifact"),
         }
 
         tasks = []
@@ -9489,6 +9758,7 @@ class Manager:
                 "llama_context_length": None,
                 "llama_parallel_slots": None,
                 "llama_gpu_layers": None,
+                "ninfer_artifact": launch.get("ninfer_artifact"),
             }
             tasks, member_specs = self._build_grouped_sharded_members(
                 deployment_id=deployment_id,
@@ -15232,7 +15502,7 @@ class Manager:
                 # alive when a chat engine starts, just as Laya's own launcher
                 # preserves the chat engine in the opposite start order.
                 if runtime == "laya" and protect in {
-                    "vllm", "sglang", "llama.cpp", "tensorfold",
+                    "vllm", "sglang", "llama.cpp", "tensorfold", "ninfer",
                 }:
                     continue
                 if (
@@ -16506,6 +16776,7 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        ninfer_artifact: str | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
         runtime_file_mounts: list[dict[str, str]] | None = None,
@@ -16540,6 +16811,7 @@ class Manager:
             llama_context_length=llama_context_length,
             llama_parallel_slots=llama_parallel_slots,
             llama_gpu_layers=llama_gpu_layers,
+            ninfer_artifact=ninfer_artifact,
             shm_size=shm_size,
             infiniband_device=infiniband_device,
         )
@@ -16612,6 +16884,48 @@ class Manager:
             ) from exc
         model_path = f"{self._image_hf_cache_target(image)}/hub/{siblings[0]}"
         return model_path, siblings
+
+    def _resolve_ninfer_artifact(
+        self, model: str, artifact: str, image: str | None = None,
+    ) -> str:
+        """Resolve a hub-relative ``.ninfer`` artifact on this node.
+
+        Returns the in-container artifact path for ``ninfer-serve``. The
+        reference uses the same
+        ``models--owner--repo/snapshots/<revision>/file`` form as llama.cpp, so
+        one persisted value addresses the controller and every agent.
+        """
+        relative = str(artifact or "").strip().replace("\\", "/")
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise ValueError(
+                "NInfer deployments require a cache-relative .ninfer artifact"
+            )
+        if not relative.casefold().endswith(".ninfer"):
+            raise ValueError("NInfer deployments require a .ninfer artifact")
+        # The reference must belong to the model being launched. A stale
+        # artifact from another repository would otherwise resolve fine and
+        # silently serve the wrong compiled weights.
+        expected_prefix = "models--" + model.replace("/", "--") + "/"
+        if not relative.startswith(expected_prefix):
+            raise ValueError(
+                f"NInfer artifact does not belong to {model}; prepare the "
+                "selected repository and launch again"
+            )
+        hub = Path(self.settings["hf_cache"]).expanduser() / "hub"
+        artifact_path = hub / relative
+        if not artifact_path.is_file():
+            raise ValueError(
+                "NInfer model artifact is not cached on this node "
+                f"({relative}); prepare the model weights first"
+            )
+        resolved = artifact_path.resolve(strict=True)
+        try:
+            resolved.relative_to(hub.resolve(strict=True))
+        except ValueError as exc:
+            raise ValueError(
+                "NInfer artifact path escapes the Hugging Face cache"
+            ) from exc
+        return f"{self._image_hf_cache_target(image)}/hub/{relative}"
 
     async def _create_llama_container(
         self,
@@ -17009,6 +17323,182 @@ class Manager:
             )
             raise RuntimeError(safe_error) from exc
 
+    async def _create_ninfer_container(
+        self,
+        model: str,
+        port: int | None,
+        image: str | None,
+        environment: dict[str, str] | None,
+        extra_args: list[str] | None,
+        name: str | None,
+        ninfer_artifact: str | None,
+        cluster_member: dict | None,
+        hf_token: str | None,
+        sparkdeck_deployment_id: str | None,
+        shm_size: Any = None,
+    ) -> dict:
+        """Launch one NInfer artifact server, mirroring the llama.cpp shape.
+
+        NInfer loads one compiled v3 ``.ninfer`` artifact resolved from the
+        Hugging Face cache on each node, and one server holds the whole
+        artifact, so sharded layouts are rejected rather than silently
+        degraded.
+        """
+        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
+            raise ValueError("NInfer deployments cannot run sharded")
+        if not ninfer_artifact:
+            raise ValueError("NInfer deployments require a .ninfer artifact")
+        # NInfer's CUDA backend cannot start without an NVIDIA driver. Reject
+        # here — before evicting healthy backends — rather than leaving an
+        # unusable deployment crash-looping on a CPU-only node.
+        if not _node_has_nvidia_driver():
+            raise ValueError(
+                "NInfer requires an NVIDIA GPU, and no NVIDIA driver is "
+                "available on this node"
+            )
+        image = image or DEFAULT_NINFER_IMAGE
+        # SparkDeck routes requests by the repository id, and NInfer rejects
+        # any other request model, so the served alias must be the repository
+        # id. A foreign --model-id alias would break every proxied request on
+        # an otherwise healthy deployment; reject it before any eviction.
+        explicit_alias = self._cli_option(list(extra_args or []), {"--model-id"})
+        if explicit_alias and explicit_alias != model:
+            raise ValueError(
+                "NInfer deployments route requests by the repository id; a "
+                "custom --model-id alias is not supported"
+            )
+        if port is None:
+            port = await self._allocate_port()
+        if name is None:
+            safe = model.replace("/", "-").replace("_", "-").lower()
+            name = f"ninfer-{safe}-{port}"
+        self._cluster_launch_update(
+            name, "preparing", "Preparing NInfer launch",
+            model=model, cluster_member=cluster_member,
+        )
+
+        def _ensure_image():
+            try:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+                self.client.images.get(image)
+            except docker.errors.ImageNotFound:
+                self._cluster_launch_update(
+                    name, "pulling_image",
+                    f"Downloading Docker image {image}; this can take several minutes",
+                    model=model, cluster_member=cluster_member,
+                )
+                print(f"[ninfer] pulling missing image: {image}")
+                self.client.images.pull(image)
+
+        try:
+            # Confirm the image is usable and the artifact is cached BEFORE
+            # evicting other engines: a missing image or artifact must fail
+            # without stopping healthy chat backends.
+            await asyncio.to_thread(_ensure_image)
+            # Resolve the in-container artifact path only after the image is
+            # present: a custom image declaring HF_HOME mounts the cache
+            # somewhere else, so the pull decides where the artifact must
+            # point.
+            model_path = await asyncio.to_thread(
+                self._resolve_ninfer_artifact, model, ninfer_artifact, image,
+            )
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+        # NInfer takes the node's GPU for its CUDA context, so other chat
+        # engines must be evicted before the CUDA context is created.
+        await self.evict_other_backends(protect="ninfer")
+
+        def _create():
+            command = [
+                "ninfer-serve", model_path,
+                "--host", "0.0.0.0",
+                "--port", str(_NINFER_SERVE_PORT),
+            ]
+            # SparkDeck routes requests by the repository id, and NInfer
+            # rejects any other request model, so the served alias must be
+            # the repository id (the artifact would otherwise advertise its
+            # embedded name). An explicit --model-id equal to the repository
+            # id is honoured as-is.
+            if not explicit_alias:
+                command += ["--model-id", model]
+            command.extend(str(item) for item in extra_args or [])
+            self._cluster_launch_update(
+                name, "creating_container", "Creating Docker container",
+                model=model, cluster_member=cluster_member,
+            )
+            labels = {
+                CONTROLLER_LABEL: "1", MODEL_LABEL: model,
+                ENGINE_LABEL: "ninfer",
+            }
+            if sparkdeck_deployment_id:
+                labels[DEPLOYMENT_LABEL] = sparkdeck_deployment_id
+            if cluster_member:
+                labels.update({
+                    DEPLOYMENT_LABEL: cluster_member["deployment_id"],
+                    NODE_LABEL: cluster_member["node_id"],
+                    RANK_LABEL: str(cluster_member["rank"]),
+                    MODE_LABEL: cluster_member.get("mode", "single"),
+                    NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
+                })
+            run_options = {
+                "image": image,
+                # The upstream image sets no entrypoint, so the command is the
+                # full argv and ``ninfer-serve`` resolves from the image PATH.
+                "command": command,
+                "name": name,
+                "detach": True,
+                # The artifact resolves through the Hugging Face cache, which
+                # the image mounts at its declared HF_HOME target.
+                "volumes": self._build_volumes(model, self.settings["hf_cache"], image),
+                "ipc_mode": "host",
+                "shm_size": shm_size or self.settings["shm_size"],
+                "labels": labels,
+                "restart_policy": {"Name": "unless-stopped"},
+                "ports": {f"{_NINFER_SERVE_PORT}/tcp": port},
+            }
+            container_environment = dict(environment or {})
+            # A gated or private repository must authenticate when its
+            # snapshot is resolved, exactly as the vLLM and SGLang paths do.
+            container_environment.update(self._container_hf_environment(hf_token))
+            if container_environment:
+                run_options["environment"] = container_environment
+            # The driver check above guarantees the CUDA backend can start, so
+            # the container always receives the node's GPUs.
+            try:
+                run_options["device_requests"] = [
+                    docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+                ]
+            except Exception:
+                pass
+            container = self._run_managed_container(run_options)
+            container.reload()
+            self._cluster_launch_update(
+                name, "starting", "Container created; loading the model",
+                model=model, cluster_member=cluster_member,
+            )
+            summary = self._container_summary(container)
+            if summary is not None:
+                summary["model_source"] = "public_repository"
+            return summary
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            safe_error = self._redact_hf_secret(exc)
+            self._cluster_launch_update(
+                name, "error", f"Launch failed: {safe_error}",
+                model=model, cluster_member=cluster_member, error=safe_error,
+            )
+            raise RuntimeError(safe_error) from exc
+
     async def _create_container_with_port(
         self,
         model: str,
@@ -17035,6 +17525,7 @@ class Manager:
         llama_context_length: int | None = None,
         llama_parallel_slots: int | None = None,
         llama_gpu_layers: int | None = None,
+        ninfer_artifact: str | None = None,
         shm_size: Any = None,
         infiniband_device: bool | None = None,
         runtime_file_mounts: list[dict[str, str]] | None = None,
@@ -17104,6 +17595,17 @@ class Manager:
                 model=model, port=port, image=image,
                 environment=runtime_environment,
                 extra_args=extra_args, name=name,
+                cluster_member=cluster_member,
+                hf_token=hf_token,
+                sparkdeck_deployment_id=sparkdeck_deployment_id,
+                shm_size=managed_shm_size,
+            )
+        if engine == "ninfer":
+            return await self._create_ninfer_container(
+                model=model, port=port, image=image,
+                environment=runtime_environment,
+                extra_args=extra_args, name=name,
+                ninfer_artifact=ninfer_artifact,
                 cluster_member=cluster_member,
                 hf_token=hf_token,
                 sparkdeck_deployment_id=sparkdeck_deployment_id,
@@ -17596,7 +18098,52 @@ class Manager:
             "thinking_mode", existing.get("thinking_mode", "default")
         )
 
-        if engine == "sglang":
+        if engine == "ninfer":
+            # NInfer exposes different flag names and no vLLM-style
+            # memory controls; map the shared scalars onto its argv and
+            # leave the remaining flags untouched.
+            if concurrency is not None and concurrency > 8:
+                # NInfer's documented admission range is 1..8.
+                raise ValueError("max_concurrency must be between 1 and 8")
+            flags = self._replace_command_option(
+                flags, {"--max-context"}, context_window,
+            )
+            flags = self._replace_command_option(
+                flags, {"--max-concurrency"}, concurrency,
+            )
+            if kv_dtype is not None and kv_dtype not in (
+                "bf16", "int8", "fp8", "nvfp4", "k8v4",
+            ):
+                raise ValueError(
+                    "kv_cache_dtype must be bf16, int8, fp8, nvfp4, or k8v4"
+                )
+            flags = self._replace_command_option(flags, {"--kv-dtype"}, kv_dtype)
+            # Thinking is on by default: "enabled" and "default" just remove
+            # the --no-thinking override; --preserve-thinking is an
+            # independent switch that stays in the flags.
+            flags = re.sub(
+                r"(?<!\S)--no-thinking(?:=\S+)?", "", flags,
+            ).strip()
+            thinking = str(thinking_mode or "default")
+            if thinking == "disabled":
+                flags = f"{flags} --no-thinking".strip()
+            elif thinking not in ("default", "enabled"):
+                raise ValueError("thinking_mode must be default, enabled, or disabled")
+            # Speculative edits submitted through the settings form override
+            # the flags; a form that omits the keys keeps the parsed pair.
+            if "speculative_method" in settings or (
+                "dspark_num_speculative_tokens" in settings
+            ):
+                method, draft = self._validated_ninfer_speculation(
+                    settings.get("speculative_method"),
+                    settings.get("dspark_num_speculative_tokens"),
+                )
+                flags = self._replace_command_option(flags, {"--spec"}, method)
+                flags = self._replace_command_option(
+                    flags, {"--draft-tokens"},
+                    draft if method else None,
+                )
+        elif engine == "sglang":
             flags = self._replace_command_option(
                 flags, {"--mem-fraction-static"}, gpu
             )
@@ -17618,8 +18165,14 @@ class Manager:
             flags = self._replace_command_option(
                 flags, {"--max-model-len", "--max-model-length"}, context_window
             )
-        flags = self._replace_command_option(flags, {"--kv-cache-dtype"}, kv_dtype)
-        flags = self._replace_thinking_config(flags, str(thinking_mode))
+        if engine != "ninfer":
+            # NInfer exposes neither flag: its KV dtype and thinking switch
+            # were already applied on its own branch above, and appending
+            # the vLLM spellings would fail its argument parser.
+            flags = self._replace_command_option(
+                flags, {"--kv-cache-dtype"}, kv_dtype
+            )
+            flags = self._replace_thinking_config(flags, str(thinking_mode))
 
         original = [str(value) for value in (cmd or [])]
         # Preserve host/port because Docker's network bindings and controller
@@ -17653,6 +18206,19 @@ class Manager:
                 prefix = original[:model_index + 2]
             except ValueError as exc:
                 raise ValueError("could not locate --model-path in the SGLang command") from exc
+        elif engine == "ninfer":
+            # ``ninfer-serve <artifact> ...``: the artifact is positional,
+            # so the preserved prefix is the binary plus the artifact path.
+            try:
+                artifact_index = next(
+                    index for index, token in enumerate(original)
+                    if index > 0 and not token.startswith("-")
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    "could not locate the artifact in the NInfer command"
+                ) from exc
+            prefix = original[:artifact_index + 1]
         else:
             try:
                 model_index = original.index("serve") + 1

@@ -21,6 +21,11 @@ class RuntimeKind(StrEnum):
     # output bytes. One server holds the whole model, so it follows the
     # single-engine shape llama.cpp and Laya use.
     TENSORFOLD = "tensorfold"
+    # NInfer is a single-GPU OpenAI-compatible engine serving compiled v3
+    # ``.ninfer`` artifacts. One server holds one artifact on one NVIDIA GPU,
+    # so it follows the same single-engine shape and resolves its weights
+    # from the cluster's Hugging Face cache like llama.cpp GGUF artifacts.
+    NINFER = "ninfer"
 
 
 class DeploymentKind(StrEnum):

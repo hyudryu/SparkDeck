@@ -1,4 +1,4 @@
-export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang' | 'laya' | 'tensorfold'
+export type RuntimeKind = 'vllm' | 'llama.cpp' | 'sglang' | 'laya' | 'tensorfold' | 'ninfer'
 export type DeploymentStatus = 'registered' | 'launching' | 'running' | 'ready' | 'starting' | 'stopping' | 'stopped' | 'saved' | 'degraded' | 'error' | 'unknown'
 
 export interface RuntimeCompatibility {
@@ -53,6 +53,9 @@ export interface CatalogModel {
   likes?: number
   parameter_count?: number | null
   weight_size_bytes?: number | null
+  // Compiled .ninfer artifact size: what NInfer actually loads, distinct
+  // from the source-format weights other runtimes estimate.
+  ninfer_weight_size_bytes?: number | null
   weight_size_source?: 'safetensors' | 'gguf' | 'tree' | null
   tags?: string[]
   runtime_compatibility?: RuntimeCompatibility[]

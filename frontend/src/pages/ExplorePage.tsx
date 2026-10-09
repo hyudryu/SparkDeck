@@ -22,18 +22,39 @@ const COMMUNITY_PAGE_SIZE = 50
 const EMPTY_COMPATIBILITY: NonNullable<CatalogModel['runtime_compatibility']> = []
 const EMPTY_QUANTIZATIONS: NonNullable<CatalogModel['quantizations']> = []
 const EMPTY_COMMUNITY_BENCHMARKS: BenchmarkAggregate[] = []
-// Runtimes that always run one complete copy on a single node, so a fit is
-// decided by the largest eligible node's memory rather than the cluster pool.
-// llama.cpp runs on the controller; Laya and TensorFold are single-engine
-// runtimes with no tensor or pipeline parallelism, so their replicas each
-// need a full copy.
-const SINGLE_NODE_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp', 'laya', 'tensorfold'])
+// Runtimes whose fit is decided by one node's memory rather than the pooled
+// cluster total. llama.cpp always launches on the controller, so only the
+// controller's own memory counts. Laya, TensorFold, and NInfer run one
+// complete copy per node with no tensor or pipeline parallelism, so a fit is
+// decided by the largest eligible node's memory; the deployment can target
+// any selected node, not just the controller.
+const CONTROLLER_ONLY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['llama.cpp'])
+const SINGLE_COPY_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['laya', 'tensorfold', 'ninfer'])
+// Single-GPU engines load their whole artifact onto one card, so their fit
+// is bounded by the device-0 GPU the engine will actually use, not a node's
+// summed VRAM or its largest optional card.
+const SINGLE_GPU_RUNTIMES: ReadonlySet<RuntimeKind> = new Set(['ninfer'])
+const isControllerOnlyRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && CONTROLLER_ONLY_RUNTIMES.has(runtime)
+const isSingleCopyRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && SINGLE_COPY_RUNTIMES.has(runtime)
+const isSingleGpuRuntime = (runtime: RuntimeKind | ''): boolean =>
+  runtime !== '' && SINGLE_GPU_RUNTIMES.has(runtime)
 // `activeRuntime` is '' when the filter means "all runtimes", which is not a
 // single-node runtime and keeps the pooled-capacity behavior.
-const isSingleNodeRuntime = (runtime: RuntimeKind | ''): boolean =>
-  runtime !== '' && SINGLE_NODE_RUNTIMES.has(runtime)
 const singleNodeRuntimeLabel = (runtime: RuntimeKind | ''): string =>
   runtime === '' ? 'This runtime' : RUNTIME_LABELS[runtime]
+// Single-copy runtimes fit against the largest eligible node; single-GPU
+// engines are further bounded by the largest individual GPU on it (falling
+// back to the per-node total when GPU telemetry is unavailable).
+const singleCopyCapacity = (
+  runtime: RuntimeKind | '',
+  memory: { maxCapacity: number; maxGpuCapacity: number },
+): number => (
+  isSingleGpuRuntime(runtime) && memory.maxGpuCapacity > 0
+    ? memory.maxGpuCapacity
+    : memory.maxCapacity
+)
 // One label source for every runtime picker and summary on this page.
 const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   vllm: 'vLLM',
@@ -41,6 +62,7 @@ const RUNTIME_LABELS: Record<RuntimeKind, string> = {
   'llama.cpp': 'Llama server',
   laya: 'Laya decisions',
   tensorfold: 'TensorFold',
+  ninfer: 'NInfer',
 }
 
 function formatParameters(value?: number | null) {
@@ -65,7 +87,10 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
     .map((node) => ({ node, capacity: nodeMemoryBytes(node) }))
     .filter((item): item is { node: NodeInventoryItem; capacity: number } => item.capacity !== undefined)
   if (measured.length === 0) {
-    return { capacity: 0, localCapacity: 0, measuredNodes: 0, aggregate: false, workerCapacities: [] as number[] }
+    return {
+      capacity: 0, maxCapacity: 0, maxGpuCapacity: 0, localCapacity: 0,
+      measuredNodes: 0, aggregate: false, workerCapacities: [] as number[],
+    }
   }
   const isLocal = (node: NodeInventoryItem) => node.local === true || node.id === 'local'
   const localCapacity = measured.find(({ node }) => node.local === true)?.capacity
@@ -76,6 +101,17 @@ function deployableMemory(nodes: NodeInventoryItem[]) {
     capacity: aggregate
       ? measured.reduce((sum, item) => sum + item.capacity, 0)
       : Math.max(...measured.map((item) => item.capacity)),
+    maxCapacity: Math.max(...measured.map((item) => item.capacity)),
+    maxGpuCapacity: Math.max(0, ...measured.map(({ node }) => {
+      // NInfer launches on device 0 (upstream default; SparkDeck adds no
+      // --device override), so the fit is bounded by the device-0 GPU on
+      // each node, not by the largest card it may also carry.
+      const gpus = (node.stats?.gpus ?? []).filter((gpu) => (
+        !gpu.error && Number.isFinite(gpu.mem_total_mib) && Number(gpu.mem_total_mib) > 0
+      ))
+      const device0 = gpus.find((gpu) => gpu.index === 0) ?? gpus[0]
+      return device0 ? Number(device0.mem_total_mib) * MIB : 0
+    })),
     measuredNodes: measured.length,
     aggregate,
     localCapacity,
@@ -192,6 +228,20 @@ function requiresControllerCapacity(model: DisplayCatalogModel) {
   return !hasNonLlamaRuntime && (hasLlamaRuntime || hasGgufArtifact)
 }
 
+// NInfer-only repositories ship no GGUF/safetensors weights, so in the
+// all-runtimes view their fit is the compiled artifact size against the
+// device-0 GPU — mirroring the NInfer runtime filter's behavior.
+function requiresSingleGpuCapacity(model: DisplayCatalogModel) {
+  const compatibility = model.runtime_compatibility ?? EMPTY_COMPATIBILITY
+  const hasNonNinferRuntime = compatibility.some((item) => item.runtime !== 'ninfer' && item.supported)
+  const hasNinferRuntime = compatibility.some((item) => item.runtime === 'ninfer' && item.supported)
+  return !hasNonNinferRuntime && hasNinferRuntime
+}
+
+function ninferFitWeightSize(model: DisplayCatalogModel) {
+  return model.ninfer_weight_size_bytes ?? model.weight_size_bytes
+}
+
 function preferredGgufArtifact(
   artifactOptions: GgufArtifactOption[],
   communityQuantization?: string,
@@ -253,14 +303,17 @@ function deployHref(
   if (quantization && quantization !== 'unknown') params.set('quantization', quantization)
   if (runtime === 'llama.cpp' && artifact) params.set('artifact', artifact.filename)
   // Laya reports fit as an aggregate only for display; its decision engine is
-  // single-engine, so it is never launched as a sharded layout.
-  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && sharded) params.set('layout', 'sharded')
+  // single-engine, so it is never launched as a sharded layout. TensorFold and
+  // NInfer are single-engine the same way.
+  else if (runtime !== 'llama.cpp' && runtime !== 'laya' && runtime !== 'tensorfold' && runtime !== 'ninfer' && sharded) params.set('layout', 'sharded')
   return `/models?${params.toString()}`
 }
 
 function ModelRow({
   model,
   capacity,
+  maxCapacity,
+  maxGpuCapacity,
   localCapacity,
   measuredNodes,
   aggregate,
@@ -274,6 +327,8 @@ function ModelRow({
 }: {
   model: DisplayCatalogModel
   capacity: number
+  maxCapacity: number
+  maxGpuCapacity: number
   localCapacity: number
   measuredNodes: number
   aggregate: boolean
@@ -378,12 +433,29 @@ function ModelRow({
   const rowLabel = model.id
   const parameterCount = model.parameter_count ?? model.community?.parameter_count
   const weightSize = model.weight_size_bytes ?? model.community?.weight_size_bytes
-  const fitWeightSize = isSingleNodeRuntime(deploymentRuntime)
-    ? selectedArtifact?.weightSize ?? weightSize
+  // NInfer loads the compiled artifact, so its fit uses the artifact size —
+  // even when the repository also ships GGUF quantizations.
+  const ninferArtifactSize = isSingleGpuRuntime(deploymentRuntime)
+    ? model.ninfer_weight_size_bytes ?? undefined
+    : undefined
+  const fitWeightSize = isControllerOnlyRuntime(deploymentRuntime)
+    || isSingleCopyRuntime(deploymentRuntime)
+    ? ninferArtifactSize ?? selectedArtifact?.weightSize ?? weightSize
     : weightSize
-  const fitCapacity = isSingleNodeRuntime(deploymentRuntime) ? localCapacity : capacity
-  const fitAggregate = !isSingleNodeRuntime(deploymentRuntime) && aggregate
-  const fitMeasuredNodes = isSingleNodeRuntime(deploymentRuntime)
+  // Controller-only runtimes fit against the controller's own memory;
+  // single-copy runtimes may target any selected node, so their fit is
+  // decided by the largest eligible node — and single-GPU engines by the
+  // largest individual GPU on it.
+  const fitCapacity = isControllerOnlyRuntime(deploymentRuntime)
+    ? localCapacity
+    : isSingleCopyRuntime(deploymentRuntime)
+      ? singleCopyCapacity(
+          deploymentRuntime, { maxCapacity, maxGpuCapacity },
+        )
+      : capacity
+  const fitAggregate = !isControllerOnlyRuntime(deploymentRuntime)
+    && !isSingleCopyRuntime(deploymentRuntime) && aggregate
+  const fitMeasuredNodes = isControllerOnlyRuntime(deploymentRuntime)
     ? localCapacity > 0 ? 1 : 0
     : measuredNodes
   // Sharded deployments always include the controller, then pool the largest
@@ -420,12 +492,12 @@ function ModelRow({
     {expanded && <div className="catalog-model-details" id={panelId}>
       <div className="catalog-model-detail-grid">
         <div>
-          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : isSingleNodeRuntime(deploymentRuntime) ? 'Single-node fit' : 'Cluster fit'}</span>
+          <span className="detail-label">{deploymentRuntime === 'llama.cpp' ? 'Controller fit' : isSingleCopyRuntime(deploymentRuntime) ? 'Single-node fit' : 'Cluster fit'}</span>
           <strong className={`fit-${fitTone(fitWeightSize, fitCapacity)}`}>{fitLabel(fitTone(fitWeightSize, fitCapacity))} · {fitWeightSize ? formatBytes(fitWeightSize) : 'Weight size unavailable'}{minFitLabel ? ` · ${minFitLabel}` : ''}</strong>
           <p>{fitCapacity > 0
             ? deploymentRuntime === 'llama.cpp'
               ? `${formatBytes(fitCapacity)} on the controller node. Llama server deployments run on the controller and do not pool cluster memory. `
-              : isSingleNodeRuntime(deploymentRuntime)
+              : isSingleCopyRuntime(deploymentRuntime)
               ? `${formatBytes(fitCapacity)} on the largest of ${fitMeasuredNodes} measured ${fitMeasuredNodes === 1 ? 'node' : 'nodes'}. ${singleNodeRuntimeLabel(deploymentRuntime)} runs a complete copy on one node and does not pool cluster memory. `
               : fitAggregate
               ? `${formatBytes(capacity)} aggregate memory across ${measuredNodes} measured nodes. Fit assumes a sharded deployment that can divide model weights across those nodes; replicated deployments still require the full model weights on every replica. `
@@ -458,6 +530,7 @@ function ModelRow({
           <option value="llama.cpp" disabled={!llamaSupported}>Llama server</option>
           <option value="laya" disabled={compatibilityByRuntime.get('laya') === false}>Laya decisions</option>
           <option value="tensorfold" disabled={compatibilityByRuntime.get('tensorfold') === false}>TensorFold</option>
+          <option value="ninfer" disabled={compatibilityByRuntime.get('ninfer') === false}>NInfer</option>
         </select></label>
         {deploymentRuntime === 'llama.cpp' && artifactOptions.length > 0 && <label className="catalog-deployment-type catalog-artifact-select"><span>GGUF artifact</span><select aria-label={`GGUF artifact for ${model.id}`} value={selectedArtifact?.key ?? ''} onChange={(event) => setArtifactKey(event.target.value)}>
           {artifactOptions.map((item) => <option key={item.key} value={item.key}>{item.quantization}{communityEstimatesFor(item.quantization).length > 0 ? ` · ${formatCommunityEstimates(communityEstimatesFor(item.quantization))}` : ''} · {item.filename}{item.weightSize ? ` · ${formatBytes(item.weightSize)}` : ''}</option>)}
@@ -508,9 +581,11 @@ export function ExplorePage() {
   }, [aggregates.data?.items, fitsOnly, query, tab, selectedHardware])
 
   const memory = useMemo(() => deployableMemory(nodes.data ?? []), [nodes.data])
-  const catalogFitCapacity = isSingleNodeRuntime(activeRuntime)
+  const catalogFitCapacity = isControllerOnlyRuntime(activeRuntime)
     ? memory.localCapacity
-    : memory.capacity
+    : isSingleCopyRuntime(activeRuntime)
+      ? singleCopyCapacity(activeRuntime, memory)
+      : memory.capacity
   const models = useMemo(() => {
     const catalogItems = catalog.data?.items ?? []
     const evidence = new Map<string, BenchmarkAggregate>()
@@ -566,11 +641,17 @@ export function ExplorePage() {
     }
     if (tab === 'community') visible = visible.filter((model) => Boolean(model.community))
     if (fitsOnly) visible = visible.flatMap((model) => {
-      const usesControllerCapacity = isSingleNodeRuntime(activeRuntime)
+      const usesControllerCapacity = isControllerOnlyRuntime(activeRuntime)
         || (activeRuntime === '' && requiresControllerCapacity(model))
+      const usesSingleGpuCapacity = isSingleGpuRuntime(activeRuntime)
+        || (activeRuntime === '' && requiresSingleGpuCapacity(model))
       const applicableCapacity = usesControllerCapacity
         ? memory.localCapacity
-        : memory.capacity
+        : usesSingleGpuCapacity
+          ? singleCopyCapacity('ninfer', memory)
+          : isSingleCopyRuntime(activeRuntime)
+            ? singleCopyCapacity(activeRuntime, memory)
+            : memory.capacity
       if (tab === 'community') {
         const weightEstimates = communityWeightEstimates(model, usesControllerCapacity)
         const fittingEstimate = largestFittingCommunityEstimate(
@@ -588,7 +669,9 @@ export function ExplorePage() {
       }
       const applicableWeightSize = usesControllerCapacity
         ? defaultGgufWeightSize(model, tab === 'community')
-        : model.weight_size_bytes
+        : usesSingleGpuCapacity
+          ? ninferFitWeightSize(model)
+          : model.weight_size_bytes
       return ['easy', 'tight'].includes(fitTone(applicableWeightSize, applicableCapacity)) ? [model] : []
     })
     if (fitsOnly) {
@@ -692,6 +775,7 @@ export function ExplorePage() {
               <option value="sglang">SGLang</option>
               <option value="laya">Laya decisions</option>
               <option value="tensorfold">TensorFold</option>
+              <option value="ninfer">NInfer</option>
             </select>
           </label>}
           <button className="button button-primary" type="submit">Search</button>
@@ -704,7 +788,7 @@ export function ExplorePage() {
           </select>
         </label>
         <div className="catalog-filters" aria-label="Model filters">
-          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isSingleNodeRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isSingleNodeRuntime(activeRuntime) ? 'Controller memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
+          <label><input type="checkbox" checked={fitsOnly} disabled={!fitsOnly && catalogFitCapacity <= 0} onChange={(event) => setFitsOnly(event.target.checked)} /><span><strong>Only what fits</strong><small>{catalogFitCapacity > 0 ? isControllerOnlyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} controller memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleGpuRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} device-0 GPU memory for ${singleNodeRuntimeLabel(activeRuntime)}` : isSingleCopyRuntime(activeRuntime) ? `${formatBytes(catalogFitCapacity)} largest per-node memory for ${singleNodeRuntimeLabel(activeRuntime)}` : memory.aggregate ? `${formatBytes(memory.capacity)} aggregate sharded memory across ${memory.measuredNodes} measured nodes` : `${formatBytes(memory.capacity)} largest per-node memory across ${memory.measuredNodes} measured ${memory.measuredNodes === 1 ? 'node' : 'nodes'}` : isControllerOnlyRuntime(activeRuntime) ? 'Controller memory unavailable' : isSingleCopyRuntime(activeRuntime) ? 'Node memory unavailable' : 'Cluster memory unavailable'}</small></span></label>
           {(nodes.error || aggregates.error) && <Button variant="tertiary" onClick={() => { nodes.reload(); aggregates.reload() }}>Retry metadata</Button>}
         </div>
       </div>
@@ -730,7 +814,7 @@ export function ExplorePage() {
         <div className="catalog-model-header" aria-hidden="true"><span>Model</span><span>Parameters</span><span>Weights</span>{tab === 'community' ? <><span>Output speed</span><span>Max contributors</span></> : <><span>Downloads</span><span>Likes</span></>}<span /></div>
         {displayedModels.map((model) => {
           const rowKey = `${tab}:${model.id}:${hardwareKey(model.community ?? {})}`
-          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
+          return <ModelRow key={rowKey} model={model} capacity={memory.capacity} maxCapacity={memory.maxCapacity} maxGpuCapacity={memory.maxGpuCapacity} localCapacity={memory.localCapacity} measuredNodes={memory.measuredNodes} aggregate={memory.aggregate} workerCapacities={memory.workerCapacities} expanded={expandedIds.has(rowKey)} fitsOnly={fitsOnly} communityMode={tab === 'community'} requestedRuntime={activeRuntime} onToggle={() => toggleExpanded(rowKey)} onPull={openPull} />
         })}
         {remainingCommunityModels > 0 && <div className="catalog-load-more"><Button type="button" onClick={() => setCommunityLimit((current) => current + COMMUNITY_PAGE_SIZE)}>Load more community models ({formatNumber(remainingCommunityModels)} remaining)</Button></div>}
       </section>}

@@ -52,6 +52,7 @@ export function RuntimeMark({ runtime }: { runtime: string }) {
     sglang: 'SGLang',
     laya: 'Laya decisions',
     tensorfold: 'TensorFold',
+    ninfer: 'NInfer',
   }
   return <span className="runtime-mark">{labels[runtime] ?? runtime}</span>
 }

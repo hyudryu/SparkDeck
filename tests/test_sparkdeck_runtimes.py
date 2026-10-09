@@ -5,8 +5,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock
 
 from sparkdeck.runtimes import (
-    LAYA_SERVE_PORT, LayaAdapter, LlamaCppAdapter, RuntimeRegistry, SglangAdapter,
-    TensorfoldAdapter, TENSORFOLD_SERVE_PORT, VllmAdapter,
+    LAYA_SERVE_PORT, LayaAdapter, LlamaCppAdapter, NINFER_SERVE_PORT,
+    NinferAdapter, RuntimeRegistry, SglangAdapter, TensorfoldAdapter,
+    TENSORFOLD_SERVE_PORT, VllmAdapter,
     launch_managed_container, normalize_openai_base_url,
 )
 
@@ -15,7 +16,7 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_registry_supports_every_shipped_runtime(self):
         self.assertEqual(
             set(RuntimeRegistry().kinds),
-            {"vllm", "llama.cpp", "sglang", "laya", "tensorfold"},
+            {"vllm", "llama.cpp", "sglang", "laya", "tensorfold", "ninfer"},
         )
 
     def test_vllm_launch_settings(self):
@@ -389,3 +390,68 @@ class TensorfoldBridgeTests(unittest.IsolatedAsyncioTestCase):
             kwargs["extra_args"], ["--context", "4096", "--mtp-drafts", "4"],
         )
         self.assertEqual(result["name"], "tensorfold-model")
+
+
+class NinferAdapterTests(unittest.TestCase):
+    def test_ninfer_launch_settings(self):
+        spec = NinferAdapter().launch_spec("org/model", {
+            "artifact": "model.ninfer",
+            "context_length": 8192,
+            "max_concurrency": 4,
+            "thinking": False,
+            "extra_args": ["--spec", "mtp", "--draft-tokens", "3"],
+        })
+        self.assertEqual(spec.command[:6], [
+            "ninfer-serve", "model.ninfer", "--host", "0.0.0.0",
+            "--port", str(NINFER_SERVE_PORT),
+        ])
+        self.assertEqual(spec.command[spec.command.index("--max-context") + 1], "8192")
+        self.assertEqual(spec.command[spec.command.index("--max-concurrency") + 1], "4")
+        self.assertIn("--no-thinking", spec.command)
+        self.assertIn("--spec", spec.command)
+        self.assertIsNone(spec.entrypoint)
+        self.assertNotIn("--tensor-parallel-size", spec.command)
+
+    def test_ninfer_defaults_fall_back_to_the_repository_id(self):
+        spec = NinferAdapter().launch_spec("org/model", {})
+        self.assertEqual(spec.command, [
+            "ninfer-serve", "org/model", "--host", "0.0.0.0",
+            "--port", str(NINFER_SERVE_PORT),
+        ])
+
+
+class NinferBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ninfer_bridge_uses_durable_managed_create(self):
+        manager = Mock()
+        manager._resolved_hf_token = Mock(return_value="secret")
+        manager.create_container = AsyncMock(return_value={"name": "ninfer-model"})
+
+        result = await launch_managed_container(
+            manager, NinferAdapter(), "dep-1", "ni", "org/model",
+            {"context_length": 4096, "max_concurrency": 2,
+             "extra_args": ["--spec", "mtp"]},
+        )
+
+        kwargs = manager.create_container.await_args.kwargs
+        self.assertEqual(kwargs["engine"], "ninfer")
+        self.assertEqual(kwargs["model"], "org/model")
+        self.assertEqual(kwargs["hf_token"], "secret")
+        self.assertEqual(kwargs["sparkdeck_deployment_id"], "dep-1")
+        self.assertEqual(
+            kwargs["extra_args"],
+            ["--max-context", "4096", "--max-concurrency", "2", "--spec", "mtp"],
+        )
+        self.assertEqual(result["name"], "ninfer-model")
+
+    async def test_ninfer_bridge_forwards_the_artifact_reference(self):
+        manager = Mock()
+        manager.create_container = AsyncMock(return_value={"name": "ninfer-model"})
+        artifact = "models--org--model/snapshots/x/model.ninfer"
+
+        await launch_managed_container(
+            manager, NinferAdapter(), "dep-1", "ni", "org/model",
+            {"ninfer_artifact": artifact},
+        )
+
+        kwargs = manager.create_container.await_args.kwargs
+        self.assertEqual(kwargs["ninfer_artifact"], artifact)

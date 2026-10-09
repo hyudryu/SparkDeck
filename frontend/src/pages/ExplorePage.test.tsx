@@ -123,6 +123,7 @@ describe('ExplorePage model rows', () => {
             { runtime: 'llama.cpp', supported: true },
             { runtime: 'sglang', supported: false },
             { runtime: 'laya', supported: false },
+            { runtime: 'ninfer', supported: false },
           ],
           local_deployment_ids: ['existing-vllm'],
         }],
@@ -135,6 +136,7 @@ describe('ExplorePage model rows', () => {
           { runtime: 'llama.cpp', supported: true },
           { runtime: 'sglang', supported: false },
           { runtime: 'laya', supported: false },
+          { runtime: 'ninfer', supported: false },
         ],
         quantizations: [{
           name: 'unknown', files: [{ filename: 'model.gguf', size_bytes: 6 * gib }],
@@ -161,11 +163,13 @@ describe('ExplorePage model rows', () => {
 
     const deploymentType = await screen.findByRole('combobox', { name: 'Deployment type for org/model-GGUF' })
     expect(deploymentType).toHaveValue('vllm')
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(5)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(6)
     await screen.findByText('model.gguf')
     expect(within(deploymentType).getByRole('option', { name: 'vLLM' })).toBeEnabled()
     // Laya needs decision-model checkpoints, so a plain GGUF row disables it.
     expect(within(deploymentType).getByRole('option', { name: 'Laya decisions' })).toBeDisabled()
+    // NInfer needs a compiled artifact, so a plain GGUF row disables it too.
+    expect(within(deploymentType).getByRole('option', { name: 'NInfer' })).toBeDisabled()
     await user.selectOptions(deploymentType, 'llama.cpp')
     expect(deploymentType).toHaveValue('llama.cpp')
     const selectedRow = screen.getByRole('button', { name: 'Collapse org/model-GGUF' })
@@ -842,7 +846,7 @@ describe('ExplorePage model rows', () => {
     )
 
     const deploymentType = within(modelArticle).getByRole('combobox', { name: 'Deployment type for RadixArk/Qwen3.8-27B' })
-    expect(within(deploymentType).getAllByRole('option')).toHaveLength(5)
+    expect(within(deploymentType).getAllByRole('option')).toHaveLength(6)
     await user.selectOptions(deploymentType, 'llama.cpp')
     const artifactSelect = within(modelArticle).getByRole('combobox', { name: 'GGUF artifact for RadixArk/Qwen3.8-27B' })
     expect(artifactSelect).toHaveValue('Q4_K_M\u0000qwen3.8-q4_k_m.gguf')

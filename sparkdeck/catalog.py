@@ -104,6 +104,7 @@ class HuggingFaceCatalog:
             if not isinstance(raw_items, list):
                 raise ValueError("Hugging Face returned an invalid model list")
             items = []
+            raw_siblings_by_id: dict[str, Any] = {}
             for item in raw_items:
                 if not isinstance(item, dict) or item.get("private"):
                     continue
@@ -111,26 +112,32 @@ class HuggingFaceCatalog:
                 if not public.get("id"):
                     continue
                 public["quantizations"] = _gguf_quantizations(item.get("siblings"))
+                raw_siblings_by_id[str(public["id"])] = item.get("siblings")
                 items.append(public)
-            if await self._enrich_tree_weight_sizes(items):
+            if await self._enrich_tree_weight_sizes(items, raw_siblings_by_id):
                 # A partially enriched (timed-out) result still carries
                 # inflated estimates, so it must not be cached as complete.
                 self._cache[key] = (time.monotonic(), items)
             return items
 
-    async def _enrich_tree_weight_sizes(self, items: list[dict[str, Any]]) -> bool:
-        """Replace inflated safetensors metadata estimates with tree sizes.
+    async def _enrich_tree_weight_sizes(
+        self, items: list[dict[str, Any]],
+        raw_siblings_by_id: dict[str, Any] | None = None,
+    ) -> bool:
+        """Replace inflated estimates with tree-derived sizes.
 
         Hub safetensors metadata double-counts tensors shared across shards,
         so sizes derived from element counts can be far larger than the real
-        download. Each candidate costs one tree request, pinned to the search
-        result's revision; failures keep the estimate so search never fails
-        here. Returns True when every candidate finished, meaning the result
-        is complete enough to cache.
+        download; NInfer-only listings carry no sizes at all until the file
+        tree is fetched. Each candidate costs one tree request, pinned to the
+        search result's revision; failures keep the estimate so search never
+        fails here. Returns True when every candidate finished, meaning the
+        result is complete enough to cache.
         """
+        raw_siblings_by_id = raw_siblings_by_id or {}
         candidates = [
             item for item in items
-            if _is_safetensors_candidate(item)
+            if _is_safetensors_candidate(item) or _ninfer_candidate(item)
         ]
         if not candidates:
             return True
@@ -164,9 +171,15 @@ class HuggingFaceCatalog:
             if size:
                 item["weight_size_bytes"] = size
                 item["weight_size_source"] = "tree"
-            else:
-                # A tree response without usable sizes leaves the inflated
-                # estimate in place and must not be cached as complete.
+            ninfer_size = _ninfer_sizes_from_tree(
+                raw_siblings_by_id.get(str(item.get("id"))), tree,
+            )
+            if ninfer_size is not None:
+                item["ninfer_weight_size_bytes"] = ninfer_size
+            if not size and ninfer_size is None:
+                # Neither a source-format size nor artifact sizes came out of
+                # this tree, so the candidate stays retryable instead of
+                # being cached as complete.
                 failed += 1
 
         tasks = [asyncio.create_task(load(item)) for item in candidates]
@@ -250,7 +263,7 @@ class HuggingFaceCatalog:
                 )
             )
             tree_failed = False
-            if _gguf_sizes_missing(siblings):
+            if _gguf_sizes_missing(siblings) or _ninfer_sizes_missing(siblings):
                 tree = await self._fetch_tree(
                     detail_repository, request_headers, revision,
                 )
@@ -291,6 +304,14 @@ class HuggingFaceCatalog:
                 else:
                     # An unusable tree response leaves the inflated estimate
                     # in place and must be retried, not cached as complete.
+                    tree_failed = True
+            if tree is not None:
+                # The tree fetch above may have backfilled .ninfer sibling
+                # sizes; recompute the artifact fit signal from them.
+                ninfer_size = _ninfer_artifact_size(raw)
+                if ninfer_size is not None:
+                    item["ninfer_weight_size_bytes"] = ninfer_size
+                elif _ninfer_sizes_missing(raw.get("siblings")):
                     tree_failed = True
             item["quantizations"] = _gguf_quantizations(raw.get("siblings"))
             if not tree_failed:
@@ -361,6 +382,12 @@ class HuggingFaceCatalog:
             .casefold().endswith(".gguf")
             for sibling in siblings
         )
+        has_ninfer_sibling = isinstance(siblings, list) and any(
+            isinstance(sibling, dict)
+            and str(sibling.get("rfilename") or sibling.get("path") or "")
+            .casefold().endswith(".ninfer")
+            for sibling in siblings
+        )
         formats = []
         gguf_metadata = item.get("gguf")
         if (
@@ -369,6 +396,8 @@ class HuggingFaceCatalog:
             or has_gguf_sibling
         ):
             formats.append("gguf")
+        if has_ninfer_sibling:
+            formats.append("ninfer")
         transformer_model = bool(folded_tags & {"transformers", "safetensors"})
         # A Laya-compatible checkpoint loads through the ``laya`` package, which
         # requires a decision head that only the publisher's System 1
@@ -396,8 +425,23 @@ class HuggingFaceCatalog:
                     "that this listing cannot verify."
                 ),
             },
+            # A NInfer deployment loads one compiled v3 .ninfer artifact from
+            # the repository, so a listing that actually ships one is
+            # servable; anything else cannot run on this engine.
+            {
+                "runtime": "ninfer",
+                "supported": "ninfer" in formats,
+                "reason": (
+                    "NInfer requires a repository that ships a compiled "
+                    ".ninfer artifact."
+                ),
+            },
         ]
         parameter_count, weight_size_bytes, weight_size_source = _weight_metadata(item)
+        # NInfer loads the compiled artifact, not the source-format weights,
+        # so its size travels in a dedicated field; replacing the generic
+        # weight metadata would misstate fit for every other runtime.
+        ninfer_weight_size_bytes = _ninfer_artifact_size(item)
         return {
             "id": repository,
             "author": str(item.get("author") or repository.partition("/")[0] or "")[:200] or None,
@@ -410,6 +454,7 @@ class HuggingFaceCatalog:
             "parameter_count": parameter_count,
             "weight_size_bytes": weight_size_bytes,
             "weight_size_source": weight_size_source,
+            "ninfer_weight_size_bytes": ninfer_weight_size_bytes,
             "pipeline_tag": str(item.get("pipeline_tag") or "")[:100] or None,
             "last_modified": str(item.get("lastModified") or "")[:100] or None,
             "private": False,
@@ -459,12 +504,105 @@ def _weight_metadata(item: dict[str, Any]) -> tuple[int | None, int | None, str 
     return None, None, None
 
 
+def _ninfer_sizes_missing(siblings: Any) -> bool:
+    """True when the listing ships .ninfer files without usable sizes."""
+    if not isinstance(siblings, list):
+        return False
+    seen = False
+    for sibling in siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(
+            sibling.get("rfilename") or sibling.get("path") or ""
+        ).strip()
+        if not filename.casefold().endswith(".ninfer"):
+            continue
+        seen = True
+        size = _positive_int(sibling.get("size"))
+        lfs = sibling.get("lfs")
+        if size is None and isinstance(lfs, dict):
+            size = _positive_int(lfs.get("size"))
+        if size is None:
+            return True
+    return False
+
+
+def _ninfer_candidate(item: dict[str, Any]) -> bool:
+    """True when a search listing needs a tree fetch for NInfer fit sizes."""
+    return (
+        item.get("ninfer_weight_size_bytes") is None
+        and "ninfer" in (item.get("formats") or [])
+    )
+
+
+def _ninfer_sizes_from_tree(
+    raw_siblings: Any, tree: list[dict[str, Any]] | None,
+) -> int | None:
+    """Backfill .ninfer sibling sizes from a file tree and return the fit size."""
+    if tree is None or not isinstance(raw_siblings, list):
+        return None
+    sizes = {
+        str(entry.get("path") or ""): _positive_int(entry.get("size"))
+        for entry in tree
+    }
+    resolved: list[int] = []
+    for sibling in raw_siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(
+            sibling.get("rfilename") or sibling.get("path") or ""
+        ).strip()
+        if not filename.casefold().endswith(".ninfer"):
+            continue
+        size = _positive_int(sibling.get("size"))
+        lfs = sibling.get("lfs")
+        if size is None and isinstance(lfs, dict):
+            size = _positive_int(lfs.get("size"))
+        if size is None:
+            size = sizes.get(filename)
+        if size is None:
+            return None
+        resolved.append(size)
+    return min(resolved) if resolved else None
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return number if number > 0 else None
+
+
+def _ninfer_artifact_size(item: dict[str, Any]) -> int | None:
+    """Return the smallest compiled .ninfer artifact size a repository ships.
+
+    Alternative artifacts are mutually exclusive quantizations, so the
+    model-level fit signal is the cheapest deployable option: a model stays
+    visible whenever at least one artifact fits the target GPU. ``None``
+    means the listing ships .ninfer files without usable sizes (the details
+    path retries against the file tree) or no artifacts at all.
+    """
+    siblings = item.get("siblings")
+    if not isinstance(siblings, list):
+        return None
+    smallest: int | None = None
+    for sibling in siblings:
+        if not isinstance(sibling, dict):
+            continue
+        filename = str(
+            sibling.get("rfilename") or sibling.get("path") or ""
+        ).strip()
+        if not filename.casefold().endswith(".ninfer"):
+            continue
+        size = _positive_int(sibling.get("size"))
+        lfs = sibling.get("lfs")
+        if size is None and isinstance(lfs, dict):
+            size = _positive_int(lfs.get("size"))
+        if size is None:
+            return None
+        smallest = size if smallest is None else min(smallest, size)
+    return smallest
 
 
 def quantization_from_text(*values: Any) -> str | None:

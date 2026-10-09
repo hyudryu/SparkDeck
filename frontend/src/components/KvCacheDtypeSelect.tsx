@@ -32,10 +32,20 @@ const SGLANG_KV_CACHE_DTYPES = [
   'fp4_mx_block16',
 ] as const
 
+// NInfer accepts these --kv-dtype storages.
+const NINFER_KV_CACHE_DTYPES = [
+  'bf16',
+  'int8',
+  'fp8',
+  'nvfp4',
+  'k8v4',
+] as const
+
 const optionsFor = (runtime: RuntimeKind): readonly string[] => (
   runtime === 'sglang' ? SGLANG_KV_CACHE_DTYPES
     : runtime === 'vllm' ? VLLM_KV_CACHE_DTYPES
-      : []
+      : runtime === 'ninfer' ? NINFER_KV_CACHE_DTYPES
+        : []
 )
 
 interface KvCacheDtypeSelectProps {

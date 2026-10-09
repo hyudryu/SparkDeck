@@ -1723,6 +1723,7 @@ async def agent_create_container(req: Request):
             sg_cpu_affinity=body.get("sg_cpu_affinity"),
             cluster_member=body.get("cluster_member"),
             hf_token=body.get("hf_token"),
+            sparkdeck_deployment_id=body.get("sparkdeck_deployment_id"),
             llama_artifact=body.get("llama_artifact"),
             llama_context_length=body.get("llama_context_length"),
             llama_parallel_slots=body.get("llama_parallel_slots"),
@@ -1778,12 +1779,39 @@ async def agent_check_container_environment(name: str, req: Request):
 
 
 @app.delete("/api/agent/containers/{name}")
-async def agent_remove_container(name: str, req: Request):
+async def agent_remove_container(
+    name: str, req: Request, preserve_strata_volumes: bool = False,
+):
     _require_agent(req)
     try:
-        return await manager.remove_cluster_member(name)
+        return await manager.remove_cluster_member(
+            name, preserve_strata_volumes=preserve_strata_volumes,
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/agent/volumes/strata/prune")
+async def agent_prune_strata_volumes(req: Request):
+    """Reclaim prepared Strata /data volumes by deployment key.
+
+    The controller reaches this when a Strata record's volumes outlive every
+    container that carried their key (a failed replacement after the old
+    members were already removed).
+    """
+    _require_agent(req)
+    body = await req.json()
+    keys = body.get("deployment_keys")
+    if (
+        not isinstance(keys, list)
+        or not keys
+        or any(not isinstance(item, str) or not item.strip() for item in keys)
+    ):
+        raise HTTPException(400, "deployment_keys must contain non-empty strings")
+    await asyncio.to_thread(
+        manager._drop_strata_data_volumes, [item.strip() for item in keys],
+    )
+    return {"ok": True}
 
 
 @app.get("/api/agent/containers/{name}/state")

@@ -2162,6 +2162,58 @@ describe('model deployments', () => {
     expect(await screen.findByText('Starting Saved model on This device.')).toBeInTheDocument()
   })
 
+  it('launches a saved Strata deployment on any node without weight preparation', async () => {
+    const user = userEvent.setup()
+    const preflightCalls: string[] = []
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      const method = init?.method ?? 'GET'
+      if (path.endsWith('/prepare/preflight')) {
+        preflightCalls.push(path)
+        return new Response(JSON.stringify({ eligible: false, reason: 'must not be called' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path === '/api/v1/deployments/dep-strata/start' && method === 'POST') {
+        expect(JSON.parse(String(init?.body))).toEqual({ node_ids: ['node-2'] })
+        return new Response(JSON.stringify({
+          id: 'dep-strata', alias: 'Strata model', runtime: 'strata', kind: 'managed',
+          model: { repository: 'unsloth/Qwen3.8-Flash-Next-GGUF' }, status: 'starting',
+          settings: {}, node_ids: ['node-2'],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-strata', alias: 'Strata model', runtime: 'strata', kind: 'managed',
+        model: { repository: 'unsloth/Qwen3.8-Flash-Next-GGUF' }, status: 'saved',
+        settings: {}, node_ids: ['node-2'], deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Launch' }))
+
+    // The cache is empty everywhere, yet Strata's container fetches its own
+    // pinned checkpoint on first start: both nodes stay launchable and no
+    // preparation step is offered or requested.
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Strata model' })
+    expect(within(dialog).getByRole('radio', { name: /Spark Two/ })).toBeChecked()
+    expect(within(dialog).getByRole('radio', { name: /Spark One/ })).toBeEnabled()
+    expect(within(dialog).queryByLabelText('Weights need to be transferred before launch')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: 'Launch on 1 node' })).toBeEnabled()
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-strata/start',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ node_ids: ['node-2'] }) }),
+    ))
+    expect(preflightCalls).toHaveLength(0)
+    expect(await screen.findByText('Starting Strata model on Spark Two.')).toBeInTheDocument()
+  })
+
   it('keeps viable nodes launchable when an unrelated node lacks cache space', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

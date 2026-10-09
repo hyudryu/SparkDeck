@@ -81,6 +81,28 @@ logger = logging.getLogger(__name__)
 # bookmark validation dependency-free from Manager's import graph.
 _MODE_ALLOWLIST = frozenset({"single", "replicated", "sharded", "grouped_sharded"})
 
+# Runtimes whose weights never resolve from the cluster Hugging Face cache:
+# llama.cpp verifies a selective GGUF snapshot per node at container create,
+# NInfer resolves a selective .ninfer artifact the same way, and TensorFold
+# and Strata download their own pinned checkpoints inside the container. The
+# whole-repository cache inventory is the wrong readiness signal for all of
+# them at first launch.
+_CACHE_EXTERNAL_RUNTIMES = frozenset((
+    RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
+    RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
+))
+
+# The subset above whose relaunch needs no selection revalidation: only the
+# runtimes that resolve their weights entirely inside the container, so no
+# cluster-cache readiness check exists to run. NInfer and llama.cpp are
+# excluded on purpose: their selective per-file artifact checks are
+# selective-aware and must gate a relocation before Manager removes the
+# existing ranks, because the per-node verification only runs when each
+# container is created.
+_RELAUNCH_UNVALIDATED_RUNTIMES = frozenset((
+    RuntimeKind.TENSORFOLD.value, RuntimeKind.STRATA.value,
+))
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -4166,17 +4188,7 @@ class SparkDeckService:
             )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
-        if record.runtime not in (
-            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
-            RuntimeKind.STRATA,
-        ):
-            # Llama.cpp readiness is per-file inside the resolved snapshot and
-            # is verified by each node when its container is created; the
-            # whole-repository inventory check would reject selective GGUF
-            # snapshots that are perfectly launchable. NInfer artifacts are
-            # selective the same way; TensorFold resolves its own checkpoint,
-            # and Strata downloads its own pinned checkpoints inside the
-            # container.
+        if record.runtime.value not in _CACHE_EXTERNAL_RUNTIMES:
             cached_revision = await self._validate_start_selection(
                 deployment_dict, selected_ids, settings,
             )
@@ -4544,13 +4556,27 @@ class SparkDeckService:
             # deliberately partial, so whole-repository completeness is the
             # wrong readiness signal: the selected artifact file is what the
             # launch resolves, and each node must hold it at the resolved
-            # revision.
-            relative = self._validate_public_gguf_artifact(
-                repository, artifact, None, extensions=(".ninfer",),
+            # revision. The persisted launch reference is what Manager
+            # relaunches with, so a mutable bookmark revision must not
+            # validate a snapshot the replacement will never load.
+            stored = str(
+                (launch_settings or {}).get("ninfer_artifact") or artifact
             )
-            resolved = await self._resolved_model_revision(
-                repository, revision or "main",
+            relative, pinned = self._clone_llama_artifact_identity(
+                repository, stored, extensions=(".ninfer",),
             )
+            if relative is None:
+                return None
+            relative_path = self._validate_public_gguf_artifact(
+                repository, relative, None, extensions=(".ninfer",),
+            )
+            if pinned and re.fullmatch(r"[0-9a-fA-F]{40}", pinned):
+                # An already-pinned snapshot needs no Hub round-trip.
+                resolved = pinned.lower()
+            else:
+                resolved = await self._resolved_model_revision(
+                    repository, revision or "main",
+                )
             presence = getattr(self.manager, "node_has_model_files", None)
             if not callable(presence):
                 # Without the per-file presence endpoint the inventory check
@@ -4564,7 +4590,8 @@ class SparkDeckService:
             for node_id in node_ids:
                 try:
                     has_files = await presence(
-                        node_id, repository, resolved, [relative.as_posix()],
+                        node_id, repository, resolved,
+                        [relative_path.as_posix()],
                     )
                 except Exception:
                     has_files = False
@@ -4576,6 +4603,67 @@ class SparkDeckService:
                     + ", ".join(missing)
                 )
             return resolved
+        if deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value:
+            # A selective GGUF download leaves the repository snapshot
+            # deliberately partial, so whole-repository completeness is the
+            # wrong readiness signal: the selected shard set is what the
+            # launch resolves, and each node must hold every file. The
+            # persisted artifact is a repo-relative bookmark before the first
+            # launch and a hub-relative cache reference afterwards, so both
+            # forms normalize to the same file set. Returning no revision
+            # keeps llama-server's artifact reference authoritative (it
+            # embeds the resolved snapshot path and has no --revision flag).
+            # A controller-local artifact has nothing to verify here; remote
+            # selections of one are already rejected above. The persisted
+            # launch reference (``llama_artifact``) is what Manager actually
+            # relaunches with, so it wins over the record's bookmark value:
+            # a mutable ``main`` advancing must not validate a snapshot the
+            # replacement will never load.
+            stored = str(
+                (launch_settings or {}).get("llama_artifact")
+                or (deployment.get("model") or {}).get("artifact")
+                or (deployment.get("settings") or {}).get("artifact")
+                or ""
+            )
+            relative, pinned = self._clone_llama_artifact_identity(
+                repository, stored,
+            )
+            if relative is None:
+                return None
+            files = self._expand_gguf_shard_files(
+                self._validate_public_gguf_artifact(repository, relative, None),
+            )
+            # A reference that already names an immutable snapshot needs no
+            # Hub round-trip: an offline controller must still be able to
+            # relaunch from the exact cached artifact.
+            if pinned and re.fullmatch(r"[0-9a-fA-F]{40}", pinned):
+                resolved = pinned.lower()
+            else:
+                resolved = await self._resolved_model_revision(
+                    repository, revision or "main",
+                )
+            presence = getattr(self.manager, "node_has_model_files", None)
+            if not callable(presence):
+                raise ValueError(
+                    "selected node(s) cannot verify the cached GGUF "
+                    "artifact; update their SparkDeck agent"
+                )
+            missing = []
+            for node_id in node_ids:
+                try:
+                    has_files = await presence(
+                        node_id, repository, resolved, files,
+                    )
+                except Exception:
+                    has_files = False
+                if not has_files:
+                    missing.append(node_id)
+            if missing:
+                raise ValueError(
+                    "model weights are not available on selected node(s): "
+                    + ", ".join(missing)
+                )
+            return None
         inventory = await self.manager.model_cache_inventory()
         cached = {
             node.get("id"): next((
@@ -5560,10 +5648,13 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching.
-            cached_start_revision = await self._validate_start_selection(
-                deployment, merged, launch_settings,
-            )
+            # revalidate before relaunching. Runtimes without a cache-shaped
+            # readiness check skip this: their weights resolve elsewhere (or
+            # are verified per node when each container is created).
+            if str(deployment.get("runtime") or "") not in _RELAUNCH_UNVALIDATED_RUNTIMES:
+                cached_start_revision = await self._validate_start_selection(
+                    deployment, merged, launch_settings,
+                )
             if len(merged) > 1 and contract.get("deployment_mode") != "replicated":
                 relaunch_mode = "replicated"
             node_ids = merged
@@ -5578,10 +5669,13 @@ class SparkDeckService:
                 )
             # The picker constrains choices in the UI, but an API client can
             # bypass it and the cache can change after the inventory loads —
-            # revalidate before relaunching.
-            cached_start_revision = await self._validate_start_selection(
-                deployment, node_ids, launch_settings,
-            )
+            # revalidate before relaunching. Runtimes without a cache-shaped
+            # readiness check skip this: their weights resolve elsewhere (or
+            # are verified per node when each container is created).
+            if str(deployment.get("runtime") or "") not in _RELAUNCH_UNVALIDATED_RUNTIMES:
+                cached_start_revision = await self._validate_start_selection(
+                    deployment, node_ids, launch_settings,
+                )
         if instance is not None and (node_ids is not None or additional_node_ids):
             # A per-instance grouped-sharded action addresses one engine
             # group; a node selection relocates the whole deployment. The
@@ -6326,6 +6420,26 @@ class SparkDeckService:
             stored.get("_base_url"),
         )
 
+    async def _validated_strata_preparation_nodes(
+        self, node_ids: list[str],
+    ) -> list[str]:
+        """Deduplicate and validate a Strata preparation selection.
+
+        The Strata fast path fabricates its ready plan, so it must reject
+        unknown node ids exactly like the generic planner: otherwise a
+        stale client selection succeeds here and only the launch rejects it.
+        """
+        selected = list(dict.fromkeys(
+            str(item).strip() for item in node_ids if str(item).strip()
+        ))
+        available = {
+            str(node.get("id")) for node in await self.manager.cluster_nodes()
+        }
+        unknown = [node_id for node_id in selected if node_id not in available]
+        if unknown:
+            raise ValueError(f"unknown cluster node(s): {', '.join(unknown)}")
+        return selected
+
     async def deployment_preparation_preflight(
         self, deployment_id: str, node_ids: list[str],
     ) -> dict[str, Any]:
@@ -6336,6 +6450,28 @@ class SparkDeckService:
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
+        if deployment.get("runtime") == RuntimeKind.STRATA.value:
+            # Strata downloads its own pinned checkpoint into the container's
+            # data volume on first start, so the cluster cache never holds the
+            # weights and sizing the whole repository would demand a
+            # preparation no launch ever needs.
+            selected_ids = await self._validated_strata_preparation_nodes(node_ids)
+            return {
+                "enabled": True, "model_id": model, "revision": revision,
+                "sources": [],
+                "targets": [
+                    {
+                        "node_id": node_id, "node_name": node_id,
+                        "eligible": True, "has_required_weights": True,
+                    }
+                    for node_id in selected_ids
+                ],
+                "node_ids": selected_ids, "eligible": True,
+                "action": "ready", "download_node_id": None,
+                "download_node_ids": [],
+                "transfer_target_node_ids": [], "reason": None,
+                "staging_reserve_bytes": 0,
+            }
         return await self.manager.recipe_model_preparation_preflight(
             model, revision, node_ids,
         )
@@ -6349,6 +6485,14 @@ class SparkDeckService:
             deployment_id,
         )
         files = self._llama_selective_artifact(deployment, model)
+        if deployment.get("runtime") == RuntimeKind.STRATA.value:
+            # Nothing to transfer: the container fetches its own pinned
+            # checkpoint inside its data volume on first start.
+            selected_ids = await self._validated_strata_preparation_nodes(node_ids)
+            return {
+                "workflow_id": None, "job_ids": [], "jobs": [],
+                "node_ids": selected_ids, "action": "ready", "plan": None,
+            }
         if files is not None:
             result = await self._prepare_llama_files(
                 deployment, model, revision, files, node_ids, download_node_id,
@@ -6714,6 +6858,7 @@ class SparkDeckService:
 
     def _clone_llama_artifact_identity(
         self, repository: str, artifact: Any,
+        extensions: tuple[str, ...] = (".gguf",),
     ) -> tuple[str | None, str | None]:
         """Restore a Manager cache reference and its pinned snapshot revision."""
         value = _optional_string(artifact)
@@ -6731,7 +6876,7 @@ class SparkDeckService:
             relative = "/".join(parts[3:])
             return (
                 self._validate_public_gguf_artifact(
-                    repository, relative, None,
+                    repository, relative, None, extensions=extensions,
                 ).as_posix(),
                 parts[2],
             )

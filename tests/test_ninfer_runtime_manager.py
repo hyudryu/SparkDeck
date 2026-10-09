@@ -892,6 +892,122 @@ class NinferClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
             await service.close()
             temp.cleanup()
 
+    async def test_relaunch_revalidates_the_selective_artifact_before_removing_ranks(self):
+        """The per-file .ninfer presence check is the only pre-removal
+        readiness gate for a selective snapshot: without it a bad node
+        selection would remove the serving ranks before the container
+        create discovers the missing artifact."""
+        from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        manager.node_has_model_files = AsyncMock(return_value=False)
+        service = SparkDeckService(manager, Path(temp.name))
+        service._resolved_model_revision = AsyncMock(return_value="a" * 40)
+
+        service.store.add_deployment(Deployment(
+            id="record-ni", alias="ni-live", runtime=RuntimeKind.NINFER,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model", artifact="model.ninfer"),
+            container_name="cluster-old-r0-model",
+            settings={
+                "manager_deployment_id": "cluster-old",
+                "node_ids": ["spark-2"], "deployment_mode": "single",
+            },
+        ), "http://127.0.0.1:8123")
+        manager.deployments = [{
+            "id": "cluster-old", "status": "stopped", "engine": "ninfer",
+            "mode": "single", "node_ids": ["spark-2"],
+            "sparkdeck_record_id": "record-ni",
+            "launch_settings": {
+                "engine": "ninfer", "deployment_mode": "single",
+                "node_ids": ["spark-2"], "extra_args": [],
+                "ninfer_artifact": (
+                    f"models--org--model/snapshots/{'a' * 40}/model.ninfer"
+                ),
+            },
+            "members": [{
+                "node_id": "spark-2", "rank": 0,
+                "container_name": "cluster-old-r0-model",
+            }],
+        }]
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "model weights are not available",
+            ):
+                await service.deployment_action("record-ni", "start", ["spark-2"])
+            manager.deployment_action.assert_not_awaited()
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
+    async def test_relaunch_validates_the_persisted_ninfer_snapshot(self):
+        """The relaunch resolves the snapshot pinned in the persisted
+        artifact reference, not the bookmark's current mutable revision, so
+        validation must check that exact snapshot."""
+        from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+        from sparkdeck.service import SparkDeckService
+
+        temp = tempfile.TemporaryDirectory()
+        manager = FakeClusterManager()
+        manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+        manager.node_has_model_files = AsyncMock(return_value=True)
+        service = SparkDeckService(manager, Path(temp.name))
+        # The bookmark revision would resolve to a different head; the
+        # persisted artifact reference must win instead.
+        service._resolved_model_revision = AsyncMock(return_value="c" * 40)
+
+        service.store.add_deployment(Deployment(
+            id="record-ni", alias="ni-live", runtime=RuntimeKind.NINFER,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("org/model", artifact="model.ninfer"),
+            container_name="cluster-old-r0-model",
+            settings={
+                "manager_deployment_id": "cluster-old",
+                "node_ids": ["spark-2"], "deployment_mode": "single",
+            },
+        ), "http://127.0.0.1:8123")
+        manager.deployments = [{
+            "id": "cluster-old", "status": "stopped", "engine": "ninfer",
+            "mode": "single", "node_ids": ["spark-2"],
+            "sparkdeck_record_id": "record-ni",
+            "launch_settings": {
+                "engine": "ninfer", "deployment_mode": "single",
+                "node_ids": ["spark-2"], "extra_args": [],
+                "ninfer_artifact": (
+                    f"models--org--model/snapshots/{'a' * 40}/model.ninfer"
+                ),
+            },
+            "members": [{
+                "node_id": "spark-2", "rank": 0,
+                "container_name": "cluster-old-r0-model",
+            }],
+        }]
+
+        try:
+            await service.deployment_action("record-ni", "start", ["spark-2"])
+
+            args = manager.node_has_model_files.await_args.args
+            self.assertEqual(args[0], "spark-2")
+            self.assertEqual(args[1], "org/model")
+            self.assertEqual(args[2], "a" * 40)
+            self.assertEqual(args[3], ["model.ninfer"])
+            service._resolved_model_revision.assert_not_awaited()
+            # The validated snapshot feeds the relaunch (Manager suppresses
+            # the flag itself for NInfer; the artifact path pins it).
+            manager.deployment_action.assert_awaited_once_with(
+                "cluster-old", "start", ["spark-2"],
+                model_revision="a" * 40,
+            )
+        finally:
+            await manager.http.aclose()
+            await service.close()
+            temp.cleanup()
+
     async def test_cached_revision_is_not_injected_for_ninfer(self):
         """A shared cached snapshot must not add the unsupported --revision
         flag to a NInfer launch: the artifact reference pins the snapshot."""

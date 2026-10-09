@@ -58,6 +58,7 @@ from .runtime_environment import normalize_runtime_environment
 from .runtimes import (
     apply_strata_launch_controls,
     strata_launch_environment,
+    validate_strata_served_model_name,
     RuntimeRegistry,
     launch_managed_container,
     normalize_openai_base_url,
@@ -2828,6 +2829,15 @@ class SparkDeckService:
                 if parsed <= 0:
                     raise ValueError(f"{key} must be a positive integer")
                 controls[key] = parsed
+            if "served_model_name" in controls and str(
+                stored.get("runtime")
+            ) == RuntimeKind.STRATA.value:
+                # Fail the save rather than the first Run: the launch body
+                # projects this control into the environment, so a malformed
+                # name must not survive into a bookmark.
+                validate_strata_served_model_name(
+                    controls.get("served_model_name")
+                )
             # Persist the complete structured contract: Manager's preflight
             # merges every control (KV dtype, thinking, speculative tokens,
             # cudagraph size, batched tokens) into the launch argv for vLLM
@@ -3983,17 +3993,25 @@ class SparkDeckService:
         if runtime is RuntimeKind.NINFER:
             launch_body["ninfer_artifact"] = ninfer_artifact
         if runtime is RuntimeKind.STRATA:
+            controls = settings.get("launch_controls") or {}
+            environment = settings.get("environment")
+            # A never-started bookmark persists the KV dropdown and the
+            # served model name under launch_controls rather than as
+            # environment variables, so both must be projected here or the
+            # launch silently drops them.
+            if "served_model_name" in controls:
+                environment = apply_strata_launch_controls(
+                    environment,
+                    {"served_model_name": controls.get("served_model_name")},
+                )
             # Strata's cluster launch configures the engine through the
             # container environment, so the typed context length has to
             # become the CONTEXT variable here; without this a saved context
             # window would be silently dropped at launch.
             launch_body["environment"] = strata_launch_environment(
-                settings.get("environment"),
+                environment,
                 settings.get("context_length") or settings.get("context_window"),
-                # A never-started bookmark persists the KV dropdown under
-                # launch_controls rather than a top-level settings key.
-                settings.get("kv_cache_dtype")
-                or (settings.get("launch_controls") or {}).get("kv_cache_dtype"),
+                settings.get("kv_cache_dtype") or controls.get("kv_cache_dtype"),
             )
         return launch_body
 
@@ -6902,13 +6920,20 @@ class SparkDeckService:
 
     def _managed_deployment_reserved_selectors(
         self, model: str, settings: dict[str, Any],
+        runtime: str = "",
     ) -> list[str]:
-        """Return the selectors a saved managed launch will publish."""
+        """Return the selectors a saved managed launch will publish.
+
+        ``runtime`` is the store record's runtime: runtimes whose public id
+        lives in saved settings rather than argv (Strata's launch control)
+        need it to resolve a bookmark's future served name.
+        """
         selectors = [model] if model else []
         resolver = getattr(self.manager, "_deployment_served_models", None)
         if callable(resolver):
             selectors.extend(resolver({
                 "model": model,
+                "runtime": runtime,
                 "launch_settings": {**settings, "model": model},
             }))
         return selectors
@@ -6990,6 +7015,7 @@ class SparkDeckService:
                 for item in self._managed_deployment_reserved_selectors(
                     str((deployment.get("model") or {}).get("repository") or ""),
                     dict(deployment.get("settings") or {}),
+                    str(deployment.get("runtime") or ""),
                 )
             ),
         ]
@@ -7393,6 +7419,7 @@ class SparkDeckService:
                 model = deployment.get("model") or {}
                 configured = resolver({
                     "model": str(model.get("repository") or ""),
+                    "runtime": str(deployment.get("runtime") or ""),
                     "launch_settings": dict(deployment.get("settings") or {}),
                 })
         normalized = list(dict.fromkeys(

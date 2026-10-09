@@ -61,6 +61,8 @@ _DISCOVERED_STRATA_ENVIRONMENT_NAMES = frozenset({
     "LOW_RAM",
     "MODEL",
     "RESIDENT_BUDGET_GIB",
+    # SparkDeck routing metadata the launcher keeps in the environment.
+    "SERVED_MODEL_NAME",
     "VISION",
 })
 

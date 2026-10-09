@@ -1116,9 +1116,11 @@ def build_server(
         ``--max-context``/``--max-concurrency``, ``kv_cache_dtype`` to
         ``--kv-dtype``, and speculative ``speculative_method`` plus
         ``dspark_num_speculative_tokens`` to the ``--spec``/``--draft-tokens``
-        pair; Strata deployments write ``context_window`` and
-        ``kv_cache_dtype`` into the ``CONTEXT``/``KV`` environment variables
-        its entrypoint reads),
+        pair; Strata deployments write ``context_window``,
+        ``kv_cache_dtype``, and ``served_model_name`` into the
+        ``CONTEXT``/``KV`` environment variables its entrypoint reads plus
+        the ``SERVED_MODEL_NAME`` variable that names the deployment on
+        SparkDeck's OpenAI-compatible surface),
         supported vLLM
         or SGLang memory fields, and the weights repository via ``model``
         (a Hugging Face repo id; drop any pinned ``--revision`` flag from

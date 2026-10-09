@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from manager import Manager
+from manager import Manager, SERVED_MODEL_LABEL
 
 
 BACKING_MODEL = "Intel/Qwen3.5-122B-A10B-int4-AutoRound"
@@ -223,6 +223,107 @@ class ServedModelNameTests(unittest.IsolatedAsyncioTestCase):
 
         sent = manager.http.post.await_args.kwargs["json"]
         self.assertEqual(sent["model"], SERVED_MODEL)
+
+
+STRATA_MODEL = "unsloth/Qwen3.8-Flash-Next-GGUF"
+STRATA_SERVED = "qwen3.8-flash-next"
+
+
+class StrataServedModelNameTests(unittest.IsolatedAsyncioTestCase):
+    """Strata launches have no argv, so the public id comes from the
+    SERVED_MODEL_NAME label the launcher stamps on the container."""
+
+    def strata_summary(self, served_label: str | None = None) -> dict:
+        manager = Manager.__new__(Manager)
+        labels = {
+            "vllm-controller": "1",
+            "vllm-runtime": "strata",
+            "vllm-model": STRATA_MODEL,
+        }
+        if served_label:
+            labels[SERVED_MODEL_LABEL] = served_label
+        container = SimpleNamespace(
+            short_id="d933706ebaa3",
+            name="strata-qwen38",
+            labels=labels,
+            attrs={
+                "Config": {"Image": "sparkdeck/strata:latest", "Cmd": []},
+                "Created": "2026-10-09T00:00:00Z",
+            },
+            ports={"8080/tcp": [{"HostPort": "8123"}]},
+            status="running",
+        )
+        return manager._container_summary(container)
+
+    def test_strata_label_names_the_public_model_id(self) -> None:
+        summary = self.strata_summary(STRATA_SERVED)
+
+        self.assertEqual(summary["model"], STRATA_MODEL)
+        self.assertEqual(summary["served_model"], STRATA_SERVED)
+        self.assertEqual(summary["served_models"], [STRATA_SERVED])
+
+    def test_strata_without_a_label_keeps_the_model_id(self) -> None:
+        summary = self.strata_summary()
+
+        self.assertEqual(summary["model"], STRATA_MODEL)
+        self.assertEqual(summary["served_model"], STRATA_MODEL)
+        self.assertEqual(summary["served_models"], [STRATA_MODEL])
+
+    def test_saved_strata_deployment_reads_the_served_name_variable(self) -> None:
+        deployment = {
+            "model": STRATA_MODEL,
+            "launch_settings": {
+                "engine": "strata",
+                "extra_args": [],
+                "environment": {"SERVED_MODEL_NAME": STRATA_SERVED},
+            },
+        }
+
+        self.assertEqual(
+            Manager._deployment_served_models(deployment), [STRATA_SERVED],
+        )
+
+    def test_saved_strata_bookmark_reads_the_launch_control(self) -> None:
+        """A never-started bookmark persists the served name under
+        launch_controls with the runtime at the top level — the shape the
+        service synthesizes when reserving selectors before a first launch."""
+        deployment = {
+            "model": STRATA_MODEL,
+            "runtime": "strata",
+            "launch_settings": {
+                "launch_controls": {"served_model_name": STRATA_SERVED},
+            },
+        }
+
+        self.assertEqual(
+            Manager._deployment_served_models(deployment), [STRATA_SERVED],
+        )
+
+    def test_saved_strata_deployment_without_the_variable_keeps_model_id(self) -> None:
+        deployment = {
+            "model": STRATA_MODEL,
+            "launch_settings": {
+                "engine": "strata",
+                "extra_args": [],
+                "environment": {"MODEL": "UD-Q4_K_XL"},
+            },
+        }
+
+        self.assertEqual(
+            Manager._deployment_served_models(deployment), [STRATA_MODEL],
+        )
+
+    async def test_strata_requests_are_rewritten_to_the_served_name(self) -> None:
+        manager = Manager.__new__(Manager)
+        container = self.strata_summary(STRATA_SERVED)
+
+        self.assertEqual(
+            Manager._upstream_model_id(container, STRATA_MODEL), STRATA_SERVED,
+        )
+        self.assertEqual(
+            Manager._upstream_model_id(container, STRATA_SERVED),
+            STRATA_SERVED,
+        )
 
 
 if __name__ == "__main__":

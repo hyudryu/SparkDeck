@@ -199,6 +199,7 @@ export interface DeploymentLogsResponse {
 export interface DeploymentLaunchControls {
   context_window?: number | null
   max_concurrency?: number | null
+  served_model_name?: string | null
   tensor_parallel_size?: number | null
   pipeline_parallel_size?: number | null
   kv_cache_dtype?: string | null

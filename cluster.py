@@ -32,6 +32,11 @@ TENSORFOLD_CAPABILITY = "tensorfold-launch-v1"
 NINFER_CAPABILITY = "ninfer-launch-v1"
 # Same contract as TENSORFOLD_CAPABILITY for the Strata expert-offload engine.
 STRATA_CAPABILITY = "strata-launch-v1"
+# Advertised by agents whose Manager stamps the Strata served-model-name
+# label. strata-launch-v1 agents launch Strata fine but never publish a
+# custom public id, so a launch that sets one must fail in preflight on a
+# mixed-version cluster.
+STRATA_SERVED_NAME_CAPABILITY = "strata-served-name-v1"
 
 
 class NodeAgentResponseError(RuntimeError):

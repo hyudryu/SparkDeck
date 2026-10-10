@@ -408,7 +408,9 @@ export function DashboardPage() {
     nodesResource.reload()
     routingResource.reload()
   }
-  const policyByModel = new Map((routingResource.data ?? []).map((policy) => [policy.model, policy]))
+  const policyByModel = new Map((routingResource.data ?? [])
+    .filter((policy) => Boolean(policy.model) && Array.isArray(policy.members))
+    .map((policy) => [policy.model, policy]))
   const routingChanged = () => {
     deploymentsResource.reload()
     routingResource.reload()
@@ -462,7 +464,7 @@ export function DashboardPage() {
                 <LoadingState label="Loading deployments" />
               ) : deploymentsResource.error && !deploymentsResource.data ? (
                 <EmptyState title="Deployment status unavailable" description="Refresh to retry loading model status." />
-              ) : activeDeploymentGroups.length === 0 ? (
+              ) : activeDeploymentGroups.length === 0 && policyByModel.size === 0 ? (
                 <EmptyState title="No models running" description="Start a deployment to make it available for chat and comparison." action={<Link className="button button-primary" to="/models">Open models</Link>} />
               ) : (
                 <div className="dashboard-list">
@@ -659,7 +661,7 @@ function SharedModelCluster({ model, rows, deployments, policy, routingReady, on
   routingReady: boolean
   onChanged: () => void
 }) {
-  const instanceCount = Math.max(deployments.length, policy?.members.length ?? 0)
+  const instanceCount = Math.max(deployments.length, policy?.members?.length ?? 0)
   return (
     <div className="dashboard-cluster">
       <div className="dashboard-cluster-heading">
@@ -699,7 +701,7 @@ type RoutingMemberDraft = { deployment_id: string; max_concurrency: number | nul
  * user explicitly adds or removes one.
  */
 function routingDefaults(deployments: Deployment[], policy?: ModelRoutingPolicy): RoutingMemberDraft[] {
-  if (policy) {
+  if (policy?.members) {
     return policy.members.map((member) => ({
       deployment_id: member.deployment_id,
       max_concurrency: member.max_concurrency,
@@ -843,7 +845,7 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
         </small>
       )}
       <div className="model-routing-actions">
-        <Button onClick={save} disabled={locked || !dirty || draft.members.length === 0}>Save routing</Button>
+        <Button onClick={save} disabled={locked || draft.members.length === 0 || (Boolean(policy) && !dirty)}>Save routing</Button>
         {policy && <Button onClick={clear} disabled={locked}>Clear</Button>}
         {saved && !dirty && !error && <span role="status">Routing saved</span>}
         {error && <p className="inline-error" role="alert">{error}</p>}

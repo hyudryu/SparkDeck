@@ -1403,6 +1403,68 @@ describe('Running models shared-instance routing', () => {
     expect(screen.getByRole('option', { name: '100' })).toBeInTheDocument()
   })
 
+  it('persists the default priority order when no policy exists', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const puts: unknown[] = []
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'PUT') {
+          puts.push(JSON.parse(String(init.body)))
+          return json(JSON.parse(String(init.body)))
+        }
+        return json({ items: [] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    // Creation must be possible without editing: the displayed inventory
+    // order with unlimited caps is itself a valid policy to save.
+    const save = screen.getByRole('button', { name: 'Save routing' })
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'dgx', max_concurrency: null },
+        { deployment_id: 'ws1', max_concurrency: null },
+      ],
+    })
+  })
+
+  it('renders saved policies even when every deployment is stopped', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    // With zero active deployments the saved policy must still surface:
+    // operators need to inspect, repair, or clear it without a restart.
+    expect(screen.queryByText('No models running')).not.toBeInTheDocument()
+    await screen.findByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeEnabled()
+  })
+
   it('locks the editor while routing policies are loading', async () => {
     const base = stubDashboardFetch({ active_requests: {} })
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

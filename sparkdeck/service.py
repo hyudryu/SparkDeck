@@ -7940,17 +7940,28 @@ class SparkDeckService:
         self, body: Any,
     ) -> dict[str, Any]:
         policy = self._normalize_model_routing_policy(body)
-        live_ids = {
-            deployment["id"] for deployment in await self.deployments()
-        }
+        live_deployments = await self.deployments()
+        live_ids = {deployment["id"] for deployment in live_deployments}
+        # Routing indexes members by canonical deployment id only, so an
+        # alias accepted by the store lookup must be resolved before it is
+        # persisted, or the member would never match at selection time.
         for member in policy["members"]:
-            if (
-                self.store.deployment(member["deployment_id"]) is None
-                and member["deployment_id"] not in live_ids
-            ):
-                raise LookupError(
-                    f"deployment not found: {member['deployment_id']}"
+            member_id = member["deployment_id"]
+            stored = self.store.deployment(member_id)
+            if stored is not None:
+                member["deployment_id"] = str(stored["id"])
+            elif member_id not in live_ids:
+                discovered = next(
+                    (deployment for deployment in live_deployments
+                     if str(deployment.get("alias") or "").strip() == member_id),
+                    None,
                 )
+                if discovered is None:
+                    raise LookupError(f"deployment not found: {member_id}")
+                member["deployment_id"] = str(discovered["id"])
+        if len({member["deployment_id"] for member in policy["members"]}) \
+                != len(policy["members"]):
+            raise ValueError("policy members must be unique")
         policy["updated_at"] = datetime.now(timezone.utc).isoformat()
         # Persist the staged mapping first: a failed write must leave the
         # active in-memory routing exactly as it was.

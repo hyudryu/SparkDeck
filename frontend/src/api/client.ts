@@ -1061,8 +1061,11 @@ export const api = {
   },
   modelRouting: {
     list: async (signal?: AbortSignal) => {
+      // Listing enriches members through the same full deployment
+      // inventory scan as the deployments endpoint, so it needs the same
+      // extended deadline or the editors stay locked on slow clusters.
       const data = await request<{ items: ModelRoutingPolicy[] }>(
-        '/api/v1/model-routing-policies', { signal },
+        '/api/v1/model-routing-policies', { signal }, DEPLOYMENTS_TIMEOUT_MS,
       )
       return data.items
     },

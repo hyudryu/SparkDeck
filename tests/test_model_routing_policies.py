@@ -489,6 +489,34 @@ class ModelRoutingDirectTrafficTests(unittest.IsolatedAsyncioTestCase):
                 await manager.http.aclose()
                 await service.close()
 
+    async def test_alias_member_is_canonicalized_before_persistence(self):
+        """A deployment alias in deployment_id resolves to the canonical
+        record id, since routing indexes members by id only."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                saved = await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [
+                        {"deployment_id": "model-two", "max_concurrency": 2},
+                    ],
+                })
+                self.assertEqual(
+                    saved["members"][0]["deployment_id"], "record-two",
+                )
+                self.assertTrue(saved["members"][0]["live"])
+                # Alias and canonical id describe one member: a policy
+                # carrying both collapses to a duplicate and is rejected.
+                with self.assertRaisesRegex(ValueError, "unique"):
+                    await service.upsert_model_routing_policy({
+                        "model": "shared-name", "members": [
+                            {"deployment_id": "record-two"},
+                            {"deployment_id": "model-two"},
+                        ],
+                    })
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
     async def test_member_not_serving_the_policy_model_reports_offline(self):
         """A member that is live but no longer publishes the policy's
         request id is surfaced as not live, so the UI can flag it."""

@@ -89,73 +89,48 @@ function runningDeploymentGroups(deployment: Deployment) {
   }]
 }
 
-/** Request ids a deployment publishes; the alias is unique and never shared. */
+/**
+ * Request ids a deployment publishes; the alias is unique and never shared.
+ *
+ * Mirrors the backend's `_deployment_public_model_ids`: explicit served
+ * names replace the backing repository id, which the gateway does not
+ * accept once served names are configured.
+ */
 function deploymentRequestIds(deployment: Deployment): string[] {
-  const ids = new Set<string>()
-  if (deployment.model_id) ids.add(deployment.model_id)
-  if (deployment.served_model) ids.add(deployment.served_model)
-  for (const id of deployment.served_models ?? []) ids.add(id)
-  return [...ids]
+  const served = new Set<string>()
+  if (deployment.served_model) served.add(deployment.served_model)
+  for (const id of deployment.served_models ?? []) served.add(id)
+  if (served.size) return [...served]
+  return deployment.model_id ? [deployment.model_id] : []
 }
 
+export type SharedModelGroup = { model: string; deployments: Deployment[] }
+
 /**
- * Map each deployment to the shared request id it clusters under.
+ * One group per shared request id: every request id published by two or
+ * more deployments gets its own cluster with its own routing policy.
  *
- * Deployments publishing a request id in common are one model with several
- * instances, so the panel groups them and offers priority routing. A
- * deployment with no overlap is absent from the map and renders as a plain
- * row. The cluster name is the request id shared by the most deployments.
+ * Grouping per id (rather than transitively across ids) keeps each cluster
+ * routable: a deployment serving both `x` and `y` appears in both groups,
+ * and each group's editor configures exactly the instances that can serve
+ * that id. Deployments in no group render as plain rows.
  */
-export function sharedModelClusters(deployments: Deployment[]): Map<string, string> {
-  const parent = new Map<string, string>()
-  const ensure = (key: string) => {
-    if (!parent.has(key)) parent.set(key, key)
-  }
-  const find = (key: string): string => {
-    ensure(key)
-    let root = key
-    while (parent.get(root) !== root) root = parent.get(root) as string
-    let cursor = key
-    while (parent.get(cursor) !== root) {
-      const next = parent.get(cursor) as string
-      parent.set(cursor, root)
-      cursor = next
-    }
-    return root
-  }
-  const union = (left: string, right: string) => {
-    const a = find(left)
-    const b = find(right)
-    if (a !== b) parent.set(b, a)
-  }
-  const idsByDeployment = new Map<string, string[]>()
+export function sharedModelGroups(deployments: Deployment[]): SharedModelGroup[] {
+  const membersByModel = new Map<string, Deployment[]>()
   for (const deployment of deployments) {
-    const ids = deploymentRequestIds(deployment)
-    idsByDeployment.set(deployment.id, ids)
-    for (const id of ids) union(`deployment:${deployment.id}`, `model:${id}`)
-  }
-  const membersByRoot = new Map<string, string[]>()
-  const idCountsByRoot = new Map<string, Map<string, number>>()
-  for (const deployment of deployments) {
-    const root = find(`deployment:${deployment.id}`)
-    const members = membersByRoot.get(root) ?? []
-    members.push(deployment.id)
-    membersByRoot.set(root, members)
-    const counts = idCountsByRoot.get(root) ?? new Map<string, number>()
-    for (const id of idsByDeployment.get(deployment.id) ?? []) {
-      counts.set(id, (counts.get(id) ?? 0) + 1)
+    for (const id of deploymentRequestIds(deployment)) {
+      const members = membersByModel.get(id) ?? []
+      members.push(deployment)
+      membersByModel.set(id, members)
     }
-    idCountsByRoot.set(root, counts)
   }
-  const clusters = new Map<string, string>()
-  for (const [root, members] of membersByRoot) {
+  const groups: SharedModelGroup[] = []
+  for (const [model, members] of membersByModel) {
     if (members.length < 2) continue
-    const shared = [...(idCountsByRoot.get(root) ?? [])].filter(([, count]) => count >= 2)
-    if (!shared.length) continue
-    shared.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    for (const id of members) clusters.set(id, shared[0][0])
+    groups.push({ model, deployments: members })
   }
-  return clusters
+  groups.sort((a, b) => a.model.localeCompare(b.model))
+  return groups
 }
 
 type RunningModelRow = { deployment: Deployment; group: ReturnType<typeof runningDeploymentGroups>[number] }
@@ -610,8 +585,9 @@ function DeploymentGroupRow({ deployment, group }: RunningModelRow) {
 }
 
 /**
- * Running-model rows, with deployments that share a request id grouped into
- * one cluster that carries the priority routing editor.
+ * Running-model rows. Deployments sharing a request id are grouped into one
+ * cluster per shared id, each carrying its own priority routing editor; a
+ * deployment serving two shared ids appears in both clusters.
  */
 function RunningModelList({ rows, policyByModel, onChanged }: {
   rows: RunningModelRow[]
@@ -619,29 +595,39 @@ function RunningModelList({ rows, policyByModel, onChanged }: {
   onChanged: () => void
 }) {
   const uniqueDeployments = [...new Map(rows.map((row) => [row.deployment.id, row.deployment])).values()]
-  const clusterOf = sharedModelClusters(uniqueDeployments)
-  const renderedClusters = new Set<string>()
+  const groups = sharedModelGroups(uniqueDeployments)
+  const groupsByDeployment = new Map<string, SharedModelGroup[]>()
+  for (const group of groups) {
+    for (const deployment of group.deployments) {
+      const list = groupsByDeployment.get(deployment.id) ?? []
+      list.push(group)
+      groupsByDeployment.set(deployment.id, list)
+    }
+  }
+  const renderedGroups = new Set<string>()
   const items: ReactNode[] = []
   for (const row of rows) {
-    const cluster = clusterOf.get(row.deployment.id)
-    if (!cluster) {
+    const rowGroups = groupsByDeployment.get(row.deployment.id)
+    if (!rowGroups || !rowGroups.length) {
       items.push(<DeploymentGroupRow key={row.group.key} {...row} />)
       continue
     }
-    if (renderedClusters.has(cluster)) continue
-    renderedClusters.add(cluster)
-    const clusterRows = rows.filter((item) => clusterOf.get(item.deployment.id) === cluster)
-    const clusterDeployments = [...new Map(clusterRows.map((item) => [item.deployment.id, item.deployment])).values()]
-    items.push(
-      <SharedModelCluster
-        key={`cluster:${cluster}`}
-        model={cluster}
-        rows={clusterRows}
-        deployments={clusterDeployments}
-        policy={policyByModel.get(cluster)}
-        onChanged={onChanged}
-      />,
-    )
+    for (const group of rowGroups) {
+      if (renderedGroups.has(group.model)) continue
+      renderedGroups.add(group.model)
+      const groupRows = rows.filter((item) =>
+        group.deployments.some((deployment) => deployment.id === item.deployment.id))
+      items.push(
+        <SharedModelCluster
+          key={`cluster:${group.model}`}
+          model={group.model}
+          rows={groupRows}
+          deployments={group.deployments}
+          policy={policyByModel.get(group.model)}
+          onChanged={onChanged}
+        />,
+      )
+    }
   }
   return <>{items}</>
 }
@@ -667,19 +653,26 @@ function SharedModelCluster({ model, rows, deployments, policy, onChanged }: {
 }
 
 const MODEL_ROUTING_CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6, 8, 10, 16]
+const MODEL_ROUTING_MEMBER_LIMIT = 16
 
-function routingDefaults(deployments: Deployment[], policy?: ModelRoutingPolicy) {
-  const order = (policy?.members ?? [])
-    .map((member) => member.deployment_id)
-    .filter((id) => deployments.some((deployment) => deployment.id === id))
-  for (const deployment of deployments) {
-    if (!order.includes(deployment.id)) order.push(deployment.id)
+type RoutingMemberDraft = { deployment_id: string; max_concurrency: number | null }
+
+/**
+ * The configured membership of a policy, kept separate from the live
+ * inventory: a saved policy keeps its members (even offline ones) until the
+ * user explicitly adds or removes one.
+ */
+function routingDefaults(deployments: Deployment[], policy?: ModelRoutingPolicy): RoutingMemberDraft[] {
+  if (policy) {
+    return policy.members.map((member) => ({
+      deployment_id: member.deployment_id,
+      max_concurrency: member.max_concurrency,
+    }))
   }
-  const limits: Record<string, number | null> = {}
-  for (const deployment of deployments) {
-    limits[deployment.id] = policy?.members.find((member) => member.deployment_id === deployment.id)?.max_concurrency ?? null
-  }
-  return { order, limits }
+  return deployments.slice(0, MODEL_ROUTING_MEMBER_LIMIT).map((deployment) => ({
+    deployment_id: deployment.id,
+    max_concurrency: null,
+  }))
 }
 
 /**
@@ -696,27 +689,40 @@ function ModelRoutingEditor({ model, deployments, policy, onChanged }: {
   onChanged: () => void
 }) {
   const defaults = routingDefaults(deployments, policy)
-  const serverFingerprint = JSON.stringify([defaults.order, defaults.limits])
-  const [draft, setDraft] = useState(() => ({ ...defaults, fingerprint: serverFingerprint }))
+  const serverFingerprint = JSON.stringify(defaults)
+  const [draft, setDraft] = useState(() => ({ members: defaults, fingerprint: serverFingerprint }))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [saved, setSaved] = useState(false)
   useEffect(() => {
     if (draft.fingerprint === serverFingerprint) return
-    setDraft({ ...routingDefaults(deployments, policy), fingerprint: serverFingerprint })
+    setDraft({ members: routingDefaults(deployments, policy), fingerprint: serverFingerprint })
   }, [serverFingerprint]) // eslint-disable-line react-hooks/exhaustive-deps
-  const dirty = JSON.stringify([draft.order, draft.limits]) !== serverFingerprint
+  const dirty = JSON.stringify(draft.members) !== serverFingerprint
   const statusById = new Map((policy?.members ?? []).map((member) => [member.deployment_id, member]))
-  const move = (deploymentId: string, rank: number) => {
-    const order = draft.order.filter((id) => id !== deploymentId)
-    order.splice(Math.max(0, Math.min(rank, order.length)), 0, deploymentId)
+  const deploymentById = new Map(deployments.map((deployment) => [deployment.id, deployment]))
+  const aliasOf = (deploymentId: string) =>
+    deploymentById.get(deploymentId)?.alias ?? statusById.get(deploymentId)?.alias ?? deploymentId
+  const update = (members: RoutingMemberDraft[]) => {
     setSaved(false)
-    setDraft({ ...draft, order })
+    setDraft({ ...draft, members })
+  }
+  const move = (deploymentId: string, rank: number) => {
+    const chosen = draft.members.find((member) => member.deployment_id === deploymentId)
+    if (!chosen) return
+    const members = draft.members.filter((member) => member.deployment_id !== deploymentId)
+    members.splice(Math.max(0, Math.min(rank, members.length)), 0, chosen)
+    update(members)
   }
   const setLimit = (deploymentId: string, value: string) => {
-    setSaved(false)
-    setDraft({ ...draft, limits: { ...draft.limits, [deploymentId]: value === '' ? null : Number(value) } })
+    update(draft.members.map((member) => member.deployment_id === deploymentId
+      ? { ...member, max_concurrency: value === '' ? null : Number(value) }
+      : member))
   }
+  const remove = (deploymentId: string) =>
+    update(draft.members.filter((member) => member.deployment_id !== deploymentId))
+  const add = (deploymentId: string) =>
+    update([...draft.members, { deployment_id: deploymentId, max_concurrency: null }])
   const submit = async (action: () => Promise<unknown>) => {
     setBusy(true)
     setError(undefined)
@@ -730,48 +736,72 @@ function ModelRoutingEditor({ model, deployments, policy, onChanged }: {
       setBusy(false)
     }
   }
-  const save = () => submit(() => api.modelRouting.save({
-    model,
-    members: draft.order.map((id) => ({ deployment_id: id, max_concurrency: draft.limits[id] ?? null })),
-  }))
+  const save = () => submit(() => api.modelRouting.save({ model, members: draft.members }))
   const clear = () => submit(() => api.modelRouting.remove(model))
+  const candidates = deployments.filter(
+    (deployment) => !draft.members.some((member) => member.deployment_id === deployment.id),
+  )
+  const atMemberLimit = draft.members.length >= MODEL_ROUTING_MEMBER_LIMIT
+  const truncated = !policy && deployments.length > MODEL_ROUTING_MEMBER_LIMIT
   return (
     <div className="model-routing-editor">
       <div className="model-routing-heading">
         <strong>Load balancing</strong>
         <small>Requests fill the priority instance up to its cap, then overflow to the next one.</small>
       </div>
-      {draft.order.map((deploymentId, index) => {
-        const deployment = deployments.find((item) => item.id === deploymentId)
-        if (!deployment) return null
-        const member = statusById.get(deploymentId)
-        const limit = draft.limits[deploymentId] ?? null
-        const nodes = (deployment.selected_nodes ?? []).map((node) => node.name || node.id).join(' + ')
+      {draft.members.map((member, index) => {
+        const deployment = deploymentById.get(member.deployment_id)
+        const status = statusById.get(member.deployment_id)
+        const alias = aliasOf(member.deployment_id)
+        const nodes = (deployment?.selected_nodes ?? []).map((node) => node.name || node.id).join(' + ')
+        const offline = status ? !status.live : !deployment
         return (
-          <div className="model-routing-row" key={deploymentId}>
+          <div className="model-routing-row" key={member.deployment_id}>
             <label className="model-routing-priority">
               <span>Priority</span>
-              <select value={index} disabled={busy} aria-label={`Priority for ${deployment.alias}`} onChange={(event) => move(deploymentId, Number(event.target.value))}>
-                {draft.order.map((_, rank) => <option key={rank} value={rank}>{rank + 1}</option>)}
+              <select value={index} disabled={busy} aria-label={`Priority for ${alias}`} onChange={(event) => move(member.deployment_id, Number(event.target.value))}>
+                {draft.members.map((_, rank) => <option key={rank} value={rank}>{rank + 1}</option>)}
               </select>
             </label>
             <div className="model-routing-target">
-              <strong>{deployment.alias}</strong>
+              <strong>{alias}</strong>
               {nodes && <small>{nodes}</small>}
-              {member && <small>{member.live ? `${member.inflight} in flight` : 'Offline'}</small>}
+              {status && <small>{status.live ? `${status.inflight} in flight` : 'Offline'}</small>}
+              {!status && offline && <small>Offline</small>}
             </div>
             <label className="model-routing-limit">
               <span>Max concurrent</span>
-              <select value={limit === null ? '' : String(limit)} disabled={busy} aria-label={`Max concurrent requests for ${deployment.alias}`} onChange={(event) => setLimit(deploymentId, event.target.value)}>
+              <select value={member.max_concurrency === null ? '' : String(member.max_concurrency)} disabled={busy} aria-label={`Max concurrent requests for ${alias}`} onChange={(event) => setLimit(member.deployment_id, event.target.value)}>
                 <option value="">Unlimited</option>
                 {MODEL_ROUTING_CONCURRENCY_CHOICES.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
               </select>
             </label>
+            <Button variant="tertiary" onClick={() => remove(member.deployment_id)} disabled={busy} aria-label={`Remove ${alias} from routing`}>Remove</Button>
           </div>
         )
       })}
+      {candidates.length > 0 && (
+        <div className="model-routing-candidates">
+          {candidates.map((deployment) => (
+            <Button
+              key={deployment.id}
+              variant="tertiary"
+              onClick={() => add(deployment.id)}
+              disabled={busy || atMemberLimit}
+              aria-label={`Add ${deployment.alias} to routing`}
+            >
+              Add {deployment.alias}
+            </Button>
+          ))}
+        </div>
+      )}
+      {truncated && (
+        <small>
+          Routing supports at most {MODEL_ROUTING_MEMBER_LIMIT} instances; remove one to add another.
+        </small>
+      )}
       <div className="model-routing-actions">
-        <Button onClick={save} disabled={busy || !dirty}>Save routing</Button>
+        <Button onClick={save} disabled={busy || !dirty || draft.members.length === 0}>Save routing</Button>
         {policy && <Button onClick={clear} disabled={busy}>Clear</Button>}
         {saved && !dirty && !error && <span role="status">Routing saved</span>}
         {error && <p className="inline-error" role="alert">{error}</p>}

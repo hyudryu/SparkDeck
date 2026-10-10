@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Deployment, NodeInventoryItem, SystemStats } from '../api/types'
-import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot, sharedModelClusters } from './DashboardPage'
+import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot, sharedModelGroups } from './DashboardPage'
 
 function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -1175,29 +1175,49 @@ describe('DashboardPage', () => {
   })
 })
 
-describe('sharedModelClusters', () => {
+describe('sharedModelGroups', () => {
   const deployment = (id: string, modelId: string, servedModels?: string[]) => ({
     id, alias: id, model_id: modelId, served_models: servedModels,
     runtime: 'vllm', status: 'running', managed: true, settings: {},
   }) as unknown as Deployment
 
   it('groups deployments that publish a shared request id', () => {
-    const clusters = sharedModelClusters([
+    const groups = sharedModelGroups([
       deployment('dgx', 'org/model'),
       deployment('ws1', 'org/model'),
       deployment('other', 'org/different'),
     ])
-    expect(clusters.get('dgx')).toBe('org/model')
-    expect(clusters.get('ws1')).toBe('org/model')
-    expect(clusters.has('other')).toBe(false)
+    expect(groups).toHaveLength(1)
+    expect(groups[0].model).toBe('org/model')
+    expect(groups[0].deployments.map((item) => item.id)).toEqual(['dgx', 'ws1'])
   })
 
-  it('clusters transitively through a shared served name', () => {
-    const clusters = sharedModelClusters([
+  it('groups deployments that share only a served name', () => {
+    const groups = sharedModelGroups([
       deployment('a', 'org/one', ['shared']),
       deployment('b', 'org/two', ['shared']),
     ])
-    expect(clusters.get('a')).toBe(clusters.get('b'))
+    expect(groups).toHaveLength(1)
+    expect(groups[0].model).toBe('shared')
+    expect(groups[0].deployments.map((item) => item.id)).toEqual(['a', 'b'])
+  })
+
+  it('builds one group per shared request id instead of merging transitively', () => {
+    const groups = sharedModelGroups([
+      deployment('a', 'x'),
+      deployment('b', 'ignored', ['x', 'y']),
+      deployment('c', 'y'),
+    ])
+    expect(groups.map((group) => [group.model, group.deployments.map((d) => d.id)]))
+      .toEqual([['x', ['a', 'b']], ['y', ['b', 'c']]])
+  })
+
+  it('ignores the backing model id when explicit served names exist', () => {
+    const groups = sharedModelGroups([
+      deployment('a', 'org/model', ['served-a']),
+      deployment('b', 'org/model'),
+    ])
+    expect(groups).toHaveLength(0)
   })
 })
 
@@ -1224,14 +1244,25 @@ describe('Running models shared-instance routing', () => {
           savedPolicy = body
           return json(body)
         }
-        return json({ items: savedPolicy ? [savedPolicy] : [] })
+        if (!savedPolicy) return json({ items: [] })
+        return json({ items: [{
+          model: savedPolicy.model,
+          members: savedPolicy.members.map((member) => ({
+            ...member,
+            alias: member.deployment_id === 'ws1' ? 'ws1-model' : 'dgx-model',
+            status: 'running',
+            node_names: [],
+            live: true,
+            inflight: 0,
+          })),
+        }] })
       }
       return base(input as RequestInfo, init)
     }))
     render(<MemoryRouter><DashboardPage /></MemoryRouter>)
 
     await screen.findByText('2 instances share this request id')
-    const heading = screen.getByText('org/shared', { selector: '.dashboard-cluster-heading strong' })
+    const heading = screen.getByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
     expect(heading.closest('.dashboard-cluster')).not.toBeNull()
 
     fireEvent.change(screen.getByLabelText('Priority for ws1-model'), { target: { value: '0' } })
@@ -1240,13 +1271,65 @@ describe('Running models shared-instance routing', () => {
 
     await waitFor(() => expect(puts).toHaveLength(1))
     expect(puts[0]).toEqual({
-      model: 'org/shared',
+      model: 'shared-name',
       members: [
         { deployment_id: 'ws1', max_concurrency: 3 },
         { deployment_id: 'dgx', max_concurrency: null },
       ],
     })
     await waitFor(() => expect(screen.getByText('Routing saved')).toBeInTheDocument())
+  })
+
+  it('keeps configured membership separate from the live inventory', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const puts: unknown[] = []
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'old', max_concurrency: null, alias: 'old-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [
+          wire('dgx', 'dgx-model', 'DGX Spark'),
+          wire('ws1', 'ws1-model', 'RTX Pro 6000'),
+          wire('extra', 'extra-model', 'Extra node'),
+        ] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'PUT') {
+          puts.push(JSON.parse(String(init.body)))
+          return json({ model: 'shared-name', members: [] })
+        }
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('3 instances share this request id')
+    // The configured members render (offline one included); live deployments
+    // outside the policy are only offered as explicit Add candidates.
+    expect(screen.getByText('old-model')).toBeInTheDocument()
+    expect(screen.getByText('Offline')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save routing' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Add dgx-model to routing' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Add extra-model to routing' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add dgx-model to routing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save routing' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3 },
+        { deployment_id: 'old', max_concurrency: null },
+        { deployment_id: 'dgx', max_concurrency: null },
+      ],
+    })
   })
 
   it('renders a plain row for a deployment with no shared request id', async () => {

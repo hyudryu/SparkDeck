@@ -15,6 +15,7 @@ def _service(deployments, native=None):
     service.store.deployment.return_value = None
     service.deployments = AsyncMock(return_value=deployments)
     service._native_llama_model = AsyncMock(return_value=native)
+    service._model_routing_policies = {}
     return service
 
 

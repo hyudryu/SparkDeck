@@ -849,6 +849,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .model-routing-target strong, .model-routing-target small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .model-routing-target strong { font-size: 12px; font-weight: 600; }
 .model-routing-target small { color: var(--text-secondary); font-size: 11px; }
+.model-routing-candidates { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .model-routing-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .model-routing-actions span[role="status"] { color: var(--success); font-size: 11px; }
 .model-routing-actions .inline-error { margin: 0; font-size: 11px; }

@@ -326,5 +326,115 @@ class ModelRoutingProxyTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
 
+class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
+    async def test_members_may_be_live_discovered_deployments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                rows = live_rows() + [{
+                    "id": "container:one", "alias": "container:one",
+                    "runtime": "vllm", "kind": "discovered", "status": "running",
+                    "served_models": ["shared-name"],
+                    "model": {"repository": "org/discovered"},
+                }]
+                service.deployments = AsyncMock(return_value=rows)
+                saved = await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [
+                        {"deployment_id": "container:one", "max_concurrency": 2},
+                        {"deployment_id": "record-one", "max_concurrency": None},
+                    ],
+                })
+                self.assertEqual(
+                    [member["deployment_id"] for member in saved["members"]],
+                    ["container:one", "record-one"],
+                )
+                self.assertTrue(saved["members"][0]["live"])
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_failed_persistence_leaves_active_policies_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [
+                        {"deployment_id": "record-one", "max_concurrency": None},
+                    ],
+                })
+
+                def fail(_policies=None):
+                    raise OSError("disk full")
+
+                service._save_model_routing_policies = fail
+                with self.assertRaises(OSError):
+                    await service.upsert_model_routing_policy({
+                        "model": "shared-name", "members": [
+                            {"deployment_id": "record-two", "max_concurrency": 5},
+                        ],
+                    })
+                self.assertEqual(
+                    [
+                        member["deployment_id"]
+                        for member in service._model_routing_policies["shared-name"]["members"]
+                    ],
+                    ["record-one"],
+                )
+                with self.assertRaises(OSError):
+                    service.delete_model_routing_policy("shared-name")
+                self.assertIn("shared-name", service._model_routing_policies)
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_stream_cleanup_failure_still_releases_the_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                async def chunks():
+                    try:
+                        yield "data: one\n\n"
+                    finally:
+                        raise RuntimeError("cleanup failed")
+
+                service._model_routing_inflight["record-two"] = 1
+                wrapped = service._release_routing_slot_stream(chunks(), "record-two")
+                collected = []
+                with self.assertRaises(RuntimeError):
+                    async for chunk in wrapped:
+                        collected.append(chunk)
+                self.assertEqual(collected, ["data: one\n\n"])
+                self.assertEqual(service._model_routing_inflight, {})
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_catalog_publishes_shared_name_on_policy_priority_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                rows = live_rows()
+                rows[1]["last_deployed_at"] = "2026-10-10T00:00:00Z"
+                service._model_routing_policies = {
+                    "shared-name": {
+                        "model": "shared-name",
+                        "members": [
+                            {"deployment_id": "record-one", "max_concurrency": None},
+                            {"deployment_id": "record-two", "max_concurrency": None},
+                        ],
+                        "updated_at": None,
+                    },
+                }
+                owners = service._shared_selector_owners(
+                    rows, {"shared-name": {"record-one", "record-two"}},
+                )
+                # record-two is the newest deployment, but the policy's first
+                # live member publishes the shared name in the catalog.
+                self.assertEqual(owners, {"shared-name": "record-one"})
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
 if __name__ == "__main__":
     unittest.main()

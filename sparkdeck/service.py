@@ -7485,10 +7485,11 @@ class SparkDeckService:
     ) -> dict[str, str]:
         """Choose the live owner each shared request id routes to.
 
-        Mirrors ``_live_deployment_for_model_id``: an exact live id/alias
-        match keeps the name, otherwise the most recently deployed owner
-        wins. The catalog must publish the shared name on that same owner or
-        discovery and inference disagree.
+        Mirrors the inference path: an exact live id/alias match keeps the
+        name, a routing policy publishes the shared name on its first live
+        member (the priority instance), otherwise the most recently deployed
+        owner wins. The catalog must publish the shared name on the same
+        owner inference prefers or discovery and inference disagree.
         """
         by_id = {deployment["id"]: deployment for deployment in deployments}
         winners: dict[str, str] = {}
@@ -7499,6 +7500,20 @@ class SparkDeckService:
             if exact is not None and exact["id"] in owners:
                 winners[model_id] = str(exact["id"])
                 continue
+            policy = self._model_routing_policies.get(model_id)
+            if policy is not None:
+                priority = next(
+                    (
+                        str(member["deployment_id"])
+                        for member in policy["members"]
+                        if member["deployment_id"] in by_id
+                        and member["deployment_id"] in owners
+                    ),
+                    None,
+                )
+                if priority is not None:
+                    winners[model_id] = priority
+                    continue
             candidates = [by_id[owner] for owner in owners if owner in by_id]
             if not candidates:
                 continue
@@ -7812,12 +7827,12 @@ class SparkDeckService:
             policies[policy["model"]] = policy
         return policies
 
-    def _save_model_routing_policies(self) -> None:
+    def _save_model_routing_policies(
+        self, policies: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        source = self._model_routing_policies if policies is None else policies
         atomic_private_json_write(self._model_routing_path, {
-            "policies": [
-                self._model_routing_policies[key]
-                for key in sorted(self._model_routing_policies)
-            ],
+            "policies": [source[key] for key in sorted(source)],
         })
 
     @classmethod
@@ -7914,21 +7929,35 @@ class SparkDeckService:
         self, body: Any,
     ) -> dict[str, Any]:
         policy = self._normalize_model_routing_policy(body)
+        live_ids = {
+            deployment["id"] for deployment in await self.deployments()
+        }
         for member in policy["members"]:
-            if self.store.deployment(member["deployment_id"]) is None:
+            if (
+                self.store.deployment(member["deployment_id"]) is None
+                and member["deployment_id"] not in live_ids
+            ):
                 raise LookupError(
                     f"deployment not found: {member['deployment_id']}"
                 )
         policy["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._model_routing_policies[policy["model"]] = policy
-        self._save_model_routing_policies()
+        # Persist the staged mapping first: a failed write must leave the
+        # active in-memory routing exactly as it was.
+        staged = dict(self._model_routing_policies)
+        staged[policy["model"]] = policy
+        self._save_model_routing_policies(staged)
+        self._model_routing_policies = staged
         items = await self.model_routing_policies()
         return next(item for item in items if item["model"] == policy["model"])
 
     def delete_model_routing_policy(self, model: str) -> bool:
-        if self._model_routing_policies.pop(str(model or "").strip(), None) is None:
+        key = str(model or "").strip()
+        if key not in self._model_routing_policies:
             return False
-        self._save_model_routing_policies()
+        staged = dict(self._model_routing_policies)
+        staged.pop(key, None)
+        self._save_model_routing_policies(staged)
+        self._model_routing_policies = staged
         return True
 
     def _select_routed_member(
@@ -7988,8 +8017,10 @@ class SparkDeckService:
             async for chunk in stream:
                 yield chunk
         finally:
-            await close_async_stream(stream)
-            self._release_routing_slot(deployment_id)
+            try:
+                await close_async_stream(stream)
+            finally:
+                self._release_routing_slot(deployment_id)
 
     def _note_shared_selector_owner(
         self, model_id: str, chosen: dict[str, Any],

@@ -674,10 +674,18 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cards[0]["deployment_mode"], "replicated")
         self.assertEqual(cards[0]["model_revision"], "release-b")
 
-    async def test_concurrent_duplicate_alias_launches_only_one_container(self):
-        async def launch(*_args, **_kwargs):
+    async def test_concurrent_duplicate_alias_launches_both_profiles(self):
+        """Two concurrent duplicate-alias launches are routine: creation
+        suffixes the display alias and each profile launches its own
+        container. Sharing the model's request id is reported as a warning
+        on the second action instead of blocking it."""
+        async def launch(*args, **_kwargs):
             await asyncio.sleep(0.01)
-            return {"name": "sparkdeck-shared-dep", "port": 8000, "status": "running"}
+            alias = str(args[3])
+            return {
+                "name": f"sparkdeck-{alias}-dep", "port": 8000,
+                "status": "running",
+            }
 
         launch_mock = AsyncMock(side_effect=launch)
         body = {"model": "org/model", "alias": "shared", "runtime": "vllm"}
@@ -688,12 +696,23 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             )
 
-        self.assertEqual(launch_mock.await_count, 1)
-        self.assertEqual(len([item for item in results if isinstance(item, dict)]), 1)
-        errors = [item for item in results if isinstance(item, Exception)]
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], ValueError)
-        self.assertEqual(len(self.service.store.deployments()), 1)
+        self.assertEqual(launch_mock.await_count, 2)
+        self.assertTrue(all(isinstance(item, dict) for item in results))
+        self.assertEqual(
+            sorted(item["alias"] for item in results), ["shared", "shared-2"],
+        )
+        self.assertEqual(
+            sorted(item["container_name"] for item in results),
+            ["sparkdeck-shared-2-dep", "sparkdeck-shared-dep"],
+        )
+        warnings = [
+            warning
+            for item in results
+            for warning in item.get("selector_warnings") or []
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("selector 'org/model' is already served", warnings[0])
+        self.assertEqual(len(self.service.store.deployments()), 2)
 
     async def test_background_cluster_launch_returns_after_durable_start_and_reports_progress(self):
         release_launch = asyncio.Event()

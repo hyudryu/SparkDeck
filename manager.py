@@ -9740,6 +9740,11 @@ class Manager:
                     deployment["status"] = self._grouped_deployment_status(
                         deployment
                     )
+                    if action == "start":
+                        # A group restart puts this deployment back in
+                        # service; the shared-selector recency ranking must
+                        # see it as the most recently deployed owner.
+                        deployment["last_deployed_at"] = time.time()
             elif errors:
                 # A partial start is still intended to be running; keep it in
                 # the health monitor's candidate set so the successful rank is

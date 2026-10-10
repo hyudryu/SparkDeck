@@ -3499,15 +3499,27 @@ class SparkDeckService:
             # by suffixing instead of failing the request.
             alias = await self._next_available_deployment_alias(alias)
             await self._assert_deployment_alias_available(alias, deployment_id)
+            launch_selector_warnings: list[str] = []
             if launch:
-                # Create-with-launch is a start: its request ids must not
-                # collide with an already live deployment. The guard and the
-                # launch registrations below share this critical section, so
-                # a concurrent start cannot slip between them.
-                await self._assert_deployment_start_selectors({
-                    "id": deployment_id, "alias": alias, "kind": kind.value,
-                    "model": {"repository": model}, "settings": settings,
-                })
+                # Create-with-launch is a start: a request id an already live
+                # deployment serves is reported as a warning, not a block.
+                # The collection and the launch registrations below share
+                # this critical section, so a concurrent start cannot slip
+                # between them.
+                launch_selector_warnings = (
+                    await self._deployment_selector_warnings({
+                        "id": deployment_id, "alias": alias, "kind": kind.value,
+                        "model": {"repository": model}, "settings": settings,
+                    })
+                )
+
+            def with_selector_warnings(response: dict[str, Any]) -> dict[str, Any]:
+                if launch_selector_warnings and isinstance(response, dict):
+                    return {
+                        **response,
+                        "selector_warnings": list(launch_selector_warnings),
+                    }
+                return response
             artifact_is_local = False
             model_is_local_path = False
             artifact_homes: list[str] | None = None
@@ -3675,7 +3687,9 @@ class SparkDeckService:
                 except Exception:
                     self._delete_credential(deployment_id, credential_ref)
                     raise
-                return (self.store.deployment(deployment_id) or deployment.to_dict())
+                return with_selector_warnings(
+                    self.store.deployment(deployment_id) or deployment.to_dict(),
+                )
 
             if requested_node_ids is not None:
                 if any(item != "local" for item in requested_node_ids):
@@ -3746,7 +3760,7 @@ class SparkDeckService:
                             self.manager.public_target_node(node) for node in selected
                         ],
                     })
-                    return result
+                    return with_selector_warnings(result)
                 ninfer_artifact = None
                 if runtime is RuntimeKind.NINFER:
                     # Cluster members resolve the artifact from their own
@@ -3769,9 +3783,11 @@ class SparkDeckService:
                     ninfer_artifact=ninfer_artifact,
                 )
                 if background:
-                    return await self._begin_cluster_deployment(
-                        deployment, settings, mode, requested_node_ids,
-                        selected, launch_body,
+                    return with_selector_warnings(
+                        await self._begin_cluster_deployment(
+                            deployment, settings, mode, requested_node_ids,
+                            selected, launch_body,
+                        ),
                     )
                 try:
                     cluster = await self.manager.create_deployment(launch_body)
@@ -3813,7 +3829,7 @@ class SparkDeckService:
                         self.manager.public_target_node(node) for node in selected
                     ],
                 })
-                return result
+                return with_selector_warnings(result)
 
             if not launch:
                 # Controller-local bookmark without saved node preferences.
@@ -3823,7 +3839,7 @@ class SparkDeckService:
                 self.store.add_deployment(deployment, None, None)
                 result = self.store.deployment(deployment_id) or deployment.to_dict()
                 result.update({"status": "saved"})
-                return result
+                return with_selector_warnings(result)
 
             adapter = self.registry.get(runtime)
             if runtime is RuntimeKind.NINFER:
@@ -3897,7 +3913,7 @@ class SparkDeckService:
                 result.update({
                     "status": launched.get("status", "running"), "port": int(port),
                 })
-                return result
+                return with_selector_warnings(result)
             finally:
                 launch_complete.set()
                 self._deployment_launches.pop(deployment_id, None)
@@ -4844,17 +4860,38 @@ class SparkDeckService:
                     "deployment launch is still in progress; wait for container creation"
                 )
             if action != "start":
-                return await self._deployment_action_locked(
+                if action != "add_instance":
+                    return await self._deployment_action_locked(
+                        deployment_id, action, node_ids, additional_node_ids,
+                        promote, instance,
+                    )
+                # An add-instance launch puts another engine group live
+                # under the same request id and refreshes the deployment's
+                # recency, so it needs the same shared-selector warning as a
+                # start. The scan shares the alias lock with starts so it
+                # reads one consistent live picture.
+                async with self._deployment_alias_lock:
+                    selector_warnings = await self._start_action_selector_warnings(
+                        deployment_id,
+                    )
+                result = await self._deployment_action_locked(
                     deployment_id, action, node_ids, additional_node_ids,
                     promote, instance,
                 )
+                if selector_warnings and isinstance(result, dict):
+                    result = {**result, "selector_warnings": selector_warnings}
+                return result
             # Selector arbitration and the in-flight registration are one
-            # step: the guard reads other records' live selectors, so a
-            # concurrent start could otherwise slip between check and
-            # registration and publish a duplicate model id. The registration
-            # also lets deletion wait for the launch to settle.
+            # step: the scan reads other records' live selectors, so a
+            # concurrent start could otherwise slip between collection and
+            # registration and miss a shared request id. Sharing a request id
+            # with a live deployment is allowed (routing prefers the newest
+            # owner); the overlap is reported as a warning on the action. The
+            # registration also lets deletion wait for the launch to settle.
             async with self._deployment_alias_lock:
-                await self._assert_start_action_selectors(deployment_id)
+                selector_warnings = await self._start_action_selector_warnings(
+                    deployment_id,
+                )
                 self._deployment_launches.setdefault(
                     deployment_id, asyncio.Event(),
                 )
@@ -4863,13 +4900,16 @@ class SparkDeckService:
                     # without changing the saved bookmark on a failed start.
                     self._deployment_launch_node_ids[deployment_id] = list(node_ids)
             try:
-                return await self._deployment_action_locked(
+                result = await self._deployment_action_locked(
                     deployment_id, action, node_ids, additional_node_ids,
                     promote, instance,
                 )
             finally:
                 self._deployment_launches.pop(deployment_id, None)
                 self._deployment_launch_node_ids.pop(deployment_id, None)
+            if selector_warnings and isinstance(result, dict):
+                result = {**result, "selector_warnings": selector_warnings}
+            return result
 
     @asynccontextmanager
     async def _deployment_lifecycle_lock(
@@ -7089,9 +7129,9 @@ class SparkDeckService:
         """Display aliases stay unique across the whole deployment catalog.
 
         Repository and served selectors are deliberately not checked here:
-        multiple records may target the same model, and conflicts between
-        live launches are rejected by ``_assert_deployment_start_selectors``
-        when a start is requested.
+        multiple records may target the same model, and a live overlap is
+        reported by ``_deployment_selector_warnings`` when a start is
+        requested.
         """
         folded = alias.casefold()
         for item in await self.deployments():
@@ -7124,8 +7164,8 @@ class SparkDeckService:
                 return candidate
         return f"{base}-{uuid.uuid4().hex[:8]}"
 
-    async def _assert_start_action_selectors(self, deployment_id: str) -> None:
-        """Resolve the record a start action targets, then arbitrate selectors."""
+    async def _start_action_selector_warnings(self, deployment_id: str) -> list[str]:
+        """Resolve the record a start action targets, then collect its warnings."""
         stored = self.store.deployment(deployment_id, include_private=True)
         if not stored and deployment_id.startswith("container:"):
             container = await self._resolve_discovered_container(deployment_id)
@@ -7135,22 +7175,30 @@ class SparkDeckService:
                 container.get("model") or container.get("served_model"),
             )
         if stored:
-            await self._assert_deployment_start_selectors(stored)
+            return await self._deployment_selector_warnings(stored)
+        return []
 
-    async def _assert_deployment_start_selectors(
+    async def _deployment_selector_warnings(
         self, deployment: dict[str, Any],
-    ) -> None:
-        """Reject a launch whose request ids are already published live.
+    ) -> list[str]:
+        """Warn when a launch reuses a request id a live deployment serves.
 
         Records may share repository and served selectors while saved or
-        stopped; the conflict only matters once two launches would answer at
-        the same time and a bare model id could no longer be routed
-        unambiguously. Registered external endpoints reserve only the names
-        actually advertised while healthy; their desired state cannot reserve
-        a launch because SparkDeck does not own their lifecycle.
+        stopped, and a shared name is permitted at launch: routing resolves
+        it to the most recently deployed owner. Running two deployments under
+        the same request id is legitimate (parallel profiles, an A/B pair),
+        so the overlap surfaces as a soft warning on the action instead of
+        blocking it. A discovered container start is a real launch too (its
+        Docker restart or promotion refreshes the owner recency); only
+        registered external endpoints stay exempt, because SparkDeck does
+        not own their lifecycle and their desired state cannot reserve a
+        launch.
         """
-        if str(deployment.get("kind") or "") != DeploymentKind.MANAGED.value:
-            return
+        kind = str(deployment.get("kind") or "")
+        if kind != DeploymentKind.MANAGED.value and not str(
+            deployment.get("id") or ""
+        ).startswith("container:"):
+            return []
         requested: list[tuple[str, str]] = []
         seen: set[str] = set()
         candidates: list[tuple[str, str]] = [
@@ -7171,7 +7219,8 @@ class SparkDeckService:
             seen.add(folded)
             requested.append((selector.strip(), label))
         if not requested:
-            return
+            return []
+        warnings: list[str] = []
         for item in await self.deployments():
             item_id = str(item.get("id") or "")
             if item_id == str(deployment.get("id")):
@@ -7229,11 +7278,15 @@ class SparkDeckService:
             }
             for selector, label in requested:
                 if selector.casefold() in occupied:
-                    raise ValueError(
+                    message = (
                         f"deployment {label} '{selector}' is already served by "
-                        f"running deployment '{item.get('alias')}'; stop it "
-                        "first or choose a different served model name"
+                        f"running deployment '{item.get('alias')}'; requests "
+                        "using that name may reach either deployment while "
+                        "both run"
                     )
+                    if message not in warnings:
+                        warnings.append(message)
+        return warnings
 
     async def rename_deployment(self, deployment_id: str, alias: Any) -> dict[str, Any]:
         alias = str(alias or "").strip()
@@ -7414,6 +7467,35 @@ class SparkDeckService:
             })
         return result
 
+    def _shared_selector_owners(
+        self,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+    ) -> dict[str, str]:
+        """Choose the live owner each shared request id routes to.
+
+        Mirrors ``_live_deployment_for_model_id``: an exact live id/alias
+        match keeps the name, otherwise the most recently deployed owner
+        wins. The catalog must publish the shared name on that same owner or
+        discovery and inference disagree.
+        """
+        by_id = {deployment["id"]: deployment for deployment in deployments}
+        winners: dict[str, str] = {}
+        for model_id, owners in request_owners.items():
+            if len(owners) < 2:
+                continue
+            exact = self.store.deployment(model_id, include_private=True)
+            if exact is not None and exact["id"] in owners:
+                winners[model_id] = str(exact["id"])
+                continue
+            candidates = [by_id[owner] for owner in owners if owner in by_id]
+            if not candidates:
+                continue
+            winners[model_id] = str(
+                max(candidates, key=self._selector_owner_sort_key)["id"],
+            )
+        return winners
+
     async def models(self) -> dict[str, Any]:
         data = []
         seen = set()
@@ -7429,17 +7511,18 @@ class SparkDeckService:
         request_owners = self._deployment_request_owners(
             deployments, public_ids,
         )
+        shared_owners = self._shared_selector_owners(deployments, request_owners)
         for deployment in deployments:
             model_ids = [
                 model_id for model_id in public_ids[deployment["id"]]
                 if self._model_id_routes_to_deployment(
-                    model_id, deployment, request_owners,
+                    model_id, deployment, request_owners, shared_owners,
                 )
             ]
             if not model_ids:
                 alias = str(deployment.get("alias") or "").strip()
                 if alias and self._model_id_routes_to_deployment(
-                    alias, deployment, request_owners,
+                    alias, deployment, request_owners, shared_owners,
                 ):
                     model_ids = [alias]
             for model_id in model_ids:
@@ -7599,8 +7682,12 @@ class SparkDeckService:
         model_id: str,
         deployment: dict[str, Any],
         request_owners: dict[str, set[str]],
+        shared_owners: dict[str, str] | None = None,
     ) -> bool:
         """Return whether gateway lookup selects exactly this deployment."""
+        winner = (shared_owners or {}).get(model_id)
+        if winner is not None:
+            return winner == deployment["id"]
         exact = self.store.deployment(model_id, include_private=True)
         owners = request_owners.get(model_id, set())
         if exact is not None and exact["id"] in owners:
@@ -7644,33 +7731,91 @@ class SparkDeckService:
         if exact is not None and exact["id"] in live_by_id:
             return {**exact, **live_by_id[exact["id"]]}
 
-        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        # One candidate set spans persisted records and discovered
+        # containers: a shared request id has a single winner regardless of
+        # which class each owner belongs to.
+        candidates: list[dict[str, Any]] = []
         for stored in stored_deployments:
             live = live_by_id.get(stored["id"])
             if live is None:
                 continue
             if model_id in self._deployment_public_model_ids(live):
-                matches.append((stored, live))
-        if len(matches) > 1:
-            raise LookupError(
-                "served model name is ambiguous; use a deployment alias"
-            )
-        if not matches:
-            discovered = [
-                deployment for deployment in deployments
-                if deployment["id"] not in stored_by_id
-                and (
-                    model_id in self._deployment_public_model_ids(deployment)
-                    or model_id == str(deployment.get("alias") or "").strip()
-                )
-            ]
-            if len(discovered) > 1:
-                raise LookupError(
-                    "served model name is ambiguous; use a deployment alias"
-                )
-            return discovered[0] if discovered else None
-        stored, live = matches[0]
-        return {**stored, **live}
+                candidates.append({**stored, **live})
+        for deployment in deployments:
+            if deployment["id"] in stored_by_id:
+                continue
+            if (
+                model_id in self._deployment_public_model_ids(deployment)
+                or model_id == str(deployment.get("alias") or "").strip()
+            ):
+                candidates.append(deployment)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Several live deployments may share one request id; routing has to
+        # stay deterministic, so the most recently deployed owner answers
+        # while the older ones remain reachable by their aliases.
+        chosen = max(candidates, key=self._selector_owner_sort_key)
+        self._note_shared_selector_owner(model_id, chosen)
+        return chosen
+
+    def _note_shared_selector_owner(
+        self, model_id: str, chosen: dict[str, Any],
+    ) -> None:
+        """Log a shared request id's owner when the ownership changes.
+
+        A shared name is legitimate, so the request path must not log on
+        every inference; one line per ownership change is enough to explain
+        where a bare model id currently lands.
+        """
+        observed = getattr(self, "_shared_selector_owners_log", None)
+        if observed is None:
+            observed = self._shared_selector_owners_log = {}
+        owner = str(chosen.get("id") or "")
+        if observed.get(model_id) == owner:
+            return
+        observed[model_id] = owner
+        logger.warning(
+            "served model name %r is shared by several live deployments; "
+            "routing to %r",
+            model_id, chosen.get("alias") or owner,
+        )
+
+    @classmethod
+    def _selector_owner_timestamp(cls, value: Any) -> float | None:
+        """Parse a deployment timestamp into epoch seconds, or ``None``.
+
+        Records carry epoch floats on some writers and ISO-8601 strings on
+        others, so both forms must order correctly.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00"),
+                ).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _selector_owner_sort_key(
+        cls, deployment: dict[str, Any],
+    ) -> tuple[float, str]:
+        """Order live owners of a shared selector; newest deployment wins.
+
+        Timestamps are absent on some discovered containers, so the id is
+        the deterministic tiebreaker and the fallback.
+        """
+        for field in ("last_deployed_at", "last_used_at", "created_at"):
+            stamp = cls._selector_owner_timestamp(deployment.get(field))
+            if stamp is not None:
+                return (stamp, str(deployment.get("id") or ""))
+        return (0.0, str(deployment.get("id") or ""))
 
     def source_ip_routing_rules(self) -> list[dict[str, Any]]:
         return self.manager.list_source_ip_routing_rules()

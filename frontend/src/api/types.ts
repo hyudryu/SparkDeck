@@ -164,6 +164,9 @@ export interface Deployment {
   single_host_topology_replayable?: boolean
   distributed_host_topology_replayable?: boolean
   last_error?: string
+  // Soft overlap notices returned by an action (a request id another live
+  // deployment also serves); the launch still proceeds.
+  selector_warnings?: string[]
   created_at?: string
   updated_at?: string
   last_deployed_at?: string | number

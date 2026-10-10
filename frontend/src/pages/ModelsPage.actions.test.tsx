@@ -2085,6 +2085,39 @@ describe('deployment group controls', () => {
     expect(await screen.findByText('running')).toBeInTheDocument()
   })
 
+  it('surfaces selector warnings from a grouped start action', async () => {
+    const user = userEvent.setup()
+    const stopped = {
+      ...grouped, status: 'stopped', desired_state: 'stopped',
+      instances: grouped.instances.map((instance) => ({ ...instance, status: 'stopped', desired_state: 'stopped' })),
+    }
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [stopped] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (String(input).endsWith('/dep-1/start') && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          ...stopped, status: 'starting', desired_state: 'running',
+          deployment_mode: undefined, required_node_count: undefined,
+          node_ids: undefined, selected_nodes: undefined,
+          selector_warnings: [
+            "deployment selector 'org/model' is already served by running deployment 'TP2'; requests using that name may reach either deployment while both run",
+          ],
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start a group for Chat model' })
+    await user.click(within(dialog).getByRole('radio', { name: /Group 1/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Start selected group' }))
+
+    const warning = await screen.findByText(/is already served by running deployment 'TP2'/)
+    expect(warning).toHaveClass('inline-warning')
+  })
+
   it('probes again after accepting a group action with a degraded status and no launch phase', async () => {
     const user = userEvent.setup()
     const stopped = {

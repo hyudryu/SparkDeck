@@ -388,6 +388,7 @@ export interface WireDeployment {
   has_stop_hook?: boolean
   has_settings_env_file?: boolean
   direct_start?: boolean
+  selector_warnings?: string[]
 }
 
 interface WireDeploymentDetail extends WireDeployment {
@@ -473,6 +474,7 @@ export function deploymentFromWire(item: WireDeployment): Deployment {
     has_stop_hook: item.has_stop_hook,
     has_settings_env_file: item.has_settings_env_file,
     direct_start: item.direct_start,
+    selector_warnings: item.selector_warnings,
   }
 }
 

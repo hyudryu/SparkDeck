@@ -68,7 +68,7 @@ class FakeManager:
 
 
 class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_creation_shares_discovered_selector_until_start(self):
+    async def test_creation_shares_discovered_selector_and_start_warns(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             service = SparkDeckService(manager, Path(directory))
@@ -92,18 +92,28 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(created["alias"], "PUBLIC-SELECTOR")
 
-                # The conflict surfaces when the record tries to start.
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "alias 'PUBLIC-SELECTOR' is already served by running",
-                ):
-                    await service.deployment_action(created["id"], "start")
+                # The overlap surfaces as a warning when the record starts;
+                # the launch itself is not blocked.
+                warnings = await service._deployment_selector_warnings(
+                    service.store.deployment(
+                        created["id"], include_private=True,
+                    ),
+                )
+                self.assertEqual(
+                    warnings,
+                    [
+                        "deployment alias 'PUBLIC-SELECTOR' is already served "
+                        "by running deployment 'Discovered display name'; "
+                        "requests using that name may reach either deployment "
+                        "while both run"
+                    ],
+                )
                 self.assertEqual(len(service.store.deployments()), 1)
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_start_rejects_repository_shared_with_discovered_alias(self):
+    async def test_start_reports_repository_shared_with_discovered_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             service = SparkDeckService(manager, Path(directory))
@@ -124,16 +134,24 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(len(service.store.deployments()), 1)
 
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "selector 'org/new' is already served by running",
-                ):
-                    await service.deployment_action(created["id"], "start")
+                warnings = await service._deployment_selector_warnings(
+                    service.store.deployment(
+                        created["id"], include_private=True,
+                    ),
+                )
+                self.assertEqual(
+                    warnings,
+                    [
+                        "deployment selector 'org/new' is already served by "
+                        "running deployment 'ORG/NEW'; requests using that "
+                        "name may reach either deployment while both run"
+                    ],
+                )
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_start_rejects_served_name_shared_with_discovered_alias(self):
+    async def test_start_reports_served_name_shared_with_discovered_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._deployment_served_models = Manager._deployment_served_models
@@ -160,16 +178,25 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(len(service.store.deployments()), 1)
 
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "selector 'public-selector' is already served by running",
-                ):
-                    await service.deployment_action(created["id"], "start")
+                warnings = await service._deployment_selector_warnings(
+                    service.store.deployment(
+                        created["id"], include_private=True,
+                    ),
+                )
+                self.assertEqual(
+                    warnings,
+                    [
+                        "deployment selector 'public-selector' is already "
+                        "served by running deployment 'PUBLIC-SELECTOR'; "
+                        "requests using that name may reach either deployment "
+                        "while both run"
+                    ],
+                )
             finally:
                 await service.close()
                 await manager.http.aclose()
 
-    async def test_start_rejects_selectors_owned_by_live_public_ids(self):
+    async def test_start_reports_selectors_owned_by_live_public_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._deployment_served_models = Manager._deployment_served_models
@@ -205,17 +232,73 @@ class DeploymentRenameSynchronizationTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(len(service.store.deployments()), 2)
 
-                # Neither launch may go live while the selectors are taken.
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "selector 'org/new' is already served by running",
-                ):
-                    await service.deployment_action(first["id"], "start")
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "selector 'vision-public' is already served by running",
-                ):
-                    await service.deployment_action(second["id"], "start")
+                # Both launches are allowed; each reports the shared
+                # selector as a warning instead of failing.
+                first_warnings = await service._deployment_selector_warnings(
+                    service.store.deployment(first["id"], include_private=True),
+                )
+                self.assertEqual(
+                    first_warnings,
+                    [
+                        "deployment selector 'org/new' is already served by "
+                        "running deployment 'Production Vision'; requests "
+                        "using that name may reach either deployment while "
+                        "both run"
+                    ],
+                )
+                second_warnings = await service._deployment_selector_warnings(
+                    service.store.deployment(second["id"], include_private=True),
+                )
+                self.assertEqual(
+                    second_warnings,
+                    [
+                        "deployment selector 'vision-public' is already "
+                        "served by running deployment 'Production Vision'; "
+                        "requests using that name may reach either deployment "
+                        "while both run"
+                    ],
+                )
+            finally:
+                await service.close()
+                await manager.http.aclose()
+
+    async def test_discovered_container_start_reports_a_shared_selector(self):
+        """Starting or promoting a discovered container changes owner
+        recency like any launch, so the overlap is reported; only registered
+        external endpoints stay exempt."""
+        live_owner = {
+            "id": "live-deployment", "alias": "Production Vision",
+            "runtime": "vllm", "kind": "managed", "status": "running",
+            "model": {"repository": "org/model"},
+            "served_models": ["org/model", "vision-public"], "settings": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                service.deployments = AsyncMock(return_value=[live_owner])
+                discovered = {
+                    "id": "container:existing", "kind": "external",
+                    "alias": "Existing", "status": "stopped",
+                    "model": {"repository": "org/model"}, "settings": {},
+                }
+                warnings = await service._deployment_selector_warnings(
+                    discovered,
+                )
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(
+                    "selector 'org/model' is already served", warnings[0],
+                )
+
+                registered = {
+                    "id": "external-registered", "kind": "external",
+                    "alias": "Hosted copy", "status": "error",
+                    "model": {"repository": "org/model"}, "settings": {},
+                }
+                self.assertEqual(
+                    await service._deployment_selector_warnings(registered),
+                    [],
+                )
             finally:
                 await service.close()
                 await manager.http.aclose()

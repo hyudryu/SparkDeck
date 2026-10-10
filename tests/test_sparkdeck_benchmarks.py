@@ -209,7 +209,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             item["deployment_id"] == "dep-1" for item in result["data"]
         ))
 
-    async def test_models_contract_uses_alias_for_ambiguous_served_name(self):
+    async def test_models_contract_advertises_shared_name_on_its_winner(self):
         self.service.deployments = AsyncMock(return_value=[
             {
                 "id": "dep-1", "alias": "model-one", "runtime": "vllm",
@@ -227,8 +227,9 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["id"] for item in result["data"]],
-            ["model-one", "model-two"],
+            ["model-one", "shared-name"],
         )
+        self.assertEqual(result["data"][1]["deployment_id"], "dep-2")
 
     async def test_inactive_deployment_does_not_reserve_its_served_name(self):
         self.service.deployments = AsyncMock(return_value=[
@@ -268,9 +269,11 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.models()
 
+        # The shared id belongs to its winner; the discovered container's
+        # alias is not re-advertised as a second route to the same name.
         self.assertEqual(
             [(item["id"], item["deployment_id"]) for item in result["data"]],
-            [("registered-alias", "registered")],
+            [("shared-name", "registered")],
         )
 
     def test_discovered_deployment_preserves_all_served_names(self):

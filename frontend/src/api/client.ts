@@ -55,6 +55,8 @@ import type {
   UsageAnalysis,
   UsageSummary,
   InferenceRoutingRule,
+  ModelRoutingPolicy,
+  ModelRoutingPolicyInput,
   SystemUpdateOverview,
   SystemUpdateJob,
   RouterOSConnectionInput,
@@ -1056,6 +1058,26 @@ export const api = {
         method: 'DELETE',
       })
     },
+  },
+  modelRouting: {
+    list: async (signal?: AbortSignal) => {
+      // Listing enriches members through the same full deployment
+      // inventory scan as the deployments endpoint, so it needs the same
+      // extended deadline or the editors stay locked on slow clusters.
+      const data = await request<{ items: ModelRoutingPolicy[] }>(
+        '/api/v1/model-routing-policies', { signal }, DEPLOYMENTS_TIMEOUT_MS,
+      )
+      return data.items
+    },
+    save: (policy: ModelRoutingPolicyInput) =>
+      request<ModelRoutingPolicy>('/api/v1/model-routing-policies', {
+        method: 'PUT',
+        body: JSON.stringify(policy),
+      }),
+    remove: (model: string) => request<void>(
+      `/api/v1/model-routing-policies?${new URLSearchParams({ model })}`,
+      { method: 'DELETE' },
+    ),
   },
   settings: {
     get: (signal?: AbortSignal) => requestWithFallback<AppSettings>('/api/v1/settings', '/api/settings', { signal }),

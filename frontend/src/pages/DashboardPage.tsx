@@ -1,15 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import {
   Activity,
   Cloud,
   Gauge,
+  Layers,
   RefreshCw,
   Server,
   Users,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
-import type { ActiveRequestGroupStats, ActiveRequestStats, AdmissionStats, Deployment, NodeInventoryItem, SystemStats } from '../api/types'
+import type { ActiveRequestGroupStats, ActiveRequestStats, AdmissionStats, Deployment, ModelRoutingPolicy, NodeInventoryItem, SystemStats } from '../api/types'
 import { Button, EmptyState, LoadingState, PageHeader, Panel, RuntimeMark, Status } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
@@ -86,6 +88,52 @@ function runningDeploymentGroups(deployment: Deployment) {
     label: (deployment.selected_nodes?.map((node) => node.name || node.id) ?? deployment.node_ids ?? []).join(' + '),
   }]
 }
+
+/**
+ * Request ids a deployment publishes; the alias is unique and never shared.
+ *
+ * Mirrors the backend's `_deployment_public_model_ids`: explicit served
+ * names replace the backing repository id, which the gateway does not
+ * accept once served names are configured.
+ */
+function deploymentRequestIds(deployment: Deployment): string[] {
+  const served = new Set<string>()
+  if (deployment.served_model) served.add(deployment.served_model)
+  for (const id of deployment.served_models ?? []) served.add(id)
+  if (served.size) return [...served]
+  return deployment.model_id ? [deployment.model_id] : []
+}
+
+export type SharedModelGroup = { model: string; deployments: Deployment[] }
+
+/**
+ * One group per shared request id: every request id published by two or
+ * more deployments gets its own cluster with its own routing policy.
+ *
+ * Grouping per id (rather than transitively across ids) keeps each cluster
+ * routable: a deployment serving both `x` and `y` appears in both groups,
+ * and each group's editor configures exactly the instances that can serve
+ * that id. Deployments in no group render as plain rows.
+ */
+export function sharedModelGroups(deployments: Deployment[]): SharedModelGroup[] {
+  const membersByModel = new Map<string, Deployment[]>()
+  for (const deployment of deployments) {
+    for (const id of deploymentRequestIds(deployment)) {
+      const members = membersByModel.get(id) ?? []
+      members.push(deployment)
+      membersByModel.set(id, members)
+    }
+  }
+  const groups: SharedModelGroup[] = []
+  for (const [model, members] of membersByModel) {
+    if (members.length < 2) continue
+    groups.push({ model, deployments: members })
+  }
+  groups.sort((a, b) => a.model.localeCompare(b.model))
+  return groups
+}
+
+type RunningModelRow = { deployment: Deployment; group: ReturnType<typeof runningDeploymentGroups>[number] }
 
 function MetricBar({ value, label }: { value: number | null | undefined; label: string }) {
   const measured = finiteNumber(value)
@@ -287,6 +335,7 @@ export function DashboardPage() {
   const deploymentsResource = useDashboardResource((signal) => api.dashboard.deployments(signal), polling('deployments'))
   const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal), polling('sync'))
   const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal), polling('nodes'))
+  const routingResource = useDashboardResource((signal) => api.modelRouting.list(signal))
   useEffect(() => {
     resourcesRef.current = {
       stats: statsResource,
@@ -357,6 +406,14 @@ export function DashboardPage() {
     deploymentsResource.reload()
     syncResource.reload()
     nodesResource.reload()
+    routingResource.reload()
+  }
+  const policyByModel = new Map((routingResource.data ?? [])
+    .filter((policy) => Boolean(policy.model) && Array.isArray(policy.members))
+    .map((policy) => [policy.model, policy]))
+  const routingChanged = () => {
+    deploymentsResource.reload()
+    routingResource.reload()
   }
 
   return (
@@ -407,18 +464,16 @@ export function DashboardPage() {
                 <LoadingState label="Loading deployments" />
               ) : deploymentsResource.error && !deploymentsResource.data ? (
                 <EmptyState title="Deployment status unavailable" description="Refresh to retry loading model status." />
-              ) : activeDeploymentGroups.length === 0 ? (
+              ) : activeDeploymentGroups.length === 0 && policyByModel.size === 0 ? (
                 <EmptyState title="No models running" description="Start a deployment to make it available for chat and comparison." action={<Link className="button button-primary" to="/models">Open models</Link>} />
               ) : (
                 <div className="dashboard-list">
-                  {activeDeploymentGroups.map(({ deployment, group }) => (
-                    <div className="dashboard-list-row" key={group.key}>
-                      <span className={`status-dot status-${group.status}`} aria-hidden="true" />
-                      <span className="sr-only">Status: {group.status}</span>
-                      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}{group.stopPending && <small>Stop pending</small>}{!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}</div>
-                      <RuntimeMark runtime={deployment.runtime} />
-                    </div>
-                  ))}
+                  <RunningModelList
+                    rows={activeDeploymentGroups}
+                    policyByModel={policyByModel}
+                    routingReady={!routingResource.loading && !routingResource.error}
+                    onChanged={routingChanged}
+                  />
                 </div>
               )}
             </Panel>
@@ -516,6 +571,284 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
         <span className="session-stage" title={sampledPromptRate && hasPromptRate ? 'Latest prompt-speed estimate from uncached tokens and engine time to first token, including scheduling.' : undefined}><span className="session-stage-label">Prompt processing</span><span className="session-stage-value">{promptLabel}</span></span>
         <span className="session-stage"><span className="session-stage-label">Output</span><span className="session-stage-value">{stageRate(request.output_tok_s, waiting)}</span></span>
         <span className="session-stage"><span className="session-stage-label">Thinking</span><span className="session-stage-value">{stageRate(request.thinking_tok_s, waiting)}</span></span>
+      </div>
+    </div>
+  )
+}
+
+function DeploymentGroupRow({ deployment, group }: RunningModelRow) {
+  return (
+    <div className="dashboard-list-row">
+      <span className={`status-dot status-${group.status}`} aria-hidden="true" />
+      <span className="sr-only">Status: {group.status}</span>
+      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}{group.stopPending && <small>Stop pending</small>}{!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}</div>
+      <RuntimeMark runtime={deployment.runtime} />
+    </div>
+  )
+}
+
+/**
+ * Running-model rows. Deployments sharing a request id are grouped into one
+ * cluster per shared id, each carrying its own priority routing editor; a
+ * deployment serving two shared ids appears in both clusters. Saved policies
+ * also render a cluster even while fewer than two of their members are
+ * live, so operators can inspect or clear routing during an outage.
+ */
+function RunningModelList({ rows, policyByModel, routingReady, onChanged }: {
+  rows: RunningModelRow[]
+  policyByModel: Map<string, ModelRoutingPolicy>
+  routingReady: boolean
+  onChanged: () => void
+}) {
+  const uniqueDeployments = [...new Map(rows.map((row) => [row.deployment.id, row.deployment])).values()]
+  const groups = sharedModelGroups(uniqueDeployments)
+  const policyGroups: SharedModelGroup[] = []
+  for (const model of policyByModel.keys()) {
+    if (groups.some((group) => group.model === model)) continue
+    policyGroups.push({
+      model,
+      deployments: uniqueDeployments.filter((deployment) =>
+        deploymentRequestIds(deployment).includes(model)),
+    })
+  }
+  const allGroups = [...groups, ...policyGroups]
+  const groupsByDeployment = new Map<string, SharedModelGroup[]>()
+  for (const group of allGroups) {
+    for (const deployment of group.deployments) {
+      const list = groupsByDeployment.get(deployment.id) ?? []
+      list.push(group)
+      groupsByDeployment.set(deployment.id, list)
+    }
+  }
+  const renderedGroups = new Set<string>()
+  const items: ReactNode[] = []
+  const renderCluster = (group: SharedModelGroup) => {
+    if (renderedGroups.has(group.model)) return
+    renderedGroups.add(group.model)
+    const groupRows = rows.filter((item) =>
+      group.deployments.some((deployment) => deployment.id === item.deployment.id))
+    items.push(
+      <SharedModelCluster
+        key={`cluster:${group.model}`}
+        model={group.model}
+        rows={groupRows}
+        deployments={group.deployments}
+        policy={policyByModel.get(group.model)}
+        routingReady={routingReady}
+        onChanged={onChanged}
+      />,
+    )
+  }
+  for (const row of rows) {
+    const rowGroups = groupsByDeployment.get(row.deployment.id)
+    if (!rowGroups || !rowGroups.length) {
+      items.push(<DeploymentGroupRow key={row.group.key} {...row} />)
+      continue
+    }
+    for (const group of rowGroups) renderCluster(group)
+  }
+  // Saved policies whose members are all stopped have no live row to hang
+  // on; render them at the end so their editor and Clear stay reachable.
+  for (const group of policyGroups) renderCluster(group)
+  return <>{items}</>
+}
+
+function SharedModelCluster({ model, rows, deployments, policy, routingReady, onChanged }: {
+  model: string
+  rows: RunningModelRow[]
+  deployments: Deployment[]
+  policy?: ModelRoutingPolicy
+  routingReady: boolean
+  onChanged: () => void
+}) {
+  const instanceCount = Math.max(deployments.length, policy?.members?.length ?? 0)
+  return (
+    <div className="dashboard-cluster">
+      <div className="dashboard-cluster-heading">
+        <Layers size={14} aria-hidden="true" />
+        <strong>{model}</strong>
+        <small>{instanceCount} instances share this request id</small>
+      </div>
+      {rows.map((row) => <DeploymentGroupRow key={row.group.key} {...row} />)}
+      <ModelRoutingEditor
+        model={model}
+        deployments={deployments}
+        policy={policy}
+        routingReady={routingReady}
+        onChanged={onChanged}
+      />
+    </div>
+  )
+}
+
+const MODEL_ROUTING_CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6, 8, 10, 16]
+const MODEL_ROUTING_MEMBER_LIMIT = 16
+
+/** Preset caps plus the member's current value, so a policy created via
+ * the API with a cap outside the presets still renders and stays editable. */
+function routingLimitChoices(current: number | null): number[] {
+  if (current === null || MODEL_ROUTING_CONCURRENCY_CHOICES.includes(current)) {
+    return MODEL_ROUTING_CONCURRENCY_CHOICES
+  }
+  return [...MODEL_ROUTING_CONCURRENCY_CHOICES, current].sort((a, b) => a - b)
+}
+
+type RoutingMemberDraft = { deployment_id: string; max_concurrency: number | null }
+
+/**
+ * The configured membership of a policy, kept separate from the live
+ * inventory: a saved policy keeps its members (even offline ones) until the
+ * user explicitly adds or removes one.
+ */
+function routingDefaults(deployments: Deployment[], policy?: ModelRoutingPolicy): RoutingMemberDraft[] {
+  if (policy?.members) {
+    return policy.members.map((member) => ({
+      deployment_id: member.deployment_id,
+      max_concurrency: member.max_concurrency,
+    }))
+  }
+  return deployments.slice(0, MODEL_ROUTING_MEMBER_LIMIT).map((deployment) => ({
+    deployment_id: deployment.id,
+    max_concurrency: null,
+  }))
+}
+
+/**
+ * Priority + concurrency-overflow editor for one shared request id.
+ *
+ * The priority order is the routing order: requests fill each instance up to
+ * its max-concurrent cap before overflowing to the next, so the fourth
+ * request of a priority instance capped at 3 lands on the next instance.
+ */
+function ModelRoutingEditor({ model, deployments, policy, routingReady, onChanged }: {
+  model: string
+  deployments: Deployment[]
+  policy?: ModelRoutingPolicy
+  routingReady: boolean
+  onChanged: () => void
+}) {
+  const defaults = routingDefaults(deployments, policy)
+  const serverFingerprint = JSON.stringify(defaults)
+  const [draft, setDraft] = useState(() => ({ members: defaults, fingerprint: serverFingerprint }))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [saved, setSaved] = useState(false)
+  useEffect(() => {
+    if (draft.fingerprint === serverFingerprint) return
+    setDraft({ members: routingDefaults(deployments, policy), fingerprint: serverFingerprint })
+  }, [serverFingerprint]) // eslint-disable-line react-hooks/exhaustive-deps
+  const dirty = JSON.stringify(draft.members) !== serverFingerprint
+  // Policy mutations wait for a successful policy load: editing from
+  // inventory defaults while the saved policy is unknown could silently
+  // replace configured membership.
+  const locked = busy || !routingReady
+  const statusById = new Map((policy?.members ?? []).map((member) => [member.deployment_id, member]))
+  const deploymentById = new Map(deployments.map((deployment) => [deployment.id, deployment]))
+  const aliasOf = (deploymentId: string) =>
+    deploymentById.get(deploymentId)?.alias ?? statusById.get(deploymentId)?.alias ?? deploymentId
+  const update = (members: RoutingMemberDraft[]) => {
+    setSaved(false)
+    setDraft({ ...draft, members })
+  }
+  const move = (deploymentId: string, rank: number) => {
+    const chosen = draft.members.find((member) => member.deployment_id === deploymentId)
+    if (!chosen) return
+    const members = draft.members.filter((member) => member.deployment_id !== deploymentId)
+    members.splice(Math.max(0, Math.min(rank, members.length)), 0, chosen)
+    update(members)
+  }
+  const setLimit = (deploymentId: string, value: string) => {
+    update(draft.members.map((member) => member.deployment_id === deploymentId
+      ? { ...member, max_concurrency: value === '' ? null : Number(value) }
+      : member))
+  }
+  const remove = (deploymentId: string) =>
+    update(draft.members.filter((member) => member.deployment_id !== deploymentId))
+  const add = (deploymentId: string) =>
+    update([...draft.members, { deployment_id: deploymentId, max_concurrency: null }])
+  const submit = async (action: () => Promise<unknown>) => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      await action()
+      setSaved(true)
+      onChanged()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const save = () => submit(() => api.modelRouting.save({ model, members: draft.members }))
+  const clear = () => submit(() => api.modelRouting.remove(model))
+  const candidates = deployments.filter(
+    (deployment) => !draft.members.some((member) => member.deployment_id === deployment.id),
+  )
+  const atMemberLimit = draft.members.length >= MODEL_ROUTING_MEMBER_LIMIT
+  const truncated = !policy && deployments.length > MODEL_ROUTING_MEMBER_LIMIT
+  return (
+    <div className="model-routing-editor">
+      <div className="model-routing-heading">
+        <strong>Load balancing</strong>
+        <small>Requests fill the priority instance up to its cap, then overflow to the next one.</small>
+        {!routingReady && <small role="status">Loading routing policies…</small>}
+      </div>
+      {draft.members.map((member, index) => {
+        const deployment = deploymentById.get(member.deployment_id)
+        const status = statusById.get(member.deployment_id)
+        const alias = aliasOf(member.deployment_id)
+        const nodes = (deployment?.selected_nodes ?? []).map((node) => node.name || node.id).join(' + ')
+        const offline = status ? !status.live : !deployment
+        return (
+          <div className="model-routing-row" key={member.deployment_id}>
+            <label className="model-routing-priority">
+              <span>Priority</span>
+              <select value={index} disabled={locked} aria-label={`Priority for ${alias}`} onChange={(event) => move(member.deployment_id, Number(event.target.value))}>
+                {draft.members.map((_, rank) => <option key={rank} value={rank}>{rank + 1}</option>)}
+              </select>
+            </label>
+            <div className="model-routing-target">
+              <strong>{alias}</strong>
+              {nodes && <small>{nodes}</small>}
+              {status && <small>{status.live ? `${status.inflight} in flight` : 'Offline'}</small>}
+              {!status && offline && <small>Offline</small>}
+            </div>
+            <label className="model-routing-limit">
+              <span>Max concurrent</span>
+              <select value={member.max_concurrency === null ? '' : String(member.max_concurrency)} disabled={locked} aria-label={`Max concurrent requests for ${alias}`} onChange={(event) => setLimit(member.deployment_id, event.target.value)}>
+                <option value="">Unlimited</option>
+                {routingLimitChoices(member.max_concurrency).map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+              </select>
+            </label>
+            <Button variant="tertiary" onClick={() => remove(member.deployment_id)} disabled={locked} aria-label={`Remove ${alias} from routing`}>Remove</Button>
+          </div>
+        )
+      })}
+      {candidates.length > 0 && (
+        <div className="model-routing-candidates">
+          {candidates.map((deployment) => (
+            <Button
+              key={deployment.id}
+              variant="tertiary"
+              onClick={() => add(deployment.id)}
+              disabled={locked || atMemberLimit}
+              aria-label={`Add ${deployment.alias} to routing`}
+            >
+              Add {deployment.alias}
+            </Button>
+          ))}
+        </div>
+      )}
+      {truncated && (
+        <small>
+          Routing supports at most {MODEL_ROUTING_MEMBER_LIMIT} instances; remove one to add another.
+        </small>
+      )}
+      <div className="model-routing-actions">
+        <Button onClick={save} disabled={locked || draft.members.length === 0 || (Boolean(policy) && !dirty)}>Save routing</Button>
+        {policy && <Button onClick={clear} disabled={locked}>Clear</Button>}
+        {saved && !dirty && !error && <span role="status">Routing saved</span>}
+        {error && <p className="inline-error" role="alert">{error}</p>}
       </div>
     </div>
   )

@@ -1,8 +1,8 @@
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { NodeInventoryItem, SystemStats } from '../api/types'
-import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot } from './DashboardPage'
+import type { Deployment, NodeInventoryItem, SystemStats } from '../api/types'
+import { nodeResourceSnapshot, DashboardPage, inferenceSessionSnapshot, sharedModelGroups } from './DashboardPage'
 
 function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -558,6 +558,7 @@ describe('DashboardPage', () => {
       if (path.includes('/api/inference-queue')) return json({})
       if (path.includes('/api/v1/deployments')) return json({ items: [] })
       if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      if (path.includes('/api/v1/model-routing-policies')) return json({ items: [] })
       if (path.includes('/api/v1/onboarding')) return json({
         role: 'controller',
         node: { id: 'local', name: 'This node', port: 7878, access_urls: [] },
@@ -1171,5 +1172,320 @@ describe('DashboardPage', () => {
     ] as NodeInventoryItem[])
 
     expect(snapshot.map((item) => item.stats?.cpu_pct)).toEqual([0, 100])
+  })
+})
+
+describe('sharedModelGroups', () => {
+  const deployment = (id: string, modelId: string, servedModels?: string[]) => ({
+    id, alias: id, model_id: modelId, served_models: servedModels,
+    runtime: 'vllm', status: 'running', managed: true, settings: {},
+  }) as unknown as Deployment
+
+  it('groups deployments that publish a shared request id', () => {
+    const groups = sharedModelGroups([
+      deployment('dgx', 'org/model'),
+      deployment('ws1', 'org/model'),
+      deployment('other', 'org/different'),
+    ])
+    expect(groups).toHaveLength(1)
+    expect(groups[0].model).toBe('org/model')
+    expect(groups[0].deployments.map((item) => item.id)).toEqual(['dgx', 'ws1'])
+  })
+
+  it('groups deployments that share only a served name', () => {
+    const groups = sharedModelGroups([
+      deployment('a', 'org/one', ['shared']),
+      deployment('b', 'org/two', ['shared']),
+    ])
+    expect(groups).toHaveLength(1)
+    expect(groups[0].model).toBe('shared')
+    expect(groups[0].deployments.map((item) => item.id)).toEqual(['a', 'b'])
+  })
+
+  it('builds one group per shared request id instead of merging transitively', () => {
+    const groups = sharedModelGroups([
+      deployment('a', 'x'),
+      deployment('b', 'ignored', ['x', 'y']),
+      deployment('c', 'y'),
+    ])
+    expect(groups.map((group) => [group.model, group.deployments.map((d) => d.id)]))
+      .toEqual([['x', ['a', 'b']], ['y', ['b', 'c']]])
+  })
+
+  it('ignores the backing model id when explicit served names exist', () => {
+    const groups = sharedModelGroups([
+      deployment('a', 'org/model', ['served-a']),
+      deployment('b', 'org/model'),
+    ])
+    expect(groups).toHaveLength(0)
+  })
+})
+
+describe('Running models shared-instance routing', () => {
+  const wire = (id: string, alias: string, nodeName: string) => ({
+    id, alias, runtime: 'vllm', kind: 'managed', status: 'running',
+    model: { repository: 'org/shared' }, served_models: ['shared-name'],
+    selected_nodes: [{ id: nodeName, name: nodeName }],
+  })
+
+  it('groups shared instances and saves the priority policy', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const puts: unknown[] = []
+    let savedPolicy: { model: string; members: { deployment_id: string; max_concurrency: number | null }[] } | undefined
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body))
+          puts.push(body)
+          savedPolicy = body
+          return json(body)
+        }
+        if (!savedPolicy) return json({ items: [] })
+        return json({ items: [{
+          model: savedPolicy.model,
+          members: savedPolicy.members.map((member) => ({
+            ...member,
+            alias: member.deployment_id === 'ws1' ? 'ws1-model' : 'dgx-model',
+            status: 'running',
+            node_names: [],
+            live: true,
+            inflight: 0,
+          })),
+        }] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    const heading = screen.getByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
+    expect(heading.closest('.dashboard-cluster')).not.toBeNull()
+
+    fireEvent.change(screen.getByLabelText('Priority for ws1-model'), { target: { value: '0' } })
+    fireEvent.change(screen.getByLabelText('Max concurrent requests for ws1-model'), { target: { value: '3' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save routing' }))
+
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3 },
+        { deployment_id: 'dgx', max_concurrency: null },
+      ],
+    })
+    await waitFor(() => expect(screen.getByText('Routing saved')).toBeInTheDocument())
+  })
+
+  it('keeps configured membership separate from the live inventory', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const puts: unknown[] = []
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'old', max_concurrency: null, alias: 'old-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [
+          wire('dgx', 'dgx-model', 'DGX Spark'),
+          wire('ws1', 'ws1-model', 'RTX Pro 6000'),
+          wire('extra', 'extra-model', 'Extra node'),
+        ] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'PUT') {
+          puts.push(JSON.parse(String(init.body)))
+          return json({ model: 'shared-name', members: [] })
+        }
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('3 instances share this request id')
+    // The configured members render (offline one included); live deployments
+    // outside the policy are only offered as explicit Add candidates.
+    expect(screen.getByText('old-model')).toBeInTheDocument()
+    expect(screen.getByText('Offline')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save routing' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Add dgx-model to routing' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Add extra-model to routing' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add dgx-model to routing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save routing' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3 },
+        { deployment_id: 'old', max_concurrency: null },
+        { deployment_id: 'dgx', max_concurrency: null },
+      ],
+    })
+  })
+
+  it('renders a plain row for a deployment with no shared request id', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('solo', 'solo-model', 'Local node')] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+    await screen.findByText('solo-model')
+    expect(screen.queryByText('1 instances share this request id')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save routing' })).not.toBeInTheDocument()
+  })
+
+  it('keeps a saved policy editable when only one member is live', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'old', max_concurrency: null, alias: 'old-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    // A policy survives an outage of the other members: the cluster still
+    // renders from the saved policy, sized by configured membership.
+    await screen.findByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
+    expect(screen.getByText('2 instances share this request id')).toBeInTheDocument()
+    expect(screen.getByText('old-model')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeEnabled()
+  })
+
+  it('renders a saved cap outside the preset choices as selected', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 100, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'dgx', max_concurrency: null, alias: 'dgx-model', status: 'running', node_names: [], live: true, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    const limit = screen.getByLabelText<HTMLSelectElement>('Max concurrent requests for ws1-model')
+    await waitFor(() => expect(limit).toHaveValue('100'))
+    expect(screen.getByRole('option', { name: '100' })).toBeInTheDocument()
+  })
+
+  it('persists the default priority order when no policy exists', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const puts: unknown[] = []
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'PUT') {
+          puts.push(JSON.parse(String(init.body)))
+          return json(JSON.parse(String(init.body)))
+        }
+        return json({ items: [] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    // Creation must be possible without editing: the displayed inventory
+    // order with unlimited caps is itself a valid policy to save.
+    const save = screen.getByRole('button', { name: 'Save routing' })
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'dgx', max_concurrency: null },
+        { deployment_id: 'ws1', max_concurrency: null },
+      ],
+    })
+  })
+
+  it('renders saved policies even when every deployment is stopped', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    // With zero active deployments the saved policy must still surface:
+    // operators need to inspect, repair, or clear it without a restart.
+    expect(screen.queryByText('No models running')).not.toBeInTheDocument()
+    await screen.findByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeEnabled()
+  })
+
+  it('locks the editor while routing policies are loading', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        // Never resolves: the saved policy stays unknown.
+        return new Promise<Response>(() => {})
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    expect(screen.getByText('Loading routing policies…')).toBeInTheDocument()
+    expect(screen.getByLabelText('Priority for ws1-model')).toBeDisabled()
+    expect(screen.getByLabelText('Max concurrent requests for ws1-model')).toBeDisabled()
+    // Even a dispatched edit cannot arm Save while the policy load is pending.
+    fireEvent.change(screen.getByLabelText('Max concurrent requests for ws1-model'), { target: { value: '3' } })
+    expect(screen.getByRole('button', { name: 'Save routing' })).toBeDisabled()
   })
 })

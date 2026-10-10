@@ -2112,10 +2112,12 @@ export function ModelsPage() {
     setBusy(`recipe:${recipe.id}`)
     setActionError(undefined)
     setActionNotice(undefined)
+    setWarningNotice(undefined)
     setRecipeError(undefined)
     try {
       await assertNodesUnoccupied(nodeIds, undefined, recipe.engine)
       const deployment = await api.recipes.deploy(recipe.id, nodeIds)
+      noticeSelectorWarnings(deployment)
       const selected = selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)
       setRecipeDeployment(undefined)
       acceptedDeployments.current.set(deployment.id, deployment)

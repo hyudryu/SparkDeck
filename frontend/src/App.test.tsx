@@ -831,6 +831,49 @@ describe('model deployments', () => {
     expect(await screen.findByText('Started deployment Saved cluster on This device, Spark Two.')).toBeInTheDocument()
   })
 
+  it('shows a soft warning when a recipe launch shares a served model name', async () => {
+    const user = userEvent.setup()
+    const gib = 1024 ** 3
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/storage/transfers/preflight')) return new Response(JSON.stringify({
+        enabled: false, model_id: 'org/model', revision: 'main', source: null,
+        staging_reserve_bytes: 64 * 1024 ** 2,
+        targets: [
+          { node_id: 'local', node_name: 'Spark One', has_required_weights: true, eligible: false },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (init?.method === 'POST' && path.includes('/api/v1/recipes/recipe-1/deploy')) return new Response(JSON.stringify({
+        id: 'dep-new', alias: 'Saved cluster', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['local'],
+        selector_warnings: [
+          "deployment selector 'org/model' is already served by running deployment 'TP2'; requests using that name may reach either deployment while both run",
+        ],
+      }), { status: 201, headers: { 'Content-Type': 'application/json' } })
+      const body = path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'local', name: 'Spark One', online: true, total_size: 100 * gib, models: [{ model_id: 'org/model', size_bytes: 2 * gib, revisions: ['main'] }] },
+      ] } : path.includes('/api/v1/recipes') ? { items: [{
+        id: 'recipe-1', name: 'Saved cluster', model: 'org/model', engine: 'vllm',
+        deployment_mode: 'single', required_node_count: 1, tensor_parallel_size: 1,
+        pipeline_parallel_size: 1, node_ids: ['local'], extra_args_count: 0,
+      }] } : path.includes('/api/v1/deployments') ? { items: [] }
+        : path.includes('/api/v1/nodes') ? { items: [
+          { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'org 1' }))
+    await user.click(await screen.findByRole('button', { name: 'Choose nodes & deploy' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Deploy Saved cluster' })
+    await user.click(await within(dialog).findByRole('button', { name: 'Deploy on 1 node' }))
+
+    const warning = await screen.findByText(/is already served by running deployment 'TP2'/)
+    expect(warning).toHaveClass('inline-warning')
+    expect(await screen.findByText('Started deployment Saved cluster on This device.')).toBeInTheDocument()
+  })
+
   it('shows recipe nodes while the model-cache inventory is still loading', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

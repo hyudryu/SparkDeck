@@ -4,6 +4,7 @@ A grouped-sharded deployment runs N independent sharded engine groups, each on
 its own tensor-parallel-sized node set, behind one served name.
 """
 
+import time
 import unittest
 from unittest import mock
 
@@ -383,6 +384,36 @@ class GroupedShardedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment["members"][2]["desired_state"], "stopped")
         self.assertEqual(deployment["desired_state"], "running")
         self.assertEqual(deployment["status"], "starting")
+
+    async def test_per_instance_start_refreshes_deployment_recency(self) -> None:
+        """A group restart puts the deployment back in service, so a shared
+        request id must rank it as the most recently deployed owner."""
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment["desired_state"] = "stopped"
+        deployment["status"] = "stopped"
+        for member in deployment["members"]:
+            member["status"] = "stopped"
+        deployment["last_deployed_at"] = 1_700_000_000
+
+        before = time.time()
+        result = await instance.deployment_action("d1", "start", instance=0)
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(deployment["last_deployed_at"], before)
+
+    async def test_failed_per_instance_start_keeps_deployment_recency(self) -> None:
+        instance, deployment, actions = self.lifecycle_manager()
+        deployment["last_deployed_at"] = 1_700_000_000
+
+        async def failing_member_action(member, action, *, log_tail=300):
+            raise RuntimeError("rank restart rejected")
+
+        instance._member_action = failing_member_action
+
+        result = await instance.deployment_action("d1", "start", instance=0)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(deployment["last_deployed_at"], 1_700_000_000)
 
     async def test_full_stop_unchanged_by_grouped_mode(self) -> None:
         instance, deployment, actions = self.lifecycle_manager()

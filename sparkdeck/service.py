@@ -4860,10 +4860,27 @@ class SparkDeckService:
                     "deployment launch is still in progress; wait for container creation"
                 )
             if action != "start":
-                return await self._deployment_action_locked(
+                if action != "add_instance":
+                    return await self._deployment_action_locked(
+                        deployment_id, action, node_ids, additional_node_ids,
+                        promote, instance,
+                    )
+                # An add-instance launch puts another engine group live
+                # under the same request id and refreshes the deployment's
+                # recency, so it needs the same shared-selector warning as a
+                # start. The scan shares the alias lock with starts so it
+                # reads one consistent live picture.
+                async with self._deployment_alias_lock:
+                    selector_warnings = await self._start_action_selector_warnings(
+                        deployment_id,
+                    )
+                result = await self._deployment_action_locked(
                     deployment_id, action, node_ids, additional_node_ids,
                     promote, instance,
                 )
+                if selector_warnings and isinstance(result, dict):
+                    result = {**result, "selector_warnings": selector_warnings}
+                return result
             # Selector arbitration and the in-flight registration are one
             # step: the scan reads other records' live selectors, so a
             # concurrent start could otherwise slip between collection and
@@ -7171,11 +7188,16 @@ class SparkDeckService:
         it to the most recently deployed owner. Running two deployments under
         the same request id is legitimate (parallel profiles, an A/B pair),
         so the overlap surfaces as a soft warning on the action instead of
-        blocking it. Registered external endpoints reserve only the names
-        actually advertised while healthy; their desired state cannot reserve
-        a launch because SparkDeck does not own their lifecycle.
+        blocking it. A discovered container start is a real launch too (its
+        Docker restart or promotion refreshes the owner recency); only
+        registered external endpoints stay exempt, because SparkDeck does
+        not own their lifecycle and their desired state cannot reserve a
+        launch.
         """
-        if str(deployment.get("kind") or "") != DeploymentKind.MANAGED.value:
+        kind = str(deployment.get("kind") or "")
+        if kind != DeploymentKind.MANAGED.value and not str(
+            deployment.get("id") or ""
+        ).startswith("container:"):
             return []
         requested: list[tuple[str, str]] = []
         seen: set[str] = set()

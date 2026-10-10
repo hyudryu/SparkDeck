@@ -1731,6 +1731,41 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("selector_warnings", started)
         self.manager.create_deployment.assert_awaited()
 
+    async def test_add_instance_reports_a_shared_selector(self):
+        """An add-instance launch puts another engine group live under the
+        same request id and refreshes the deployment's recency, so it warns
+        about a shared selector exactly like a start."""
+        self.service.store.add_deployment(Deployment(
+            id="grow-record", alias="TP4", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED, model=ModelIdentity("org/model"),
+            settings={"manager_deployment_id": "cluster-grow"},
+        ), "http://127.0.0.1:8000")
+        self.manager.add_deployment_instance = AsyncMock(return_value={
+            "ok": True, "node_ids": ["remote-1"],
+        })
+        live_owner = {
+            "id": "owner-record", "alias": "TP2", "kind": "managed",
+            "status": "running", "model": {"repository": "org/model"},
+            "served_models": ["org/model"], "settings": {},
+        }
+
+        with patch.object(
+            self.service, "deployments", AsyncMock(return_value=[live_owner]),
+        ):
+            result = await self.service.deployment_action(
+                "grow-record", "add_instance", ["remote-1"],
+            )
+
+        self.assertEqual(
+            result["selector_warnings"],
+            [
+                "deployment selector 'org/model' is already served by "
+                "running deployment 'TP2'; requests using that name may "
+                "reach either deployment while both run"
+            ],
+        )
+        self.manager.add_deployment_instance.assert_awaited()
+
     async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
         saved = await self.service.create_deployment({
             "model": "org/model", "alias": "Managed", "runtime": "sglang",

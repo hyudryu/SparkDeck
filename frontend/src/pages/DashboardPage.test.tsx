@@ -1346,4 +1346,84 @@ describe('Running models shared-instance routing', () => {
     expect(screen.queryByText('1 instances share this request id')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Save routing' })).not.toBeInTheDocument()
   })
+
+  it('keeps a saved policy editable when only one member is live', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'old', max_concurrency: null, alias: 'old-model', status: 'stopped', node_names: [], live: false, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    // A policy survives an outage of the other members: the cluster still
+    // renders from the saved policy, sized by configured membership.
+    await screen.findByText('shared-name', { selector: '.dashboard-cluster-heading strong' })
+    expect(screen.getByText('2 instances share this request id')).toBeInTheDocument()
+    expect(screen.getByText('old-model')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeEnabled()
+  })
+
+  it('renders a saved cap outside the preset choices as selected', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 100, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'dgx', max_concurrency: null, alias: 'dgx-model', status: 'running', node_names: [], live: true, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        return json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    const limit = screen.getByLabelText<HTMLSelectElement>('Max concurrent requests for ws1-model')
+    await waitFor(() => expect(limit).toHaveValue('100'))
+    expect(screen.getByRole('option', { name: '100' })).toBeInTheDocument()
+  })
+
+  it('locks the editor while routing policies are loading', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        // Never resolves: the saved policy stays unknown.
+        return new Promise<Response>(() => {})
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    expect(screen.getByText('Loading routing policies…')).toBeInTheDocument()
+    expect(screen.getByLabelText('Priority for ws1-model')).toBeDisabled()
+    expect(screen.getByLabelText('Max concurrent requests for ws1-model')).toBeDisabled()
+    // Even a dispatched edit cannot arm Save while the policy load is pending.
+    fireEvent.change(screen.getByLabelText('Max concurrent requests for ws1-model'), { target: { value: '3' } })
+    expect(screen.getByRole('button', { name: 'Save routing' })).toBeDisabled()
+  })
 })

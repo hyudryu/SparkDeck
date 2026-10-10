@@ -436,5 +436,78 @@ class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
 
+class ModelRoutingDirectTrafficTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_alias_traffic_consumes_the_member_cap(self):
+        """An alias request to a policy member occupies that member's
+        concurrency slot, so a shared request overflows while it runs."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            started = []
+            release = asyncio.Event()
+
+            async def cluster_inference(manager_id, *args, **kwargs):
+                started.append(manager_id)
+                if len(started) >= 2:
+                    release.set()
+                else:
+                    await release.wait()
+                return {"model": "shared-name", "choices": [], "usage": {}}
+
+            manager.proxy_cluster_inference = cluster_inference
+            try:
+                await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [
+                        {"deployment_id": "record-two", "max_concurrency": 1},
+                        {"deployment_id": "record-one", "max_concurrency": None},
+                    ],
+                })
+                direct = asyncio.create_task(service.proxy(
+                    {"model": "model-two", "messages": [], "stream": False},
+                    "chat/completions",
+                ))
+                for _ in range(200):
+                    if started:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(service._model_routing_inflight.get("record-two"), 1)
+                shared = await service.proxy(
+                    {"model": "shared-name", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+                await direct
+                # The alias request holds record-two's only slot, so the
+                # shared request overflows to the second member.
+                self.assertEqual(started, ["cluster-two", "cluster-one"])
+                self.assertTrue("choices" in shared)
+                for _ in range(200):
+                    if not service._model_routing_inflight:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(service._model_routing_inflight, {})
+            finally:
+                release.set()
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_member_not_serving_the_policy_model_reports_offline(self):
+        """A member that is live but no longer publishes the policy's
+        request id is surfaced as not live, so the UI can flag it."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                await service.upsert_model_routing_policy({
+                    "model": "org/retired", "members": [
+                        {"deployment_id": "record-one"},
+                    ],
+                })
+                items = await service.model_routing_policies()
+                self.assertEqual(len(items), 1)
+                self.assertEqual(items[0]["members"][0]["deployment_id"], "record-one")
+                self.assertFalse(items[0]["members"][0]["live"])
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
 if __name__ == "__main__":
     unittest.main()

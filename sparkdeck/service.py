@@ -506,6 +506,11 @@ class SparkDeckService:
         self._model_routing_policies: dict[str, dict[str, Any]] = (
             self._load_model_routing_policies()
         )
+        self._model_routing_member_ids: set[str] = {
+            member["deployment_id"]
+            for policy in self._model_routing_policies.values()
+            for member in policy["members"]
+        }
         self._model_routing_inflight: dict[str, int] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
@@ -7899,6 +7904,12 @@ class SparkDeckService:
                 deployment_id = member["deployment_id"]
                 stored = self.store.deployment(deployment_id) or {}
                 live_row = live.get(deployment_id) or {}
+                # Live means routable for this policy id: a running
+                # deployment relaunched under other served names is not a
+                # candidate _select_routed_member would ever pick.
+                serves_policy_model = bool(live_row) and policy["model"] in (
+                    self._deployment_public_model_ids(live_row)
+                )
                 row = live_row or stored
                 node_names = [
                     str(node.get("name") or node.get("id") or "")
@@ -7915,7 +7926,7 @@ class SparkDeckService:
                         or "unknown"
                     ),
                     "node_names": [name for name in node_names if name],
-                    "live": deployment_id in live,
+                    "live": serves_policy_model,
                     "inflight": self._model_routing_inflight.get(deployment_id, 0),
                 })
             items.append({
@@ -7947,6 +7958,7 @@ class SparkDeckService:
         staged[policy["model"]] = policy
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
+        self._rebuild_routing_member_index()
         items = await self.model_routing_policies()
         return next(item for item in items if item["model"] == policy["model"])
 
@@ -7958,6 +7970,28 @@ class SparkDeckService:
         staged.pop(key, None)
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
+        self._rebuild_routing_member_index()
+        return True
+
+    def _rebuild_routing_member_index(self) -> None:
+        self._model_routing_member_ids = {
+            member["deployment_id"]
+            for policy in self._model_routing_policies.values()
+            for member in policy["members"]
+        }
+
+    def _reserve_policy_slot(self, deployment_id: str) -> bool:
+        """Count a directly-routed request against a policy member's cap.
+
+        Alias and source-IP traffic consumes the same concurrency budget as
+        policy-selected requests, so a member busy on its unique selector
+        cannot also be picked as idle for the shared id.
+        """
+        if not deployment_id or deployment_id not in self._model_routing_member_ids:
+            return False
+        self._model_routing_inflight[deployment_id] = (
+            self._model_routing_inflight.get(deployment_id, 0) + 1
+        )
         return True
 
     def _select_routed_member(
@@ -8491,6 +8525,12 @@ class SparkDeckService:
                     self._note_shared_selector_owner(requested_model, deployment)
             if deployment is None:
                 deployment = stored_deployment
+        if routing_slot is None and deployment is not None:
+            # Alias and source-IP traffic bypasses the policy selector but
+            # still consumes a policy member's concurrency budget.
+            direct_id = str(deployment.get("id") or "")
+            if self._reserve_policy_slot(direct_id):
+                routing_slot = direct_id
         observation = self._community_observation_start(
             self._community_observation_scopes(deployment, requested_model), deferred=True,
         )

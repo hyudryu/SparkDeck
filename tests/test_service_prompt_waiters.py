@@ -143,7 +143,9 @@ class ServicePromptWaiterTests(unittest.IsolatedAsyncioTestCase):
         self.service._proxy_registered_unlimited.assert_not_awaited()
 
     async def test_canceled_queued_proxy_does_not_contaminate_active_startup(self):
-        self.service._live_deployment_for_model_id = AsyncMock(return_value=self.deployment)
+        self.service._live_candidates_for_model_id = AsyncMock(
+            return_value=(self.deployment, []),
+        )
         scopes = self.service._community_observation_scopes(self.deployment, "target")
         startup = self.service._community_observation_start(scopes, deferred=True)
         startup["startup_benchmark"] = True

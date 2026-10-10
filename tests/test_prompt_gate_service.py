@@ -19,7 +19,9 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def configure_target(self):
         self.deployment = self.persist_target("serving-target")
-        self.service._live_deployment_for_model_id = AsyncMock(return_value=self.deployment)
+        self.service._live_candidates_for_model_id = AsyncMock(
+            return_value=(self.deployment, []),
+        )
 
     def persist_target(self, name):
         if self.service.store.deployment(name) is None:
@@ -105,8 +107,8 @@ class PromptGateServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_different_serving_targets_process_prompts_concurrently(self):
         targets = {name: self.persist_target(name) for name in ('a', 'b')}
-        self.service._live_deployment_for_model_id = AsyncMock(
-            side_effect=lambda model: targets[model],
+        self.service._live_candidates_for_model_id = AsyncMock(
+            side_effect=lambda model: (targets[model], []),
         )
         entered = {name: asyncio.Event() for name in targets}
         finish = asyncio.Event()

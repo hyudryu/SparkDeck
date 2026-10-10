@@ -441,6 +441,7 @@ export function ModelsPage() {
   const [formError, setFormError] = useState<string>()
   const [actionError, setActionError] = useState<string>()
   const [actionNotice, setActionNotice] = useState<string>()
+  const [warningNotice, setWarningNotice] = useState<string>()
   const [recipeError, setRecipeError] = useState<string>()
   const [recipeTransferNotice, setRecipeTransferNotice] = useState<string>()
   const [recipeTransferJobs, setRecipeTransferJobs] = useState<Record<string, RecipeTrackedJob>>({})
@@ -1473,6 +1474,13 @@ export function ModelsPage() {
     return null
   }
 
+  // A start may share a served model name with another live deployment; the
+  // backend allows it and returns the overlap as a soft warning.
+  const noticeSelectorWarnings = (result: Deployment | void) => {
+    const warnings = result?.selector_warnings ?? []
+    setWarningNotice(warnings.length ? warnings.join(' ') : undefined)
+  }
+
   const confirmStart = async () => {
     if (!startSelection) return
     const { deployment, nodeIds } = startSelection
@@ -1485,6 +1493,7 @@ export function ModelsPage() {
     setBusy(deployment.id)
     setStartError(undefined)
     setStartNotice(undefined)
+    setWarningNotice(undefined)
     try {
       if (preparesWeights) {
         // Route missing weights to every selected node before a saved launch
@@ -1525,7 +1534,8 @@ export function ModelsPage() {
       const promote = canPromoteDiscovered(deployment)
       const adoptingDirect = promote && deployment.direct_start
       await assertNodesUnoccupied(directLifecycle ? deployment.node_ids ?? [] : nodeIds, deployment.id, deployment.runtime)
-      await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
+      const started = await api.deployments.action(deployment.id, 'start', directLifecycle ? undefined : nodeIds, undefined, promote)
+      noticeSelectorWarnings(started)
       setActionNotice(directLifecycle
         ? `Starting ${deployment.alias} on its existing fixed target.`
         : `${promote && !adoptingDirect ? 'Converting' : 'Starting'} ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}.`)
@@ -1653,9 +1663,11 @@ export function ModelsPage() {
     const { deployment, currentIds, additionalIds } = additionalLaunch
     setBusy(deployment.id)
     setAdditionalError(undefined)
+    setWarningNotice(undefined)
     try {
       await assertNodesUnoccupied([...currentIds, ...additionalIds], deployment.id, deployment.runtime)
-      await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
+      const started = await api.deployments.action(deployment.id, 'start', undefined, additionalIds)
+      noticeSelectorWarnings(started)
       setActionNotice(`Launching ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], additionalIds, localLabel)} too. Existing replicas restart during the relaunch.`)
       setAdditionalLaunch(undefined)
       resource.reload()
@@ -1700,9 +1712,11 @@ export function ModelsPage() {
     const { deployment, nodeIds } = addInstanceLaunch
     setBusy(deployment.id)
     setAddInstanceError(undefined)
+    setWarningNotice(undefined)
     try {
       await assertNodesUnoccupied(nodeIds, deployment.id, deployment.runtime)
-      await api.deployments.action(deployment.id, 'add_instance', nodeIds)
+      const started = await api.deployments.action(deployment.id, 'add_instance', nodeIds)
+      noticeSelectorWarnings(started)
       setActionNotice(`Starting another deployment of ${deployment.alias} on ${selectedNodeLabel(nodes.data ?? [], nodeIds, localLabel)}. Requests load-balance across every engine group.`)
       setAddInstanceLaunch(undefined)
       resource.reload()
@@ -2227,6 +2241,7 @@ export function ModelsPage() {
       {recipes.error && <ErrorState message={`Saved configurations: ${recipes.error}`} onRetry={recipes.reload} />}
       {actionError && <p className="form-error" role="alert">{actionError}</p>}
       {actionNotice && <p className="inline-success" role="status">{actionNotice}</p>}
+      {warningNotice && <p className="inline-warning" role="status">{warningNotice}</p>}
       {resource.data?.length === 0 && (
         <EmptyState title="No deployments yet" description="Save a deployment for any runtime, then launch it on the nodes you choose." action={<Button variant="primary" onClick={openCreator}>Create your first deployment</Button>} />
       )}

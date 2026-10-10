@@ -174,26 +174,16 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_ambiguous_served_name_requires_deployment_alias(self):
+    async def test_shared_served_name_routes_to_the_newest_live_owner(self):
+        """Sharing one request id across live deployments is allowed, so
+        resolution must stay deterministic instead of failing: the most
+        recently deployed owner answers and the older one stays reachable by
+        its alias."""
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
-            manager.deployments = [
-                {
-                    "id": "cluster-one", "sparkdeck_record_id": "record-one",
-                    "status": "running",
-                    "launch_settings": {
-                        "extra_args": ["--served-model-name", "shared-name"],
-                    },
-                },
-                {
-                    "id": "cluster-two", "sparkdeck_record_id": "record-two",
-                    "status": "running",
-                    "launch_settings": {
-                        "extra_args": ["--served-model-name", "shared-name"],
-                    },
-                },
-            ]
-            manager._deployment_served_models = Manager._deployment_served_models
+            manager.proxy_cluster_inference = AsyncMock(return_value={
+                "model": "shared-name", "choices": [], "usage": {},
+            })
             service = SparkDeckService(manager, Path(directory))
             for record_id, alias, manager_id in (
                 ("record-one", "model-one", "cluster-one"),
@@ -206,11 +196,46 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                     settings={"manager_deployment_id": manager_id},
                 ))
 
-            with self.assertRaisesRegex(LookupError, "ambiguous"):
-                await service.proxy(
-                    {"model": "shared-name", "messages": [], "stream": False},
-                    "chat/completions",
-                )
+            def live(deployed_at_by_record):
+                return [
+                    {
+                        "id": record_id, "alias": alias, "runtime": "vllm",
+                        "kind": "managed", "status": "running",
+                        "served_models": ["shared-name"],
+                        "model": {"repository": f"org/{alias}"},
+                        "settings": {"manager_deployment_id": manager_id},
+                        "last_deployed_at": deployed_at_by_record[record_id],
+                    }
+                    for record_id, alias, manager_id in (
+                        ("record-one", "model-one", "cluster-one"),
+                        ("record-two", "model-two", "cluster-two"),
+                    )
+                ]
+
+            service.deployments = AsyncMock(return_value=live({
+                "record-one": 1.0, "record-two": 2.0,
+            }))
+            await service.proxy(
+                {"model": "shared-name", "messages": [], "stream": False},
+                "chat/completions",
+            )
+            self.assertEqual(
+                manager.proxy_cluster_inference.await_args.args[0],
+                "cluster-two",
+            )
+
+            # Re-deploying the first profile makes it the newest owner.
+            service.deployments = AsyncMock(return_value=live({
+                "record-one": 3.0, "record-two": 2.0,
+            }))
+            await service.proxy(
+                {"model": "shared-name", "messages": [], "stream": False},
+                "chat/completions",
+            )
+            self.assertEqual(
+                manager.proxy_cluster_inference.await_args.args[0],
+                "cluster-one",
+            )
 
             await manager.http.aclose()
             await service.close()

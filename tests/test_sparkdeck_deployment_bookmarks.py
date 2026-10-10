@@ -1671,7 +1671,9 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             ["--served-model-name", "org/discovered"],
         )
 
-    async def test_start_rejects_selector_already_live_on_running_deployment(self):
+    async def test_start_allows_selector_already_live_on_running_deployment(self):
+        """Two profiles may serve one request id at the same time; the
+        overlap is reported as a soft warning and the launch proceeds."""
         tp2_id = (await self.service.create_deployment({
             "model": "org/model", "alias": "TP2", "runtime": "vllm",
             "node_ids": ["remote-1"], "deployment_mode": "single",
@@ -1690,22 +1692,43 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             self.service, "deployments",
             AsyncMock(return_value=[tp2]),
         ):
-            with self.assertRaisesRegex(
-                ValueError, "selector 'org/model' is already served by running",
-            ):
-                await self.service.deployment_action("TP4", "start")
-        listed = {
-            item["alias"]: item for item in await self.service.deployments()
-        }
-        self.assertEqual(listed["TP4"]["status"], "saved")
-
-        # Once the other profile stops, the same selector may launch.
-        with patch.object(
-            self.service, "deployments",
-            AsyncMock(return_value=[{**tp2, "status": "stopped"}]),
-        ):
             started = await self.service.deployment_action("TP4", "start")
+
         self.assertEqual(started["status"], "starting")
+        self.assertEqual(
+            started["selector_warnings"],
+            [
+                "deployment selector 'org/model' is already served by "
+                "running deployment 'TP2'; requests using that name may "
+                "reach either deployment while both run"
+            ],
+        )
+        self.manager.create_deployment.assert_awaited()
+
+    async def test_start_reports_no_warning_when_the_other_profile_stopped(self):
+        """A stopped owner does not reserve the selector, so the launch is
+        silent."""
+        owner_id = (await self.service.create_deployment({
+            "model": "org/model", "alias": "Idle TP2", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        }))["id"]
+        await self.service.create_deployment({
+            "model": "org/model", "alias": "Fresh TP4", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        idle = {
+            "id": owner_id, "alias": "Idle TP2", "kind": "managed",
+            "status": "stopped", "model": {"repository": "org/model"},
+            "served_models": ["org/model"], "settings": {},
+        }
+
+        with patch.object(
+            self.service, "deployments", AsyncMock(return_value=[idle]),
+        ):
+            started = await self.service.deployment_action("Fresh TP4", "start")
+
+        self.assertEqual(started["status"], "starting")
+        self.assertNotIn("selector_warnings", started)
         self.manager.create_deployment.assert_awaited()
 
     async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
@@ -1723,13 +1746,17 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status), patch.object(
                 self.service, "deployments", AsyncMock(return_value=[{**external, "status": status}]),
             ):
-                await self.service._assert_deployment_start_selectors(requested)
+                self.assertEqual(
+                    await self.service._deployment_selector_warnings(requested),
+                    [],
+                )
         with patch.object(self.service, "deployments", AsyncMock(return_value=[external])):
             result = await self.service.deployment_action(saved["id"], "start")
         self.assertEqual(result["status"], "starting")
+        self.assertNotIn("selector_warnings", result)
         self.manager.create_deployment.assert_awaited()
 
-    async def test_live_external_alias_conflicts_and_discovered_container_selectors_remain_protected(self):
+    async def test_live_external_alias_conflicts_and_discovered_container_selectors_are_reported(self):
         requested = {"id": "new", "kind": "managed", "alias": "Managed",
                      "model": {"repository": "org/model"}, "settings": {}}
         endpoint = {"id": "external", "kind": "external", "alias": "org/model",
@@ -1739,14 +1766,21 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         for live in (endpoint, discovered):
             with self.subTest(live=live), patch.object(
                 self.service, "deployments", AsyncMock(return_value=[live]),
-            ), self.assertRaisesRegex(ValueError, "selector 'org/model' is already served"):
-                await self.service._assert_deployment_start_selectors(requested)
+            ):
+                warnings = await self.service._deployment_selector_warnings(
+                    requested,
+                )
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(
+                    "selector 'org/model' is already served", warnings[0],
+                )
+        # Alias uniqueness itself is still enforced for renames.
         with patch.object(self.service, "deployments", AsyncMock(return_value=[endpoint])), self.assertRaisesRegex(
             ValueError, "already in use",
         ):
             await self.service._assert_deployment_alias_available("org/model", "new")
 
-    async def test_start_releases_selector_after_all_groups_explicitly_stop(self):
+    async def test_start_reports_no_warning_after_all_groups_explicitly_stop(self):
         for alias in ("TP2", "TP4"):
             await self.service.create_deployment({
                 "model": "org/model", "alias": alias, "runtime": "vllm",
@@ -1768,9 +1802,10 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         ):
             started = await self.service.deployment_action("TP4", "start")
         self.assertEqual(started["status"], "starting")
+        self.assertNotIn("selector_warnings", started)
         self.manager.create_deployment.assert_awaited()
 
-    async def test_stopped_group_selector_remains_reserved_when_state_is_uncertain(self):
+    async def test_stopped_group_selector_is_still_reported_when_state_is_uncertain(self):
         requested = {
             "id": "new-tp4", "kind": "managed", "alias": "TP4",
             "model": {"repository": "org/model"}, "settings": {},
@@ -1802,15 +1837,21 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
                 self.service, "deployments",
                 AsyncMock(return_value=[{**stopped, **changes}]),
             ):
-                with self.assertRaisesRegex(ValueError, "already served"):
-                    await self.service._assert_deployment_start_selectors(requested)
+                warnings = await self.service._deployment_selector_warnings(
+                    requested,
+                )
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("already served", warnings[0])
         self.service._deployment_launches["old-tp2"] = object()
         try:
             with patch.object(
                 self.service, "deployments", AsyncMock(return_value=[stopped]),
             ):
-                with self.assertRaisesRegex(ValueError, "already served"):
-                    await self.service._assert_deployment_start_selectors(requested)
+                warnings = await self.service._deployment_selector_warnings(
+                    requested,
+                )
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("already served", warnings[0])
         finally:
             self.service._deployment_launches.pop("old-tp2")
 

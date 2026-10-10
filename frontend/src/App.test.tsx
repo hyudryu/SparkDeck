@@ -2036,6 +2036,47 @@ describe('model deployments', () => {
     ))
   })
 
+  it('shows a soft warning when the served model name is already live', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (init?.method === 'POST' && path === '/api/v1/deployments/dep-2/start') {
+        return new Response(JSON.stringify({
+          id: 'dep-2', alias: 'Solo model', runtime: 'vllm', kind: 'managed',
+          model: { repository: 'org/model' }, status: 'starting', settings: {}, node_ids: ['node-2'],
+          selector_warnings: [
+            "deployment selector 'org/model' is already served by running deployment 'TP2'; requests using that name may reach either deployment while both run",
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-2', alias: 'Solo model', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/model' }, status: 'stopped', settings: {}, node_ids: [],
+        deployment_mode: 'single', required_node_count: 1,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Spark One', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'node-2', name: 'Spark Two', online: true, docker_ready: true, selectable: true },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [
+        { id: 'node-2', name: 'Spark Two', online: true, models: [{ model_id: 'org/model', size_bytes: 2_000_000_000, revisions: ['main'] }] },
+      ] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Start Solo model' })
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+
+    // The launch proceeds; the overlap is a warning, not a blocked start.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/deployments/dep-2/start',
+      expect.objectContaining({ method: 'POST' }),
+    ))
+    const warning = await screen.findByText(/is already served by running deployment 'TP2'/)
+    expect(warning).toHaveClass('inline-warning')
+    expect(screen.getByText('Starting Solo model on Spark Two.')).toBeInTheDocument()
+  })
+
   it('uses the persisted deployment revision when choosing start nodes', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

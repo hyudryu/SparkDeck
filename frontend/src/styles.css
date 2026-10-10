@@ -129,9 +129,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 @keyframes spin { to { transform: rotate(360deg); } }
 .muted { color: var(--text-secondary); font-size: 12px; }
 .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-.inline-error, .form-error, .inline-success { border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.inline-error, .form-error, .inline-success, .inline-warning { border-radius: 8px; padding: 10px 12px; font-size: 13px; }
 .inline-error, .form-error { color: var(--danger); background: var(--danger-soft); }
 .inline-success { color: var(--success); background: var(--success-soft); }
+.inline-warning { color: var(--warning); background: var(--warning-soft); }
 .form-error { margin-bottom: 16px; }
 
 .field, .search-field, .select-field { display: grid; gap: 6px; min-width: 0; }

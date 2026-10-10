@@ -7445,6 +7445,35 @@ class SparkDeckService:
             })
         return result
 
+    def _shared_selector_owners(
+        self,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+    ) -> dict[str, str]:
+        """Choose the live owner each shared request id routes to.
+
+        Mirrors ``_live_deployment_for_model_id``: an exact live id/alias
+        match keeps the name, otherwise the most recently deployed owner
+        wins. The catalog must publish the shared name on that same owner or
+        discovery and inference disagree.
+        """
+        by_id = {deployment["id"]: deployment for deployment in deployments}
+        winners: dict[str, str] = {}
+        for model_id, owners in request_owners.items():
+            if len(owners) < 2:
+                continue
+            exact = self.store.deployment(model_id, include_private=True)
+            if exact is not None and exact["id"] in owners:
+                winners[model_id] = str(exact["id"])
+                continue
+            candidates = [by_id[owner] for owner in owners if owner in by_id]
+            if not candidates:
+                continue
+            winners[model_id] = str(
+                max(candidates, key=self._selector_owner_sort_key)["id"],
+            )
+        return winners
+
     async def models(self) -> dict[str, Any]:
         data = []
         seen = set()
@@ -7460,17 +7489,18 @@ class SparkDeckService:
         request_owners = self._deployment_request_owners(
             deployments, public_ids,
         )
+        shared_owners = self._shared_selector_owners(deployments, request_owners)
         for deployment in deployments:
             model_ids = [
                 model_id for model_id in public_ids[deployment["id"]]
                 if self._model_id_routes_to_deployment(
-                    model_id, deployment, request_owners,
+                    model_id, deployment, request_owners, shared_owners,
                 )
             ]
             if not model_ids:
                 alias = str(deployment.get("alias") or "").strip()
                 if alias and self._model_id_routes_to_deployment(
-                    alias, deployment, request_owners,
+                    alias, deployment, request_owners, shared_owners,
                 ):
                     model_ids = [alias]
             for model_id in model_ids:
@@ -7630,8 +7660,12 @@ class SparkDeckService:
         model_id: str,
         deployment: dict[str, Any],
         request_owners: dict[str, set[str]],
+        shared_owners: dict[str, str] | None = None,
     ) -> bool:
         """Return whether gateway lookup selects exactly this deployment."""
+        winner = (shared_owners or {}).get(model_id)
+        if winner is not None:
+            return winner == deployment["id"]
         exact = self.store.deployment(model_id, include_private=True)
         owners = request_owners.get(model_id, set())
         if exact is not None and exact["id"] in owners:
@@ -7675,64 +7709,90 @@ class SparkDeckService:
         if exact is not None and exact["id"] in live_by_id:
             return {**exact, **live_by_id[exact["id"]]}
 
-        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        # One candidate set spans persisted records and discovered
+        # containers: a shared request id has a single winner regardless of
+        # which class each owner belongs to.
+        candidates: list[dict[str, Any]] = []
         for stored in stored_deployments:
             live = live_by_id.get(stored["id"])
             if live is None:
                 continue
             if model_id in self._deployment_public_model_ids(live):
-                matches.append((stored, live))
-        if len(matches) > 1:
-            # Several live deployments may share one request id; routing has
-            # to stay deterministic, so the most recently deployed owner
-            # answers while the older ones remain reachable by their aliases.
-            stored, live = max(
-                matches,
-                key=lambda pair: self._selector_owner_sort_key(
-                    {**pair[0], **pair[1]},
-                ),
-            )
-            logger.warning(
-                "served model name %r is shared by %d live deployments; "
-                "routing to %r",
-                model_id, len(matches), live.get("alias") or live.get("id"),
-            )
-            return {**stored, **live}
-        if not matches:
-            discovered = [
-                deployment for deployment in deployments
-                if deployment["id"] not in stored_by_id
-                and (
-                    model_id in self._deployment_public_model_ids(deployment)
-                    or model_id == str(deployment.get("alias") or "").strip()
-                )
-            ]
-            if len(discovered) > 1:
-                chosen = max(
-                    discovered, key=self._selector_owner_sort_key,
-                )
-                logger.warning(
-                    "served model name %r is shared by %d discovered "
-                    "deployments; routing to %r",
-                    model_id, len(discovered),
-                    chosen.get("alias") or chosen.get("id"),
-                )
-                return chosen
-            return discovered[0] if discovered else None
-        stored, live = matches[0]
-        return {**stored, **live}
+                candidates.append({**stored, **live})
+        for deployment in deployments:
+            if deployment["id"] in stored_by_id:
+                continue
+            if (
+                model_id in self._deployment_public_model_ids(deployment)
+                or model_id == str(deployment.get("alias") or "").strip()
+            ):
+                candidates.append(deployment)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        # Several live deployments may share one request id; routing has to
+        # stay deterministic, so the most recently deployed owner answers
+        # while the older ones remain reachable by their aliases.
+        chosen = max(candidates, key=self._selector_owner_sort_key)
+        self._note_shared_selector_owner(model_id, chosen)
+        return chosen
 
-    @staticmethod
-    def _selector_owner_sort_key(deployment: dict[str, Any]) -> tuple[float, str]:
+    def _note_shared_selector_owner(
+        self, model_id: str, chosen: dict[str, Any],
+    ) -> None:
+        """Log a shared request id's owner when the ownership changes.
+
+        A shared name is legitimate, so the request path must not log on
+        every inference; one line per ownership change is enough to explain
+        where a bare model id currently lands.
+        """
+        observed = getattr(self, "_shared_selector_owners_log", None)
+        if observed is None:
+            observed = self._shared_selector_owners_log = {}
+        owner = str(chosen.get("id") or "")
+        if observed.get(model_id) == owner:
+            return
+        observed[model_id] = owner
+        logger.warning(
+            "served model name %r is shared by several live deployments; "
+            "routing to %r",
+            model_id, chosen.get("alias") or owner,
+        )
+
+    @classmethod
+    def _selector_owner_timestamp(cls, value: Any) -> float | None:
+        """Parse a deployment timestamp into epoch seconds, or ``None``.
+
+        Records carry epoch floats on some writers and ISO-8601 strings on
+        others, so both forms must order correctly.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00"),
+                ).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _selector_owner_sort_key(
+        cls, deployment: dict[str, Any],
+    ) -> tuple[float, str]:
         """Order live owners of a shared selector; newest deployment wins.
 
         Timestamps are absent on some discovered containers, so the id is
         the deterministic tiebreaker and the fallback.
         """
         for field in ("last_deployed_at", "last_used_at", "created_at"):
-            value = deployment.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return (float(value), str(deployment.get("id") or ""))
+            stamp = cls._selector_owner_timestamp(deployment.get(field))
+            if stamp is not None:
+                return (stamp, str(deployment.get("id") or ""))
         return (0.0, str(deployment.get("id") or ""))
 
     def source_ip_routing_rules(self) -> list[dict[str, Any]]:

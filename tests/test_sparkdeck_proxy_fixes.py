@@ -212,8 +212,10 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
 
+            # Production records carry ISO-8601 timestamps, not epochs.
             service.deployments = AsyncMock(return_value=live({
-                "record-one": 1.0, "record-two": 2.0,
+                "record-one": "2026-10-01T00:00:00Z",
+                "record-two": "2026-10-09T00:00:00Z",
             }))
             await service.proxy(
                 {"model": "shared-name", "messages": [], "stream": False},
@@ -226,7 +228,8 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
             # Re-deploying the first profile makes it the newest owner.
             service.deployments = AsyncMock(return_value=live({
-                "record-one": 3.0, "record-two": 2.0,
+                "record-one": "2026-10-10T00:00:00Z",
+                "record-two": "2026-10-09T00:00:00Z",
             }))
             await service.proxy(
                 {"model": "shared-name", "messages": [], "stream": False},
@@ -236,6 +239,203 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 manager.proxy_cluster_inference.await_args.args[0],
                 "cluster-one",
             )
+
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_shared_selector_ranks_discovered_owners_with_stored_ones(self):
+        """A discovered container that shares a stored deployment's request
+        id competes in the same candidate set; the newest launch wins."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.proxy_cluster_inference = AsyncMock(return_value={
+                "model": "shared-name", "choices": [], "usage": {},
+            })
+            service = SparkDeckService(manager, Path(directory))
+            service.store.add_deployment(Deployment(
+                id="record-stored", alias="stored-profile",
+                runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+                model=ModelIdentity("org/stored"),
+                settings={"manager_deployment_id": "cluster-stored"},
+            ))
+            def live(stored_at, discovered_at):
+                return [
+                    {
+                        "id": "record-stored", "alias": "stored-profile",
+                        "runtime": "vllm", "kind": "managed",
+                        "status": "running",
+                        "served_models": ["shared-name"],
+                        "model": {"repository": "org/stored"},
+                        "settings": {"manager_deployment_id": "cluster-stored"},
+                        "last_deployed_at": stored_at,
+                    },
+                    {
+                        "id": "container:discovered-container",
+                        "alias": "discovered-profile",
+                        "runtime": "vllm", "kind": "external",
+                        "status": "running",
+                        "served_models": ["shared-name"],
+                        "container_name": "discovered-container",
+                        "model": {"repository": "org/discovered"},
+                        "last_deployed_at": discovered_at,
+                    },
+                ]
+
+            # The stored profile is the newest launch: it answers.
+            service.deployments = AsyncMock(return_value=live(
+                "2026-10-09T00:00:00Z", "2026-10-01T00:00:00Z",
+            ))
+            await service.proxy(
+                {"model": "shared-name", "messages": [], "stream": False},
+                "chat/completions",
+            )
+            self.assertEqual(
+                manager.proxy_cluster_inference.await_args.args[0],
+                "cluster-stored",
+            )
+
+            # Re-deploying the discovered container makes it the winner; it
+            # competes in the same set instead of losing to the stored class.
+            manager._vllm_chat.return_value = {"choices": [], "usage": {}}
+            manager.list_containers.return_value = [{
+                "name": "discovered-container", "id": "discovered-id",
+                "runtime": "vllm", "status": "running",
+                "model": "org/discovered", "port": 8000,
+            }]
+            service.deployments = AsyncMock(return_value=live(
+                "2026-10-01T00:00:00Z", "2026-10-09T00:00:00Z",
+            ))
+            await service.proxy(
+                {"model": "shared-name", "messages": [], "stream": False},
+                "chat/completions",
+            )
+            self.assertEqual(
+                manager._vllm_chat.await_args.kwargs,
+                {
+                    "container_name": "discovered-container",
+                    "deployment_id": "container:discovered-container",
+                },
+            )
+
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_models_catalog_publishes_the_shared_name_on_its_winner(self):
+        """Discovery must agree with inference: the shared id is advertised
+        on the deployment that routing selects."""
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.deployments = [
+                {
+                    "id": "cluster-one", "sparkdeck_record_id": "record-one",
+                    "status": "running",
+                    "launch_settings": {
+                        "extra_args": ["--served-model-name", "shared-name"],
+                    },
+                },
+                {
+                    "id": "cluster-two", "sparkdeck_record_id": "record-two",
+                    "status": "running",
+                    "launch_settings": {
+                        "extra_args": ["--served-model-name", "shared-name"],
+                    },
+                },
+            ]
+            manager._deployment_served_models = Manager._deployment_served_models
+            service = SparkDeckService(manager, Path(directory))
+            for record_id, alias, manager_id in (
+                ("record-one", "model-one", "cluster-one"),
+                ("record-two", "model-two", "cluster-two"),
+            ):
+                service.store.add_deployment(Deployment(
+                    id=record_id, alias=alias, runtime=RuntimeKind.VLLM,
+                    kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity(f"org/{alias}"),
+                    settings={"manager_deployment_id": manager_id},
+                ))
+            service.deployments = AsyncMock(return_value=[
+                {
+                    "id": "record-one", "alias": "model-one", "runtime": "vllm",
+                    "kind": "managed", "status": "running",
+                    "served_models": ["shared-name"],
+                    "model": {"repository": "org/model-one"},
+                    "settings": {"manager_deployment_id": "cluster-one"},
+                    "last_deployed_at": "2026-10-01T00:00:00Z",
+                },
+                {
+                    "id": "record-two", "alias": "model-two", "runtime": "vllm",
+                    "kind": "managed", "status": "running",
+                    "served_models": ["shared-name"],
+                    "model": {"repository": "org/model-two"},
+                    "settings": {"manager_deployment_id": "cluster-two"},
+                    "last_deployed_at": "2026-10-09T00:00:00Z",
+                },
+            ])
+
+            models = await service.models()
+
+            self.assertEqual(
+                sorted(
+                    (item["id"], item["deployment_id"])
+                    for item in models["data"]
+                ),
+                [("model-one", "record-one"), ("shared-name", "record-two")],
+            )
+
+            await manager.http.aclose()
+            await service.close()
+
+    async def test_shared_selector_logs_ownership_changes_once(self):
+        """Shared names are routine, so the request path logs one line per
+        ownership change instead of one per inference."""
+        from unittest.mock import patch as patch_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            manager.proxy_cluster_inference = AsyncMock(return_value={
+                "model": "shared-name", "choices": [], "usage": {},
+            })
+            service = SparkDeckService(manager, Path(directory))
+            for record_id, alias, manager_id, deployed_at in (
+                ("record-one", "model-one", "cluster-one", "2026-10-01T00:00:00Z"),
+                ("record-two", "model-two", "cluster-two", "2026-10-09T00:00:00Z"),
+            ):
+                service.store.add_deployment(Deployment(
+                    id=record_id, alias=alias, runtime=RuntimeKind.VLLM,
+                    kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity(f"org/{alias}"),
+                    settings={"manager_deployment_id": manager_id},
+                ))
+            live = [
+                {
+                    "id": record_id, "alias": alias, "runtime": "vllm",
+                    "kind": "managed", "status": "running",
+                    "served_models": ["shared-name"],
+                    "model": {"repository": f"org/{alias}"},
+                    "settings": {"manager_deployment_id": manager_id},
+                    "last_deployed_at": deployed_at,
+                }
+                for record_id, alias, manager_id, deployed_at in (
+                    ("record-one", "model-one", "cluster-one", "2026-10-01T00:00:00Z"),
+                    ("record-two", "model-two", "cluster-two", "2026-10-09T00:00:00Z"),
+                )
+            ]
+            service.deployments = AsyncMock(return_value=live)
+
+            with patch_module(
+                "sparkdeck.service.logger.warning",
+            ) as warning:
+                for _ in range(3):
+                    await service.proxy(
+                        {"model": "shared-name", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+
+            shared_logs = [
+                call for call in warning.call_args_list
+                if "is shared by several live deployments" in str(call)
+            ]
+            self.assertEqual(len(shared_logs), 1)
 
             await manager.http.aclose()
             await service.close()
@@ -393,7 +593,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_ambiguous_external_served_names_route_by_container_alias(self):
+    async def test_shared_external_served_name_advertises_a_winner_and_keeps_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
@@ -425,9 +625,11 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 "chat/completions",
             )
 
+            # The shared name advertises on the newest (here: id-tiebroken)
+            # owner; the other container stays reachable through its alias.
             self.assertEqual(
                 [item["id"] for item in models["data"]],
-                ["container-one", "container-two"],
+                ["container-one", "shared-name"],
             )
             self.assertEqual(response["model"], "container-two")
             self.assertEqual(manager._vllm_chat.await_args.kwargs, {

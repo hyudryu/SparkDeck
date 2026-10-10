@@ -63,7 +63,9 @@ class CodexModelsTests(unittest.IsolatedAsyncioTestCase):
             _deployment("two", "second", ["shared"]),
             _deployment("three", "stopped", ["offline"], "stopped"),
         ]).models()
-        assert [model["slug"] for model in result["models"]] == ["first", "second"]
+        # The shared name advertises on its deterministic winner (id
+        # tiebreaker here); the other profile stays visible by its alias.
+        assert [model["slug"] for model in result["models"]] == ["first", "shared"]
         assert [model["slug"] for model in result["models"]] == [
             model["id"] for model in result["data"]
         ]

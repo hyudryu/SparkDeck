@@ -1379,12 +1379,14 @@ export function ModelsPage() {
     const { deployment, action, instance } = groupSelection
     setBusy(deployment.id)
     setGroupError(undefined)
+    if (action === 'start') setWarningNotice(undefined)
     try {
       if (action === 'start') await assertNodesUnoccupied((deployment.instances ?? [])
         .filter((group) => instance === 'all' || group.instance_id === instance)
         .flatMap((group) => groupNodeIds(deployment, group)), deployment.id, deployment.runtime)
       const updated = await api.deployments.action(deployment.id, action, undefined, undefined, false,
         instance === 'all' ? undefined : instance)
+      if (action === 'start') noticeSelectorWarnings(updated)
       setGroupSelection(undefined)
       // The action response includes the new per-group desired states. Use
       // it immediately so another stopped group can be started without

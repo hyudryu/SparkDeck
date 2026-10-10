@@ -2743,6 +2743,32 @@ async def v1_delete_inference_routing_rule(
     return {"ok": True}
 
 
+@app.get("/api/v1/model-routing-policies")
+async def v1_model_routing_policies():
+    return {"items": await sparkdeck.model_routing_policies()}
+
+
+@app.put("/api/v1/model-routing-policies")
+async def v1_upsert_model_routing_policy(req: Request):
+    try:
+        body = await req.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "request body must be valid JSON") from exc
+    try:
+        return await sparkdeck.upsert_model_routing_policy(body)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/v1/model-routing-policies")
+async def v1_delete_model_routing_policy(model: str = Query(...)):
+    if not sparkdeck.delete_model_routing_policy(model):
+        raise HTTPException(404, "model routing policy was not found")
+    return {"ok": True}
+
+
 @app.post("/api/v1/runtime-flags/preview")
 async def v1_runtime_flags_preview(req: Request):
     """Preview the exact editable argv after backend normalization."""

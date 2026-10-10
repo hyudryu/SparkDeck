@@ -46,6 +46,7 @@ from .envfile_settings import (
     resolve_control_updates,
 )
 from .models import BenchmarkSample, Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from .private_json import atomic_private_json_write
 from .runtime_file_mounts import normalize_runtime_file_mounts
 from .stream_cleanup import close_async_stream
 from .prompt_gate import PromptGates
@@ -496,6 +497,16 @@ class SparkDeckService:
         self._deployment_launches: dict[str, asyncio.Event] = {}
         self._deployment_launch_node_ids: dict[str, list[str]] = {}
         self._deployment_launch_tasks: dict[str, asyncio.Task] = {}
+        # Priority + concurrency-overflow routing for shared request ids:
+        # one ordered member list per model id, plus live in-flight counts
+        # keyed by deployment id. Selection and its slot reservation happen
+        # in one synchronous step, so concurrent requests cannot both take
+        # the last slot of a capped member.
+        self._model_routing_path = self._data_dir / "model_routing_policies.json"
+        self._model_routing_policies: dict[str, dict[str, Any]] = (
+            self._load_model_routing_policies()
+        )
+        self._model_routing_inflight: dict[str, int] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -7714,10 +7725,16 @@ class SparkDeckService:
             )
         )
 
-    async def _live_deployment_for_model_id(
+    async def _live_candidates_for_model_id(
         self, model_id: str,
-    ) -> dict[str, Any] | None:
-        """Resolve a request id to the live deployment that owns it."""
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Resolve a request id to its exact owner or its shared-name candidates.
+
+        An exact live id/alias match returns ``(deployment, [])``; a shared
+        request id returns ``(None, candidates)`` spanning persisted records
+        and discovered containers, so one candidate set drives both the
+        default newest-owner resolution and policy routing.
+        """
         deployments = [
             deployment for deployment in await self.deployments()
             if self._deployment_can_serve_inference(deployment)
@@ -7729,7 +7746,7 @@ class SparkDeckService:
         }
         exact = self.store.deployment(model_id, include_private=True)
         if exact is not None and exact["id"] in live_by_id:
-            return {**exact, **live_by_id[exact["id"]]}
+            return {**exact, **live_by_id[exact["id"]]}, []
 
         # One candidate set spans persisted records and discovered
         # containers: a shared request id has a single winner regardless of
@@ -7749,6 +7766,15 @@ class SparkDeckService:
                 or model_id == str(deployment.get("alias") or "").strip()
             ):
                 candidates.append(deployment)
+        return None, candidates
+
+    async def _live_deployment_for_model_id(
+        self, model_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a request id to the live deployment that owns it."""
+        exact, candidates = await self._live_candidates_for_model_id(model_id)
+        if exact is not None:
+            return exact
         if not candidates:
             return None
         if len(candidates) == 1:
@@ -7759,6 +7785,211 @@ class SparkDeckService:
         chosen = max(candidates, key=self._selector_owner_sort_key)
         self._note_shared_selector_owner(model_id, chosen)
         return chosen
+
+    # ---- Model routing policies: priority + concurrency overflow ----
+
+    MAX_MODEL_ROUTING_MEMBERS = 16
+    MAX_MODEL_ROUTING_CONCURRENCY = 1000
+
+    def _load_model_routing_policies(self) -> dict[str, dict[str, Any]]:
+        path = self._model_routing_path
+        if not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("model routing policy file is unreadable; ignoring it")
+            return {}
+        rows = value.get("policies") if isinstance(value, dict) else None
+        if not isinstance(rows, list):
+            return {}
+        policies: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                policy = self._normalize_model_routing_policy(row)
+            except ValueError:
+                continue
+            policies[policy["model"]] = policy
+        return policies
+
+    def _save_model_routing_policies(self) -> None:
+        atomic_private_json_write(self._model_routing_path, {
+            "policies": [
+                self._model_routing_policies[key]
+                for key in sorted(self._model_routing_policies)
+            ],
+        })
+
+    @classmethod
+    def _normalize_model_routing_policy(cls, value: Any) -> dict[str, Any]:
+        """Validate one policy; member order is the routing priority."""
+        if not isinstance(value, dict):
+            raise ValueError("model routing policy must be an object")
+        model = str(value.get("model") or "").strip()
+        if not model or len(model) > 512:
+            raise ValueError("model must be a non-empty string of at most 512 characters")
+        members_raw = value.get("members")
+        if (
+            not isinstance(members_raw, list)
+            or not 1 <= len(members_raw) <= cls.MAX_MODEL_ROUTING_MEMBERS
+        ):
+            raise ValueError(
+                "members must list between 1 and "
+                f"{cls.MAX_MODEL_ROUTING_MEMBERS} instances"
+            )
+        members: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in members_raw:
+            if not isinstance(row, dict):
+                raise ValueError("each routing member must be an object")
+            deployment_id = str(row.get("deployment_id") or "").strip()
+            if not deployment_id:
+                raise ValueError("each routing member requires a deployment_id")
+            if deployment_id in seen:
+                raise ValueError(f"duplicate routing member: {deployment_id}")
+            seen.add(deployment_id)
+            limit = row.get("max_concurrency")
+            if limit is not None:
+                if (
+                    isinstance(limit, bool)
+                    or not isinstance(limit, int)
+                    or not 1 <= limit <= cls.MAX_MODEL_ROUTING_CONCURRENCY
+                ):
+                    raise ValueError(
+                        "max_concurrency must be null or an integer between 1 and "
+                        f"{cls.MAX_MODEL_ROUTING_CONCURRENCY}"
+                    )
+            members.append({
+                "deployment_id": deployment_id,
+                "max_concurrency": limit,
+            })
+        return {
+            "model": model,
+            "members": members,
+            "updated_at": value.get("updated_at"),
+        }
+
+    async def model_routing_policies(self) -> list[dict[str, Any]]:
+        """List policies enriched with live member status and in-flight counts."""
+        live = {
+            deployment["id"]: deployment
+            for deployment in await self.deployments()
+            if self._deployment_can_serve_inference(deployment)
+        }
+        items = []
+        for key in sorted(self._model_routing_policies):
+            policy = self._model_routing_policies[key]
+            members = []
+            for member in policy["members"]:
+                deployment_id = member["deployment_id"]
+                stored = self.store.deployment(deployment_id) or {}
+                live_row = live.get(deployment_id) or {}
+                row = live_row or stored
+                node_names = [
+                    str(node.get("name") or node.get("id") or "")
+                    for node in row.get("selected_nodes") or []
+                    if isinstance(node, dict)
+                ] or [str(node_id) for node_id in row.get("node_ids") or []]
+                members.append({
+                    **member,
+                    "alias": str(row.get("alias") or deployment_id),
+                    "runtime": row.get("runtime"),
+                    "status": str(
+                        live_row.get("status")
+                        or stored.get("desired_state")
+                        or "unknown"
+                    ),
+                    "node_names": [name for name in node_names if name],
+                    "live": deployment_id in live,
+                    "inflight": self._model_routing_inflight.get(deployment_id, 0),
+                })
+            items.append({
+                "model": policy["model"],
+                "members": members,
+                "updated_at": policy.get("updated_at"),
+            })
+        return items
+
+    async def upsert_model_routing_policy(
+        self, body: Any,
+    ) -> dict[str, Any]:
+        policy = self._normalize_model_routing_policy(body)
+        for member in policy["members"]:
+            if self.store.deployment(member["deployment_id"]) is None:
+                raise LookupError(
+                    f"deployment not found: {member['deployment_id']}"
+                )
+        policy["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._model_routing_policies[policy["model"]] = policy
+        self._save_model_routing_policies()
+        items = await self.model_routing_policies()
+        return next(item for item in items if item["model"] == policy["model"])
+
+    def delete_model_routing_policy(self, model: str) -> bool:
+        if self._model_routing_policies.pop(str(model or "").strip(), None) is None:
+            return False
+        self._save_model_routing_policies()
+        return True
+
+    def _select_routed_member(
+        self, model_id: str, candidates: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Pick a policy member for a shared request id and reserve its slot.
+
+        Members are tried in priority order; the first live member below its
+        concurrency cap wins, so request ``cap + 1`` overflows to the next
+        instance. When every capped member is saturated, the least-loaded
+        live member takes the request instead of failing it. The reservation
+        is part of the selection: callers release the slot when the response
+        completes.
+        """
+        policy = self._model_routing_policies.get(model_id)
+        if not policy:
+            return None
+        live_by_id = {
+            str(candidate.get("id") or ""): candidate for candidate in candidates
+        }
+        members = [
+            member for member in policy["members"]
+            if member["deployment_id"] in live_by_id
+        ]
+        if not members:
+            return None
+        chosen: str | None = None
+        for member in members:
+            limit = member["max_concurrency"]
+            inflight = self._model_routing_inflight.get(member["deployment_id"], 0)
+            if limit is None or inflight < limit:
+                chosen = member["deployment_id"]
+                break
+        if chosen is None:
+            chosen = min(
+                members,
+                key=lambda member: self._model_routing_inflight.get(
+                    member["deployment_id"], 0,
+                ),
+            )["deployment_id"]
+        self._model_routing_inflight[chosen] = (
+            self._model_routing_inflight.get(chosen, 0) + 1
+        )
+        return live_by_id[chosen]
+
+    def _release_routing_slot(self, deployment_id: str) -> None:
+        current = self._model_routing_inflight.get(deployment_id, 0)
+        if current > 1:
+            self._model_routing_inflight[deployment_id] = current - 1
+        else:
+            self._model_routing_inflight.pop(deployment_id, None)
+
+    async def _release_routing_slot_stream(
+        self, stream: AsyncIterator[str], deployment_id: str,
+    ) -> AsyncIterator[str]:
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await close_async_stream(stream)
+            self._release_routing_slot(deployment_id)
 
     def _note_shared_selector_owner(
         self, model_id: str, chosen: dict[str, Any],
@@ -8200,14 +8431,33 @@ class SparkDeckService:
         stored_deployment = self.store.deployment(
             requested_model, include_private=True,
         )
+        routing_slot: str | None = None
         if source_route is not None:
             source_route, deployment = await self._pin_source_route(
                 source_route, requested_model,
             )
         else:
-            deployment = await self._live_deployment_for_model_id(
+            exact, candidates = await self._live_candidates_for_model_id(
                 requested_model
             )
+            if exact is not None:
+                deployment = exact
+            else:
+                # A policy for this request id routes by priority with a
+                # concurrency overflow; without one (or with no live member)
+                # the newest owner answers as before.
+                deployment = self._select_routed_member(
+                    requested_model, candidates,
+                )
+                if deployment is not None:
+                    routing_slot = str(deployment.get("id") or "")
+                elif len(candidates) == 1:
+                    deployment = candidates[0]
+                elif candidates:
+                    deployment = max(
+                        candidates, key=self._selector_owner_sort_key,
+                    )
+                    self._note_shared_selector_owner(requested_model, deployment)
             if deployment is None:
                 deployment = stored_deployment
         observation = self._community_observation_start(
@@ -8252,12 +8502,19 @@ class SparkDeckService:
                     )
             if hasattr(result, "__aiter__"):
                 streaming = True
-                return self._community_observed_stream(result, observation)
+                stream = self._community_observed_stream(result, observation)
+                if routing_slot is not None:
+                    stream = self._release_routing_slot_stream(
+                        stream, routing_slot,
+                    )
+                return stream
             return result
         finally:
             self._community_observation.reset(context_token)
             if not streaming:
                 self._community_observation_end(observation)
+                if routing_slot is not None:
+                    self._release_routing_slot(routing_slot)
 
     def _community_observation_scopes(
         self, deployment: dict[str, Any] | None, requested_model: str,

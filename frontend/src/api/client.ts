@@ -55,6 +55,8 @@ import type {
   UsageAnalysis,
   UsageSummary,
   InferenceRoutingRule,
+  ModelRoutingPolicy,
+  ModelRoutingPolicyInput,
   SystemUpdateOverview,
   SystemUpdateJob,
   RouterOSConnectionInput,
@@ -1056,6 +1058,23 @@ export const api = {
         method: 'DELETE',
       })
     },
+  },
+  modelRouting: {
+    list: async (signal?: AbortSignal) => {
+      const data = await request<{ items: ModelRoutingPolicy[] }>(
+        '/api/v1/model-routing-policies', { signal },
+      )
+      return data.items
+    },
+    save: (policy: ModelRoutingPolicyInput) =>
+      request<ModelRoutingPolicy>('/api/v1/model-routing-policies', {
+        method: 'PUT',
+        body: JSON.stringify(policy),
+      }),
+    remove: (model: string) => request<void>(
+      `/api/v1/model-routing-policies?${new URLSearchParams({ model })}`,
+      { method: 'DELETE' },
+    ),
   },
   settings: {
     get: (signal?: AbortSignal) => requestWithFallback<AppSettings>('/api/v1/settings', '/api/settings', { signal }),

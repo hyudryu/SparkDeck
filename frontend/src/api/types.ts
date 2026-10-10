@@ -1169,6 +1169,32 @@ export interface InferenceRoutingRule {
   node_ids: string[]
 }
 
+// Priority + concurrency-overflow routing for a request id several live
+// deployments share. Member order is the routing priority: requests fill
+// each member up to max_concurrency (null = unlimited) before overflowing
+// to the next instance.
+export interface ModelRoutingMember {
+  deployment_id: string
+  alias: string
+  runtime?: string | null
+  status: string
+  node_names: string[]
+  live: boolean
+  inflight: number
+  max_concurrency: number | null
+}
+
+export interface ModelRoutingPolicy {
+  model: string
+  members: ModelRoutingMember[]
+  updated_at?: string | null
+}
+
+export interface ModelRoutingPolicyInput {
+  model: string
+  members: Array<{ deployment_id: string; max_concurrency: number | null }>
+}
+
 export interface HourlyUsagePoint {
   hour: string
   input: number

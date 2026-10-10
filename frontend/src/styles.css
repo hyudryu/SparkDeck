@@ -829,3 +829,26 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .history-chart-wrap { overflow-x: auto; }
   .history-tooltip { max-width: 220px; }
 }
+
+/* Running models: shared request id clusters with priority routing */
+.dashboard-cluster { border-bottom: 1px solid var(--border-subtle); }
+.dashboard-cluster:last-child { border-bottom: 0; }
+.dashboard-cluster .dashboard-list-row { border-bottom: 1px solid var(--border-subtle); }
+.dashboard-cluster .dashboard-list-row:last-of-type { border-bottom: 0; }
+.dashboard-cluster-heading { display: flex; align-items: center; gap: 8px; padding: 10px 16px 4px; color: var(--text-secondary); }
+.dashboard-cluster-heading strong { font-size: 12px; color: var(--text-primary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.dashboard-cluster-heading small { font-size: 11px; white-space: nowrap; }
+.model-routing-editor { display: grid; gap: 8px; padding: 10px 16px 12px; background: var(--bg-subtle); border-top: 1px solid var(--border-subtle); }
+.model-routing-heading { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.model-routing-heading strong { font-size: 12px; }
+.model-routing-heading small { color: var(--text-secondary); font-size: 11px; }
+.model-routing-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.model-routing-priority, .model-routing-limit { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+.model-routing-priority select, .model-routing-limit select { min-height: 30px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; font-size: 12px; }
+.model-routing-target { min-width: 0; }
+.model-routing-target strong, .model-routing-target small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.model-routing-target strong { font-size: 12px; font-weight: 600; }
+.model-routing-target small { color: var(--text-secondary); font-size: 11px; }
+.model-routing-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.model-routing-actions span[role="status"] { color: var(--success); font-size: 11px; }
+.model-routing-actions .inline-error { margin: 0; font-size: 11px; }

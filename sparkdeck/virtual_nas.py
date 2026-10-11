@@ -3945,9 +3945,11 @@ class VirtualNAS:
                 "files": selected,
             }
             bandwidth_mbps = self._download_bandwidth_mbps()
-            if bandwidth_mbps > 0 and VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+            if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
                 download_status.get("capabilities") or []
             ):
+                # An explicit 0 overrides a stale node-local cap; omitting the
+                # field (old agents that would reject it) keeps node-local.
                 json_body["max_download_bandwidth_mbps"] = bandwidth_mbps
             operation = self.node_registry.request(
                 job["target_node_id"], "POST",
@@ -4095,9 +4097,11 @@ class VirtualNAS:
                     "hf_token": token,
                 }
                 bandwidth_mbps = self._download_bandwidth_mbps()
-                if bandwidth_mbps > 0 and VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+                if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
                     download_status.get("capabilities") or []
                 ):
+                    # Explicit 0 overrides a stale node-local cap; old agents
+                    # reject the field, so only they keep it omitted.
                     download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
                 job["download_cancelable"] = VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY in (
                     download_status.get("capabilities") or []

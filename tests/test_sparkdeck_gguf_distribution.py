@@ -249,7 +249,7 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
             manager.node_registry.request.await_args.kwargs["json_body"],
         )
 
-    async def test_unlimited_controller_omits_the_field(self):
+    async def test_unlimited_controller_forwards_explicit_zero(self):
         manager = Manager.__new__(Manager)
         manager.virtual_nas = self.nas  # default provider: 0 = unlimited
         manager.node_registry = Mock()
@@ -262,6 +262,20 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
         manager.node_registry.request = AsyncMock(return_value={"ok": True})
         manager._resolved_hf_token = Mock(return_value=None)
 
+        await manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["model.gguf"],
+        )
+        # The explicit 0 overrides a stale node-local cap; an omitted field
+        # would mean "keep node-local" and leave a capped worker throttled.
+        self.assertEqual(
+            manager.node_registry.request.await_args.kwargs["json_body"][
+                "max_download_bandwidth_mbps"], 0.0,
+        )
+
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY],
+        }])
         await manager.node_download_model_files(
             "worker-1", "org/model", "a" * 40, ["model.gguf"],
         )

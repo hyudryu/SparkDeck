@@ -3290,7 +3290,9 @@ class Manager:
             "files": list(filenames),
         }
         bandwidth_mbps = self.virtual_nas._download_bandwidth_mbps()
-        if bandwidth_mbps > 0 and await self.node_supports_download_bandwidth(node_id):
+        if await self.node_supports_download_bandwidth(node_id):
+            # Explicit 0 overrides a stale node-local cap; old agents reject
+            # the field, so only they keep it omitted.
             download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
         with self.virtual_nas.transfer_operation(model_id):
             return await self.virtual_nas._await_uncancelable(self.node_registry.request(
@@ -12098,6 +12100,14 @@ class Manager:
         return self.public_settings()
 
     async def update_settings(self, data: dict) -> dict:
+        # Validate the bandwidth cap before mutating anything: a payload can
+        # carry several keys, and a rejected cap must not leave earlier keys
+        # already applied to the live settings object.
+        if "max_download_bandwidth_mbps" in data:
+            data = dict(data)
+            data["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(
+                data["max_download_bandwidth_mbps"],
+            )
         async with self.lock:
             for k, v in data.items():
                 # Dashboard visibility is presentation-only node state. Keep
@@ -12110,11 +12120,6 @@ class Manager:
                     # token should remain unchanged.
                     if k == "hf_token" and not str(v or "").strip():
                         continue
-                    if k == "max_download_bandwidth_mbps":
-                        # Enforce the unit range at the write path so every
-                        # reader (download workers, image pull) can trust the
-                        # persisted value.
-                        v = parse_bandwidth_mbps(v)
                     self.settings[k] = v
             self._save_settings()
         if self.settings.get("virtual_nas_enabled") and not self.is_joined_worker():

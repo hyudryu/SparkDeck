@@ -2,7 +2,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import sparkdeck.download_throttle as throttle
 from sparkdeck.download_throttle import (
@@ -89,7 +89,7 @@ class InstallSocketThrottleTests(unittest.TestCase):
 
     def test_zero_rate_is_not_installed_and_positive_rate_throttles_reads(self):
         result = self.run_worker(
-            "import socket\n"
+            "import socket, ssl\n"
             "from sparkdeck.download_throttle import install_socket_throttle\n"
             "assert install_socket_throttle(0) is False\n"
             "assert install_socket_throttle(10 ** 9) is True\n"
@@ -100,10 +100,66 @@ class InstallSocketThrottleTests(unittest.TestCase):
             "a.sendall(b'world')\n"
             "buf = bytearray(5)\n"
             "assert b.recv_into(buf) == 5 and bytes(buf) == b'world'\n"
+            # HTTPS reads go through ssl.SSLSocket's own overrides of the
+            # recv methods; a base-socket-only patch would miss them.
+            "assert getattr(ssl.SSLSocket.recv, '_sparkdeck_throttled', False)\n"
+            "assert getattr(ssl.SSLSocket.recv_into, '_sparkdeck_throttled', False)\n"
+            "assert ssl.SSLSocket.recv is not socket.socket.recv\n"
             "print('ok')\n"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ok", result.stdout)
+
+
+class WrapReadsTests(unittest.TestCase):
+    """Wrapper charging logic against a synthetic class (no global patch)."""
+
+    def test_charges_each_read_shape(self):
+        class Synthetic:
+            def recv(self, bufsize):
+                return b"abcd"
+
+            def recv_into(self, buffer, nbytes=0):
+                return 3
+
+            def recvfrom(self, bufsize):
+                return b"xy", ("127.0.0.1", 53)
+
+            def recvfrom_into(self, buffer, nbytes=0):
+                return 2, ("127.0.0.1", 53)
+
+        bucket = Mock()
+        throttle._wrap_reads(Synthetic, bucket)
+        instance = Synthetic()
+        instance.recv(4096)
+        instance.recv_into(bytearray(10))
+        instance.recvfrom(4096)
+        instance.recvfrom_into(bytearray(10))
+        self.assertEqual(
+            [call.args[0] for call in bucket.acquire.call_args_list], [4, 3, 2, 2],
+        )
+
+    def test_already_charged_methods_are_not_wrapped_twice(self):
+        class Base:
+            def recv(self, bufsize):
+                return b"data"
+
+        class Child(Base):
+            pass
+
+        base_bucket, child_bucket = Mock(), Mock()
+        throttle._wrap_reads(Base, base_bucket)
+        throttle._wrap_reads(Child, child_bucket)
+        Child().recv(4096)
+        self.assertEqual([c.args[0] for c in base_bucket.acquire.call_args_list], [4])
+        child_bucket.acquire.assert_not_called()
+
+    def test_missing_methods_are_skipped(self):
+        class Bare:
+            pass
+
+        throttle._wrap_reads(Bare, Mock())
+        self.assertFalse(hasattr(Bare, "recv"))
 
 
 if __name__ == "__main__":

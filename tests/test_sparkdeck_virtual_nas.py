@@ -5295,7 +5295,10 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             await nas._download_selected_files(job, "")
             self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
 
-    async def test_unlimited_cap_omits_the_remote_field(self):
+    async def test_unlimited_cap_sends_explicit_zero_to_capable_agents(self):
+        # Omitting the field means "keep the node-local cap", so a worker
+        # left with a stale nonzero limit could never be set free. A capable
+        # agent must receive the explicit 0; old agents keep it omitted.
         with tempfile.TemporaryDirectory() as directory:
             nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
                              Mock(), lambda: True)
@@ -5314,6 +5317,10 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
                    "revision": RESOLVED_REVISION, "requested_revision": "main",
                    "target_node_id": "ws1", "selected_files": ["q.gguf"],
                    "bytes_total": 8, "status": "queued", "kind": "download"}
+            await nas._download_selected_files(job, "")
+            self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 0.0)
+
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
             await nas._download_selected_files(job, "")
             self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
 

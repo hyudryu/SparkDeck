@@ -182,6 +182,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 400)
 
+
     async def test_invalid_deployment_defaults_are_rejected_without_saving(self):
         with patch.object(server.sparkdeck.store, "set_setting") as set_setting:
             bad_runtime = await self.client.put(
@@ -550,3 +551,39 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             json.loads(requests[0].content)["hf_token"], "hf_forwarded_secret",
         )
+
+
+class ManagerSettingsWriteTests(unittest.IsolatedAsyncioTestCase):
+    """update_settings must reject an invalid cap without applying any key."""
+
+    def bare_manager(self):
+        manager = Manager.__new__(Manager)
+        manager.lock = asyncio.Lock()
+        manager.settings = {
+            "max_concurrent_models": 2, "max_download_bandwidth_mbps": 2.0,
+        }
+        manager._save_settings = Mock()
+        manager._resolved_hf_token = Mock(return_value="")
+        manager.virtual_nas = Mock(start=Mock(), stop=AsyncMock())
+        manager.is_joined_worker = Mock(return_value=True)
+        return manager
+
+    async def test_invalid_bandwidth_applies_no_other_key(self):
+        manager = self.bare_manager()
+        with self.assertRaises(ValueError):
+            await manager.update_settings({
+                "max_concurrent_models": 9, "max_download_bandwidth_mbps": "fast",
+            })
+        # The request 400s, so nothing may have changed in the live settings.
+        self.assertEqual(manager.settings["max_concurrent_models"], 2)
+        self.assertEqual(manager.settings["max_download_bandwidth_mbps"], 2.0)
+        manager._save_settings.assert_not_called()
+
+    async def test_valid_bandwidth_is_parsed_and_persisted(self):
+        manager = self.bare_manager()
+        await manager.update_settings({
+            "max_concurrent_models": 9, "max_download_bandwidth_mbps": 3.5,
+        })
+        self.assertEqual(manager.settings["max_concurrent_models"], 9)
+        self.assertEqual(manager.settings["max_download_bandwidth_mbps"], 3.5)
+        manager._save_settings.assert_called_once()

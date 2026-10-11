@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import socket
+import ssl
 import threading
 import time
 
@@ -82,14 +83,54 @@ _bucket: TokenBucket | None = None
 _installed = False
 
 
+def _result_byte_count(result: object) -> int:
+    if isinstance(result, tuple):
+        result = result[0] if result else b""
+    if isinstance(result, int):
+        return result
+    if isinstance(result, (bytes, bytearray)):
+        return len(result)
+    return 0
+
+
+def _wrap_reads(cls: type, bucket: TokenBucket) -> None:
+    """Charge every buffered read on ``cls`` to ``bucket``.
+
+    ``ssl.SSLSocket`` overrides these methods, so patching only
+    ``socket.socket`` would leave HTTPS transfers (what the Hub actually
+    serves) unbilled; both classes must be patched explicitly. ``read`` and
+    ``read_into`` on SSLSocket are deliberately left alone: its ``recv``
+    implementations call them internally, and wrapping both would bill the
+    same bytes twice.
+    """
+    for name in ("recv", "recv_into", "recvfrom", "recvfrom_into"):
+        original = getattr(cls, name, None)
+        if original is None or getattr(original, "_sparkdeck_throttled", False):
+            # Missing, or already charged by a patch through inheritance.
+            continue
+
+        def charge(self, *args, _original=original, **kwargs):  # type: ignore[no-untyped-def]
+            result = _original(self, *args, **kwargs)
+            count = _result_byte_count(result)
+            if count > 0:
+                bucket.acquire(count)
+            return result
+
+        charge.__name__ = name
+        charge._sparkdeck_throttled = True
+        setattr(cls, name, charge)  # type: ignore[method-assign]
+
+
 def install_socket_throttle(bytes_per_second: float) -> bool:
     """Throttle every socket read in this process to the given byte rate.
 
     Returns True when the patch was installed. Idempotent. The Hugging Face
     download worker calls this before importing huggingface_hub: Hub HTTP
-    reads then pay for their bytes from the shared bucket. Xet-backed storage
-    is downloaded by a Rust client that bypasses Python sockets, so callers
-    must disable Xet whenever this returns True.
+    reads then pay for their bytes from the shared bucket, including HTTPS,
+    because ``ssl.SSLSocket`` overrides the recv methods and would otherwise
+    bypass the base-socket patch. Xet-backed storage is downloaded by a Rust
+    client that bypasses Python sockets, so callers must disable Xet whenever
+    this returns True.
     """
     global _bucket, _installed
     if _installed:
@@ -97,39 +138,10 @@ def install_socket_throttle(bytes_per_second: float) -> bool:
     if bytes_per_second <= 0:
         return False
     bucket = TokenBucket(bytes_per_second)
-    original_recv = socket.socket.recv
-    original_recv_into = socket.socket.recv_into
-    original_recvfrom = socket.socket.recvfrom
-    original_recvfrom_into = socket.socket.recvfrom_into
-
-    def recv(self, bufsize, *args):  # type: ignore[no-untyped-def]
-        data = original_recv(self, bufsize, *args)
-        if data:
-            bucket.acquire(len(data))
-        return data
-
-    def recv_into(self, buffer, nbytes=0, *args):  # type: ignore[no-untyped-def]
-        read = original_recv_into(self, buffer, nbytes, *args)
-        if read:
-            bucket.acquire(read)
-        return read
-
-    def recvfrom(self, bufsize, *args):  # type: ignore[no-untyped-def]
-        data, address = original_recvfrom(self, bufsize, *args)
-        if data:
-            bucket.acquire(len(data))
-        return data, address
-
-    def recvfrom_into(self, buffer, nbytes=0, *args):  # type: ignore[no-untyped-def]
-        read, address = original_recvfrom_into(self, buffer, nbytes, *args)
-        if read:
-            bucket.acquire(read)
-        return read, address
-
-    socket.socket.recv = recv  # type: ignore[method-assign]
-    socket.socket.recv_into = recv_into  # type: ignore[method-assign]
-    socket.socket.recvfrom = recvfrom  # type: ignore[method-assign]
-    socket.socket.recvfrom_into = recvfrom_into  # type: ignore[method-assign]
+    _wrap_reads(socket.socket, bucket)
+    ssl_socket = getattr(ssl, "SSLSocket", None)
+    if ssl_socket is not None:
+        _wrap_reads(ssl_socket, bucket)
     _bucket = bucket
     _installed = True
     return True

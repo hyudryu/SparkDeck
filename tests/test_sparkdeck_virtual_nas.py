@@ -5220,6 +5220,10 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["model_id"], "org/model")
             self.assertEqual(payload["bytes_per_second"], 1_000_000.0)
             self.assertNotIn("files", payload)
+            # A capped worker gets a live-cap file to watch; it is cleaned up
+            # when the operation finishes.
+            self.assertTrue(payload.get("rate_file"))
+            self.assertFalse(Path(payload["rate_file"]).exists())
 
     async def test_full_snapshot_payload_applies_node_provider_cap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5235,6 +5239,52 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
                 directory, provider=0, requested_revision="main",
             )
             self.assertEqual(payload["bytes_per_second"], 0.0)
+            # Unlimited starts cannot adopt a later cap mid-run (the worker
+            # chose Xet), so they carry no live-cap file.
+            self.assertNotIn("rate_file", payload)
+
+    def test_weight_rate_file_lives_only_while_the_worker_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                path = Path(payload["rate_file"])
+                captured["content"] = path.read_text(encoding="utf-8")
+                captured["path"] = path
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 500_000.0,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+            self.assertFalse(captured["path"].exists())
+
+    def test_apply_download_bandwidth_cap_rewrites_registered_rate_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            rate_file = nas._register_download_rate_file("op-1", 500_000.0)
+            self.assertIsNotNone(rate_file)
+            self.assertEqual(rate_file.read_text(encoding="utf-8"), "500000.0")
+            # The cap is removed while the download runs; the watcher picks
+            # up the 0 and stops delaying.
+            nas.apply_download_bandwidth_cap(0.0)
+            self.assertEqual(rate_file.read_text(encoding="utf-8"), "0.0")
+            nas._release_download_rate_file("op-1")
+            self.assertFalse(rate_file.exists())
+
+    def test_uncapped_weight_start_has_no_rate_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            self.assertIsNone(nas._register_download_rate_file("op", 0.0))
+            nas.apply_download_bandwidth_cap(500_000.0)  # no-op, must not raise
 
     def test_selective_worker_subprocess_receives_files_and_rate(self):
         with tempfile.TemporaryDirectory() as directory:

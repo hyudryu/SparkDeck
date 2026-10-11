@@ -75,10 +75,19 @@ class WorkerMainTests(unittest.TestCase):
             self.payload(files=["a.gguf"], bytes_per_second=125_000.0),
             throttle_installed=True,
         )
-        install.assert_called_once_with(125_000.0)
+        install.assert_called_once_with(125_000.0, None)
         self.assertEqual(env["HF_HUB_DISABLE_XET"], "1")
         self.assertIsNone(env["HF_XET_HIGH_PERFORMANCE"])
         hub.hf_hub_download.assert_called_once()
+
+    def test_rate_file_is_forwarded_for_live_reeating(self):
+        # The queue registers a rate file alongside a capped full-snapshot
+        # worker so a settings change re-rates the transfer in flight.
+        hub, install, _ = self.run_main(
+            self.payload(bytes_per_second=125_000.0, rate_file="/tmp/rate.txt"),
+            throttle_installed=True,
+        )
+        install.assert_called_once_with(125_000.0, "/tmp/rate.txt")
 
 
 if __name__ == "__main__":

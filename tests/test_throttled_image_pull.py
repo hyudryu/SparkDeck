@@ -10,12 +10,13 @@ import time
 import unittest
 from collections import namedtuple
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import sparkdeck.throttled_image_pull as tip
 from sparkdeck.throttled_image_pull import (
     PROGRESS_NAME,
     PROXY_IMAGE,
+    RATE_NAME,
     SKOPEO_IMAGE,
     ThrottledPullError,
     _auth_entry,
@@ -215,10 +216,12 @@ class FakeDockerApi:
 
     def __init__(self, *, copy_exit=0, proxy_dies=False, stderr_tail=b"fatal: copy failed",
                  load_events=None, verify_fails=False, inspect_size=100,
-                 helpers_missing=False, security_options=None):
+                 helpers_missing=False, security_options=None,
+                 copy_inspect_fails=False):
         self.security_options = security_options or []
         self.copy_exit = copy_exit
         self.proxy_dies = proxy_dies
+        self.copy_inspect_fails = copy_inspect_fails
         self.stderr_tail = stderr_tail
         self.load_events = load_events if load_events is not None else [
             {"stream": "Loaded image: docker.io/library/nginx:latest"},
@@ -310,6 +313,8 @@ class FakeDockerApi:
         if role == "inspect":
             # The preflight inspect always finishes on its first poll.
             return {"State": {"Running": False, "ExitCode": 0}}
+        if self.copy_inspect_fails:
+            raise RuntimeError(f"no such container: {container_id}")
         self._copy_polls += 1
         if self._copy_polls < 2:
             return {"State": {"Running": True, "ExitCode": 0}}
@@ -342,7 +347,14 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.api = api
         staging = staging or Path(tempfile.mkdtemp())
-        mkdtemp_values = [str(staging)] + ([str(auth_dir)] if auth_dir else [])
+        # The flow creates staging, the optional single-registry auth dir,
+        # and the always-created colon-safe CA staging dir, in that order.
+        ca_dir = tempfile.mkdtemp(prefix="sparkdeck-test-cas-")
+        mkdtemp_values = (
+            [str(staging)]
+            + ([str(auth_dir)] if auth_dir else [])
+            + [ca_dir]
+        )
         events = []
         with (
             # The flow tests own registry auth explicitly; the developer
@@ -561,6 +573,76 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIn("SPARKDECK_IMAGE_STAGING_DIR", events[-1]["error"])
         self.assertIn("download limit to 0", events[-1]["error"])
+
+    async def test_rate_file_carries_the_initial_cap_for_live_updates(self):
+        api = FakeDockerApi()
+        staging = Path(tempfile.mkdtemp())
+        captured = {}
+
+        def on_start(container_id):
+            if container_id != "copy-1":
+                return
+            captured["rate"] = (staging / RATE_NAME).read_text(encoding="utf-8")
+            staging.joinpath(PROGRESS_NAME).write_bytes(b"50")
+            staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        events, _ = await self.collect(api, staging=staging, bps=1_000_000.0)
+        self.assertEqual(captured["rate"], repr(1_000_000.0))
+        proxy = next(
+            c for c in api.created if c.get("image") == PROXY_IMAGE
+        )
+        self.assertEqual(
+            proxy["environment"]["SPARKDECK_BANDWIDTH_RATE_FILE"],
+            f"/archive/{RATE_NAME}",
+        )
+        # After the flow the file is gone with staging and no longer
+        # registered for live re-rating (the registry keys are plain strings).
+        rate_key = os.path.join(str(staging), RATE_NAME)
+        self.assertNotIn(rate_key, tip._ACTIVE_RATE_FILES)
+        self.assertFalse(os.path.exists(rate_key))
+
+    async def test_persistent_copy_inspect_failure_aborts_the_wait(self):
+        # A copy container removed externally must end the poll loop: it
+        # holds the node and cluster download budgets, so spinning on a
+        # phantom would block every later capped transfer.
+        api = FakeDockerApi(copy_inspect_fails=True)
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        with patch("sparkdeck.throttled_image_pull.asyncio.sleep",
+                   new=AsyncMock()):
+            events, _ = await self.collect(api, staging=staging)
+        self.assertIsNone(api.loaded)
+        self.assertIn("could no longer be inspected", events[-1]["error"])
+        self.assertNotIn("Successfully", json.dumps(events))
+        # The budgets and helpers are released like any other failure.
+        self.assertEqual(sorted(api.removed), ["copy-1", "inspect-1", "proxy-1"])
+
+    def test_apply_bandwidth_cap_rewrites_registered_rate_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = os.path.join(directory, RATE_NAME)
+            with open(key, "w", encoding="utf-8") as handle:
+                handle.write("1000.0")
+            tip._ACTIVE_RATE_FILES.add(key)
+            try:
+                tip.apply_bandwidth_cap(500_000.0)
+            finally:
+                tip._ACTIVE_RATE_FILES.discard(key)
+            with open(key, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "500000.0")
+            # The atomic replace leaves no temp file behind.
+            self.assertFalse(os.path.exists(key + ".tmp"))
+
+    def test_apply_bandwidth_cap_survives_a_vanished_file(self):
+        tip._ACTIVE_RATE_FILES.add(
+            os.path.join(tempfile.gettempdir(), "sparkdeck-no-such-dir", RATE_NAME),
+        )
+        tip.apply_bandwidth_cap(10.0)  # must not raise
 
     async def test_helper_bootstrap_is_surfaced_as_uncapped_one_time_pull(self):
         api = FakeDockerApi(helpers_missing=True)
@@ -807,6 +889,55 @@ class LimiterProxyTests(unittest.TestCase):
         finally:
             process.kill()
             listener.close()
+
+    def test_rate_file_change_re_rates_the_running_limiter(self):
+        # A settings change rewrites the staged rate file mid-transfer; the
+        # running proxy must throttle at the old rate first, then move at the
+        # new one without a restart.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        proxy_port = self.free_port()
+        payload = b"x" * 30_000
+        with tempfile.TemporaryDirectory() as directory:
+            rate_path = os.path.join(directory, "rate.txt")
+            with open(rate_path, "w") as handle:
+                handle.write("50000")
+            process = self.start_proxy(proxy_port, env_extra={
+                "SPARKDECK_DOWNLOAD_BPS": "50000",
+                "SPARKDECK_BANDWIDTH_RATE_FILE": rate_path,
+            })
+            client = None
+            try:
+                client, response = self.connect(
+                    proxy_port, f"127.0.0.1:{echo_port}",
+                )
+                self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+
+                def transfer():
+                    start = time.monotonic()
+                    client.sendall(payload)
+                    received = 0
+                    while received < len(payload):
+                        chunk = client.recv(65536)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                    self.assertEqual(received, len(payload))
+                    return time.monotonic() - start
+
+                throttled_seconds = transfer()
+                with open(rate_path, "w") as handle:
+                    handle.write("0")
+                time.sleep(0.7)  # outlast one 0.5 s rate poll
+                unlimited_seconds = transfer()
+            finally:
+                if client is not None:
+                    client.close()
+                process.kill()
+                listener.close()
+        # 30 KB at 50 KB/s needs at least ~0.6 s; unlimited has no sleeps at
+        # all, so the bounds only have to separate the two clearly.
+        self.assertGreaterEqual(throttled_seconds, 0.35)
+        self.assertLess(unlimited_seconds, 1.0)
 
     def test_upstream_proxy_chaining_with_authorization(self):
         listener, echo_port = self.echo_server("127.0.0.1")
@@ -1204,7 +1335,8 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(
                     tip.tempfile, "mkdtemp",
-                    side_effect=[str(staging), str(auth_dir)],
+                    side_effect=[str(staging), str(auth_dir),
+                                 tempfile.mkdtemp(prefix="sparkdeck-test-cas-")],
                 ),
                 patch.object(
                     tip.shutil, "disk_usage",
@@ -1263,7 +1395,8 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(
                     tip.tempfile, "mkdtemp",
-                    side_effect=[str(staging), str(auth_dir)],
+                    side_effect=[str(staging), str(auth_dir),
+                                 tempfile.mkdtemp(prefix="sparkdeck-test-cas-")],
                 ),
                 patch.object(
                     tip.shutil, "disk_usage",
@@ -1342,7 +1475,7 @@ class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
         binds = [
             "/staging:/archive:z",
             "/host/config.json:/auth/config.json:ro,z",
-            "/etc/docker/certs.d/reg.corp:5443:/etc/containers/certs.d/reg.corp:5443:ro,z",
+            "/sparkdeck-pull-cas-xyz:/etc/containers/certs.d:ro,z",
         ]
         await self.total({"Size": 10}, copy_binds=binds)
         created = inspect_kwargs(self.api)
@@ -1350,44 +1483,77 @@ class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RegistryCaBindsTests(unittest.TestCase):
-    """Daemon certs.d directories exposed to the skopeo helpers (PozP)."""
+    """Daemon certs.d copied into staging so binds stay colon-free."""
 
-    def test_ca_directory_becomes_a_readonly_bind(self):
-        with tempfile.TemporaryDirectory() as directory:
-            ca_dir = os.path.join(directory, "reg.corp")
-            os.mkdir(ca_dir)
-            with open(os.path.join(ca_dir, "ca.crt"), "w") as handle:
-                handle.write("-----CERT-----")
-            binds = registry_ca_binds("reg.corp", bases=[directory])
-        self.assertEqual(
-            binds, [f"{ca_dir}:/etc/containers/certs.d/reg.corp:ro,z"],
-        )
+    @staticmethod
+    def _write_ca(base, key):
+        directory = os.path.join(base, key)
+        os.mkdir(directory)
+        path = os.path.join(directory, "ca.crt")
+        with open(path, "w") as handle:
+            handle.write("-----CERT-----")
+        return path
 
-    def test_portless_key_fallback_and_cert_requirement(self):
-        with tempfile.TemporaryDirectory() as directory:
-            ca_dir = os.path.join(directory, "reg.corp")
-            os.mkdir(ca_dir)
-            with open(os.path.join(ca_dir, "ca.crt"), "w") as handle:
-                handle.write("-----CERT-----")
-            # host:port registry matches the operator's port-less directory,
-            # while the bind target keeps the full registry key skopeo uses.
-            binds = registry_ca_binds("reg.corp:5443", bases=[directory])
+    def test_ca_copies_into_staging_and_mounts_the_parent(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            self._write_ca(source, "reg.corp")
+            binds = registry_ca_binds("reg.corp", staging, bases=[source])
             self.assertEqual(
-                binds, [f"{ca_dir}:/etc/containers/certs.d/reg.corp:5443:ro,z"],
+                binds, [f"{staging}:/etc/containers/certs.d:ro,z"],
             )
-            other = os.path.join(directory, "other.corp")
-            os.mkdir(other)  # exists but contains no certificate
-            self.assertEqual(registry_ca_binds("other.corp", [directory]), [])
+            self.assertTrue(os.path.isfile(
+                os.path.join(staging, "reg.corp", "ca.crt"),
+            ))
+
+    @unittest.skipIf(os.name == "nt", "directory names cannot carry colons")
+    def test_port_qualified_key_never_reaches_the_bind_spec(self):
+        # A bind spec splits on colons: reg.corp:5443 in the source or the
+        # target would be parsed as extra fields and fail container creation,
+        # so the key must exist only INSIDE the mount.
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            self._write_ca(source, "reg.corp:5443")
+            binds = registry_ca_binds("reg.corp:5443", staging, bases=[source])
+            self.assertEqual(
+                binds, [f"{staging}:/etc/containers/certs.d:ro,z"],
+            )
+            self.assertNotIn("5443", binds[0])
+            self.assertTrue(os.path.isfile(
+                os.path.join(staging, "reg.corp:5443", "ca.crt"),
+            ))
+
+    @unittest.skipIf(os.name == "nt", "directory names cannot carry colons")
+    def test_portless_operator_directory_lands_at_the_registry_key(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            self._write_ca(source, "reg.corp")
+            binds = registry_ca_binds("reg.corp:5443", staging, bases=[source])
+            self.assertEqual(
+                binds, [f"{staging}:/etc/containers/certs.d:ro,z"],
+            )
+            self.assertTrue(os.path.isfile(
+                os.path.join(staging, "reg.corp:5443", "ca.crt"),
+            ))
+
+    def test_directory_without_certificates_yields_no_binds(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            os.mkdir(os.path.join(source, "other.corp"))  # no .crt inside
+            self.assertEqual(
+                registry_ca_binds("other.corp", staging, bases=[source]), [],
+            )
 
     def test_missing_directories_yield_no_binds(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.assertEqual(registry_ca_binds("nowhere.corp", [directory]), [])
-            self.assertEqual(registry_ca_binds("", [directory]), [])
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            self.assertEqual(
+                registry_ca_binds("nowhere.corp", staging, bases=[source]), [],
+            )
+            self.assertEqual(
+                registry_ca_binds("", staging, bases=[source]), [],
+            )
 
     def test_system_base_lookup_is_safe_when_absent(self):
         # Windows dev boxes have no /etc/docker/certs.d; the real-base call
         # must return nothing rather than raising.
-        self.assertEqual(registry_ca_binds("reg.corp"), [])
+        with tempfile.TemporaryDirectory() as staging:
+            self.assertEqual(registry_ca_binds("reg.corp", staging), [])
 
 
 class StagingParentTests(unittest.TestCase):

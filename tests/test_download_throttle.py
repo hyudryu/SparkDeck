@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -74,6 +76,81 @@ class TokenBucketTests(unittest.TestCase):
         with patch.object(throttle.time, "sleep") as slept:
             bucket.acquire(100)
         slept.assert_called_once()
+
+
+class LiveRateChangeTests(unittest.TestCase):
+    """A setting change reaches a bucket whose transfer is already running."""
+
+    def test_set_rate_rerates_live_bucket(self):
+        now = [0.0]
+        bucket = TokenBucket(100.0, clock=lambda: now[0])
+        bucket.set_rate(400.0)
+        with patch.object(throttle.time, "sleep", side_effect=lambda s: None) as slept:
+            bucket.acquire(400)
+        self.assertEqual(slept.call_args.args[0], 1.0)
+
+    def test_set_rate_zero_unlimits_and_a_new_cap_resumes_throttling(self):
+        now = [0.0]
+        bucket = TokenBucket(100.0, clock=lambda: now[0])
+        bucket.set_rate(0)
+        with patch.object(throttle.time, "sleep") as slept:
+            bucket.acquire(10_000)
+        slept.assert_not_called()
+        bucket.set_rate(50.0)
+        with patch.object(throttle.time, "sleep", side_effect=lambda s: None) as slept:
+            bucket.acquire(50)
+        self.assertEqual(slept.call_args.args[0], 1.0)
+
+    def test_set_rate_ignores_garbage(self):
+        now = [0.0]
+        bucket = TokenBucket(100.0, clock=lambda: now[0])
+        bucket.set_rate("fast")
+        bucket.set_rate(None)
+        with patch.object(throttle.time, "sleep", side_effect=lambda s: None) as slept:
+            bucket.acquire(100)
+        self.assertEqual(slept.call_args.args[0], 1.0)
+
+    def test_apply_rate_file_updates_bucket_and_tolerates_bad_content(self):
+        now = [0.0]
+        bucket = TokenBucket(100.0, clock=lambda: now[0])
+        waits = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "rate.txt")
+            with open(path, "w") as handle:
+                handle.write("250\n")
+            throttle.apply_rate_file(bucket, path)
+            with patch.object(
+                throttle.time, "sleep",
+                side_effect=lambda s: waits.append(s),
+            ):
+                bucket.acquire(250)   # 1.0 s at the applied 250 B/s
+                with open(path, "w") as handle:
+                    handle.write("not-a-number")
+                throttle.apply_rate_file(bucket, path)
+                bucket.acquire(250)   # old rate kept: another 1.0 s of due
+                throttle.apply_rate_file(bucket, os.path.join(directory, "gone"))
+                bucket.acquire(250)   # missing file keeps it too
+        self.assertEqual(waits, [1.0, 2.0, 3.0])
+
+
+class RateFileWatcherProcessTests(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    def test_install_with_rate_file_starts_the_watcher_thread(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import os, tempfile, threading\n"
+             "from sparkdeck.download_throttle import install_socket_throttle\n"
+             "path = os.path.join(tempfile.mkdtemp(), 'rate.txt')\n"
+             "open(path, 'w').write('1000000')\n"
+             "assert install_socket_throttle(1_000_000, path) is True\n"
+             "names = [t.name for t in threading.enumerate()]\n"
+             "assert names.count('sparkdeck-rate-watch') == 1\n"
+             "print('ok')\n"],
+            capture_output=True, text=True, cwd=str(self.REPO_ROOT), timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
 
 
 class InstallSocketThrottleTests(unittest.TestCase):

@@ -54,6 +54,37 @@ _PROXY_PORT = 8899
 # Written by the proxy into the shared staging volume; the poll loop reads it
 # from the host. It counts bytes the token bucket actually moved.
 PROGRESS_NAME = "proxy_bytes"
+# Cap file the proxy re-reads while it runs (bytes per second, 0 = unlimited).
+# It lives in staging (bind-mounted at /archive) so the host can rewrite it
+# when the bandwidth setting changes mid-pull.
+RATE_NAME = "rate.txt"
+
+# Rate files of the capped pulls running in this process; a settings change
+# rewrites them so transfers in flight re-rate. Plain strings, not Path
+# objects: staging paths are built under the caller's os.name (the uid
+# handling patches it to exercise the Linux paths), and cleanup runs in an
+# executor thread where a captured PosixPath could no longer be combined.
+# Iterated and mutated only from the owning event loop plus the settings
+# handler, both under the GIL.
+_ACTIVE_RATE_FILES: set[str] = set()
+
+
+def apply_bandwidth_cap(bytes_per_second: float) -> None:
+    """Re-rate the capped image pulls currently running in this process.
+
+    Pulls that started unlimited used the plain daemon-side pull, which no
+    user-space limiter can touch; the newly enabled cap applies to them
+    nothing and to every subsequent transfer entirely.
+    """
+    value = repr(float(bytes_per_second))
+    for path in list(_ACTIVE_RATE_FILES):
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(value)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 # The token bucket mirrors sparkdeck.download_throttle's virtual-time
 # schedule, but it runs inside the proxy container where no project module is
@@ -68,10 +99,12 @@ PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
 UPSTREAM = os.environ.get("SPARKDECK_UPSTREAM_PROXY") or ""
 UPSTREAM_CA = os.environ.get("SPARKDECK_UPSTREAM_PROXY_CA") or ""
 NO_PROXY = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+RATE_FILE = os.environ.get("SPARKDECK_BANDWIDTH_RATE_FILE") or ""
 DUE = [0.0]
 LOCK = threading.Lock()
 TOTAL = [0]
 LAST_REPORT = [0.0]
+LAST_RATE_POLL = [0.0]
 
 def report(force=False):
     if not PROGRESS:
@@ -88,9 +121,29 @@ def report(force=False):
     except OSError:
         pass
 
+def poll_rate():
+    # The owner rewrites the staged rate file when the bandwidth setting
+    # changes, so a pull already in flight re-rates instead of finishing at
+    # its dispatched rate; 0 or less in the file means unlimited.
+    global RATE
+    if not RATE_FILE:
+        return
+    now = time.monotonic()
+    if now - LAST_RATE_POLL[0] < 0.5:
+        return
+    LAST_RATE_POLL[0] = now
+    try:
+        with open(RATE_FILE) as handle:
+            value = float(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return
+    with LOCK:
+        RATE = value if value > 0 else float("inf")
+
 def spend(n):
     if n <= 0:
         return
+    poll_rate()
     with LOCK:
         TOTAL[0] += n
         now = time.monotonic()
@@ -396,18 +449,23 @@ CONTAINERS_CERTS_D = "/etc/containers/certs.d"
 
 
 def registry_ca_binds(
-    registry_host: str, bases: list[str] | None = None,
+    registry_host: str, certs_staging: Path | str,
+    bases: list[str] | None = None,
 ) -> list[str]:
-    """Bind mounts exposing the daemon's per-registry CA to the helpers.
+    """Colon-safe exposure of the daemon's per-registry CA to the helpers.
 
     ``containers/image`` (skopeo) reads ``/etc/containers/certs.d/<registry>``
-    exactly like dockerd reads ``/etc/docker/certs.d/<registry>``, so a
-    read-only bind of the daemon's directory keeps private-CA registries
-    verifiable on the capped path. The registry key keeps its port (Docker
-    keys the directory by ``host[:port]``), falling back to the port-less
-    spelling the operator may have used. Only certificates are exposed.
+    exactly like dockerd reads ``/etc/docker/certs.d/<registry>``, so the
+    certificates are copied into ``<certs_staging>/<registry key>`` and one
+    bind mounts the staging parent at ``/etc/containers/certs.d``. The copy
+    is not a nicety: Docker bind specs split on colons, so a port-qualified
+    registry (``reg.corp:5443``) in the source or target path would be parsed
+    as extra fields and fail container creation. Copying also lets the
+    port-less directory spelling the operator may have created land at the
+    key skopeo actually looks up. Only this registry's certificates are
+    copied.
     """
-    if not registry_host:
+    if not registry_host or not str(certs_staging):
         return []
     keys = [registry_host]
     host, _, port = registry_host.partition(":")
@@ -420,16 +478,21 @@ def registry_ca_binds(
             try:
                 if not os.path.isdir(directory):
                     continue
-                if not any(
-                    name.lower().endswith(".crt")
-                    for name in os.listdir(directory)
-                ):
+                names = [
+                    name for name in os.listdir(directory)
+                    if name.lower().endswith(".crt")
+                ]
+                if not names:
                     continue
+                destination = Path(certs_staging) / registry_host
+                destination.mkdir(parents=True, exist_ok=True)
+                for name in names:
+                    shutil.copy2(
+                        os.path.join(directory, name), destination / name,
+                    )
             except OSError:
                 continue
-            return [
-                f"{directory}:{CONTAINERS_CERTS_D}/{registry_host}:ro,z",
-            ]
+            return [f"{certs_staging}:{CONTAINERS_CERTS_D}:ro,z"]
     return []
 
 
@@ -553,7 +616,10 @@ def _preflight_binds(copy_binds: list[str]) -> list[str]:
     """
     return [
         bind for bind in copy_binds
-        if ":/auth/config.json" in bind or f":{CONTAINERS_CERTS_D}/" in bind
+        # Match the certs.d target at either spelling: the current
+        # parent-mount bind (``...:/etc/containers/certs.d:ro,z``) and the
+        # per-registry directory bind skopeo also honors.
+        if ":/auth/config.json" in bind or f":{CONTAINERS_CERTS_D}" in bind
     ]
 
 
@@ -655,15 +721,20 @@ def staging_capacity_error(staging: Path, total_bytes: int) -> str | None:
         free = shutil.disk_usage(staging).free
     except OSError:
         return None
-    required = total_bytes + total_bytes // 8 + 512 * 1024 * 1024
+    # The docker-archive destination writes the layers DEcompressed
+    # (containers/image's tarfile writer never recompresses), but the
+    # registry only reports compressed layer sizes. Compiled GPU layers
+    # commonly expand 2-3x under gzip, so the requirement is 3x the
+    # compressed total plus 1 GB of headroom rather than a near-1.0 guess.
+    required = total_bytes * 3 + 1024 * 1024 * 1024
     if free >= required:
         return None
     return (
         f"the pull staging directory ({staging.parent}) has "
-        f"{free / 1e9:.1f} GB free but this image needs about "
-        f"{total_bytes / 1e9:.1f} GB; set SPARKDECK_IMAGE_STAGING_DIR to a "
-        "larger filesystem, or set the download limit to 0 to pull without "
-        "staging"
+        f"{free / 1e9:.1f} GB free but this image's decompressed archive "
+        f"needs up to about {required / 1e9:.1f} GB; set "
+        "SPARKDECK_IMAGE_STAGING_DIR to a larger filesystem, or set the "
+        "download limit to 0 to pull without staging"
     )
 
 
@@ -688,6 +759,7 @@ async def throttled_image_pull_events(
     proxy_container: str | None = None
     copy_container: str | None = None
     auth_dir: Path | None = None
+    ca_dir: Path | None = None
     staging = Path(tempfile.mkdtemp(
         prefix="sparkdeck-pull-", dir=staging_parent(),
     ))
@@ -757,10 +829,21 @@ async def throttled_image_pull_events(
             copy_binds.append(f"{written}:/auth/config.json:ro,z")
         # Private secure registries keep their CA in the daemon's certs.d,
         # which the isolated skopeo containers cannot see without a bind;
-        # inherit it so the capped path verifies like the daemon does.
-        copy_binds += registry_ca_binds(registry_host)
+        # inherit it so the capped path verifies like the daemon does. The
+        # copy target keeps the colon-named registry key OFF the bind spec.
+        ca_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-cas-"))
+        copy_binds += registry_ca_binds(registry_host, ca_dir)
+        # The proxy re-reads this file (at /archive/rate.txt) while it runs,
+        # so a settings change re-rates the pull already in flight. Plain
+        # string path: staging may be a PosixPath-shaped object when the
+        # flow emulates a Linux host, and string joins stay valid anywhere.
+        rate_path = os.path.join(str(staging), RATE_NAME)
+        with open(rate_path, "w", encoding="utf-8") as handle:
+            handle.write(repr(float(bytes_per_second)))
+        _ACTIVE_RATE_FILES.add(rate_path)
         proxy_environment = {
             "SPARKDECK_DOWNLOAD_BPS": repr(float(bytes_per_second)),
+            "SPARKDECK_BANDWIDTH_RATE_FILE": f"/archive/{RATE_NAME}",
             "SPARKDECK_BANDWIDTH_PROGRESS": f"/archive/{PROGRESS_NAME}",
             "PYTHONUNBUFFERED": "1",
             # Proxy-only hosts reach registries via the corporate proxy;
@@ -876,6 +959,7 @@ async def throttled_image_pull_events(
         progress_path = staging / PROGRESS_NAME
         current = -1
         info: dict = {}
+        inspect_failures = 0
         while True:
             counter = await asyncio.to_thread(_read_counter, progress_path)
             if counter != current:
@@ -896,8 +980,19 @@ async def throttled_image_pull_events(
                 }
             try:
                 info = await _run_docker(client, "inspect_container", copy_container)
-            except Exception:
+                inspect_failures = 0
+            except Exception as exc:
+                # A container removed externally (or a daemon that has
+                # stopped answering for it) must end the wait, not spin:
+                # this loop holds the node and cluster download budgets, so
+                # every later capped transfer would block behind a phantom.
                 info = {}
+                inspect_failures += 1
+                if inspect_failures >= 20:
+                    raise ThrottledPullError(
+                        "the bandwidth-limited copy container could no "
+                        f"longer be inspected: {exc}"
+                    ) from exc
             if isinstance(info, dict) and info and not (
                 (info.get("State") or {}).get("Running", False)
             ):
@@ -974,8 +1069,11 @@ async def throttled_image_pull_events(
                 pass
 
         def cleanup_staging() -> None:
+            _ACTIVE_RATE_FILES.discard(os.path.join(str(staging), RATE_NAME))
             shutil.rmtree(staging, ignore_errors=True)
             if auth_dir is not None:
                 shutil.rmtree(auth_dir, ignore_errors=True)
+            if ca_dir is not None:
+                shutil.rmtree(ca_dir, ignore_errors=True)
 
         await loop.run_in_executor(None, cleanup_staging)

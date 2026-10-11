@@ -1138,6 +1138,26 @@ async def agent_pull_image(req: Request):
         raise HTTPException(502, str(exc)[:500]) from exc
 
 
+@app.post("/api/agent/bandwidth")
+async def agent_apply_bandwidth_cap(req: Request):
+    """Re-rate the transfers in flight on this node after a cap change.
+
+    The controller pushes this when its max download bandwidth setting moves,
+    so capped workers and pulls here pick up the new value mid-transfer
+    instead of finishing at their dispatched rate.
+    """
+    _require_agent(req)
+    body = await req.json()
+    try:
+        bandwidth_mbps = parse_bandwidth_mbps(
+            body.get("max_download_bandwidth_mbps"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    manager.apply_bandwidth_cap_live(bandwidth_mbps)
+    return {"max_download_bandwidth_mbps": bandwidth_mbps}
+
+
 @app.post("/api/agent/images/identity")
 async def agent_image_identity(req: Request):
     _require_agent(req)

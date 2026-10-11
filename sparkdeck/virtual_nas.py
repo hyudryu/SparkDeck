@@ -747,6 +747,9 @@ class VirtualNAS:
         ] = {}
         self._queue_lock = asyncio.Lock()
         self._download_operations: dict[str, dict[str, Any]] = {}
+        # key -> (rate file, its directory) for capped workers in flight;
+        # apply_download_bandwidth_cap rewrites these when the setting moves.
+        self._download_rate_files: dict[str, tuple[Path, Path]] = {}
         self._process_download_locks: dict[str, asyncio.Lock] = {}
         self._download_tombstone_path = self.data_dir / "virtual_nas_canceled_downloads.json"
         self._download_tombstone_error = False
@@ -1143,6 +1146,51 @@ class VirtualNAS:
         except ValueError:
             return 0.0
 
+    def _register_download_rate_file(
+        self, key: str, bytes_per_second: float,
+    ) -> Path | None:
+        """The live-cap file a capped worker watches, or None when uncapped.
+
+        The parent rewrites the file through apply_download_bandwidth_cap
+        when the setting changes; the worker's throttle watcher re-reads it.
+        A worker that started unlimited has no file: its socket throttle (and
+        the Xet disable that goes with it) is decided at start, so enabling a
+        cap can only apply to subsequent transfers.
+        """
+        if bytes_per_second <= 0:
+            return None
+        rate_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-dl-rate-"))
+        rate_file = rate_dir / "rate.txt"
+        try:
+            rate_file.write_text(str(float(bytes_per_second)), encoding="utf-8")
+        except OSError:
+            shutil.rmtree(rate_dir, ignore_errors=True)
+            return None
+        self._download_rate_files[key] = (rate_file, rate_dir)
+        return rate_file
+
+    def _release_download_rate_file(self, key: str) -> None:
+        entry = self._download_rate_files.pop(key, None)
+        if entry is not None:
+            shutil.rmtree(entry[1], ignore_errors=True)
+
+    def apply_download_bandwidth_cap(self, bytes_per_second: float) -> None:
+        """Re-rate the capped Hub weight downloads running on this node.
+
+        Weight transfers that started without a cap finish uncapped: the
+        socket throttle and the Xet fallback are chosen at worker start and
+        cannot be retrofitted onto a running Xet client, so the newly enabled
+        limit applies from the next transfer.
+        """
+        value = str(float(bytes_per_second))
+        for rate_file, _directory in list(self._download_rate_files.values()):
+            try:
+                tmp = rate_file.with_name("rate.txt.tmp")
+                tmp.write_text(value, encoding="utf-8")
+                os.replace(tmp, rate_file)
+            except OSError:
+                pass
+
     @asynccontextmanager
     async def _capped_internet_transfer(self, bytes_per_second: float):
         """Serialize one node's capped internet transfers behind one budget.
@@ -1275,19 +1323,27 @@ class VirtualNAS:
             {"creationflags": subprocess.CREATE_NO_WINDOW}
             if os.name == "nt" else {"start_new_session": True}
         )
-        payload = json.dumps({
+        rate_key = uuid.uuid4().hex
+        rate_file = self._register_download_rate_file(rate_key, bytes_per_second)
+        payload_fields = {
             "model_id": model_id, "revision": revision,
             "parent_pid": os.getpid(), "cache_dir": str(self._hub()),
             "files": files, "bytes_per_second": bytes_per_second,
             "token": token,
-        })
-        completed = subprocess.run(
-            [sys.executable, "-m", "sparkdeck.hf_download_worker"],
-            input=payload.encode(), stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=str(Path(__file__).resolve().parent.parent),
-            check=False, **launch_options,
-        )
+        }
+        if rate_file is not None:
+            payload_fields["rate_file"] = str(rate_file)
+        payload = json.dumps(payload_fields)
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "sparkdeck.hf_download_worker"],
+                input=payload.encode(), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                check=False, **launch_options,
+            )
+        finally:
+            self._release_download_rate_file(rate_key)
         if completed.returncode != 0:
             raise RuntimeError(
                 "Hugging Face download failed; verify repository access, "
@@ -1363,13 +1419,23 @@ class VirtualNAS:
                 process = await self._await_uncancelable(launch)
                 state["cancel"].set()
                 raise
-            payload = json.dumps({"model_id": model_id, "revision": revision,
-                                  "parent_pid": os.getpid(),
-                                  "cache_dir": str(self._hub()),
-                                  "bytes_per_second": self._download_bandwidth_bytes_per_second(
-                                      bandwidth_mbps,
-                                  ),
-                                  "token": explicit_token if explicit_token is not None else self._token_provider() or ""})
+            worker_bps = self._download_bandwidth_bytes_per_second(
+                bandwidth_mbps,
+            )
+            rate_file = self._register_download_rate_file(
+                operation_id, worker_bps,
+            )
+            payload_fields = {
+                "model_id": model_id, "revision": revision,
+                "parent_pid": os.getpid(),
+                "cache_dir": str(self._hub()),
+                "bytes_per_second": worker_bps,
+                "token": (explicit_token if explicit_token is not None
+                          else self._token_provider() or ""),
+            }
+            if rate_file is not None:
+                payload_fields["rate_file"] = str(rate_file)
+            payload = json.dumps(payload_fields)
             completion = asyncio.create_task(process.communicate(payload.encode()))
             cancel_wait = asyncio.create_task(state["cancel"].wait())
             await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
@@ -1390,6 +1456,7 @@ class VirtualNAS:
             return {"ok": True, "model_id": model_id, "revision": revision,
                     "size_bytes": _nonnegative_int(model.get("size_bytes"))}
         finally:
+            self._release_download_rate_file(operation_id)
             try:
                 async def finish_writer():
                     while process is not None and process.returncode is None:

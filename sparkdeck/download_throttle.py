@@ -124,7 +124,13 @@ def capped_transfer_timeout_seconds(
 
 
 class TokenBucket:
-    """A thread-safe fixed-rate byte schedule; ``clock`` is injectable for tests."""
+    """A thread-safe fixed-rate byte schedule; ``clock`` is injectable for tests.
+
+    ``set_rate`` re-rates a live bucket so a bandwidth setting change reaches a
+    transfer already in flight. Reservations already on the schedule stay due
+    at their old time, so raising the cap (or removing it) takes effect as the
+    schedule drains rather than instantly.
+    """
 
     def __init__(self, bytes_per_second: float, clock=time.monotonic):
         if bytes_per_second <= 0:
@@ -133,18 +139,56 @@ class TokenBucket:
         self._clock = clock
         self._lock = threading.Lock()
         self._due = 0.0
+        self._unlimited = False
+
+    def set_rate(self, bytes_per_second: object) -> None:
+        """Change the live rate; a non-positive value removes the limit."""
+        try:
+            rate = float(bytes_per_second)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            if rate > 0:
+                self._rate = rate
+                self._unlimited = False
+            else:
+                self._unlimited = True
 
     def acquire(self, count: int) -> None:
         """Reserve ``count`` bytes, sleeping until the reservation comes due."""
         if count <= 0:
             return
         with self._lock:
+            if self._unlimited:
+                return
             now = self._clock()
             due = max(now, self._due) + count / self._rate
             self._due = due
             wait = due - now
         if wait > 0:
             time.sleep(wait)
+
+
+def apply_rate_file(bucket: TokenBucket, rate_file: object) -> None:
+    """Re-read ``rate_file`` into ``bucket``; a missing/broken file keeps the old rate.
+
+    The file carries the cap in bytes per second (0 or less = unlimited).
+    Writers must replace it atomically so a mid-write read never sees a
+    truncated number.
+    """
+    try:
+        with open(str(rate_file), encoding="utf-8") as handle:
+            value = float(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return
+    bucket.set_rate(value)
+
+
+def _watch_rate_file(bucket: TokenBucket, rate_file: str,
+                     poll_seconds: float = 1.0) -> None:
+    while True:
+        time.sleep(poll_seconds)
+        apply_rate_file(bucket, rate_file)
 
 
 _bucket: TokenBucket | None = None
@@ -189,7 +233,9 @@ def _wrap_reads(cls: type, bucket: TokenBucket) -> None:
         setattr(cls, name, charge)  # type: ignore[method-assign]
 
 
-def install_socket_throttle(bytes_per_second: float) -> bool:
+def install_socket_throttle(
+    bytes_per_second: float, rate_file: object = None,
+) -> bool:
     """Throttle every socket read in this process to the given byte rate.
 
     Returns True when the patch was installed. Idempotent. The Hugging Face
@@ -199,6 +245,13 @@ def install_socket_throttle(bytes_per_second: float) -> bool:
     bypass the base-socket patch. Xet-backed storage is downloaded by a Rust
     client that bypasses Python sockets, so callers must disable Xet whenever
     this returns True.
+
+    ``rate_file`` (when given) keeps a live cap in sync: a daemon watcher
+    re-reads the file, so a bandwidth setting change reaches a download
+    already in flight instead of only the next launched worker. A worker that
+    started unlimited cannot self-install later (its Xet client is already
+    streaming through Rust sockets), so the cap-change path for those stays
+    on the caller's side.
     """
     global _bucket, _installed
     if _installed:
@@ -212,6 +265,11 @@ def install_socket_throttle(bytes_per_second: float) -> bool:
         _wrap_reads(ssl_socket, bucket)
     _bucket = bucket
     _installed = True
+    if rate_file:
+        threading.Thread(
+            target=_watch_rate_file, args=(bucket, str(rate_file)),
+            daemon=True, name="sparkdeck-rate-watch",
+        ).start()
     return True
 
 

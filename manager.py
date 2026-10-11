@@ -12224,6 +12224,12 @@ class Manager:
         # Validate the bandwidth cap before mutating anything: a payload can
         # carry several keys, and a rejected cap must not leave earlier keys
         # already applied to the live settings object.
+        try:
+            old_bandwidth_mbps = float(
+                self.settings.get("max_download_bandwidth_mbps", 0) or 0,
+            )
+        except (TypeError, ValueError):
+            old_bandwidth_mbps = 0.0
         if "max_download_bandwidth_mbps" in data:
             data = dict(data)
             data["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(
@@ -12252,7 +12258,38 @@ class Manager:
             and self._image_pull_bytes_per_second(None) > 0
         ):
             self._prefetch_pull_helper_images()
-        return self.public_settings()
+        result = self.public_settings()
+        if "max_download_bandwidth_mbps" in data:
+            new_bandwidth_mbps = float(
+                data["max_download_bandwidth_mbps"] or 0,
+            )
+            if new_bandwidth_mbps != old_bandwidth_mbps:
+                # Re-rate transfers already in flight (capped ones watch a
+                # rate file) and push the new cap to agents so their own
+                # in-flight transfers re-rate as well.
+                self.apply_bandwidth_cap_live(new_bandwidth_mbps)
+                self._bandwidth_notify_task = asyncio.create_task(
+                    self._notify_agents_bandwidth_cap(new_bandwidth_mbps),
+                )
+                if old_bandwidth_mbps <= 0 < new_bandwidth_mbps:
+                    # A transfer that started unlimited cannot adopt the cap
+                    # mid-run (its worker chose Xet and skipped the socket
+                    # throttle; an unlimited pull used the daemon path), so
+                    # do not report the new value as effective for it.
+                    try:
+                        running = sum(
+                            1 for job in self.virtual_nas.list_transfers()["items"]
+                            if job.get("status") == "running"
+                        )
+                    except Exception:
+                        running = 0
+                    if running:
+                        result["bandwidth_running_note"] = (
+                            f"{running} transfer(s) already in flight started "
+                            "without a limit and finish uncapped; the new "
+                            "limit applies from the next transfer onward."
+                        )
+        return result
 
     def _prefetch_pull_helper_images(self) -> None:
         """Best-effort pre-install of the capped pull flow's helper images.
@@ -19948,6 +19985,49 @@ class Manager:
             return bandwidth_bytes_per_second(value)
         except ValueError:
             return 0.0
+
+    def apply_bandwidth_cap_live(self, bandwidth_mbps: float) -> None:
+        """Re-rate the transfers already in flight on this node.
+
+        Capped weight workers and capped image pulls watch a rate file that
+        this rewrites. Transfers that started unlimited are not covered: a
+        weight worker chose the Xet path and skipped the socket throttle at
+        start, and an unlimited image pull used the daemon-side pull that no
+        user-space limiter can touch, so a newly enabled cap applies to them
+        not, and to every subsequent transfer in full.
+        """
+        bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
+        try:
+            self.virtual_nas.apply_download_bandwidth_cap(bytes_per_second)
+        except Exception:
+            pass
+        try:
+            from sparkdeck.throttled_image_pull import apply_bandwidth_cap
+            apply_bandwidth_cap(bytes_per_second)
+        except Exception:
+            pass
+
+    async def _notify_agents_bandwidth_cap(self, bandwidth_mbps: float) -> None:
+        """Push a changed cap to every online agent so its own in-flight
+        transfers re-rate. Agents rewrite only their registered rate files;
+        a failed call only means that node's transfers keep their
+        dispatch-time rate until they finish.
+        """
+        registry = getattr(self, "node_registry", None)
+        for node in list(getattr(registry, "nodes", None) or []):
+            node_id = str(node.get("id") or "")
+            if node_id == LOCAL_NODE_ID or not node.get("online"):
+                continue
+            try:
+                await registry.request(
+                    node_id, "POST", "/api/agent/bandwidth",
+                    json_body={
+                        "max_download_bandwidth_mbps": float(bandwidth_mbps),
+                    },
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
     async def pull_image_stream(
         self, image: str, bandwidth_mbps: float | None = None,

@@ -805,6 +805,85 @@ class NodeDownloadModelFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(kwargs["timeout"], 24 * 60 * 60 - 1)
 
 
+class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """A cap change must reach transfers already running, not only new ones."""
+
+    def fixture(self, cap_mbps):
+        m = bare_manager(cap_mbps)
+        m.lock = asyncio.Lock()
+        m._save_settings = Mock()
+        m._prefetch_pull_helper_images = Mock()
+        m.public_settings = Mock(return_value={})
+        m.virtual_nas = Mock()
+        m.virtual_nas.start = Mock()
+        m.virtual_nas.stop = AsyncMock()
+        m.virtual_nas.list_transfers = Mock(return_value={"items": []})
+        m.node_registry = Mock()
+        m.node_registry.nodes = [
+            {"id": "local", "name": "This node", "online": True},
+            {"id": "ws1", "name": "WS1", "online": True},
+            {"id": "ws2", "name": "WS2", "online": False},
+        ]
+        m.node_registry.request = AsyncMock(return_value={"ok": True})
+        return m
+
+    async def test_cap_change_re_rates_locally_and_pushes_agents(self):
+        m = self.fixture(0.0)
+        m.apply_bandwidth_cap_live = Mock()
+        await m.update_settings({"max_download_bandwidth_mbps": 50})
+        m.apply_bandwidth_cap_live.assert_called_once_with(50.0)
+        await m._bandwidth_notify_task
+        # Local node skipped, offline node skipped, online agent notified.
+        m.node_registry.request.assert_awaited_once()
+        args = m.node_registry.request.await_args
+        self.assertEqual(args.args[0], "ws1")
+        self.assertEqual(args.args[1], "POST")
+        self.assertEqual(args.args[2], "/api/agent/bandwidth")
+        self.assertEqual(
+            args.kwargs["json_body"], {"max_download_bandwidth_mbps": 50.0},
+        )
+
+    async def test_enabling_cap_notes_uncapped_in_flight_transfers(self):
+        m = self.fixture(0.0)
+        m.apply_bandwidth_cap_live = Mock()
+        m.virtual_nas.list_transfers = Mock(return_value={"items": [
+            {"status": "running"}, {"status": "completed"},
+        ]})
+        result = await m.update_settings({"max_download_bandwidth_mbps": 40})
+        self.assertIn("bandwidth_running_note", result)
+        self.assertIn("1 transfer", result["bandwidth_running_note"])
+
+    async def test_changing_an_existing_cap_leaves_no_note(self):
+        # Capped transfers adopt a changed cap live through their rate file,
+        # so nothing about them needs deferring or disclosing.
+        m = self.fixture(100.0)
+        m.apply_bandwidth_cap_live = Mock()
+        m.virtual_nas.list_transfers = Mock(return_value={"items": [
+            {"status": "running"},
+        ]})
+        result = await m.update_settings({"max_download_bandwidth_mbps": 20})
+        m.apply_bandwidth_cap_live.assert_called_once_with(20.0)
+        self.assertNotIn("bandwidth_running_note", result)
+
+    async def test_unchanged_cap_does_not_touch_transfers(self):
+        m = self.fixture(25.0)
+        m.apply_bandwidth_cap_live = Mock()
+        await m.update_settings({"max_download_bandwidth_mbps": 25.0})
+        m.apply_bandwidth_cap_live.assert_not_called()
+
+    def test_apply_bandwidth_cap_live_writes_both_listeners(self):
+        m = self.fixture(0.0)
+        m.virtual_nas.apply_download_bandwidth_cap = Mock()
+        with patch(
+            "sparkdeck.throttled_image_pull.apply_bandwidth_cap",
+        ) as pull_apply:
+            m.apply_bandwidth_cap_live(50.0)
+        m.virtual_nas.apply_download_bandwidth_cap.assert_called_once_with(
+            6_250_000.0,
+        )
+        pull_apply.assert_called_once_with(6_250_000.0)
+
+
 class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):
     """One cluster-wide budget for every full-cap dispatch.
 

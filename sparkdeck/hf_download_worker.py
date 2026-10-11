@@ -49,7 +49,12 @@ def main() -> None:
     files = payload.get("files")
     files = [str(filename) for filename in files] if files else None
     bytes_per_second = float(payload.get("bytes_per_second") or 0)
-    if bytes_per_second > 0 and install_socket_throttle(bytes_per_second):
+    # The optional rate file lets a settings change re-rate this download
+    # while it runs; see download_throttle.install_socket_throttle.
+    rate_file = payload.get("rate_file")
+    if bytes_per_second > 0 and install_socket_throttle(
+        bytes_per_second, rate_file,
+    ):
         # The socket throttle only governs Python reads; the Xet client
         # streams through its own Rust HTTP stack. A capped download must
         # fall back to plain Hub HTTP, otherwise the limit is not real.

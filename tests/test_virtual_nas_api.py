@@ -429,6 +429,35 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("ephemeral", response.text)
 
+    async def test_agent_bandwidth_push_re_rates_in_flight_transfers(self):
+        applied = Mock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager, "apply_bandwidth_cap_live", applied),
+        ):
+            response = await self.client.post(
+                "/api/agent/bandwidth",
+                json={"max_download_bandwidth_mbps": 25.0},
+            )
+        self.assertEqual(response.status_code, 200)
+        applied.assert_called_once_with(25.0)
+        self.assertEqual(
+            response.json(), {"max_download_bandwidth_mbps": 25.0},
+        )
+
+    async def test_agent_bandwidth_push_rejects_invalid_values(self):
+        applied = Mock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager, "apply_bandwidth_cap_live", applied),
+        ):
+            response = await self.client.post(
+                "/api/agent/bandwidth",
+                json={"max_download_bandwidth_mbps": "fast"},
+            )
+        self.assertEqual(response.status_code, 400)
+        applied.assert_not_called()
+
     async def test_agent_download_tracks_validated_durable_operation(self):
         operation_id = "11111111-1111-4111-8111-111111111111"
         checked = AsyncMock(return_value={"ok": True})

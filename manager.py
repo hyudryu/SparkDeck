@@ -69,6 +69,7 @@ from sparkdeck.runtime_environment import (
 from sparkdeck.download_throttle import (
     CAPPED_UNKNOWN_BYTES_ALLOWANCE,
     IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    acquire_dispatch_slot,
     bandwidth_bytes_per_second,
     capped_transfer_timeout_seconds,
     parse_bandwidth_mbps,
@@ -3293,12 +3294,14 @@ class Manager:
         agent, so concurrent dispatches to different nodes would multiply the
         configured budget. Unlimited dispatches never hold the slot. Bare
         test fixtures may lack the lock; then there is nothing to serialize.
+        The slot is reentrant within one operation's task tree (a gathered
+        member launch is not an independent budget consumer), so a
+        deployment fan-out can hold it across nested seed/pull requests
+        without deadlocking on its own lock.
         """
-        lock = getattr(self, "dispatched_download_lock", None)
-        if not capped or lock is None:
-            yield
-            return
-        async with lock:
+        async with acquire_dispatch_slot(
+            getattr(self, "dispatched_download_lock", None), capped,
+        ):
             yield
 
     async def node_download_model_files(
@@ -8995,7 +8998,16 @@ class Manager:
         if launch_persisted is not None and not launch_persisted.done():
             launch_persisted.set_result(deployment)
 
-        created = await asyncio.gather(*tasks, return_exceptions=True)
+        # Every member launch pulls its runtime image (at this deployment's
+        # divided share) and seeds weights through the capped paths. Hold the
+        # cluster dispatch slot for the whole capped fan-out: a second
+        # deployment or a queued transfer on another node must not move a
+        # second full budget concurrently. Member prefetches nested under
+        # this task tree pass through the reentrant slot.
+        async with self._dispatched_download_slot(
+            self._cluster_image_pull_share_mbps(max(1, len(node_ids))) > 0,
+        ):
+            created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []
         model_sources = []
         for spec, result in zip(member_specs, created):
@@ -10162,7 +10174,15 @@ class Manager:
             )
             self._save_deployments()
 
-            created = await asyncio.gather(*tasks, return_exceptions=True)
+            # Same cluster budget rule as the primary launch fan-out: the
+            # added group's capped image pulls and prefetches hold the
+            # dispatch slot for their duration.
+            async with self._dispatched_download_slot(
+                self._cluster_image_pull_share_mbps(
+                    max(1, len(requested)),
+                ) > 0,
+            ):
+                created = await asyncio.gather(*tasks, return_exceptions=True)
             errors = []
             for spec, result in zip(member_specs, created):
                 if isinstance(result, Exception):
@@ -18352,9 +18372,9 @@ class Manager:
                     f"{_STRATA_DEFAULT_IMAGE_MIN_DRIVER} or "
                     f"newer; this node reports {version}"
                 )
-        # Strata takes the node's GPU for its CUDA context, so other chat
-        # engines must be evicted before the CUDA context is created.
-        await self.evict_other_backends(protect="strata")
+        # Eviction is deferred until this launch is proven able to proceed
+        # (see the cap guard below); port and name allocation do not touch
+        # the GPU.
         if port is None:
             port = await self._allocate_port()
         if name is None:
@@ -18383,17 +18403,10 @@ class Manager:
         # watcher once the container is live.
         prepared_watch: dict[str, str] = {}
 
-        def _create():
+        def _create(image_identity):
             # The image is guaranteed present by the capped
-            # _ensure_runtime_image step below.
-            image_info = self.client.images.get(image)
-            # The daemon-resolved image ID is the pack's real identity: a
-            # refreshed mutable tag (notably the default :latest) must
-            # invalidate a prepared volume even though its name is unchanged.
-            image_id = getattr(image_info, "id", None)
-            image_identity = (
-                image_id if isinstance(image_id, str) and image_id else image
-            )
+            # _ensure_runtime_image step below, whose resolved identity
+            # resolves the pack volume name before eviction already ran.
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",
                 model=model, cluster_member=cluster_member,
@@ -18426,10 +18439,8 @@ class Manager:
             # upstream entrypoint ignores new CONTEXT/KV/... values while a
             # saved config exists, so a config-affecting edit lands in a
             # fresh volume whose setup runs with the new settings, while an
-            # unchanged relaunch reuses the prepared pack.
-            self._require_strata_weights_prepared(
-                deployment_key, environment, image_identity, cluster_member,
-            )
+            # unchanged relaunch reuses the prepared pack. The cap guard
+            # already ran before eviction in the async scope above.
             data_volume = self._strata_data_volume(
                 deployment_key, environment, image_identity,
             )
@@ -18492,7 +18503,27 @@ class Manager:
                 image, name, model=model, cluster_member=cluster_member,
                 runtime="strata",
             )
-            summary = await asyncio.to_thread(_create)
+            # The daemon-resolved image ID is the pack's real identity: a
+            # refreshed mutable tag (notably the default :latest) must
+            # invalidate a prepared volume even though its name is unchanged.
+            image_info = await asyncio.to_thread(self.client.images.get, image)
+            image_id = getattr(image_info, "id", None)
+            image_identity = (
+                image_id if isinstance(image_id, str) and image_id else image
+            )
+            # The cap/marker precondition runs BEFORE any eviction: a first
+            # capped launch (or a changed fingerprint) is expected to be
+            # refused here, and a refused launch must not take healthy
+            # engines offline first.
+            await asyncio.to_thread(
+                self._require_strata_weights_prepared, deployment_key,
+                environment, image_identity, cluster_member,
+            )
+            # Strata takes the node's GPU for its CUDA context, so the other
+            # chat engines are evicted only once this launch will proceed —
+            # and still before the CUDA context is created inside _create.
+            await self.evict_other_backends(protect="strata")
+            summary = await asyncio.to_thread(_create, image_identity)
             if prepared_watch.get("volume"):
                 self._begin_strata_prepared_marker(
                     name, model, prepared_watch["volume"],
@@ -19925,23 +19956,16 @@ class Manager:
         q: asyncio.Queue = asyncio.Queue()
         bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
         from sparkdeck.throttled_image_pull import (
-            is_loopback_registry_image, no_proxy_matches_image,
-            throttled_image_pull_events,
+            is_loopback_registry_image, throttled_image_pull_events,
         )
-        # NO_PROXY hosts are reachable directly and are not the capped
-        # internet uplink, exactly like the loopback and insecure-registry
-        # exemptions below: the daemon dials them directly, and the helper's
-        # limiter would wrongly chain them through the corporate proxy.
-        no_proxy_value = (
-            os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-        )
+        # NO_PROXY is NOT exempted here: it is proxy policy, not an uplink
+        # exemption, and the daemon path it would fall to is unthrottled.
+        # The limiter dials NO_PROXY hosts directly instead (forwarded to
+        # the helper below). Only genuinely off-uplink registries — loopback
+        # and daemon-trusted insecure ones — keep the daemon path.
         if (
             bytes_per_second > 0
             and not is_loopback_registry_image(image)
-            and not (
-                no_proxy_value
-                and no_proxy_matches_image(image, no_proxy_value)
-            )
             and not await self._registry_is_insecure(image)
         ):
             # The daemon does registry I/O outside this process, so a capped

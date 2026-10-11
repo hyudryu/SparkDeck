@@ -61,11 +61,13 @@ PROGRESS_NAME = "proxy_bytes"
 # and the running total is reported for progress.
 _PROXY_SCRIPT = """
 import base64, os, socket, ssl, threading, time
+from urllib.parse import unquote
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
 PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
 UPSTREAM = os.environ.get("SPARKDECK_UPSTREAM_PROXY") or ""
 UPSTREAM_CA = os.environ.get("SPARKDECK_UPSTREAM_PROXY_CA") or ""
+NO_PROXY = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
 DUE = [0.0]
 LOCK = threading.Lock()
 TOTAL = [0]
@@ -132,8 +134,30 @@ def parse_upstream(url):
     auth = ""
     if "@" in url:
         auth, _, url = url.rpartition("@")
+        # Proxy URLs percent-encode userinfo delimiters (@ : %%); the Basic
+        # credential must carry the decoded username and password.
+        auth = unquote(auth)
     host, port = split_authority(url)
     return auth, host, int(port or ("443" if secure else "80")), secure
+
+def no_proxy_direct(authority):
+    # NO_PROXY is proxy policy, not an uplink exemption: the destination is
+    # still capped, the limiter just dials it directly instead of sending
+    # the CONNECT through the corporate proxy that excluded it.
+    if not NO_PROXY:
+        return False
+    host = split_authority(authority)[0].strip().lower().rstrip(".")
+    for raw in NO_PROXY.replace(",", " ").split():
+        entry = (
+            raw.strip().removeprefix("http://").removeprefix("https://")
+            .rstrip("/")
+        )
+        if entry == "*":
+            return True
+        entry = split_authority(entry)[0].strip().lower().lstrip(".").rstrip(".")
+        if entry and (host == entry or host.endswith("." + entry)):
+            return True
+    return False
 
 def upstream_context(host):
     # A TLS-protected corporate endpoint needs a real TLS handshake before
@@ -148,8 +172,9 @@ def upstream_context(host):
 
 def connect_target(authority):
     # Without an upstream, dial the registry directly; with one (corporate
-    # proxy-only hosts), send the CONNECT to the proxy and chain through.
-    if not UPSTREAM:
+    # proxy-only hosts), send the CONNECT to the proxy and chain through —
+    # except for NO_PROXY hosts, which the proxy explicitly does not serve.
+    if not UPSTREAM or no_proxy_direct(authority):
         host, port = split_authority(authority)
         return socket.create_connection((host, int(port or "443")), 10)
     auth, host, port, secure = parse_upstream(UPSTREAM)
@@ -333,78 +358,6 @@ def is_loopback_registry_image(image: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
-
-
-def no_proxy_matches_image(image: str, no_proxy_value: str) -> bool:
-    """True when the image's registry matches one NO_PROXY list entry.
-
-    The daemon honors NO_PROXY by dialing matching registries directly, and
-    the capped helper's limiter would still chain every CONNECT through the
-    corporate proxy (which can reject bypassed hosts), so callers pull these
-    references with the daemon instead — the same exemption the loopback and
-    insecure-registry checks already grant. Matching follows Docker's own
-    proxy semantics: ``*`` matches everything; a bare name matches that host
-    and any subdomain; entries may carry a scheme prefix, a leading dot, or
-    an explicit ``:port`` (port must match when given); IP hosts also match
-    CIDR entries.
-    """
-    head = registry_head(image)
-    if head is None:
-        reference = str(image or "").strip().removeprefix("docker://")
-        head_part, slash, _rest = reference.partition("/")
-        # Unqualified (``alpine``, even with a tag colon) and namespaced-only
-        # (``library/alpine``) references resolve to Docker Hub; the daemon's
-        # proxy bypass applies to that registry, not to the bare token.
-        if not slash or (
-            "@" not in head_part
-            and not ("." in head_part or ":" in head_part or head_part == "localhost")
-        ):
-            head = "docker.io"
-    value = str(no_proxy_value or "").strip()
-    if not head or not value:
-        return False
-    host, port = split_authority(head)
-    host = host.rstrip(".").lower()
-    try:
-        address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = (
-            ipaddress.ip_address(host)
-        )
-    except ValueError:
-        address = None
-    # ``index.docker.io`` and ``docker.io`` name the same registry; match a
-    # NO_PROXY entry against either spelling of the reference's registry.
-    canonical = "docker.io" if host == "index.docker.io" else host
-    candidates = []
-    for alias in _registry_aliases(canonical):
-        candidates.append(alias.rstrip("."))
-    for raw in re.split(r"[,\s]+", value):
-        entry = (
-            str(raw).strip().removeprefix("http://").removeprefix("https://")
-        ).rstrip("/")
-        if not entry:
-            continue
-        if entry == "*":
-            return True
-        try:
-            network = ipaddress.ip_network(entry, strict=False)
-        except ValueError:
-            network = None
-        if network is not None:
-            if address is not None and address in network:
-                return True
-            continue  # a network entry never matches a hostname
-        entry_host, entry_port = split_authority(entry)
-        entry_host = entry_host.rstrip(".").lower().lstrip(".")
-        if not entry_host:
-            continue
-        if entry_port and entry_port != port:
-            continue
-        if any(
-            candidate == entry_host or candidate.endswith("." + entry_host)
-            for candidate in candidates
-        ):
-            return True
-    return False
 
 
 def staging_parent() -> str | None:
@@ -782,25 +735,26 @@ async def throttled_image_pull_events(
         # everywhere else.
         copy_binds = [f"{staging}:/archive:z"]
         has_authfile = False
-        entry = _auth_entry(docker_config, registry_host)
-        if entry is not None:
+        # Grant the helpers only the one registry this pull needs: mounting
+        # the original config.json would hand the skopeo containers every
+        # unrelated registry's secret, unlike an ordinary daemon pull. The
+        # materialized single-entry file is 0600 and removed with staging.
+        registry_auth = _auth_entry(docker_config, registry_host)
+        if registry_auth is None:
+            registry_auth = helper_credentials(docker_config, registry_host)
+        if registry_auth is not None:
+            auth_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-auth-"))
+            written = auth_dir / "config.json"
+            written.write_text(
+                json.dumps({"auths": {registry_host: registry_auth}}),
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(written, 0o600)
+            except OSError:
+                pass
             has_authfile = True
-            copy_binds.append(f"{authfile}:/auth/config.json:ro,z")
-        else:
-            helper_auth = helper_credentials(docker_config, registry_host)
-            if helper_auth is not None:
-                auth_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-auth-"))
-                written = auth_dir / "config.json"
-                written.write_text(
-                    json.dumps({"auths": {registry_host: helper_auth}}),
-                    encoding="utf-8",
-                )
-                try:
-                    os.chmod(written, 0o600)
-                except OSError:
-                    pass
-                has_authfile = True
-                copy_binds.append(f"{written}:/auth/config.json:ro,z")
+            copy_binds.append(f"{written}:/auth/config.json:ro,z")
         # Private secure registries keep their CA in the daemon's certs.d,
         # which the isolated skopeo containers cannot see without a bind;
         # inherit it so the capped path verifies like the daemon does.
@@ -810,9 +764,13 @@ async def throttled_image_pull_events(
             "SPARKDECK_BANDWIDTH_PROGRESS": f"/archive/{PROGRESS_NAME}",
             "PYTHONUNBUFFERED": "1",
             # Proxy-only hosts reach registries via the corporate proxy;
-            # the limiter chains CONNECT through it when configured.
+            # the limiter chains CONNECT through it when configured, and
+            # honors NO_PROXY by dialing those hosts directly (still capped).
             "SPARKDECK_UPSTREAM_PROXY": os.environ.get(
                 "HTTPS_PROXY", os.environ.get("https_proxy", ""),
+            ),
+            "NO_PROXY": os.environ.get(
+                "NO_PROXY", os.environ.get("no_proxy", ""),
             ),
             "SPARKDECK_UPSTREAM_PROXY_CA": "",
         }

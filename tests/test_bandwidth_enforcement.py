@@ -151,30 +151,11 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m.client.api.pull.assert_called_once()
         self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
 
-    async def test_no_proxy_registry_uses_the_daemon_despite_the_cap(self):
-        # The daemon honors NO_PROXY by dialing the registry directly, while
-        # the capped helper would chain every CONNECT through the proxy the
-        # operator explicitly excluded — an internal registry behind
-        # NO_PROXY therefore pulls through the daemon, like loopback does.
-        m = bare_manager(100.0)
-        m.client.api.pull.return_value = [{"status": "ok"}]
-        with patch.dict(os.environ, {"NO_PROXY": "registry.internal.example"}):
-            chunks = await self.collect(
-                m, "registry.internal.example/team/img:1",
-            )
-        m.client.api.pull.assert_called_once_with(
-            "registry.internal.example/team/img:1", stream=True, decode=True,
-        )
-        self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
-
-    async def test_no_proxy_matches_hub_images_by_docker_io_entry(self):
-        m = bare_manager(100.0)
-        m.client.api.pull.return_value = [{"status": "ok"}]
-        with patch.dict(os.environ, {"NO_PROXY": "corp.example,docker.io"}):
-            await self.collect(m, "alpine:latest")
-        m.client.api.pull.assert_called_once()
-
-    async def test_no_proxy_mismatch_still_uses_the_capped_helper(self):
+    async def test_no_proxy_registries_stay_behind_the_capped_helper(self):
+        # NO_PROXY is proxy policy, not an uplink exemption: exempting its
+        # hosts would silently disable the cap for every pull through the
+        # unthrottled daemon path. The limiter dials those hosts directly
+        # (covered in test_throttled_image_pull.LimiterProxyTests).
         m = bare_manager(100.0)
         used = []
 
@@ -182,7 +163,7 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
             used.append(image)
             yield {"status": "Downloading"}
 
-        with patch.dict(os.environ, {"NO_PROXY": "other.example"}), patch(
+        with patch.dict(os.environ, {"NO_PROXY": "*"}), patch(
             "sparkdeck.throttled_image_pull.throttled_image_pull_events",
             fake_events,
         ):
@@ -897,6 +878,118 @@ class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):
         m = bare_manager(100.0)
         async with m._dispatched_download_slot(True):
             pass
+
+    async def test_slot_is_reentrant_inside_the_holder_task_tree(self):
+        # A deployment fan-out holds the slot across its member launches;
+        # every member prefetch acquires the same slot too. Members are
+        # children of the holder, so they must pass through (the budget is
+        # already reserved) instead of deadlocking on the outer hold.
+        m = bare_manager(100.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+
+        async def member(seed=True):
+            async with m._dispatched_download_slot(seed):
+                return True
+
+        async with m._dispatched_download_slot(True):
+            nested = await asyncio.wait_for(
+                asyncio.gather(member(), member(seed=False)), 1.0,
+            )
+        self.assertEqual(nested, [True, True])
+        self.assertFalse(lock.locked())
+
+    async def test_holder_flag_does_not_leak_to_sibling_dispatches(self):
+        # The reentrancy flag is per task tree: a sibling started after the
+        # holder's reservation must still wait for the slot.
+        m = bare_manager(100.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+        order = []
+
+        async def holder():
+            async with m._dispatched_download_slot(True):
+                order.append("holder")
+                await asyncio.sleep(0.05)
+
+        async def sibling():
+            async with m._dispatched_download_slot(True):
+                order.append("sibling")
+
+        outer = asyncio.create_task(holder())
+        await asyncio.sleep(0)  # sibling's context copies the default flag
+        other = asyncio.create_task(sibling())
+        await asyncio.gather(outer, other)
+        self.assertEqual(order, ["holder", "sibling"])
+
+
+class DeploymentLaunchDispatchSlotTests(unittest.IsolatedAsyncioTestCase):
+    """A capped member fan-out reserves the cluster budget (QCHh)."""
+
+    def launcher(self, cap_mbps=100.0):
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
+        self.capability = IMAGE_PULL_BANDWIDTH_CAPABILITY
+        m = bare_manager(cap_mbps)
+        m.dispatched_download_lock = asyncio.Lock()
+        m.deployments = []
+        m._save_deployments = Mock()
+        m._resolved_hf_token = Mock(return_value=None)
+        m._deployment_launch_settings = Mock(return_value={})
+        m.public_target_node = Mock(side_effect=lambda node: node)
+        return m
+
+    async def launch(self, m, observed):
+        async def fake_member(node_id, payload):
+            observed[node_id] = m.dispatched_download_lock.locked()
+            # The member launch's own capped seed must pass through the
+            # fan-out reservation rather than deadlock on it.
+            async def seed():
+                async with m._dispatched_download_slot(True):
+                    return True
+            observed[node_id + ":seed"] = await asyncio.wait_for(seed(), 1.0)
+            return {"status": "starting", "id": "c", "port": 1,
+                    "model_source": "unknown"}
+
+        m._create_member = AsyncMock(side_effect=fake_member)
+        m._preflight_deployment_launch = AsyncMock(return_value={
+            "body": {"model": "org/model", "node_ids": ["local", "ws1"],
+                     "extra_args": []},
+            "engine": "sglang", "mode": "single",
+            "node_ids": ["local", "ws1"],
+            "available": {
+                "local": {"id": "local", "name": "Coordinator"},
+                "ws1": {"id": "ws1", "name": "WS1",
+                        "capabilities": [self.capability]},
+            },
+            "model": "org/model", "vllm_parallel_layout": None,
+            "requested_port": None, "local_port": None,
+            "master_ip": None,
+            "fabrics": {"local": (None, None), "ws1": (None, None)},
+        })
+        return await m._create_deployment({"model": "org/model"})
+
+    async def test_capped_member_fanout_holds_the_dispatch_slot(self):
+        m = self.launcher(100.0)
+        observed = {}
+        await self.launch(m, observed)
+        # Both member launches run under one reservation, and their nested
+        # seed requests pass through the holder's task tree.
+        self.assertEqual(
+            [observed["local"], observed["ws1"]], [True, True],
+        )
+        self.assertEqual(
+            [observed["local:seed"], observed["ws1:seed"]], [True, True],
+        )
+        self.assertFalse(m.dispatched_download_lock.locked())
+
+    async def test_uncapped_member_fanout_never_holds_the_slot(self):
+        m = self.launcher(0.0)
+        observed = {}
+        await self.launch(m, observed)
+        self.assertEqual(
+            [observed["local"], observed["ws1"]], [False, False],
+        )
+        self.assertEqual(
+            [observed["local:seed"], observed["ws1:seed"]], [True, True],
+        )
 
 
 class RequireBandwidthCapableNodesTests(unittest.TestCase):

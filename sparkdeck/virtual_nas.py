@@ -37,6 +37,7 @@ from urllib.parse import quote, urlencode
 
 from .catalog import quantization_from_text
 from .download_throttle import (
+    acquire_dispatch_slot,
     bandwidth_bytes_per_second,
     capped_transfer_timeout_seconds,
     parse_bandwidth_mbps,
@@ -1170,12 +1171,12 @@ class VirtualNAS:
         fan-out) carries the full node-wide cap, so only one may run at a
         time while a cap is active; unlimited dispatches keep the pre-cap
         parallel behavior. async with owns the release: a caller cancelled
-        while queued never frees a holder's lock.
+        while queued never frees a holder's lock. The slot is reentrant
+        within one holder's task tree (the same lock is shared with the
+        manager helpers), so a deployment launch that already reserved the
+        budget passes through instead of deadlocking on its nested seeds.
         """
-        if not capped:
-            yield
-            return
-        async with self._dispatched_download_lock:
+        async with acquire_dispatch_slot(self._dispatched_download_lock, capped):
             yield
 
     @_transfer_operation

@@ -13,6 +13,7 @@ from pathlib import Path
 from cluster import NodeAgentResponseError
 from sparkdeck.download_throttle import (
     IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    acquire_dispatch_slot,
     capped_transfer_timeout_seconds,
     parse_bandwidth_mbps,
 )
@@ -146,6 +147,8 @@ class ImagePatchJobs:
                     return copy.deepcopy(existing)
         if not agent and ("expected_base_id" in payload or "expected_base_identity" in payload):
             raise ValueError("expected_base_id and expected_base_identity are reserved for cluster coordination")
+        missing_bandwidth: list = []
+        cap_mbps = 0.0
         if agent:
             selected = [{"id": "local", "name": "This node"}]
         else:
@@ -183,12 +186,28 @@ class ImagePatchJobs:
                 request["max_download_bandwidth_mbps"] = cap_mbps
         if any(j["status"] in ACTIVE for j in self.jobs):
             raise ValueError("An image patch build is already active. Wait for it to finish.")
+        node_records = []
+        for n in selected:
+            record = {
+                "node_id": n["id"], "node_name": n["name"],
+                "status": "queued", "logs": [],
+            }
+            # A mixed fleet is addressed per node: the shared request stays
+            # free of the coordination field so legacy agents accept the
+            # POST, while each bandwidth-capable node records the resolved
+            # cap so a stale node-local cap cannot keep throttling its base
+            # pull (the dispatch attaches the field to that node's payload).
+            if missing_bandwidth and IMAGE_PULL_BANDWIDTH_CAPABILITY in n.get(
+                "capabilities", [],
+            ):
+                record["max_download_bandwidth_mbps"] = cap_mbps
+            node_records.append(record)
         job = {
             "id": job_id or uuid.uuid4().hex, "base_image": request["base_image"], "image": request["image"],
             "request_fingerprint": fingerprint,
             "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued",
             "files": [{"target": f["target"], "sha256": hashlib.sha256(f["content"].encode("utf-8")).hexdigest()} for f in request["files"]],
-            "nodes": [{"node_id": n["id"], "node_name": n["name"], "status": "queued", "logs": []} for n in selected],
+            "nodes": node_records,
         }
         previous_jobs = self.jobs
         self.jobs = [job, *previous_jobs[:99]]
@@ -333,7 +352,32 @@ class ImagePatchJobs:
                 node["status"] = "building"
                 self._save_progress()
                 try:
-                    result = await (self._local(node, request) if agent or node["node_id"] == "local" else self._remote(node, request))
+                    node_request = request
+                    if (
+                        "max_download_bandwidth_mbps" not in request
+                        and "max_download_bandwidth_mbps" in node
+                    ):
+                        # Mixed-fleet dispatch: this node advertises the
+                        # bandwidth capability, so attach its recorded cap
+                        # (legacy nodes keep the field-free shared request).
+                        node_request = {
+                            **request,
+                            "max_download_bandwidth_mbps":
+                                node["max_download_bandwidth_mbps"],
+                        }
+                    build_capped = float(
+                        node_request.get("max_download_bandwidth_mbps") or 0,
+                    ) > 0
+                    # The build pulls its uncached base at the node it runs
+                    # on, so it must respect the cluster dispatch budget like
+                    # every other capped operation: hold the same slot while
+                    # the base pull (controller-local or remote) is under
+                    # way. Uncapped builds keep the pre-cap parallel behavior.
+                    async with acquire_dispatch_slot(
+                        getattr(self.manager, "dispatched_download_lock", None),
+                        build_capped,
+                    ):
+                        result = await (self._local(node, node_request) if agent or node["node_id"] == "local" else self._remote(node, node_request))
                     if result["files"] != job["files"]:
                         raise RuntimeError("Built image file hashes do not match the submitted patch")
                     if request.get("expected_base_id") and request["expected_base_id"] != result["base_id"]:

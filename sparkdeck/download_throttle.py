@@ -15,6 +15,8 @@ across the sleep.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import math
 import socket
 import ssl
@@ -26,6 +28,34 @@ import time
 MAX_BANDWIDTH_MBPS = 1_000_000.0
 
 _BITS_PER_MEGABIT = 1_000_000
+
+# True inside the task tree of an operation that already holds the cluster
+# dispatch slot. asyncio tasks copy their creator's context, so a launch
+# member (or any nested dispatch) created under a holder sees this flag and
+# skips re-acquiring the non-reentrant budget lock instead of deadlocking.
+dispatch_slot_held: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "sparkdeck_dispatch_slot_held", default=False,
+)
+
+
+@contextlib.asynccontextmanager
+async def acquire_dispatch_slot(lock, capped: bool):
+    """Serialize capped cluster dispatches on ``lock``, reentrant per task tree.
+
+    Unlimited operations never touch the lock. A holder's own child tasks
+    (gathered member launches, nested seed requests) are already covered by
+    the reservation, so they pass through; sibling operations from another
+    dispatch wait for the slot.
+    """
+    if not capped or lock is None or dispatch_slot_held.get():
+        yield
+        return
+    async with lock:
+        token = dispatch_slot_held.set(True)
+        try:
+            yield
+        finally:
+            dispatch_slot_held.reset(token)
 
 
 def parse_bandwidth_mbps(value: object) -> float:

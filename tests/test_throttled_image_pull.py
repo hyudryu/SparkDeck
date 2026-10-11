@@ -23,7 +23,6 @@ from sparkdeck.throttled_image_pull import (
     helper_credentials,
     is_loopback_registry_image,
     matches_insecure_registry,
-    no_proxy_matches_image,
     normalize_image_reference,
     registry_ca_binds,
     select_docker_config,
@@ -157,71 +156,6 @@ class AuthEntryTests(unittest.TestCase):
         self.assertEqual(_auth_entry(entry, "registry:5000"), {"auth": "eQ=="})
         self.assertIsNone(_auth_entry({"auths": {"other:5000": {"auth": "eQ=="}}}, "registry:5000"))
         self.assertIsNone(_auth_entry({"auths": {"docker.io": {}}}, "docker.io"))
-
-
-class NoProxyMatchTests(unittest.TestCase):
-    """Docker's NO_PROXY semantics applied to an image's registry host."""
-
-    def test_bare_host_matches_host_and_subdomains(self):
-        self.assertTrue(no_proxy_matches_image(
-            "registry.internal.example/team/img:1", "registry.internal.example",
-        ))
-        self.assertTrue(no_proxy_matches_image(
-            "cache.registry.internal.example/img:1", "registry.internal.example",
-        ))
-        self.assertFalse(no_proxy_matches_image(
-            "registry.internal.example.evil.net/img:1", "registry.internal.example",
-        ))
-        self.assertTrue(no_proxy_matches_image(
-            "any.internal.example/img:1", ".internal.example",
-        ))
-
-    def test_wildcard_matches_everything(self):
-        self.assertTrue(no_proxy_matches_image("ghcr.io/org/img:1", "*"))
-
-    def test_hub_images_match_the_docker_io_alias(self):
-        # An unqualified reference pulls from docker.io, so a NO_PROXY entry
-        # for docker.io must exempt it (and index.docker.io likewise).
-        self.assertTrue(no_proxy_matches_image("alpine:latest", "docker.io"))
-        self.assertTrue(no_proxy_matches_image(
-            "index.docker.io/library/alpine:latest", "docker.io",
-        ))
-        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", "docker.io"))
-
-    def test_explicit_port_must_match(self):
-        self.assertTrue(no_proxy_matches_image(
-            "registry.corp:5000/team/img:1", "registry.corp:5000",
-        ))
-        self.assertFalse(no_proxy_matches_image(
-            "registry.corp:5000/team/img:1", "registry.corp:8080",
-        ))
-        # An entry without a port covers every port on that host.
-        self.assertTrue(no_proxy_matches_image(
-            "registry.corp:5000/team/img:1", "registry.corp",
-        ))
-
-    def test_cidr_entries_match_ip_hosts_only(self):
-        self.assertTrue(no_proxy_matches_image("10.1.2.3:5000/img:1", "10.0.0.0/8"))
-        self.assertFalse(no_proxy_matches_image("192.168.1.5/img:1", "10.0.0.0/8"))
-        # A network entry never matches a hostname, even one resolving into it.
-        self.assertFalse(no_proxy_matches_image("host.internal/img:1", "10.0.0.0/8"))
-
-    def test_scheme_prefix_and_trailing_punctuation_are_tolerated(self):
-        self.assertTrue(no_proxy_matches_image(
-            "registry.corp/img:1", "http://registry.corp/",
-        ))
-        self.assertTrue(no_proxy_matches_image(
-            "registry.corp/img:1", "REGISTRY.CORP.",
-        ))
-
-    def test_comma_and_space_separated_lists(self):
-        value = " other.example , registry.corp "
-        self.assertTrue(no_proxy_matches_image("registry.corp/img:1", value))
-        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", value))
-
-    def test_empty_value_and_unqualified_daemon_registries(self):
-        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", ""))
-        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", "  "))
 
 
 class HelperCredentialsTests(unittest.TestCase):
@@ -798,6 +732,9 @@ class LimiterProxyTests(unittest.TestCase):
             "SPARKDECK_DOWNLOAD_BPS": "10000000",
             "SPARKDECK_BANDWIDTH_PROGRESS": "",
             "SPARKDECK_PROXY_PORT": str(port),
+            # The developer machine's own proxy policy must not decide
+            # whether these scripted tests chain or dial directly.
+            "NO_PROXY": "",
         })
         env.update(env_extra or {})
         process = subprocess.Popen(
@@ -1068,6 +1005,151 @@ class LimiterProxyTests(unittest.TestCase):
             listener.close()
             tls_listener.close()
 
+    def test_no_proxy_host_is_dialed_directly_but_still_capped(self):
+        # NO_PROXY is proxy policy: the limiter dials the excluded host
+        # itself (bytes still move through its token bucket) instead of
+        # asking the corporate proxy that refused to serve it.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+        upstream_used = []
+
+        def watch_upstream():
+            try:
+                connection, _ = upstream.accept()
+            except OSError:
+                return
+            upstream_used.append("touched")
+            connection.close()
+
+        threading.Thread(target=watch_upstream, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"http://127.0.0.1:{upstream_port}",
+            "SPARKDECK_DOWNLOAD_BPS": "4096",
+            "NO_PROXY": "other.example, 127.0.0.1",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-direct")
+            self.assertEqual(client.recv(64), b"ping-direct")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+        self.assertEqual(upstream_used, [])
+
+    def test_no_proxy_mismatch_still_chains_through_upstream(self):
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+        captured = {}
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            captured["request"] = request
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"http://127.0.0.1:{upstream_port}",
+            "NO_PROXY": "internal.example",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-chain")
+            self.assertEqual(client.recv(64), b"ping-chain")
+            client.close()
+            self.assertIn(b"CONNECT", captured.get("request", b""))
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
+    def test_upstream_proxy_credentials_are_percent_decoded(self):
+        # HTTPS_PROXY percent-encodes userinfo delimiters (@ : %); the Basic
+        # credential must carry the decoded username and password.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+        captured = {}
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            captured["request"] = request
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": (
+                f"http://user%40corp%3Apw%25@127.0.0.1:{upstream_port}"
+            ),
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-auth")
+            self.assertEqual(client.recv(64), b"ping-auth")
+            client.close()
+            expected = base64.b64encode(b"user@corp:pw%")
+            self.assertIn(
+                b"Proxy-Authorization: Basic " + expected,
+                captured.get("request", b""),
+            )
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
 
 class RegistryTrustTests(unittest.TestCase):
     def test_insecure_entries_match_cidr_hosts_and_ports(self):
@@ -1103,10 +1185,17 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
             )
             api = FakeDockerApi()
             staging = Path(tempfile.mkdtemp())
+            auth_dir = Path(tempfile.mkdtemp())
+            captured: dict = {}
 
             def on_start(container_id):
-                if container_id == "copy-1":
-                    staging.joinpath("image.tar").write_bytes(b"tar")
+                if container_id != "copy-1":
+                    return
+                written = auth_dir / "config.json"
+                captured["auth"] = (
+                    json.loads(written.read_text()) if written.exists() else None
+                )
+                staging.joinpath("image.tar").write_bytes(b"tar")
 
             api.on_start = on_start
             client = Mock()
@@ -1114,7 +1203,8 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
             events = []
             with (
                 patch.object(
-                    tip.tempfile, "mkdtemp", side_effect=[str(staging)],
+                    tip.tempfile, "mkdtemp",
+                    side_effect=[str(staging), str(auth_dir)],
                 ),
                 patch.object(
                     tip.shutil, "disk_usage",
@@ -1128,10 +1218,68 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
                     events.append(event)
             self.assertEqual(events[-1], {"status": "Successfully pulled nginx"})
             copy = copy_kwargs(api)
+            # Only the selected registry's credential is mounted: the flow
+            # materializes a single-entry copy instead of the whole config.
             self.assertTrue(any(
+                bind.startswith(f"{auth_dir / 'config.json'}:")
+                and bind.endswith(":/auth/config.json:ro,z")
+                for bind in copy["host_config"]["Binds"]
+            ), copy["host_config"]["Binds"])
+            self.assertFalse(any(
                 str(config) in bind for bind in copy["host_config"]["Binds"]
             ), copy["host_config"]["Binds"])
+            self.assertEqual(
+                captured["auth"], {"auths": {"docker.io": {"auth": "dTpz"}}},
+            )
             self.assertIn("--authfile", copy["command"])
+
+    async def test_only_the_pulled_registry_credential_is_materialized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / "docker-config"
+            config_dir.mkdir()
+            config = config_dir / "config.json"
+            config.write_text(json.dumps({"auths": {
+                "docker.io": {"auth": "dTpz"},
+                "ghcr.io": {"username": "octo", "password": "gh-secret"},
+            }}), encoding="utf-8")
+            api = FakeDockerApi()
+            staging = Path(tempfile.mkdtemp())
+            auth_dir = Path(tempfile.mkdtemp())
+            captured: dict = {}
+
+            def on_start(container_id):
+                if container_id != "copy-1":
+                    return
+                written = auth_dir / "config.json"
+                captured["auth"] = (
+                    json.loads(written.read_text()) if written.exists() else None
+                )
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+            api.on_start = on_start
+            client = Mock()
+            client.api = api
+            events = []
+            with (
+                patch.object(
+                    tip.tempfile, "mkdtemp",
+                    side_effect=[str(staging), str(auth_dir)],
+                ),
+                patch.object(
+                    tip.shutil, "disk_usage",
+                    return_value=_USAGE(10 ** 15, 0, 10 ** 15),
+                ),
+                patch.dict(os.environ, {"DOCKER_CONFIG": str(config_dir)}),
+            ):
+                async for event in throttled_image_pull_events(
+                    client, "nginx", 1000.0,
+                ):
+                    events.append(event)
+            self.assertEqual(events[-1], {"status": "Successfully pulled nginx"})
+            self.assertEqual(
+                captured["auth"], {"auths": {"docker.io": {"auth": "dTpz"}}},
+            )
+            self.assertNotIn("ghcr.io", captured["auth"]["auths"])
 
 
 def inspect_kwargs(api):

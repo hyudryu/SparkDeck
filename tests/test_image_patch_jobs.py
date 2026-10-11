@@ -215,6 +215,76 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
             await self.finish(job)
         self.assertNotIn("max_download_bandwidth_mbps", captured)
 
+    async def test_mixed_fleet_stamps_the_zero_cap_per_node(self):
+        # A mixed legacy + capable selection keeps the shared request
+        # field-free (legacy agents reject unknown fields), but the capable
+        # agent must still receive the explicit 0: its node-local setting
+        # may be stale and would otherwise throttle the build although the
+        # controller is unlimited.
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "legacy", "name": "legacy", "capabilities": [CAPABILITY]},
+            {"id": "capable", "name": "capable",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        bodies: dict = {}
+
+        async def fake_remote(node, request):
+            bodies[node["node_id"]] = dict(request)
+            return result()
+
+        with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
+            job = await self.finish(
+                await self.jobs.start(request(["legacy", "capable"])),
+            )
+        self.assertNotIn("max_download_bandwidth_mbps", bodies["legacy"])
+        self.assertEqual(bodies["capable"]["max_download_bandwidth_mbps"], 0.0)
+        # The dispatch field comes from the job's per-node records, which
+        # carry the cap only for the bandwidth-capable node.
+        records = {n["node_id"]: n for n in job["nodes"]}
+        self.assertNotIn("max_download_bandwidth_mbps", records["legacy"])
+        self.assertEqual(records["capable"]["max_download_bandwidth_mbps"], 0.0)
+
+    async def test_capped_remote_build_holds_the_cluster_dispatch_slot(self):
+        # The base pull runs on the remote node at the forwarded cap; while
+        # it is under way the shared budget slot must be reserved, or a
+        # concurrent capped download on another node doubles the uplink.
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        held: list = []
+
+        async def fake_remote(node, request):
+            held.append(self.manager.dispatched_download_lock.locked())
+            return result()
+
+        with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
+            await self.finish(
+                await self.jobs.start(request(["worker"])),
+            )
+        self.assertEqual(held, [True])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_uncapped_remote_build_never_holds_the_slot(self):
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        held: list = []
+
+        async def fake_remote(node, request):
+            held.append(self.manager.dispatched_download_lock.locked())
+            return result()
+
+        with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
+            await self.finish(
+                await self.jobs.start(request(["worker"])),
+            )
+        self.assertEqual(held, [False])
+
     async def test_agent_stamps_forwarded_cap_but_gui_caller_may_not_supply_it(self):
         captured: dict = {}
 

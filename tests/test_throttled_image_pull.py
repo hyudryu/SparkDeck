@@ -997,6 +997,24 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_current_userns_marker_also_refuses_the_capped_pull(self):
+        # Moby fixed the doubled SecurityOptions spelling, so current daemons
+        # report the remap as plain "name=userns". Missing that marker would
+        # run the copy as the host UID and fail mid-pull on the 0700 staging
+        # directory instead of refusing with the actionable knob.
+        api = FakeDockerApi(security_options=[
+            "name=userns", "name=seccomp,profile=default",
+        ])
+        with (
+            patch.object(tip.os, "name", "posix"),
+            patch.object(tip.os, "getuid", return_value=1000, create=True),
+            patch.object(tip.os, "getgid", return_value=1000, create=True),
+        ):
+            events, _ = await self.collect(api)
+        errors = [event for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("userns-remap", errors[0]["error"])
+
 
 class ProxyTrustWiringTests(unittest.IsolatedAsyncioTestCase):
     """SSL_CERT_FILE forwarding into the limiter container (PozT/PozP)."""
@@ -1145,6 +1163,83 @@ class LimiterProxyTests(unittest.TestCase):
         finally:
             process.kill()
             listener.close()
+
+    def test_plain_http_absolute_form_request_is_forwarded(self):
+        # A genuinely insecure registry or plain-HTTP mirror sends its
+        # traffic as absolute-form requests to HTTP_PROXY, not a CONNECT
+        # tunnel. The limiter must dial the URL endpoint, rewrite to
+        # origin-form, and serve it through the same charged pump.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port)
+        try:
+            client = socket.create_connection(("127.0.0.1", proxy_port), 5)
+            request = (
+                "GET http://127.0.0.1:%d/v2/_catalog HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n\r\n" % (echo_port, echo_port)
+            )
+            client.sendall(request.encode())
+            echoed = b""
+            deadline = time.monotonic() + 5
+            while b"GET" not in echoed and time.monotonic() < deadline:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                echoed += chunk
+            self.assertIn(b"GET /v2/_catalog HTTP/1.1", echoed)
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+
+    def test_unsupported_proxy_request_shapes_are_rejected(self):
+        # Origin-form requests are not proxy traffic, and https-form GETs
+        # must arrive as CONNECT instead; both get an explicit refusal
+        # rather than a mis-forward.
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port)
+        try:
+            for request in (
+                "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n",
+                "GET https://registry.example/v2/ HTTP/1.1\r\n"
+                "Host: registry.example\r\n\r\n",
+            ):
+                client = socket.create_connection(("127.0.0.1", proxy_port), 5)
+                client.sendall(request.encode())
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                self.assertIn(b"405", response.split(b"\r\n", 1)[0])
+                client.close()
+        finally:
+            process.kill()
+
+    def test_wildcard_no_proxy_entries_match_hostnames(self):
+        # Go's proxy matcher (Docker's own rule) turns a leading "*.domain"
+        # wildcard into a suffix rule. The matcher runs inside the proxy
+        # container, so execute the script prefix (before the listener loop)
+        # and drive it with the real normalization.
+        script = tip._PROXY_SCRIPT.split("listener = socket.socket()")[0]
+        namespace = {}
+        with patch.dict(os.environ, {
+            "SPARKDECK_DOWNLOAD_BPS": "1000",
+            "SPARKDECK_BANDWIDTH_PROGRESS": "",
+            "SPARKDECK_BANDWIDTH_RATE_FILE": "",
+            "SPARKDECK_UPSTREAM_PROXY": "",
+            "SPARKDECK_DAEMON_PROXY": "",
+            "SPARKDECK_DAEMON_NO_PROXY": "",
+            "SPARKDECK_UPSTREAM_PROXY_CA": "",
+            "NO_PROXY": "*.test.example.com,.internal.corp",
+        }, clear=False):
+            exec(compile(script, "<proxy-prefix>", "exec"), namespace)
+        self.assertTrue(namespace["no_proxy_direct"](
+            "registry-1.test.example.com:443",
+        ))
+        self.assertTrue(namespace["no_proxy_direct"]("a.internal.corp:5000"))
+        self.assertFalse(namespace["no_proxy_direct"]("ghcr.io:443"))
 
     def test_rate_file_change_re_rates_the_running_limiter(self):
         # A settings change rewrites the staged rate file mid-transfer; the
@@ -1781,7 +1876,12 @@ class LimiterProxyTests(unittest.TestCase):
 
 
 class RegistryTrustTests(unittest.TestCase):
-    def test_insecure_entries_match_cidr_hosts_and_ports(self):
+    @patch("socket.getaddrinfo", side_effect=OSError)
+    def test_insecure_entries_match_cidr_hosts_and_ports(self, resolver):
+        # CIDR entries now consult DNS for hostname references (dockerd
+        # matches registries resolving INTO the subnet); these fixtures test
+        # name/port matching, so resolution stays unreachable and any host
+        # the test does not intend must not accidentally match via DNS.
         insecure = ["127.0.0.0/8", "::1/128", "private.registry:5000", "lan.registry"]
         self.assertTrue(
             matches_insecure_registry("private.registry:5000/team/img:1", insecure),
@@ -1795,9 +1895,53 @@ class RegistryTrustTests(unittest.TestCase):
         self.assertFalse(matches_insecure_registry("nginx:latest", insecure))
         self.assertFalse(matches_insecure_registry("bad:99999/x", ["::1/128"]))
 
-    def test_insecure_registry_entries_merge_indexconfigs(self):
+    def test_endpoint_port_entries_stay_scoped_to_their_port(self):
+        # dockerd documents "--insecure-registry reg.corp:5000" as that
+        # host-and-port endpoint. Matching a port-less reference would
+        # disable certificate verification for the same host's default-443
+        # registry the daemon still trusts, admitting a forged image.
+        self.assertFalse(matches_insecure_registry(
+            "reg.corp/team/image", ["reg.corp:5000"],
+        ))
+        self.assertTrue(matches_insecure_registry(
+            "reg.corp:5000/team/image", ["reg.corp:5000"],
+        ))
+        # A port-less reference implies 443, so an explicit-443 entry is its
+        # equivalent; a port-less entry still covers every port on the host.
+        self.assertTrue(matches_insecure_registry(
+            "reg.corp/team/image", ["reg.corp:443"],
+        ))
+        self.assertTrue(matches_insecure_registry(
+            "reg.corp:5000/team/image", ["reg.corp"],
+        ))
+
+    def test_insecure_cidrs_apply_to_hostnames_resolving_inside_them(self):
+        # dockerd applies a CIDR entry to registries whose domain resolves
+        # into the subnet; ignoring non-literal hosts would leave TLS
+        # verification on against a plaintext or privately signed endpoint
+        # the daemon pulls freely.
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 0)),
+            ],
+        ) as resolver:
+            self.assertTrue(matches_insecure_registry(
+                "reg.corp/team/image", ["10.0.0.0/8"],
+            ))
+        resolver.assert_called_once_with("reg.corp", None)
+
+    def test_insecure_cidrs_stay_off_when_resolution_fails(self):
+        with patch("socket.getaddrinfo", side_effect=OSError):
+            self.assertFalse(matches_insecure_registry(
+                "reg.corp/team/image", ["10.0.0.0/8"],
+            ))
+
+    @patch("socket.getaddrinfo", side_effect=OSError)
+    def test_insecure_registry_entries_merge_indexconfigs(self, resolver):
         # Docker records named insecure hosts only under IndexConfigs with
         # Secure:false; consulting the CIDRs alone misses them entirely.
+        # Named hosts stay unresolved here so only the name match decides.
         entries = insecure_registry_entries({
             "InsecureRegistryCIDRs": ["10.0.0.0/8"],
             "IndexConfigs": {
@@ -2174,6 +2318,20 @@ class DaemonProxyConfigTests(unittest.TestCase):
 
     def test_empty_daemon_reports_no_proxy(self):
         self.assertEqual(daemon_proxy_config({}), ("", ""))
+
+    def test_top_level_daemon_fields_are_a_source(self):
+        # The Engine API reports the daemon proxy as top-level /info fields
+        # (HttpProxy/HttpsProxy/NoProxy) as well. A host configured only
+        # through dockerd's daemon configuration or the systemd environment
+        # leaves the nested objects empty, and a limiter without this source
+        # would dial registries the network only reaches through the proxy.
+        proxy, no_proxy = daemon_proxy_config({
+            "HttpProxy": "http://proxy.corp:8080",
+            "HttpsProxy": "https://proxy.corp:8443",
+            "NoProxy": "localhost,.corp",
+        })
+        self.assertEqual(proxy, "https://proxy.corp:8443")
+        self.assertEqual(no_proxy, "localhost,.corp")
         self.assertEqual(daemon_proxy_config(None), ("", ""))
         self.assertEqual(
             daemon_proxy_config({"RegistryConfig": {"NoProxy": [""]}}),

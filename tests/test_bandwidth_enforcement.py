@@ -51,6 +51,44 @@ class ImagePullShareTests(unittest.TestCase):
         self.assertIsNone(m._image_pull_share_mbps({"image_pull_bandwidth_mbps": "25"}))
         self.assertIsNone(m._image_pull_share_mbps({"image_pull_bandwidth_mbps": True}))
 
+    def test_launch_phase_prefers_the_live_cap(self):
+        # A member launched at cap 100 across four nodes still downloads
+        # weights after the cap drops to 20 mid-image-pull; the new phase
+        # must re-divide the CURRENT cap, not keep the stamped share.
+        m = bare_manager(100.0)
+        m._live_bandwidth_cap_mbps = 20.0
+        share, cluster = m._launch_phase_bandwidth({
+            "image_pull_bandwidth_mbps": 25.0,
+            "cluster_pull_bandwidth_mbps": 100.0,
+            "image_pull_fanout_width": 4,
+        })
+        self.assertEqual((share, cluster), (5.0, 20.0))
+
+    def test_launch_phase_without_a_live_cap_keeps_the_dispatch_stamp(self):
+        # No broadcast has landed on this agent: fall back to the anchor the
+        # controller stamped at dispatch, never the stale node-local setting.
+        m = bare_manager(0.0)
+        share, cluster = m._launch_phase_bandwidth({
+            "image_pull_bandwidth_mbps": 25.0,
+            "cluster_pull_bandwidth_mbps": 100.0,
+            "image_pull_fanout_width": 4,
+        })
+        self.assertEqual((share, cluster), (25.0, 100.0))
+
+    def test_launch_phase_legacy_member_and_standalone_launch_untouched(self):
+        m = bare_manager(100.0)
+        m._live_bandwidth_cap_mbps = 20.0
+        # Legacy payload (no width stamp): dispatched values pass through.
+        self.assertEqual(
+            m._launch_phase_bandwidth({
+                "image_pull_bandwidth_mbps": 25.0,
+                "cluster_pull_bandwidth_mbps": 100.0,
+            }),
+            (25.0, 100.0),
+        )
+        # Standalone local launch: no stamps at all.
+        self.assertEqual(m._launch_phase_bandwidth(None), (None, None))
+
 
 class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
     async def test_present_image_does_not_pull(self):
@@ -391,6 +429,44 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
                 "org/model", cluster_member={
                     "image_pull_bandwidth_mbps": 25.0,
                     "cluster_pull_bandwidth_mbps": 100.0,
+                }, runtime="sglang",
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "main",
+            bandwidth_mbps=25.0, cluster_bandwidth_mbps=100.0,
+        )
+
+    async def test_cap_change_midlaunch_redivides_the_current_cap(self):
+        # The image-pull phase already re-rated through the broadcast; the
+        # weight phase starts a NEW rate file, so it must divide the newest
+        # controller cap across the fan-out width. Left on the launch-time
+        # share this would restore the old aggregate after a cap drop.
+        m = self.harness(0.0)
+        m._live_bandwidth_cap_mbps = 20.0
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", cluster_member={
+                    "image_pull_bandwidth_mbps": 25.0,
+                    "cluster_pull_bandwidth_mbps": 100.0,
+                    "image_pull_fanout_width": 4,
+                }, runtime="sglang",
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "main",
+            bandwidth_mbps=5.0, cluster_bandwidth_mbps=20.0,
+        )
+
+    async def test_no_broadcast_yet_keeps_the_dispatched_weight_share(self):
+        # Before any broadcast lands, the weight phase uses the anchor the
+        # controller stamped at dispatch, not this agent's own (stale or
+        # zero) setting.
+        m = self.harness(0.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", cluster_member={
+                    "image_pull_bandwidth_mbps": 25.0,
+                    "cluster_pull_bandwidth_mbps": 100.0,
+                    "image_pull_fanout_width": 4,
                 }, runtime="sglang",
             )
         m.virtual_nas._download_model_process.assert_awaited_once_with(
@@ -1106,6 +1182,48 @@ class NodeDownloadModelFilesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(kwargs["timeout"], 24 * 60 * 60 - 1)
 
+    async def test_capped_dispatch_sizes_deadline_from_selected_files(self):
+        # The request names its exact files and the selected-file estimate
+        # exists: an unknown-size allowance (~32 GiB) would time out a
+        # healthy 80 GiB multi-shard GGUF seed at a low cap and dispatch a
+        # duplicate candidate while the agent's uncancelable download runs.
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        m = self._manager(1.0, supports_bandwidth=True)
+        m.virtual_nas.estimate_selected_files_size = AsyncMock(
+            return_value=80 * 1024 ** 3,
+        )
+        await m.node_download_model_files(
+            "ws1", "org/model", "r" * 40, ["q-00001.gguf", "q-00002.gguf"],
+        )
+        kwargs = m.node_registry.request.await_args.kwargs
+        self.assertEqual(
+            kwargs["timeout"],
+            capped_transfer_timeout_seconds(
+                1.0, 80 * 1024 ** 3,
+                default=24 * 60 * 60, floor=24 * 60 * 60,
+            ),
+        )
+        # 80 GiB at 1 Mbps needs ~13 days of runway, far past the 32 GiB
+        # unknown-size allowance.
+        self.assertGreater(kwargs["timeout"], 8 * 24 * 60 * 60)
+
+    async def test_failed_estimate_falls_back_to_the_unknown_allowance(self):
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        m = self._manager(50.0, supports_bandwidth=True)
+        m.virtual_nas.estimate_selected_files_size = AsyncMock(
+            side_effect=RuntimeError("hub unreachable"),
+        )
+        await m.node_download_model_files("ws1", "org/model", "r" * 40, ["q.gguf"])
+        kwargs = m.node_registry.request.await_args.kwargs
+        self.assertEqual(
+            kwargs["timeout"],
+            capped_transfer_timeout_seconds(
+                50.0, default=24 * 60 * 60, floor=24 * 60 * 60,
+            ),
+        )
+
 
 class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
     """A cap change must reach transfers already running, not only new ones."""
@@ -1126,6 +1244,9 @@ class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             {"id": "ws1", "name": "WS1", "online": True},
             {"id": "ws2", "name": "WS2", "online": False},
         ]
+        m.node_registry.probe = AsyncMock(side_effect=lambda node, **kwargs: {
+            "id": node["id"], "online": node.get("online", False),
+        })
         m.node_registry.request = AsyncMock(return_value={"ok": True})
         return m
 
@@ -1144,6 +1265,37 @@ class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             args.kwargs["json_body"], {"max_download_bandwidth_mbps": 50.0},
         )
+
+    async def test_pairing_records_without_online_field_still_receive_push(self):
+        # The durable registry stores pairing records, which never carry an
+        # "online" field: liveness lives in probe results. Deciding from the
+        # stored dict would treat every remote node as offline and silently
+        # drop the entire broadcast.
+        m = self.fixture(0.0)
+        m.apply_bandwidth_cap_live = Mock()
+        m.node_registry.nodes = [{"id": "ws1", "name": "WS1"}]
+        m.node_registry.probe = AsyncMock(return_value={
+            "id": "ws1", "online": True,
+        })
+        await m.update_settings({"max_download_bandwidth_mbps": 30})
+        await m._bandwidth_notify_task
+        m.node_registry.request.assert_awaited_once()
+        args = m.node_registry.request.await_args
+        self.assertEqual(args.args[0], "ws1")
+        self.assertEqual(
+            args.kwargs["json_body"], {"max_download_bandwidth_mbps": 30.0},
+        )
+
+    async def test_agent_probe_reports_offline_skips_delivery(self):
+        m = self.fixture(0.0)
+        m.apply_bandwidth_cap_live = Mock()
+        m.node_registry.nodes = [{"id": "ws1", "name": "WS1"}]
+        m.node_registry.probe = AsyncMock(return_value={
+            "id": "ws1", "online": False,
+        })
+        await m.update_settings({"max_download_bandwidth_mbps": 30})
+        await m._bandwidth_notify_task
+        m.node_registry.request.assert_not_awaited()
 
     async def test_rapid_saves_serialize_agent_broadcasts_last_wins(self):
         # Two quick saves must not race as two independent broadcast tasks
@@ -1209,6 +1361,9 @@ class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
             6_250_000.0,
         )
         pull_apply.assert_called_once_with(6_250_000.0)
+        # The newest cap is also remembered so later launch phases can
+        # re-divide it across their fan-out width.
+        self.assertEqual(m._live_bandwidth_cap_mbps, 50.0)
 
 
 class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):

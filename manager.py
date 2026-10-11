@@ -3333,6 +3333,20 @@ class Manager:
             "files": list(filenames),
         }
         bandwidth_mbps = self.virtual_nas._download_bandwidth_mbps()
+        # The request names its exact files and the selected-file estimate
+        # exists, so size the deadline from those bytes: the unknown-size
+        # allowance only covers ~32 GiB at the capped rate, which would
+        # report a healthy multi-shard GGUF seed as failed and dispatch a
+        # duplicate candidate while the agent's uncancelable download runs.
+        selected_bytes = 0
+        if bandwidth_mbps > 0:
+            try:
+                selected_bytes = await self.virtual_nas.estimate_selected_files_size(
+                    model_id, revision, list(filenames),
+                    explicit_token=self._resolved_hf_token() or None,
+                )
+            except Exception:
+                selected_bytes = 0
         supports_bandwidth = await self.node_supports_download_bandwidth(node_id)
         if supports_bandwidth:
             # Explicit 0 overrides a stale node-local cap; old agents reject
@@ -3360,8 +3374,8 @@ class Manager:
                         # scale the deadline with the rate like the queued
                         # paths do.
                         timeout=capped_transfer_timeout_seconds(
-                            bandwidth_mbps, default=24 * 60 * 60,
-                            floor=24 * 60 * 60,
+                            bandwidth_mbps, selected_bytes,
+                            default=24 * 60 * 60, floor=24 * 60 * 60,
                         ),
                     )
                 )
@@ -8777,6 +8791,10 @@ class Manager:
                         # change mid-launch scales the member share of
                         # the new cap, not the agent's own setting.
                         "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
+                        # Fan-out width so a later launch phase can re-divide
+                        # the current cap instead of trusting the stamped
+                        # launch-time share.
+                        "image_pull_fanout_width": len(node_ids),
                     },
                 })
                 if engine == "vllm":
@@ -8954,6 +8972,10 @@ class Manager:
                     "fabric_interface": fabric_interface,
                     "image_pull_bandwidth_mbps": pull_share_mbps,
                     "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
+                    # Fan-out width so a later launch phase can re-divide
+                    # the current cap instead of trusting the stamped
+                    # launch-time share.
+                    "image_pull_fanout_width": len(node_ids),
                 },
             })
             if mode == "sharded":
@@ -20035,6 +20057,10 @@ class Manager:
         user-space limiter can touch, so a newly enabled cap applies to them
         not, and to every subsequent transfer in full.
         """
+        # Remember the cap: a multi-phase member launch resolving after this
+        # point must divide the CURRENT cap across its fan-out width instead
+        # of trusting the share stamped when the launch was accepted.
+        self._live_bandwidth_cap_mbps = float(bandwidth_mbps)
         bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
         try:
             self.virtual_nas.apply_download_bandwidth_cap(bytes_per_second)
@@ -20055,7 +20081,17 @@ class Manager:
         registry = getattr(self, "node_registry", None)
         for node in list(getattr(registry, "nodes", None) or []):
             node_id = str(node.get("id") or "")
-            if node_id == LOCAL_NODE_ID or not node.get("online"):
+            if node_id == LOCAL_NODE_ID:
+                continue
+            # The durable pairing records never carry an "online" field;
+            # liveness exists only in probe results. Skipping on the stored
+            # dict would mark every remote node offline and silently drop
+            # the whole broadcast. Probe (cached, health-only) for liveness.
+            try:
+                status = await registry.probe(node, details=False)
+            except Exception:
+                status = {}
+            if not (isinstance(status, dict) and status.get("online")):
                 continue
             try:
                 await registry.request(
@@ -20247,6 +20283,37 @@ class Manager:
             return None
         return float(cluster)
 
+    def _launch_phase_bandwidth(
+        self, cluster_member: dict | None = None,
+    ) -> tuple[float | None, float | None]:
+        """Resolve (share, cluster cap) for a NEW phase of a dispatched launch.
+
+        The member payload carries the share and cap stamped when the launch
+        was accepted. When the operator moves the cap during an earlier phase,
+        the bandwidth broadcast has already reached this node with the newest
+        controller value, so a phase that creates a fresh rate file must
+        divide THAT cap across the fan-out width: left on the launch-time
+        stamp, a cap lowered mid-launch would restore the old aggregate (four
+        members launched at cap/4 each would keep prefetching weights at the
+        old share after the cap drops). Without a current cap or a width
+        stamp, fall back to the dispatched values, matching dispatch-time
+        behavior.
+        """
+        share = self._image_pull_share_mbps(cluster_member)
+        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
+        width = (cluster_member or {}).get("image_pull_fanout_width")
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            return share, cluster_mbps
+        live = getattr(self, "_live_bandwidth_cap_mbps", None)
+        effective = live if live is not None else cluster_mbps
+        if effective is None:
+            return share, cluster_mbps
+        try:
+            effective = max(0.0, float(effective))
+        except (TypeError, ValueError):
+            return share, cluster_mbps
+        return effective / max(1, width), effective
+
     async def _ensure_runtime_image(
         self, image: str, name: str | None = None, model: str | None = None,
         cluster_member: dict | None = None, runtime: str = "",
@@ -20286,7 +20353,7 @@ class Manager:
         # internet lock otherwise. The cluster-wide dispatch slot must cover it
         # too, or a capped image download runs at the full configured rate
         # beside a capped NAS, patch, or member operation on another node.
-        share_mbps = self._image_pull_share_mbps(cluster_member)
+        share_mbps, cluster_mbps = self._launch_phase_bandwidth(cluster_member)
         effective_mbps = share_mbps
         if effective_mbps is None:
             try:
@@ -20295,7 +20362,6 @@ class Manager:
                 )
             except ValueError:
                 effective_mbps = 0.0
-        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
         async with self._dispatched_download_slot(effective_mbps > 0):
             await self.pull_image_result(image, share_mbps, cluster_mbps)
 
@@ -20378,8 +20444,7 @@ class Manager:
         into a private volume, so its launcher refuses first launches while
         capped.
         """
-        share = self._image_pull_share_mbps(cluster_member)
-        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
+        share, cluster_mbps = self._launch_phase_bandwidth(cluster_member)
         if share is None:
             try:
                 share = parse_bandwidth_mbps(

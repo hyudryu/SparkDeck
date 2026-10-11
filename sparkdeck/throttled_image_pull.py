@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import uuid
@@ -228,7 +229,12 @@ def no_proxy_direct(authority):
         )
         if entry == "*":
             return True
-        entry = split_authority(entry)[0].strip().lower().lstrip(".").rstrip(".")
+        # Go's proxy matcher (the rule Docker itself follows) turns a
+        # leading "*.domain" wildcard into a suffix rule; without stripping
+        # it here, wildcard exclusions could never match a hostname and
+        # excluded internal registries would still ride the corporate proxy.
+        entry = split_authority(entry)[0].strip().lower()
+        entry = entry.removeprefix("*.").lstrip(".").rstrip(".")
         if "/" in entry:
             # A CIDR entry matches by subnet containment only. Suffix logic
             # cannot see a network ("10.0.0.0/8" matches 10.1.2.3, not any
@@ -290,6 +296,44 @@ def connect_target(authority):
         raise OSError("upstream proxy refused CONNECT: " + status.decode("latin-1"))
     return sock
 
+def forward_plain(lines, target):
+    # Plain-HTTP registry traffic (an insecure registry or an http:// mirror)
+    # reaches the proxy as an absolute-form request, not a CONNECT tunnel;
+    # Go's transport picks the shape by destination scheme. Serving only
+    # CONNECT would fail every genuinely plaintext pull with a 405, so parse
+    # the request and forward it through the same charged pump.
+    if not target.lower().startswith("http://"):
+        return None
+    authority, slash, path = target[len("http://"):].partition("/")
+    if not authority:
+        return None
+    auth = ""
+    if UPSTREAM and not no_proxy_direct(authority):
+        # A proxy re-parses an absolute-form request itself: forward the
+        # request lines untouched and add the proxy credentials, if any.
+        auth, host, port, secure = parse_upstream(UPSTREAM)
+        upstream = socket.create_connection((host, port), 10)
+        if secure:
+            upstream = upstream_context(host).wrap_socket(
+                upstream, server_hostname=host,
+            )
+        outbound_lines = list(lines)
+    else:
+        # Direct (no proxy, or a NO_PROXY host): dial the URL endpoint and
+        # rewrite to the origin-form the registry server expects.
+        host, port = split_authority(authority)
+        upstream = socket.create_connection((host, int(port or "80")), 10)
+        words = lines[0].split(b" ")
+        origin_line = (
+            words[0] + b" /" + path.encode("latin-1") + b" " + words[-1]
+        )
+        outbound_lines = [origin_line] + list(lines[1:])
+    outbound = b"\\r\\n".join(outbound_lines)
+    if auth:
+        token = base64.b64encode(auth.encode("latin-1")).decode("ascii")
+        outbound += b"\\r\\nProxy-Authorization: Basic " + token.encode("ascii")
+    return upstream, outbound + b"\\r\\n\\r\\n"
+
 def handle(client):
     upstream = None
     try:
@@ -300,12 +344,21 @@ def handle(client):
                 return
             request += chunk
         head, _, rest = request.partition(b"\\r\\n\\r\\n")
-        parts = head.split(b"\\r\\n")[0].decode("latin-1").split()
-        if len(parts) < 3 or parts[0].upper() != "CONNECT":
-            client.sendall(b"HTTP/1.1 405 Method Not Allowed\\r\\n\\r\\n")
+        lines = head.split(b"\\r\\n")
+        parts = lines[0].decode("latin-1").split()
+        if len(parts) < 3:
+            client.sendall(b"HTTP/1.1 400 Bad Request\\r\\n\\r\\n")
             return
-        upstream = connect_target(parts[1])
-        client.sendall(b"HTTP/1.1 200 Connection established\\r\\n\\r\\n")
+        if parts[0].upper() == "CONNECT":
+            upstream = connect_target(parts[1])
+            client.sendall(b"HTTP/1.1 200 Connection established\\r\\n\\r\\n")
+        else:
+            forwarded = forward_plain(lines, parts[1])
+            if forwarded is None:
+                client.sendall(b"HTTP/1.1 405 Method Not Allowed\\r\\n\\r\\n")
+                return
+            upstream, outbound = forwarded
+            upstream.sendall(outbound)
         if rest:
             upstream.sendall(rest)
         threading.Thread(target=pump, args=(upstream, client, True), daemon=True).start()
@@ -395,6 +448,33 @@ def split_authority(authority: str) -> tuple[str, str]:
     return host, port
 
 
+def _resolved_registry_addresses(host: str) -> list:
+    """Every IP a registry hostname resolves to; literal IPs pass through.
+
+    Resolution failure yields no matches: the daemon keeps TLS on for an
+    endpoint it cannot place inside an insecure CIDR either.
+    """
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return []
+    addresses = []
+    seen = set()
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(str(info[4][0]).strip("[]"))
+        except ValueError:
+            continue
+        if str(address) not in seen:
+            seen.add(str(address))
+            addresses.append(address)
+    return addresses
+
+
 def matches_insecure_registry(image: str, insecure: list[str]) -> bool:
     """True when the image's registry matches a daemon insecure entry.
 
@@ -413,22 +493,35 @@ def matches_insecure_registry(image: str, insecure: list[str]) -> bool:
         bare = "[" + host + "]"
     else:
         bare = head.partition(":")[0]
+    registry_addresses = None
     for entry in insecure:
         candidate = str(entry or "").strip().lower()
         if not candidate:
             continue
         if "/" in candidate:
+            # Docker applies a CIDR entry to registries whose HOSTNAME
+            # RESOLVES into the network, not only to literal-IP references.
             try:
                 network = ipaddress.ip_network(candidate, strict=False)
-                if ipaddress.ip_address(host) in network:
-                    return True
             except ValueError:
-                pass
+                continue
+            if registry_addresses is None:
+                registry_addresses = _resolved_registry_addresses(host)
+            for address in registry_addresses:
+                if address.version == network.version and address in network:
+                    return True
             continue
         if candidate == head or candidate == bare:
             return True
         entry_host, entry_port = split_authority(candidate)
-        if entry_port and not port and entry_host == host:
+        if entry_host != host:
+            continue
+        # An entry naming an explicit port describes that endpoint only:
+        # "reg.corp:5000" must not disable certificate verification for the
+        # same host's default-443 registry, which the daemon still trusts.
+        # A port-less reference implies 443, so an explicit 443 entry is its
+        # equivalent.
+        if (entry_port or "443") == (port or "443"):
             return True
     return False
 
@@ -638,6 +731,11 @@ def daemon_proxy_config(daemon_info: dict) -> tuple[str, str]:
     """
     sources = []
     info = daemon_info or {}
+    # The Engine API reports the daemon proxy as TOP-LEVEL /info fields
+    # (HttpProxy, HttpsProxy, NoProxy) as well; a host configured solely
+    # through dockerd's daemon configuration or systemd environment leaves
+    # the nested objects empty, so info itself is a source too.
+    sources.append(info)
     registry_config = info.get("RegistryConfig")
     if isinstance(registry_config, dict):
         sources.append(registry_config)
@@ -1141,12 +1239,12 @@ async def throttled_image_pull_events(
             # file; there the override must be omitted.
             security = daemon_info.get("SecurityOptions") or []
             options = [str(item) for item in security]
-            # Daemon.Info reports remapping as the literal SecurityOptions
-            # entries "name=rootless" and "name=name=userns" (the doubled
-            # prefix is how moby emits the userns marker), so match exactly.
+            # Moby emits the userns marker as "name=userns"; the doubled
+            # "name=name=userns" spelling came from a historical daemon-info
+            # bug that old engines still ship, so treat either as remapped.
             if "name=rootless" in options:
                 pass
-            elif "name=name=userns" in options:
+            elif "name=userns" in options or "name=name=userns" in options:
                 # Rootful userns-remap: bind mounts keep host permissions the
                 # remapped container UID cannot use, so the 0700 staging
                 # directory and 0600 auth file are unusable no matter which

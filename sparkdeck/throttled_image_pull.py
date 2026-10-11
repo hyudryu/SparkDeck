@@ -358,7 +358,11 @@ def _auth_entry(docker_config: dict, registry_host: str) -> dict | None:
         key_host = str(key).removeprefix("https://").removeprefix("http://")
         key_host = key_host.partition("/")[0].lower()
         if key_host in _registry_aliases(registry_host) and isinstance(entry, dict):
-            if entry.get("auth"):
+            # containers/image's Docker-config parser honors both ``auth``
+            # and an identity-token login; requiring ``auth`` would run
+            # skopeo anonymously for identitytoken-only logins that the
+            # daemon itself can use.
+            if entry.get("auth") or entry.get("identitytoken"):
                 return entry
     return None
 
@@ -699,7 +703,26 @@ async def throttled_image_pull_events(
                 ) or []
             except Exception:
                 security = []
-            if "name=rootless" not in [str(item) for item in security]:
+            options = [str(item) for item in security]
+            # Daemon.Info reports remapping as the literal SecurityOptions
+            # entries "name=rootless" and "name=name=userns" (the doubled
+            # prefix is how moby emits the userns marker), so match exactly.
+            if "name=rootless" in options:
+                pass
+            elif "name=name=userns" in options:
+                # Rootful userns-remap: bind mounts keep host permissions the
+                # remapped container UID cannot use, so the 0700 staging
+                # directory and 0600 auth file are unusable no matter which
+                # user the container runs as. Omitting the override would
+                # merely replace a confusing denial, and making it work would
+                # need world-writable staging and a world-readable credential
+                # copy; refuse with the actionable knob instead.
+                raise ThrottledPullError(
+                    "bandwidth-limited pulls cannot run on a Docker daemon "
+                    "with userns-remap; set the download bandwidth limit to "
+                    "0 on this node"
+                )
+            else:
                 user = f"{os.getuid()}:{os.getgid()}"
         copy = await _run_docker(
             client, "create_container",

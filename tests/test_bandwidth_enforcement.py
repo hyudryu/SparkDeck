@@ -501,7 +501,10 @@ class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
         return m
 
     async def test_capped_member_deadline_covers_the_model_bytes(self):
-        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+        from sparkdeck.download_throttle import (
+            CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+            capped_transfer_timeout_seconds,
+        )
 
         m = self._manager()
         await m._create_member("ws1", {
@@ -512,10 +515,14 @@ class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
         m.virtual_nas.estimate_download_size.assert_awaited_once_with(
             "org/model", "v2.0", explicit_token="tok",
         )
+        # The launch also pulls a missing runtime image, whose size is not
+        # known yet, so the image allowance rides on top of the model bytes.
         self.assertEqual(
             m.node_registry.request.await_args.kwargs["timeout"],
             capped_transfer_timeout_seconds(
-                25.0, 70 * 1024 ** 3, default=1800,
+                25.0,
+                70 * 1024 ** 3 + CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+                default=1800,
             ),
         )
 
@@ -531,7 +538,10 @@ class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_unknown_size_falls_back_to_the_allowance(self):
-        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+        from sparkdeck.download_throttle import (
+            CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+            capped_transfer_timeout_seconds,
+        )
 
         m = self._manager()
         m.virtual_nas.estimate_download_size = AsyncMock(
@@ -543,7 +553,9 @@ class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(
             m.node_registry.request.await_args.kwargs["timeout"],
-            capped_transfer_timeout_seconds(25.0, 0, default=1800),
+            capped_transfer_timeout_seconds(
+                25.0, CAPPED_UNKNOWN_BYTES_ALLOWANCE, default=1800,
+            ),
         )
 
 

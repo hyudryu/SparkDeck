@@ -138,6 +138,16 @@ class AuthEntryTests(unittest.TestCase):
         self.assertEqual(_auth_entry(config, "docker.io"), {"auth": "eA=="})
         self.assertIsNone(_auth_entry(config, "ghcr.io"))
 
+    def test_identitytoken_only_login_is_returned(self):
+        # The daemon can pull with an identity token alone; the helper must
+        # not downgrade such a login to anonymous just because ``auth`` is
+        # absent.
+        entry = {"auths": {"ghcr.io": {"identitytoken": "gho_token"}}}
+        self.assertEqual(
+            _auth_entry(entry, "ghcr.io"), {"identitytoken": "gho_token"},
+        )
+        self.assertIsNone(_auth_entry({"auths": {"ghcr.io": {}}}, "ghcr.io"))
+
     def test_registry_port_key_matches_and_empty_auth_ignored(self):
         # Auth keys are host[:port], sometimes with a trailing path like
         # index.docker.io/v1/; the port must not be lost when comparing.
@@ -628,6 +638,31 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.collect(api)
         # Unknown daemon mode must behave exactly like today's rootful path.
         self.assertEqual(copy_kwargs(api).get("user"), "4242:4242")
+
+    async def test_userns_remap_daemon_refuses_the_capped_pull(self):
+        # Rootful userns-remap maps container root to a subordinate UID, and
+        # bind mounts keep host permissions, so the 0700 staging directory
+        # and 0600 auth file are unusable under any container user. Refuse
+        # up front with the actionable knob instead of failing mid-pull.
+        api = FakeDockerApi(security_options=[
+            "name=name=userns", "name=seccomp,profile=default",
+        ])
+        with (
+            patch.object(tip.os, "name", "posix"),
+            patch.object(tip.os, "getuid", return_value=1000, create=True),
+            patch.object(tip.os, "getgid", return_value=1000, create=True),
+        ):
+            events, _ = await self.collect(api)
+        errors = [event for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("userns-remap", errors[0]["error"])
+        self.assertFalse(
+            [
+                created for created in api.created
+                if created.get("image") == SKOPEO_IMAGE
+                and list(created.get("command") or [])[:1] == ["copy"]
+            ],
+        )
 
 
 class HelperBootstrapTests(unittest.IsolatedAsyncioTestCase):

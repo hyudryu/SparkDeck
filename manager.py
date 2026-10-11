@@ -66,6 +66,7 @@ from sparkdeck.runtime_environment import (
     normalize_runtime_environment,
 )
 from sparkdeck.download_throttle import (
+    CAPPED_UNKNOWN_BYTES_ALLOWANCE,
     IMAGE_PULL_BANDWIDTH_CAPABILITY,
     bandwidth_bytes_per_second,
     capped_transfer_timeout_seconds,
@@ -7190,14 +7191,18 @@ class Manager:
             capped = False
         if capped:
             try:
-                expected_bytes = await self.virtual_nas.estimate_download_size(
+                model_bytes = await self.virtual_nas.estimate_download_size(
                     str(payload.get("model") or ""),
                     self._cli_option(payload.get("extra_args") or [], {"--revision"})
                     or "main",
                     explicit_token=self._resolved_hf_token(),
                 )
             except Exception:
-                expected_bytes = 0
+                model_bytes = 0
+            # The launch also pulls a missing runtime image (multi-GiB CUDA
+            # runtimes dwarf small models), so keep the unknown-size image
+            # allowance on top of the model's own bytes.
+            expected_bytes = model_bytes + CAPPED_UNKNOWN_BYTES_ALLOWANCE
         try:
             return await self.node_registry.request(
                 node_id,

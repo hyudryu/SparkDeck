@@ -19,6 +19,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -65,10 +66,19 @@ from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
 )
+from sparkdeck.download_throttle import (
+    CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+    IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    acquire_dispatch_slot,
+    bandwidth_bytes_per_second,
+    capped_transfer_timeout_seconds,
+    parse_bandwidth_mbps,
+)
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
     VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
@@ -106,6 +116,11 @@ DEFAULT_SETTINGS = {
     # Stored server-side and never returned by the settings/state APIs. An
     # empty value falls back to the process environment or the HF cache token.
     "hf_token": "",
+    # Cluster-wide cap for pulling weights and images from the internet, in
+    # megabits per second; 0 disables limiting. The controller sends this to
+    # agent-side download jobs, and image pulls run through a throttled
+    # helper path when it is set.
+    "max_download_bandwidth_mbps": 0.0,
     "port_range_start": 8000,
     "port_range_end": 8099,
     "shm_size": "16g",
@@ -468,6 +483,10 @@ STRATA_VOLUME_LABEL = "io.sparkdeck.strata-deployment"
 # stamped on the container so teardown can find the volume even though a
 # cluster member's DEPLOYMENT_LABEL is the per-launch Manager deployment id.
 STRATA_VOLUME_KEY_LABEL = "io.sparkdeck.strata-volume-key"
+# Stamped inside the /data volume by _begin_strata_prepared_marker once the
+# engine first serves; a capped relaunch requires it as proof that the
+# entrypoint's uncappable setup pass finished (volume existence is not).
+STRATA_PREPARED_MARKER = "/data/.sparkdeck-prepared"
 SERVED_MODEL_LABEL = "io.sparkdeck.served-model"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
@@ -954,6 +973,16 @@ class Manager:
         self._deployment_pricing_lock = asyncio.Lock()
         self._host_port_reservation_lock = asyncio.Lock()
         self._host_port_reservations: set[int] = set()
+        # One capped internet transfer runs at a time on this node: the
+        # configured bandwidth is a node-wide budget, so a concurrent image
+        # pull and Hub download must not each spend the full rate. Virtual
+        # NAS download workers take the same lock (passed at construction).
+        self.internet_transfer_lock = asyncio.Lock()
+        # Every controller-dispatched download is sent the full node-wide
+        # cap and lands on a different agent, so per-node locks cannot
+        # coordinate them: dispatches run one at a time cluster-wide. The
+        # Virtual NAS queue takes the same lock (passed at construction).
+        self.dispatched_download_lock = asyncio.Lock()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -976,6 +1005,11 @@ class Manager:
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
             self._resolved_hf_token,
             ownership_reclaimer=self._reclaim_model_cache_ownership,
+            download_bandwidth_provider=lambda: self.settings.get(
+                "max_download_bandwidth_mbps", 0,
+            ),
+            internet_transfer_lock=self.internet_transfer_lock,
+            dispatched_download_lock=self.dispatched_download_lock,
         )
         # Embedding inference keeps its own virtual environment and worker
         # processes: the controller's dependency set stays untouched, and a
@@ -1400,6 +1434,8 @@ class Manager:
                 VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
+                IMAGE_PULL_BANDWIDTH_CAPABILITY,
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
@@ -3203,8 +3239,8 @@ class Manager:
         cleaned = [str(value) for value in files if isinstance(value, str) and value]
         return cleaned or None
 
-    async def node_supports_selective_downloads(self, node_id: str) -> bool:
-        """Report whether one node's live agent advertises selective downloads.
+    async def node_supports_capability(self, node_id: str, capability: str) -> bool:
+        """Report whether one node's live agent advertises one capability.
 
         Capability advertisements only exist in the agent's health response;
         the persisted pairing record never carries them, so the check must
@@ -3219,7 +3255,17 @@ class Manager:
         ), None)
         if node is None:
             return False
-        return VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY in (node.get("capabilities") or [])
+        return capability in (node.get("capabilities") or [])
+
+    async def node_supports_selective_downloads(self, node_id: str) -> bool:
+        return await self.node_supports_capability(
+            node_id, VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+        )
+
+    async def node_supports_download_bandwidth(self, node_id: str) -> bool:
+        return await self.node_supports_capability(
+            node_id, VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
+        )
 
     async def node_has_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
@@ -3239,6 +3285,24 @@ class Manager:
             timeout=60,
         )
         return bool((result or {}).get("complete"))
+
+    @asynccontextmanager
+    async def _dispatched_download_slot(self, capped: bool):
+        """Hold the cluster-wide dispatch budget for one capped operation.
+
+        Every controller dispatch sends the full node-wide cap to its target
+        agent, so concurrent dispatches to different nodes would multiply the
+        configured budget. Unlimited dispatches never hold the slot. Bare
+        test fixtures may lack the lock; then there is nothing to serialize.
+        The slot is reentrant within one operation's task tree (a gathered
+        member launch is not an independent budget consumer), so a
+        deployment fan-out can hold it across nested seed/pull requests
+        without deadlocking on its own lock.
+        """
+        async with acquire_dispatch_slot(
+            getattr(self, "dispatched_download_lock", None), capped,
+        ):
+            yield
 
     async def node_download_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
@@ -3262,18 +3326,59 @@ class Manager:
         # to whatever worker-local token exists.
         # Track controller-dispatched downloads even when the destination
         # still runs an older agent without its own update admission guard.
+        download_body = {
+            "revision": revision,
+            "requested_revision": requested_revision or revision,
+            "hf_token": self._resolved_hf_token() or "",
+            "files": list(filenames),
+        }
+        bandwidth_mbps = self.virtual_nas._download_bandwidth_mbps()
+        # The request names its exact files and the selected-file estimate
+        # exists, so size the deadline from those bytes: the unknown-size
+        # allowance only covers ~32 GiB at the capped rate, which would
+        # report a healthy multi-shard GGUF seed as failed and dispatch a
+        # duplicate candidate while the agent's uncancelable download runs.
+        selected_bytes = 0
+        if bandwidth_mbps > 0:
+            try:
+                selected_bytes = await self.virtual_nas.estimate_selected_files_size(
+                    model_id, revision, list(filenames),
+                    explicit_token=self._resolved_hf_token() or None,
+                )
+            except Exception:
+                selected_bytes = 0
+        supports_bandwidth = await self.node_supports_download_bandwidth(node_id)
+        if supports_bandwidth:
+            # Explicit 0 overrides a stale node-local cap; old agents reject
+            # the field, so only they keep it omitted.
+            download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+        elif bandwidth_mbps > 0:
+            # An older agent would apply its node-local (usually unlimited)
+            # setting and silently bypass the cluster cap.
+            raise RuntimeError(
+                f"node '{node_id}' cannot enforce the download bandwidth "
+                "limit; upgrade its SparkDeck agent or set the limit to 0"
+            )
+        # Like the queued paths, a dispatched download carries the full
+        # node-wide cap: hold the cluster dispatch slot so a concurrent
+        # image fan-out or queued weight download cannot double the budget.
         with self.virtual_nas.transfer_operation(model_id):
-            return await self.virtual_nas._await_uncancelable(self.node_registry.request(
-                node_id, "POST",
-                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
-                json_body={
-                    "revision": revision,
-                    "requested_revision": requested_revision or revision,
-                    "hf_token": self._resolved_hf_token() or "",
-                    "files": list(filenames),
-                },
-                timeout=24 * 60 * 60,
-            ))
+            async with self._dispatched_download_slot(bandwidth_mbps > 0):
+                return await self.virtual_nas._await_uncancelable(
+                    self.node_registry.request(
+                        node_id, "POST",
+                        f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
+                        json_body=download_body,
+                        # A fixed 24 h would fail ordinary GGUF artifacts at
+                        # the smallest supported cap (~1 GB at 0.1 Mbps);
+                        # scale the deadline with the rate like the queued
+                        # paths do.
+                        timeout=capped_transfer_timeout_seconds(
+                            bandwidth_mbps, selected_bytes,
+                            default=24 * 60 * 60, floor=24 * 60 * 60,
+                        ),
+                    )
+                )
 
     async def node_transfer_model_files(
         self, source_node_id: str, target_node_id: str,
@@ -7119,13 +7224,62 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
+        # The member launch may pull its runtime image at the stamped cap
+        # share, and the agent prefetches the complete model snapshot before
+        # the request returns. Size the deadline with the model's expected
+        # bytes: the unknown-size allowance only covers ~32 GiB at the
+        # configured rate, which would cancel a normal 70B prefetch that is
+        # still making progress.
+        member = payload.get("cluster_member") or {}
+        share_mbps = member.get("image_pull_bandwidth_mbps")
+        expected_bytes = 0
+        try:
+            capped = float(share_mbps) > 0
+        except (TypeError, ValueError):
+            capped = False
+        if capped:
+            model = str(payload.get("model") or "")
+            launch_args = list(payload.get("extra_args") or [])
+            try:
+                model_bytes = await self.virtual_nas.estimate_download_size(
+                    model,
+                    self._cli_option(launch_args, {"--revision"}) or "main",
+                    explicit_token=self._resolved_hf_token(),
+                )
+            except Exception:
+                model_bytes = 0
+            # The agent also prefetches secondary repositories (--tokenizer
+            # copy, speculative draft) before answering, and it resolves
+            # environment-backed --speculative-config the same way, so the
+            # deadline must budget those too or a healthy draft download past
+            # the allowance gets reported as a failed launch.
+            try:
+                scannable = self._resolve_environment_backed_speculative_args(
+                    launch_args, dict(payload.get("environment") or {}),
+                )
+            except Exception:
+                scannable = launch_args
+            for secondary in self._secondary_repo_ids(scannable, {model}):
+                try:
+                    model_bytes += await self.virtual_nas.estimate_download_size(
+                        secondary, "main",
+                        explicit_token=self._resolved_hf_token(),
+                    )
+                except Exception:
+                    pass
+            # The launch also pulls a missing runtime image (multi-GiB CUDA
+            # runtimes dwarf small models), so keep the unknown-size image
+            # allowance on top of the model's own bytes.
+            expected_bytes = model_bytes + CAPPED_UNKNOWN_BYTES_ALLOWANCE
         try:
             return await self.node_registry.request(
                 node_id,
                 "POST",
                 "/api/agent/containers",
                 json_body=payload,
-                timeout=1800,
+                timeout=capped_transfer_timeout_seconds(
+                    share_mbps, expected_bytes, default=1800,
+                ),
             )
         finally:
             # Preflight may have cached this node before the member existed.
@@ -8587,6 +8741,12 @@ class Manager:
         (the group's first node) and master port, so every group is a
         complete tensor-parallel engine behind the shared served name.
         """
+        # Every member pulls its runtime image as it launches; divide the
+        # controller's cap across this fan-out so concurrent member pulls
+        # cannot multiply the configured cluster-wide download budget.
+        pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        cluster_pull_mbps = self._image_pull_cluster_cap_mbps()
+        self._require_bandwidth_capable_nodes(node_ids, available)
         tasks: list = []
         member_specs: list[dict] = []
         existing_by_node = {
@@ -8625,6 +8785,16 @@ class Manager:
                         "serve_port": member_port,
                         "fabric_ip": fabric_ip,
                         "fabric_interface": fabric_interface,
+                        "image_pull_bandwidth_mbps": pull_share_mbps,
+                        # Re-rate anchor for the member's runtime-image
+                        # pull: the controller's full cap, so a settings
+                        # change mid-launch scales the member share of
+                        # the new cap, not the agent's own setting.
+                        "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
+                        # Fan-out width so a later launch phase can re-divide
+                        # the current cap instead of trusting the stamped
+                        # launch-time share.
+                        "image_pull_fanout_width": len(node_ids),
                     },
                 })
                 if engine == "vllm":
@@ -8776,6 +8946,11 @@ class Manager:
                 tensor_parallel_size=int(body.get("tensor_parallel_size") or 1),
                 instances=int(body.get("instances") or 1),
             )
+        # Non-grouped fan-out: divide the controller cap across members just
+        # like the grouped builder does above.
+        pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        cluster_pull_mbps = self._image_pull_cluster_cap_mbps()
+        self._require_bandwidth_capable_nodes(node_ids, available)
         for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
             member_port = local_port if node_id == LOCAL_NODE_ID else None
@@ -8795,6 +8970,12 @@ class Manager:
                     "serve_port": member_port,
                     "fabric_ip": fabric_ip,
                     "fabric_interface": fabric_interface,
+                    "image_pull_bandwidth_mbps": pull_share_mbps,
+                    "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
+                    # Fan-out width so a later launch phase can re-divide
+                    # the current cap instead of trusting the stamped
+                    # launch-time share.
+                    "image_pull_fanout_width": len(node_ids),
                 },
             })
             if mode == "sharded":
@@ -8867,7 +9048,16 @@ class Manager:
         if launch_persisted is not None and not launch_persisted.done():
             launch_persisted.set_result(deployment)
 
-        created = await asyncio.gather(*tasks, return_exceptions=True)
+        # Every member launch pulls its runtime image (at this deployment's
+        # divided share) and seeds weights through the capped paths. Hold the
+        # cluster dispatch slot for the whole capped fan-out: a second
+        # deployment or a queued transfer on another node must not move a
+        # second full budget concurrently. Member prefetches nested under
+        # this task tree pass through the reentrant slot.
+        async with self._dispatched_download_slot(
+            self._cluster_image_pull_share_mbps(max(1, len(node_ids))) > 0,
+        ):
+            created = await asyncio.gather(*tasks, return_exceptions=True)
         errors = []
         model_sources = []
         for spec, result in zip(member_specs, created):
@@ -10034,7 +10224,15 @@ class Manager:
             )
             self._save_deployments()
 
-            created = await asyncio.gather(*tasks, return_exceptions=True)
+            # Same cluster budget rule as the primary launch fan-out: the
+            # added group's capped image pulls and prefetches hold the
+            # dispatch slot for their duration.
+            async with self._dispatched_download_slot(
+                self._cluster_image_pull_share_mbps(
+                    max(1, len(requested)),
+                ) > 0,
+            ):
+                created = await asyncio.gather(*tasks, return_exceptions=True)
             errors = []
             for spec, result in zip(member_specs, created):
                 if isinstance(result, Exception):
@@ -12073,6 +12271,20 @@ class Manager:
         return self.public_settings()
 
     async def update_settings(self, data: dict) -> dict:
+        # Validate the bandwidth cap before mutating anything: a payload can
+        # carry several keys, and a rejected cap must not leave earlier keys
+        # already applied to the live settings object.
+        try:
+            old_bandwidth_mbps = float(
+                self.settings.get("max_download_bandwidth_mbps", 0) or 0,
+            )
+        except (TypeError, ValueError):
+            old_bandwidth_mbps = 0.0
+        if "max_download_bandwidth_mbps" in data:
+            data = dict(data)
+            data["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(
+                data["max_download_bandwidth_mbps"],
+            )
         async with self.lock:
             for k, v in data.items():
                 # Dashboard visibility is presentation-only node state. Keep
@@ -12091,7 +12303,59 @@ class Manager:
             self.virtual_nas.start()
         elif not self.settings.get("virtual_nas_enabled"):
             await self.virtual_nas.stop()
-        return self.public_settings()
+        if (
+            "max_download_bandwidth_mbps" in data
+            and self._image_pull_bytes_per_second(None) > 0
+        ):
+            self._prefetch_pull_helper_images()
+        result = self.public_settings()
+        if "max_download_bandwidth_mbps" in data:
+            new_bandwidth_mbps = float(
+                data["max_download_bandwidth_mbps"] or 0,
+            )
+            if new_bandwidth_mbps != old_bandwidth_mbps:
+                # Re-rate transfers already in flight (capped ones watch a
+                # rate file) and push the new cap to agents so their own
+                # in-flight transfers re-rate as well.
+                self.apply_bandwidth_cap_live(new_bandwidth_mbps)
+                self._schedule_agents_bandwidth_notify(new_bandwidth_mbps)
+                if old_bandwidth_mbps <= 0 < new_bandwidth_mbps:
+                    # A transfer that started unlimited cannot adopt the cap
+                    # mid-run (its worker chose Xet and skipped the socket
+                    # throttle; an unlimited pull used the daemon path), so
+                    # do not report the new value as effective for it.
+                    try:
+                        running = sum(
+                            1 for job in self.virtual_nas.list_transfers()["items"]
+                            if job.get("status") == "running"
+                        )
+                    except Exception:
+                        running = 0
+                    if running:
+                        result["bandwidth_running_note"] = (
+                            f"{running} transfer(s) already in flight started "
+                            "without a limit and finish uncapped; the new "
+                            "limit applies from the next transfer onward."
+                        )
+        return result
+
+    def _prefetch_pull_helper_images(self) -> None:
+        """Best-effort pre-install of the capped pull flow's helper images.
+
+        The bootstrap pulls for SparkDeck's own pull helpers cannot be
+        rate limited (the throttle runs inside those containers), so the
+        uncapped one-time step happens at settings-save time, explicitly,
+        instead of mid-pull at the first capped request.
+        """
+        async def _run() -> None:
+            try:
+                from sparkdeck.throttled_image_pull import ensure_helper_images
+                await ensure_helper_images(self.client)
+            except Exception:
+                # A failed prefetch only defers the bootstrap to the first
+                # capped pull, which surfaces it as a progress event.
+                pass
+        self._helper_prefetch_task = asyncio.create_task(_run())
 
     # ---------- lifetime token stats ----------
     # Counters are keyed by model id plus a variant tag (quant/dtype) so the
@@ -17263,20 +17527,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[llama] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             # Resolve the in-container model path only after the image is
             # present: a custom image declaring HF_HOME mounts the cache
             # somewhere else, so the pull decides where --model must point.
@@ -17344,6 +17597,10 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="llama",
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17390,20 +17647,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[laya] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             command = [
                 "--model", model,
                 "--host", "0.0.0.0",
@@ -17480,6 +17726,20 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="laya",
+            )
+            # Laya resolves or downloads the checkpoint inside the container
+            # through the mounted shared HF cache, so prefetch it through the
+            # capped worker while a download limit is active.
+            await self._prefetch_runtime_weights(
+                model, name=name, cluster_member=cluster_member,
+                runtime="laya", hf_token=hf_token,
+                revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                extra_args=list(extra_args or []),
+                environment=dict(environment or {}),
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17534,20 +17794,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[tensorfold] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             command = [
                 "serve", model,
                 "--host", "0.0.0.0",
@@ -17614,6 +17863,19 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="tensorfold",
+            )
+            # TensorFold resolves or downloads the checkpoint inside the
+            # container through the mounted shared HF cache (it has no
+            # --revision flag, so the default branch is what it will fetch).
+            await self._prefetch_runtime_weights(
+                model, name=name, cluster_member=cluster_member,
+                runtime="tensorfold", hf_token=hf_token,
+                extra_args=list(extra_args or []),
+                environment=dict(environment or {}),
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17677,27 +17939,14 @@ class Manager:
             model=model, cluster_member=cluster_member,
         )
 
-        def _ensure_image():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[ninfer] pulling missing image: {image}")
-                self.client.images.pull(image)
-
         try:
             # Confirm the image is usable and the artifact is cached BEFORE
             # evicting other engines: a missing image or artifact must fail
             # without stopping healthy chat backends.
-            await asyncio.to_thread(_ensure_image)
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="ninfer",
+            )
             # Resolve the in-container artifact path only after the image is
             # present: a custom image declaring HF_HOME mounts the cache
             # somewhere else, so the pull decides where the artifact must
@@ -17955,6 +18204,124 @@ class Manager:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
+    def _require_strata_weights_prepared(
+        self, deployment_key: str, environment, image_identity: str,
+        cluster_member: dict | None = None,
+    ) -> None:
+        """Refuse a capped launch unless the model pack's setup is done.
+
+        A first launch (or any config change, which lands in a fresh
+        fingerprinted volume) downloads the pinned checkpoint inside the
+        container from a repository only the upstream entrypoint knows, so
+        SparkDeck can neither prefetch it under the cap nor shape the
+        container's egress. Refuse instead of silently overrunning the
+        limit. Two things decide "capped": the controller's stamped share
+        (authoritative when present — an agent still at the unlimited
+        default must not wave a capped launch through) and the node-local
+        setting otherwise. Volume existence is NOT proof of a completed
+        setup — ``_strata_data_volume`` creates the volume before the
+        container ever runs, so an interrupted launch leaves an empty one —
+        the proof is the completion marker that a prior launch stamps
+        inside the volume once the engine first serves.
+        """
+        share = self._image_pull_share_mbps(cluster_member)
+        if share is not None:
+            if share <= 0:
+                return
+        elif self._image_pull_bytes_per_second(None) <= 0:
+            return
+        name = (
+            f"{self._strata_volume_prefix(deployment_key)}-"
+            f"{self._strata_setup_fingerprint(environment, image_identity)}"
+        )
+        try:
+            self.client.volumes.get(name)
+        except docker.errors.NotFound:
+            raise RuntimeError(
+                "Strata downloads its model pack inside the container on "
+                "first launch, which the bandwidth limit cannot cover; set "
+                "the download limit to 0 for this launch, then restore it"
+            )
+        if not self._strata_prepared_marker_present(image_identity, name):
+            raise RuntimeError(
+                "Strata cannot confirm this model pack finished preparing, "
+                "so a resumed checkpoint download might overrun the "
+                "bandwidth limit; set the download limit to 0 for one "
+                "launch, then restore it"
+            )
+
+    def _strata_prepared_marker_present(self, image: str, volume_name: str) -> bool:
+        """Probe the completion marker with a one-shot helper container.
+
+        The marker proves a previous launch's setup pass completed; a probe
+        error is treated as "not proven", because under a cap the only safe
+        default is to refuse and tell the user to run once uncapped.
+        """
+        try:
+            self.client.containers.run(
+                image,
+                command=["-c", f"test -f {STRATA_PREPARED_MARKER}"],
+                entrypoint=["sh"],
+                volumes={volume_name: {"bind": "/data", "mode": "ro"}},
+                detach=False, stream=False, remove=True,
+                network_disabled=True,
+                labels={CONTROLLER_LABEL: "1"},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _begin_strata_prepared_marker(
+        self, container_name: str, model: str, volume_name: str,
+    ) -> None:
+        """Stamp the in-volume completion marker once the engine serves.
+
+        Readiness is the only proof the upstream entrypoint finished its
+        setup pass: the server binds only after the pack is complete. The
+        write is best-effort (exec ``touch`` in the live container); a
+        failed write simply means the next capped relaunch asks for one
+        uncapped launch instead of guessing.
+        """
+        async def watch():
+            try:
+                # Capped first launches of multi-hundred-GB packs on a
+                # shaped uplink can run for a day or more; poll until the
+                # engine answers or the task outlives its usefulness.
+                for _ in range(48 * 60 * 2):
+                    try:
+                        if await self.inference_target_health(
+                            model, container_name=container_name,
+                            single_target=True,
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                else:
+                    return
+                await asyncio.to_thread(
+                    self._write_strata_prepared_marker, container_name,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        tasks = getattr(self, "_strata_marker_tasks", None)
+        if tasks is None:
+            tasks = self._strata_marker_tasks = set()
+        task = asyncio.create_task(watch())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _write_strata_prepared_marker(self, container_name: str) -> None:
+        exec_handle = self.client.api.exec_create(
+            container_name, ["sh", "-c", f"touch {STRATA_PREPARED_MARKER}"],
+        )
+        self.client.api.exec_start(exec_handle["Id"], demux=True)
+        if self.client.api.exec_inspect(exec_handle["Id"]).get("ExitCode") != 0:
+            raise RuntimeError("Strata marker exec exited nonzero")
+
     def _strata_data_volume(
         self, deployment_key: str, environment, image: str | None = None,
     ) -> str:
@@ -18094,9 +18461,9 @@ class Manager:
                     f"{_STRATA_DEFAULT_IMAGE_MIN_DRIVER} or "
                     f"newer; this node reports {version}"
                 )
-        # Strata takes the node's GPU for its CUDA context, so other chat
-        # engines must be evicted before the CUDA context is created.
-        await self.evict_other_backends(protect="strata")
+        # Eviction is deferred until this launch is proven able to proceed
+        # (see the cap guard below); port and name allocation do not touch
+        # the GPU.
         if port is None:
             port = await self._allocate_port()
         if name is None:
@@ -18120,28 +18487,15 @@ class Manager:
             model=model, cluster_member=cluster_member,
         )
 
-        def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                image_info = self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[strata] pulling missing image: {image}")
-                image_info = self.client.images.pull(image)
-            # The daemon-resolved image ID is the pack's real identity: a
-            # refreshed mutable tag (notably the default :latest) must
-            # invalidate a prepared volume even though its name is unchanged.
-            image_id = getattr(image_info, "id", None)
-            image_identity = (
-                image_id if isinstance(image_id, str) and image_id else image
-            )
+        # _create runs in a worker thread; this holder carries the created
+        # volume back so the async scope can start the completion-marker
+        # watcher once the container is live.
+        prepared_watch: dict[str, str] = {}
+
+        def _create(image_identity):
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below, whose resolved identity
+            # resolves the pack volume name before eviction already ran.
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",
                 model=model, cluster_member=cluster_member,
@@ -18174,7 +18528,8 @@ class Manager:
             # upstream entrypoint ignores new CONTEXT/KV/... values while a
             # saved config exists, so a config-affecting edit lands in a
             # fresh volume whose setup runs with the new settings, while an
-            # unchanged relaunch reuses the prepared pack.
+            # unchanged relaunch reuses the prepared pack. The cap guard
+            # already ran before eviction in the async scope above.
             data_volume = self._strata_data_volume(
                 deployment_key, environment, image_identity,
             )
@@ -18226,13 +18581,43 @@ class Manager:
             # The old fingerprint's volume is now unreachable; reclaim its
             # disk once the replacement container is live.
             self._prune_strata_data_volumes(deployment_key, data_volume)
+            prepared_watch["volume"] = data_volume
             summary = self._container_summary(container)
             if summary is not None:
                 summary["model_source"] = "public_repository"
             return summary
 
         try:
-            return await asyncio.to_thread(_create)
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="strata",
+            )
+            # The daemon-resolved image ID is the pack's real identity: a
+            # refreshed mutable tag (notably the default :latest) must
+            # invalidate a prepared volume even though its name is unchanged.
+            image_info = await asyncio.to_thread(self.client.images.get, image)
+            image_id = getattr(image_info, "id", None)
+            image_identity = (
+                image_id if isinstance(image_id, str) and image_id else image
+            )
+            # The cap/marker precondition runs BEFORE any eviction: a first
+            # capped launch (or a changed fingerprint) is expected to be
+            # refused here, and a refused launch must not take healthy
+            # engines offline first.
+            await asyncio.to_thread(
+                self._require_strata_weights_prepared, deployment_key,
+                environment, image_identity, cluster_member,
+            )
+            # Strata takes the node's GPU for its CUDA context, so the other
+            # chat engines are evicted only once this launch will proceed —
+            # and still before the CUDA context is created inside _create.
+            await self.evict_other_backends(protect="strata")
+            summary = await asyncio.to_thread(_create, image_identity)
+            if prepared_watch.get("volume"):
+                self._begin_strata_prepared_marker(
+                    name, model, prepared_watch["volume"],
+                )
+            return summary
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
             self._cluster_launch_update(
@@ -18399,31 +18784,9 @@ class Manager:
             )
 
             def _create():
-                # docker-py does not pull a missing image as part of
-                # containers.run().  SGLang recipes use a separate default
-                # image, so make the first launch self-contained.
-                try:
-                    self._cluster_launch_update(
-                        name, "checking_image", f"Checking Docker image {image}",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    if recipe_launch is not None:
-                        recipe_launch.update({
-                            "phase": "Checking SGLang image", "image": image,
-                        })
-                    self.client.images.get(image)
-                except docker.errors.ImageNotFound:
-                    self._cluster_launch_update(
-                        name, "pulling_image",
-                        f"Downloading Docker image {image}; this can take several minutes",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    if recipe_launch is not None:
-                        recipe_launch.update({
-                            "phase": "Downloading SGLang image", "image": image,
-                        })
-                    print(f"[sglang] pulling missing image: {image}")
-                    self.client.images.pull(image)
+                # The image is guaranteed present by the capped
+                # _ensure_runtime_image step below.
+                self.client.images.get(image)
                 self._cluster_launch_update(
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
@@ -18505,6 +18868,20 @@ class Manager:
                     )
                 return summary
             try:
+                await self._ensure_runtime_image(
+                    image, name, model=model, cluster_member=cluster_member,
+                    runtime="sglang",
+                    on_pull=(lambda: recipe_launch.update({
+                        "phase": "Downloading SGLang image", "image": image,
+                    })) if recipe_launch is not None else None,
+                )
+                await self._prefetch_runtime_weights(
+                    model, name=name, cluster_member=cluster_member,
+                    runtime="sglang", hf_token=hf_token,
+                    revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                    extra_args=list(extra_args or []),
+                    environment=runtime_environment,
+                )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
                 safe_error = self._redact_hf_secret(exc, hf_token)
@@ -18572,20 +18949,9 @@ class Manager:
                 cmd[8] = str(gpu_memory_utilization)  # --gpu-memory-utilization value
 
             def _create():
-                try:
-                    self._cluster_launch_update(
-                        name, "checking_image", f"Checking Docker image {image}",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    self.client.images.get(image)
-                except docker.errors.ImageNotFound:
-                    self._cluster_launch_update(
-                        name, "pulling_image",
-                        f"Downloading Docker image {image}; this can take several minutes",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    print(f"[vllm] pulling missing image: {image}")
-                    self.client.images.pull(image)
+                # The image is guaranteed present by the capped
+                # _ensure_runtime_image step below.
+                self.client.images.get(image)
                 self._cluster_launch_update(
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
@@ -18673,6 +19039,22 @@ class Manager:
                     )
                 return summary
             try:
+                await self._ensure_runtime_image(
+                    image, name, model=model, cluster_member=cluster_member,
+                    runtime="vllm",
+                )
+                await self._prefetch_runtime_weights(
+                    model, name=name, cluster_member=cluster_member,
+                    runtime="vllm", hf_token=hf_token,
+                    revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                    # Pass the RESOLVED launch args: with
+                    # --speculative-config ${ENV_VAR} the raw value is the
+                    # reference, so the secondary-repo scan would skip the
+                    # draft repository and the container would download it
+                    # outside the cap.
+                    extra_args=list(extra),
+                    environment=runtime_environment,
+                )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
                 safe_error = self._redact_hf_secret(exc, hf_token)
@@ -19649,9 +20031,159 @@ class Manager:
             "results": results,
         }
 
-    async def pull_image_stream(self, image: str):
+    def _image_pull_bytes_per_second(
+        self, bandwidth_mbps: float | None = None,
+    ) -> float:
+        """Resolve the effective image-pull cap to bytes per second.
+
+        ``None`` falls back to this node's setting; an unparseable persisted
+        value reads as unlimited rather than failing the pull.
+        """
+        value = bandwidth_mbps if bandwidth_mbps is not None else (
+            self.settings.get("max_download_bandwidth_mbps", 0)
+        )
+        try:
+            return bandwidth_bytes_per_second(value)
+        except ValueError:
+            return 0.0
+
+    def apply_bandwidth_cap_live(self, bandwidth_mbps: float) -> None:
+        """Re-rate the transfers already in flight on this node.
+
+        Capped weight workers and capped image pulls watch a rate file that
+        this rewrites. Transfers that started unlimited are not covered: a
+        weight worker chose the Xet path and skipped the socket throttle at
+        start, and an unlimited image pull used the daemon-side pull that no
+        user-space limiter can touch, so a newly enabled cap applies to them
+        not, and to every subsequent transfer in full.
+        """
+        # Remember the cap: a multi-phase member launch resolving after this
+        # point must divide the CURRENT cap across its fan-out width instead
+        # of trusting the share stamped when the launch was accepted.
+        self._live_bandwidth_cap_mbps = float(bandwidth_mbps)
+        bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
+        try:
+            self.virtual_nas.apply_download_bandwidth_cap(bytes_per_second)
+        except Exception:
+            pass
+        try:
+            from sparkdeck.throttled_image_pull import apply_bandwidth_cap
+            apply_bandwidth_cap(bytes_per_second)
+        except Exception:
+            pass
+
+    async def _notify_agents_bandwidth_cap(self, bandwidth_mbps: float) -> None:
+        """Push a changed cap to every online agent so its own in-flight
+        transfers re-rate. Agents rewrite only their registered rate files;
+        a failed call only means that node's transfers keep their
+        dispatch-time rate until they finish.
+        """
+        registry = getattr(self, "node_registry", None)
+        for node in list(getattr(registry, "nodes", None) or []):
+            node_id = str(node.get("id") or "")
+            if node_id == LOCAL_NODE_ID:
+                continue
+            # The durable pairing records never carry an "online" field;
+            # liveness exists only in probe results. Skipping on the stored
+            # dict would mark every remote node offline and silently drop
+            # the whole broadcast. Probe (cached, health-only) for liveness.
+            try:
+                status = await registry.probe(node, details=False)
+            except Exception:
+                status = {}
+            if not (isinstance(status, dict) and status.get("online")):
+                continue
+            try:
+                await registry.request(
+                    node_id, "POST", "/api/agent/bandwidth",
+                    json_body={
+                        "max_download_bandwidth_mbps": float(bandwidth_mbps),
+                    },
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    def _schedule_agents_bandwidth_notify(self, bandwidth_mbps: float) -> None:
+        """Queue a cap broadcast, coalescing rapid successive saves.
+
+        Two settings saves in quick succession must not race as two
+        independent notification tasks: whichever finished last could be
+        the OLDER value, leaving every agent parked at a stale cap. The
+        newest value is stashed in a pending slot and a single delivery
+        loop owns the wire: it sends whatever is pending, and if a newer
+        save landed while it was sending, it re-reads the slot and sends
+        again. Broadcasts therefore reach agents in save order, last one
+        always winning.
+        """
+        self._bandwidth_notify_pending = float(bandwidth_mbps)
+        task = getattr(self, "_bandwidth_notify_task", None)
+        if task is not None and not task.done():
+            return
+        self._bandwidth_notify_task = asyncio.create_task(
+            self._notify_agents_bandwidth_loop(),
+        )
+
+    async def _notify_agents_bandwidth_loop(self) -> None:
+        while True:
+            value = getattr(self, "_bandwidth_notify_pending", None)
+            if value is None:
+                return
+            self._bandwidth_notify_pending = None
+            await self._notify_agents_bandwidth_cap(value)
+
+    async def pull_image_stream(
+        self, image: str, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
+    ):
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
+        bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
+        from sparkdeck.throttled_image_pull import (
+            is_loopback_registry_image, throttled_image_pull_events,
+        )
+        # NO_PROXY is NOT exempted here: it is proxy policy, not an uplink
+        # exemption, and the daemon path it would fall to is unthrottled.
+        # The limiter dials NO_PROXY hosts directly instead (forwarded to
+        # the helper below). An insecure-registries entry is not an
+        # exemption either: it sets transport TRUST (plain HTTP / unverified
+        # TLS), not locality, so the helper keeps the pull and turns its own
+        # TLS verification off for exactly that registry. Only loopback
+        # registries are provably off the uplink and keep the daemon path.
+        if bytes_per_second > 0 and not is_loopback_registry_image(image):
+            # The daemon does registry I/O outside this process, so a capped
+            # pull runs through the throttled helper instead (see
+            # sparkdeck.throttled_image_pull) and feeds the same SSE contract.
+            # The cluster-wide cap rides along so a live settings change
+            # re-rates this pull by its allocated share: a fan-out of N
+            # members pulling at cap/N must re-rate to new_cap/N each, not
+            # to new_cap per member.
+            # The node-wide transfer lock stops a concurrent Hub download
+            # from doubling this node's internet rate. async with keeps the
+            # release owned: a request cancelled while queued to acquire
+            # never frees the holder's lock.
+            cluster_bytes_per_second = self._image_pull_bytes_per_second(
+                cluster_bandwidth_mbps,
+            )
+            lock = getattr(self, "internet_transfer_lock", None)
+            try:
+                if lock is None:
+                    async for event in throttled_image_pull_events(
+                        self.client, image, bytes_per_second,
+                        cluster_bytes_per_second=cluster_bytes_per_second,
+                    ):
+                        yield f"data: {json.dumps(event)}\n\n"
+                else:
+                    async with lock:
+                        async for event in throttled_image_pull_events(
+                            self.client, image, bytes_per_second,
+                            cluster_bytes_per_second=cluster_bytes_per_second,
+                        ):
+                            yield f"data: {json.dumps(event)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: {\"done\": true}\n\n"
+            return
 
         def producer():
             try:
@@ -19671,10 +20203,361 @@ class Manager:
                 break
             yield f"data: {json.dumps(item)}\n\n"
 
-    async def pull_image_result(self, image: str) -> dict:
+    def _require_bandwidth_capable_nodes(
+        self, node_ids: list[str], available: dict[str, dict],
+    ) -> None:
+        """Refuse a capped cluster launch on agents that cannot enforce it.
+
+        Members carry their bandwidth share in the launch payload; an older
+        same-protocol agent accepts the container request but ignores the
+        nested value and follows its previous uncapped image and weight
+        paths, so a mixed-version cluster would silently violate the cap.
+        """
+        try:
+            cap_mbps = parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            )
+        except ValueError:
+            cap_mbps = 0.0
+        if cap_mbps <= 0:
+            return
+        unsupported = [
+            str((available.get(node_id) or {}).get("name") or node_id)
+            for node_id in node_ids
+            if node_id != LOCAL_NODE_ID
+            and IMAGE_PULL_BANDWIDTH_CAPABILITY
+            not in ((available.get(node_id) or {}).get("capabilities") or [])
+        ]
+        if unsupported:
+            raise ValueError(
+                "cluster node(s) cannot enforce the download bandwidth "
+                "limit; upgrade the agent on: " + ", ".join(unsupported)
+            )
+
+    def _image_pull_cluster_cap_mbps(self) -> float:
+        """The controller's max download bandwidth setting, in Mbps."""
+        try:
+            return max(0.0, parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            ))
+        except ValueError:
+            return 0.0
+
+    def _cluster_image_pull_share_mbps(self, fanout_width: int) -> float:
+        """Controller cap divided across the members of one launch fan-out.
+
+        Always explicit (0 = unlimited) so a member agent applies the
+        controller's decision instead of a stale node-local setting.
+        """
+        cap = self._image_pull_cluster_cap_mbps()
+        if cap <= 0:
+            return 0.0
+        return cap / max(1, int(fanout_width))
+
+    def _image_pull_share_mbps(
+        self, cluster_member: dict | None = None,
+    ) -> float | None:
+        """Bandwidth override for one launch pull, in megabits per second.
+
+        A controller-fanned-out launch divides the configured cap across the
+        members of the fan-out and stamps that share on the member payload,
+        so a launch member pulls at the controller's share while the agent
+        keeps honoring its own setting for everything else.
+        """
+        share = (cluster_member or {}).get("image_pull_bandwidth_mbps")
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            return None
+        return float(share)
+
+    def _cluster_pull_bandwidth_mbps(
+        self, cluster_member: dict | None = None,
+    ) -> float | None:
+        """The controller cap stamped on a launch member's payload.
+
+        This is the re-rate denominator for the member's dispatched share;
+        None (no stamp, e.g. a standalone local launch) falls back to the
+        node's own settings reading at the use sites.
+        """
+        cluster = (cluster_member or {}).get("cluster_pull_bandwidth_mbps")
+        if isinstance(cluster, bool) or not isinstance(cluster, (int, float)):
+            return None
+        return float(cluster)
+
+    def _launch_phase_bandwidth(
+        self, cluster_member: dict | None = None,
+    ) -> tuple[float | None, float | None]:
+        """Resolve (share, cluster cap) for a NEW phase of a dispatched launch.
+
+        The member payload carries the share and cap stamped when the launch
+        was accepted. When the operator moves the cap during an earlier phase,
+        the bandwidth broadcast has already reached this node with the newest
+        controller value, so a phase that creates a fresh rate file must
+        divide THAT cap across the fan-out width: left on the launch-time
+        stamp, a cap lowered mid-launch would restore the old aggregate (four
+        members launched at cap/4 each would keep prefetching weights at the
+        old share after the cap drops). Without a current cap or a width
+        stamp, fall back to the dispatched values, matching dispatch-time
+        behavior.
+        """
+        share = self._image_pull_share_mbps(cluster_member)
+        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
+        width = (cluster_member or {}).get("image_pull_fanout_width")
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            return share, cluster_mbps
+        live = getattr(self, "_live_bandwidth_cap_mbps", None)
+        effective = live if live is not None else cluster_mbps
+        if effective is None:
+            return share, cluster_mbps
+        try:
+            effective = max(0.0, float(effective))
+        except (TypeError, ValueError):
+            return share, cluster_mbps
+        return effective / max(1, width), effective
+
+    async def _ensure_runtime_image(
+        self, image: str, name: str | None = None, model: str | None = None,
+        cluster_member: dict | None = None, runtime: str = "",
+        on_pull=None,
+    ) -> None:
+        """Pull a missing runtime image through the bandwidth-capped path.
+
+        Launchers used to call ``client.images.pull`` directly, which the
+        daemon runs uncapped. This keeps the deployment-triggered pull on the
+        same capped path as the Images page and updates the same launch
+        progress record the container-creation closure uses.
+        """
+        def _check_present() -> bool:
+            if name is not None:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+            try:
+                self.client.images.get(image)
+                return True
+            except docker.errors.ImageNotFound:
+                return False
+        if await asyncio.to_thread(_check_present):
+            return
+        if name is not None:
+            self._cluster_launch_update(
+                name, "pulling_image",
+                f"Downloading Docker image {image}; this can take several minutes",
+                model=model, cluster_member=cluster_member,
+            )
+        if on_pull is not None:
+            on_pull()
+        print(f"[{runtime}] pulling missing image: {image}")
+        # Like the weight prefetch that follows, a standalone controller-local
+        # launch dispatches this pull itself, and it holds only the node-local
+        # internet lock otherwise. The cluster-wide dispatch slot must cover it
+        # too, or a capped image download runs at the full configured rate
+        # beside a capped NAS, patch, or member operation on another node.
+        share_mbps, cluster_mbps = self._launch_phase_bandwidth(cluster_member)
+        effective_mbps = share_mbps
+        if effective_mbps is None:
+            try:
+                effective_mbps = parse_bandwidth_mbps(
+                    self.settings.get("max_download_bandwidth_mbps", 0),
+                )
+            except ValueError:
+                effective_mbps = 0.0
+        async with self._dispatched_download_slot(effective_mbps > 0):
+            await self.pull_image_result(image, share_mbps, cluster_mbps)
+
+    # Launch arguments whose VALUE is a Hugging Face repository other than
+    # the primary model. The runtime resolves these inside the container, so
+    # while a cap is active they must go through the capped worker too.
+    _SECONDARY_REPO_FLAGS = (
+        "--tokenizer", "--tokenizer-path", "--speculative-draft-model-path",
+    )
+    # Keys inside --speculative-config (a JSON argument) naming a draft model.
+    _SPECULATIVE_MODEL_KEYS = ("model", "draft_model", "draft_model_path")
+    # Operator environment variables that move the container's Hugging Face
+    # endpoint or cache location. Prefetching downloads from the default
+    # endpoint into the hub directory mounted at the image-declared default
+    # path, so while a cap is active these overrides would send the container
+    # to a different server or directory and it would re-download past the
+    # limit; the launch must refuse instead.
+    _CAP_CONFLICTING_HF_ENV_KEYS = frozenset({
+        "HF_HOME", "HF_HUB_CACHE", "HF_ENDPOINT",
+        "HUGGINGFACE_HUB_CACHE", "HUGGINGFACE_HUB_ENDPOINT",
+    })
+
+    def _secondary_repo_ids(self, extra_args, primary: set[str]) -> list[str]:
+        """HF repositories named by the launch args beyond the primary model.
+
+        A --tokenizer copy or a speculative draft model would otherwise be
+        fetched by the online container outside every SparkDeck throttle.
+        Values that are not repository ids (local directories, JSON blobs)
+        are skipped: the container reads local files without a download.
+        """
+        args = [str(item) for item in (extra_args or [])]
+        found: list[str] = []
+
+        def _add(value) -> None:
+            value = str(value or "").strip()
+            if not value or value in primary or value in found:
+                return
+            from sparkdeck.virtual_nas import validate_model_id
+            try:
+                validate_model_id(value)
+            except ValueError:
+                return
+            found.append(value)
+
+        for flag in self._SECONDARY_REPO_FLAGS:
+            _add(self._cli_option(args, {flag}))
+        spec = self._cli_option(args, {"--speculative-config"})
+        if spec:
+            try:
+                config = json.loads(str(spec))
+            except (TypeError, ValueError):
+                config = None
+            if isinstance(config, dict):
+                for key in self._SPECULATIVE_MODEL_KEYS:
+                    _add(config.get(key))
+        return found
+
+    async def _prefetch_runtime_weights(
+        self, model: str, name: str | None = None,
+        cluster_member: dict | None = None, runtime: str = "",
+        hf_token: str | None = None, revision: str | None = None,
+        extra_args: list | None = None, environment: dict | None = None,
+    ) -> None:
+        """Prepare missing HF weights through the capped worker pre-launch.
+
+        vLLM, SGLang, Laya, and TensorFold resolve the model inside the
+        runtime container, so an uncached deployment would fetch the weights
+        over the uplink outside every SparkDeck throttle. When a download cap
+        is active, each snapshot is downloaded first through the same capped
+        worker (and the node-wide transfer lock) that the Transfer queue
+        uses, into the hub directory the container mounts, so the container
+        starts offline. Repositories the launch arguments name beyond the
+        primary model (a --tokenizer copy, a speculative draft model) ride
+        the same capped path, or the online container would download them
+        past the limit. The cluster-wide dispatch slot is reserved across the
+        prefetch: a standalone local launch is a controller-dispatched capped
+        transfer, and running it beside a capped remote transfer would move
+        two full rates through one capped uplink. Strata is not covered here:
+        its entrypoint picks the checkpoint repository itself and stages it
+        into a private volume, so its launcher refuses first launches while
+        capped.
+        """
+        share, cluster_mbps = self._launch_phase_bandwidth(cluster_member)
+        if share is None:
+            try:
+                share = parse_bandwidth_mbps(
+                    self.settings.get("max_download_bandwidth_mbps", 0),
+                )
+            except ValueError:
+                share = 0.0
+        if share <= 0:
+            return
+        conflicts = sorted(
+            str(key).strip().upper() for key in (environment or {})
+            if str(key).strip().upper() in self._CAP_CONFLICTING_HF_ENV_KEYS
+        )
+        if conflicts:
+            # Not silently ignored: accepting the override would launch a
+            # container that re-downloads from the operator-chosen endpoint
+            # or cache directory, outside every throttle.
+            raise RuntimeError(
+                "the download bandwidth limit cannot be enforced together "
+                "with the runtime environment override(s) "
+                + ", ".join(conflicts)
+                + ": SparkDeck prefetches from the default Hugging Face "
+                "endpoint into the cache directory the container mounts at "
+                "its declared default path. Remove the override, or set the "
+                "download limit to 0 to let the container download directly."
+            )
+        nas = getattr(self, "virtual_nas", None)
+        if nas is None:
+            return
+        from sparkdeck.virtual_nas import _is_commit_sha, validate_model_id
+        try:
+            model_id = validate_model_id(model)
+        except ValueError:
+            # A local directory path; the container reads files directly.
+            return
+        token = self._resolved_hf_token(hf_token)
+        requested = str(revision or "").strip() or "main"
+        targets = [(model_id, requested)]
+        for secondary in self._secondary_repo_ids(extra_args, {model_id}):
+            # Secondary repositories carry no revision flag; the runtimes
+            # fetch their default branch.
+            targets.append((secondary, "main"))
+
+        def _resolve_revision(repo_id: str, want: str) -> str:
+            if _is_commit_sha(want):
+                return want
+            from huggingface_hub import HfApi
+            info = HfApi(token=token or None).model_info(
+                repo_id, revision=want,
+            )
+            return str(getattr(info, "sha", "") or "").strip()
+
+        pending: list[tuple[str, str, str]] = []
+        for repo_id, want in targets:
+            try:
+                resolved = await asyncio.to_thread(
+                    _resolve_revision, repo_id, want,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not resolve {repo_id} on Hugging Face while the "
+                    "download limit is active; set the limit to 0 to let the "
+                    "runtime container download the weights itself"
+                ) from exc
+            if not _is_commit_sha(resolved):
+                raise RuntimeError(
+                    f"Hugging Face did not report an immutable revision for "
+                    f"{repo_id} while the download limit is active"
+                )
+
+            def _cached(
+                repo_id=repo_id, resolved=resolved, want=want,
+            ) -> bool:
+                return any(
+                    item.get("model_id") == repo_id
+                    and nas._has_revision(item, resolved, want)
+                    for item in nas.inventory()
+                )
+
+            if await asyncio.to_thread(_cached):
+                continue
+            pending.append((repo_id, resolved, want))
+        if not pending:
+            return
+        # One reservation across the whole prefetch; the slot is reentrant,
+        # so a launch already holding it (cluster fan-out) passes through.
+        async with self._dispatched_download_slot(True):
+            for repo_id, resolved, want in pending:
+                if name is not None:
+                    self._cluster_launch_update(
+                        name, "downloading_weights",
+                        f"Downloading model weights {repo_id}; "
+                        "this can take a while",
+                        model=model, cluster_member=cluster_member,
+                    )
+                print(
+                    f"[{runtime}] prefetching weights: "
+                    f"{repo_id}@{resolved[:12]}"
+                )
+                await nas._download_model_process(
+                    repo_id, resolved, token, want, bandwidth_mbps=share,
+                    cluster_bandwidth_mbps=cluster_mbps,
+                )
+
+    async def pull_image_result(
+        self, image: str, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
+    ) -> dict:
         """Pull one image locally and collapse Docker progress into a result."""
         error = None
-        async for event in self.pull_image_stream(image):
+        async for event in self.pull_image_stream(
+            image, bandwidth_mbps, cluster_bandwidth_mbps,
+        ):
             try:
                 payload = json.loads(event.removeprefix("data:").strip())
             except (AttributeError, json.JSONDecodeError):
@@ -19696,16 +20579,62 @@ class Manager:
         if not image:
             raise ValueError("image is required")
         selected = await self.selected_cluster_nodes(node_ids)
+        # Agents validate the cap themselves; sending 0 explicitly keeps a
+        # controller-side "unlimited" from being overridden by stale
+        # node-local settings. Capped pulls need the download-style 24 h
+        # ceiling instead of the 30-minute uncapped one.
+        try:
+            cap_mbps = parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            )
+        except ValueError:
+            cap_mbps = 0.0
+        if cap_mbps > 0:
+            # An older agent accepts max_download_bandwidth_mbps but pulls
+            # uncapped, which would silently violate the setting. Fail the
+            # whole request instead of dispatching unenforceable caps.
+            unsupported = [
+                str(node.get("name") or node["id"]) for node in selected
+                if node["id"] != LOCAL_NODE_ID
+                and IMAGE_PULL_BANDWIDTH_CAPABILITY
+                not in (node.get("capabilities") or [])
+            ]
+            if unsupported:
+                raise ValueError(
+                    "cluster node(s) cannot enforce the download bandwidth "
+                    "limit; upgrade the agent on: " + ", ".join(unsupported)
+                )
+        # Concurrent capped pulls across N nodes would each move the full
+        # configured rate, multiplying the cluster total past the setting.
+        # Divide the rate across the selected nodes so the cluster stays
+        # within one budget.
+        share_mbps = cap_mbps / len(selected) if cap_mbps > 0 and selected else cap_mbps
 
         async def pull(node: dict) -> dict:
             if node["id"] == LOCAL_NODE_ID:
-                return await self.pull_image_result(image)
+                return await self.pull_image_result(
+                    image, share_mbps, cap_mbps,
+                )
             return await self.node_registry.request(
                 node["id"], "POST", "/api/agent/images/pull",
-                json_body={"image": image}, timeout=1800,
+                json_body={
+                    "image": image,
+                    "max_download_bandwidth_mbps": share_mbps,
+                    "cluster_bandwidth_mbps": cap_mbps,
+                },
+                timeout=capped_transfer_timeout_seconds(
+                    share_mbps, default=1800,
+                ),
             )
 
-        pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)
+        # The fan-out consumes the whole cluster budget while a cap is set,
+        # so it holds the same dispatch slot the queued weight downloads use:
+        # an image pull and a queued download targeting different nodes
+        # would otherwise each move the full rate.
+        async with self._dispatched_download_slot(cap_mbps > 0):
+            pulled = await asyncio.gather(
+                *(pull(node) for node in selected), return_exceptions=True,
+            )
         results = []
         for node, result in zip(selected, pulled):
             item = {

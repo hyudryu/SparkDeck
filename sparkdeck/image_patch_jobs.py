@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cluster import NodeAgentResponseError
+from sparkdeck.download_throttle import (
+    IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    acquire_dispatch_slot,
+    capped_transfer_timeout_seconds,
+    parse_bandwidth_mbps,
+)
 from sparkdeck.image_patches import build_patched_image, normalize_patch_request, valid_base_image_identity
 
 CAPABILITY = "patched-images-v1"
@@ -113,7 +119,19 @@ class ImagePatchJobs:
     async def start(self, payload, *, agent=False):
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
-        request = normalize_patch_request({k: v for k, v in payload.items() if k not in {"node_ids", "job_id"}})
+        request = normalize_patch_request(
+            {k: v for k, v in payload.items()
+             if k not in {"node_ids", "job_id", "max_download_bandwidth_mbps"}}
+        )
+        bandwidth = payload.get("max_download_bandwidth_mbps")
+        if bandwidth is not None:
+            if not agent:
+                raise ValueError(
+                    "max_download_bandwidth_mbps is reserved for cluster coordination"
+                )
+            # The controller's forwarded cap is authoritative on this node:
+            # its own setting may still be the unlimited default.
+            request["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(bandwidth)
         job_id = payload.get("job_id")
         if "job_id" in payload:
             if not agent:
@@ -129,6 +147,8 @@ class ImagePatchJobs:
                     return copy.deepcopy(existing)
         if not agent and ("expected_base_id" in payload or "expected_base_identity" in payload):
             raise ValueError("expected_base_id and expected_base_identity are reserved for cluster coordination")
+        missing_bandwidth: list = []
+        cap_mbps = 0.0
         if agent:
             selected = [{"id": "local", "name": "This node"}]
         else:
@@ -139,14 +159,55 @@ class ImagePatchJobs:
             unsupported = [n["name"] for n in selected if n["id"] != "local" and CAPABILITY not in n.get("capabilities", [])]
             if unsupported:
                 raise ValueError("Update SparkDeck before building patched images on: " + ", ".join(unsupported))
+            # A remote build's base pull happens on that node with its local
+            # settings; forward this controller's cap instead and refuse the
+            # dispatch to agents that could not honor it.
+            try:
+                cap_mbps = parse_bandwidth_mbps(
+                    (getattr(self.manager, "settings", None) or {}).get(
+                        "max_download_bandwidth_mbps", 0,
+                    )
+                )
+            except (AttributeError, ValueError):
+                cap_mbps = 0.0
+            missing_bandwidth = [
+                n["name"] for n in selected
+                if n["id"] != "local"
+                and IMAGE_PULL_BANDWIDTH_CAPABILITY not in n.get("capabilities", [])
+            ]
+            if cap_mbps > 0 and missing_bandwidth:
+                raise ValueError(
+                    "Update SparkDeck before enforcing the download limit on: "
+                    + ", ".join(missing_bandwidth)
+                )
+            if not missing_bandwidth:
+                # Explicit 0 overrides a stale node-local cap; omit the field
+                # for old agents that would reject it.
+                request["max_download_bandwidth_mbps"] = cap_mbps
         if any(j["status"] in ACTIVE for j in self.jobs):
             raise ValueError("An image patch build is already active. Wait for it to finish.")
+        node_records = []
+        for n in selected:
+            record = {
+                "node_id": n["id"], "node_name": n["name"],
+                "status": "queued", "logs": [],
+            }
+            # A mixed fleet is addressed per node: the shared request stays
+            # free of the coordination field so legacy agents accept the
+            # POST, while each bandwidth-capable node records the resolved
+            # cap so a stale node-local cap cannot keep throttling its base
+            # pull (the dispatch attaches the field to that node's payload).
+            if missing_bandwidth and IMAGE_PULL_BANDWIDTH_CAPABILITY in n.get(
+                "capabilities", [],
+            ):
+                record["max_download_bandwidth_mbps"] = cap_mbps
+            node_records.append(record)
         job = {
             "id": job_id or uuid.uuid4().hex, "base_image": request["base_image"], "image": request["image"],
             "request_fingerprint": fingerprint,
             "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued",
             "files": [{"target": f["target"], "sha256": hashlib.sha256(f["content"].encode("utf-8")).hexdigest()} for f in request["files"]],
-            "nodes": [{"node_id": n["id"], "node_name": n["name"], "status": "queued", "logs": []} for n in selected],
+            "nodes": node_records,
         }
         previous_jobs = self.jobs
         self.jobs = [job, *previous_jobs[:99]]
@@ -164,11 +225,116 @@ class ImagePatchJobs:
         node["logs"] = [*node["logs"], str(line)[:2000]][-200:]
         self._schedule_log_flush()
 
+    async def _base_image_present(self, node, base: str) -> bool:
+        """Whether the target daemon already caches the base image.
+
+        The capped pull is a skopeo copy into a fresh archive, not a manifest
+        check: unconditionally prefetching a cached base would re-download
+        the entire image and break offline builds. A failed or ambiguous
+        check counts as missing, keeping the pull-first behavior.
+        """
+        if node.get("node_id") == "local":
+            def _present():
+                try:
+                    self.manager.client.images.get(base)
+                    return True
+                except Exception:
+                    return False
+            try:
+                return await asyncio.to_thread(_present)
+            except Exception:
+                return False
+        try:
+            payload = await self.manager.node_registry.request(
+                node["node_id"], "POST", "/api/agent/images/identity",
+                json_body={"image": base}, timeout=30,
+            )
+        except Exception:
+            return False
+        return isinstance(payload, dict) and bool(
+            str(payload.get("id") or "").strip()
+        )
+
+    async def _prefetch_base_image(self, node, request):
+        """Pull the build's base image under the cluster dispatch slot.
+
+        The reservation covers ONLY this pull phase: the capped base pull is
+        the sole bandwidth consumer of a capped patch build. The pull runs
+        only when the target daemon actually lacks the base; a cached base
+        must not be recopied. A node-targeted pull is used (not the Images
+        fan-out) so a mixed fleet pulls at this node's recorded cap, which is
+        the authority the build was dispatched with.
+        """
+        base = str(request.get("base_image") or "").strip()
+        if not base:
+            return
+        if await self._base_image_present(node, base):
+            return
+        cap_mbps = float(request.get("max_download_bandwidth_mbps") or 0)
+        async with acquire_dispatch_slot(
+            getattr(self.manager, "dispatched_download_lock", None), True,
+        ):
+            if node["node_id"] == "local":
+                await self.manager.pull_image_result(base, cap_mbps)
+            else:
+                await self.manager.node_registry.request(
+                    node["node_id"], "POST", "/api/agent/images/pull",
+                    json_body={
+                        "image": base,
+                        "max_download_bandwidth_mbps": cap_mbps,
+                    },
+                    timeout=capped_transfer_timeout_seconds(
+                        cap_mbps, default=1800,
+                    ),
+                )
+
     async def _local(self, node, request):
         loop = asyncio.get_running_loop()
         def log(line):
             loop.call_soon_threadsafe(self._log, node, line)
-        result = await asyncio.to_thread(build_patched_image, self.manager.client, request, log)
+        # The build runs in a worker thread with a synchronous docker
+        # client, and its images.pull ignores the bandwidth setting. Fetch
+        # a missing base through the capped pull API first when capped.
+        forwarded = request.get("max_download_bandwidth_mbps")
+        pull_kwargs: dict = {}
+        if forwarded is not None:
+            # The controller forwarded its cap: it is authoritative here
+            # because this node's own setting may still be unlimited.
+            capped = float(forwarded) > 0
+            pull_kwargs = {"bandwidth_mbps": float(forwarded)}
+        else:
+            resolver = getattr(self.manager, "_image_pull_bytes_per_second", None)
+            try:
+                capped = bool(resolver) and resolver(None) > 0
+            except TypeError:
+                capped = False
+        if capped:
+            try:
+                def _base_missing():
+                    try:
+                        self.manager.client.images.get(request["base_image"])
+                        return False
+                    except Exception as exc:
+                        if exc.__class__.__name__ != "ImageNotFound":
+                            raise
+                        return True
+                if await asyncio.to_thread(_base_missing):
+                    log("Pulling base image (bandwidth-limited)…")
+                    await self.manager.pull_image_result(
+                        request["base_image"], **pull_kwargs,
+                    )
+            except Exception as exc:
+                self._log(node, f"Base image pull failed: {exc}")
+                raise
+        # max_download_bandwidth_mbps is a coordination field the controller
+        # (or a forwarded agent dispatch) adds to the request; the patch
+        # builder re-validates its payload against the strict field set, so
+        # strip it before handing the request over.
+        build_request = {
+            key: value for key, value in request.items()
+            if key != "max_download_bandwidth_mbps"
+        }
+        result = await asyncio.to_thread(build_patched_image, self.manager.client, build_request, log)
         self.manager._images_cache = []
         self.manager._images_ts = 0
         return result
@@ -177,7 +343,17 @@ class ImagePatchJobs:
         registry = self.manager.node_registry
         remote_id = uuid.uuid4().hex
         remote_request = {**request, "job_id": remote_id}
-        deadline = time.monotonic() + 7200
+        # The agent-side base pull honors the forwarded cap, so a large base
+        # image at a low cap legitimately runs past the historical fixed two
+        # hours. Scale the polling window with the cap (unknown archive size
+        # uses the capped-transfer allowance), and re-arm it whenever the
+        # remote reports new progress: slow work is not a stalled job.
+        window = capped_transfer_timeout_seconds(
+            request.get("max_download_bandwidth_mbps"), default=7200.0,
+            floor=7200.0,
+        )
+        deadline = time.monotonic() + window
+        seen_remote_logs: list | None = None
         poll_warnings = []
         remote = None
         method = "POST"
@@ -212,7 +388,13 @@ class ImagePatchJobs:
                     method = "GET"
                     poll_warnings = [*poll_warnings, ("Status temporarily unavailable; retrying the existing build: " + str(exc))[:2000]][-20:]
             detail = remote["nodes"][0] if remote else {}
-            logs = [str(line)[:2000] for line in [*detail.get("logs", [])[-200:], *poll_warnings]][-200:]
+            # Remote progress (not transient poll warnings) is what proves the
+            # build is still working, so the polling window re-arms only on it.
+            detail_logs = [str(line)[:2000] for line in detail.get("logs", [])[-200:]]
+            if detail.get("logs") is not None and detail_logs != seen_remote_logs:
+                seen_remote_logs = detail_logs
+                deadline = time.monotonic() + window
+            logs = [*detail_logs, *poll_warnings][-200:]
             if logs != node["logs"]:
                 node["logs"] = logs
                 self._save_progress()
@@ -233,7 +415,35 @@ class ImagePatchJobs:
                 node["status"] = "building"
                 self._save_progress()
                 try:
-                    result = await (self._local(node, request) if agent or node["node_id"] == "local" else self._remote(node, request))
+                    node_request = request
+                    if (
+                        "max_download_bandwidth_mbps" not in request
+                        and "max_download_bandwidth_mbps" in node
+                    ):
+                        # Mixed-fleet dispatch: this node advertises the
+                        # bandwidth capability, so attach its recorded cap
+                        # (legacy nodes keep the field-free shared request).
+                        node_request = {
+                            **request,
+                            "max_download_bandwidth_mbps":
+                                node["max_download_bandwidth_mbps"],
+                        }
+                    build_capped = float(
+                        node_request.get("max_download_bandwidth_mbps") or 0,
+                    ) > 0
+                    # The bandwidth budget is consumed ONLY while pulling an
+                    # uncached base image; the build itself is disk/CPU work.
+                    # Pre-pull the base under the cluster dispatch slot, then
+                    # release the slot before building: holding the budget
+                    # across a long docker build (or the entire remote job
+                    # poll) would block every other capped transfer for work
+                    # that moves no registry bytes. A cached base makes the
+                    # pull a quick manifest round-trip, and the builder then
+                    # finds the image present and pulls nothing. Uncapped
+                    # builds keep the pre-cap parallel behavior.
+                    if build_capped:
+                        await self._prefetch_base_image(node, node_request)
+                    result = await (self._local(node, node_request) if agent or node["node_id"] == "local" else self._remote(node, node_request))
                     if result["files"] != job["files"]:
                         raise RuntimeError("Built image file hashes do not match the submitted patch")
                     if request.get("expected_base_id") and request["expected_base_id"] != result["base_id"]:

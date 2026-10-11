@@ -36,6 +36,7 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.nodes = [node("local", "Coordinator", local=True), node("remote-1", "Worker")]
         self.manager.cluster_nodes = AsyncMock(return_value=self.nodes)
         self.manager.pull_image_result = AsyncMock(return_value={"ok": True})
+        self.manager.settings = {"max_download_bandwidth_mbps": 0}
         self.manager.node_registry = Mock()
         self.manager.node_registry.request = AsyncMock(return_value={"ok": True})
 
@@ -46,13 +47,115 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["node_ids"], ["remote-1", "local"])
-        self.manager.pull_image_result.assert_awaited_once_with("ghcr.io/example/vllm:latest")
+        self.manager.pull_image_result.assert_awaited_once_with(
+            "ghcr.io/example/vllm:latest", 0.0, 0.0,
+        )
         self.manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/images/pull",
-            json_body={"image": "ghcr.io/example/vllm:latest"}, timeout=1800,
+            json_body={
+                "image": "ghcr.io/example/vllm:latest",
+                # 0 is sent explicitly so a controller-side "unlimited"
+                # cannot be overridden by stale node-local settings.
+                "max_download_bandwidth_mbps": 0.0,
+                # The re-rate anchor rides along: the member scales by its
+                # share of the controller value, not its own stale setting.
+                "cluster_bandwidth_mbps": 0.0,
+            },
+            timeout=1800,
         )
         self.assertNotIn("agent_url", result["selected_nodes"][0])
         self.assertNotIn("fabric_ip", result["selected_nodes"][0])
+
+    async def test_capped_pull_fanout_divides_the_cap_across_nodes(self):
+        # Two selected nodes at a 100 Mbps setting each pull at 50 Mbps, and
+        # the capped request timeout is derived from the rate, not fixed.
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
+
+        self.nodes[1]["capabilities"] = [IMAGE_PULL_BANDWIDTH_CAPABILITY]
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
+        self.manager.pull_image_result.assert_awaited_once_with(
+            "example/image", 50.0, 100.0,
+        )
+        self.manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "POST", "/api/agent/images/pull",
+            json_body={"image": "example/image",
+                       "max_download_bandwidth_mbps": 50.0,
+                       "cluster_bandwidth_mbps": 100.0},
+            timeout=capped_transfer_timeout_seconds(50.0, default=1800),
+        )
+
+    async def test_capped_fanout_serializes_behind_the_dispatch_slot(self):
+        # Each dispatched node gets the FULL node-wide cap (here the whole
+        # 100 Mbps on the single remote node), so two simultaneous capped
+        # fan-outs would double the cluster total. They must queue behind
+        # one shared dispatch slot, then both complete.
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
+
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.nodes[1]["capabilities"] = [IMAGE_PULL_BANDWIDTH_CAPABILITY]
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_request(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"ok": True}
+
+        self.manager.node_registry.request.side_effect = slow_request
+        first = asyncio.create_task(
+            self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+        )
+        await started.wait()
+        self.assertTrue(self.manager.dispatched_download_lock.locked())
+        second = asyncio.create_task(
+            self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+        )
+        await asyncio.sleep(0.02)
+        self.assertFalse(second.done())
+        release.set()
+        first_result, second_result = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=5,
+        )
+        self.assertTrue(first_result["ok"] and second_result["ok"])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_uncapped_fanouts_run_without_the_dispatch_slot(self):
+        # Unlimited pulls do not spend the capped budget, so they must not
+        # queue behind one another: both enter concurrently.
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        both_in = asyncio.Event()
+        inside = 0
+
+        async def counting_request(*args, **kwargs):
+            nonlocal inside
+            inside += 1
+            if inside >= 2:
+                both_in.set()
+            await both_in.wait()
+            return {"ok": True}
+
+        self.manager.node_registry.request.side_effect = counting_request
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+                self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+            ),
+            timeout=5,
+        )
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_capped_pull_rejects_agents_without_the_capability(self):
+        # An older agent accepts max_download_bandwidth_mbps but pulls
+        # uncapped; the fan-out must fail instead of silently violating it.
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        with self.assertRaisesRegex(ValueError, "cannot enforce the download"):
+            await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
+        self.manager.pull_image_result.assert_not_awaited()
+        self.manager.node_registry.request.assert_not_awaited()
 
     async def test_pull_reports_per_node_partial_failure(self):
         self.manager.node_registry.request.side_effect = RuntimeError("agent unavailable")

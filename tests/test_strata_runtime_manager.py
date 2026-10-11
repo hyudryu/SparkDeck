@@ -721,6 +721,40 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
 
         manager.evict_other_backends.assert_awaited_once_with(protect="strata")
 
+    async def test_a_capped_first_launch_is_refused_before_eviction(self):
+        """Strata prepares its model pack inside the container on the first
+        launch, so a capped launch is expected to be refused — and a refused
+        launch must not take healthy engines offline before the rejection."""
+        manager = _manager()
+        manager.settings = {
+            **manager.settings, "max_download_bandwidth_mbps": 100.0,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "cannot cover"):
+            await _launch(manager)
+        manager.evict_other_backends.assert_not_awaited()
+        manager._run_managed_container.assert_not_called()
+
+    async def test_a_capped_relaunch_evicts_only_after_the_marker_passes(self):
+        manager = _manager()
+        manager.settings = {
+            **manager.settings, "max_download_bandwidth_mbps": 100.0,
+        }
+        # Proven prepared: the volume exists and carries the marker.
+        manager.client.volumes.get = Mock(return_value=Mock())
+        manager.client.containers.run = Mock(return_value=b"")
+        order = []
+        manager.evict_other_backends = AsyncMock(
+            side_effect=lambda *, protect: order.append("evict") or {},
+        )
+        manager._run_managed_container = Mock(
+            side_effect=lambda opts: order.append("container") or Mock(),
+        )
+
+        await _launch(manager)
+
+        self.assertEqual(order, ["evict", "container"])
+
     async def test_sharded_strata_is_rejected(self):
         manager = _manager()
 
@@ -759,12 +793,18 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
 
         manager = _manager()
         manager.client.images.get = Mock(
-            side_effect=docker.errors.ImageNotFound("missing"),
+            side_effect=[docker.errors.ImageNotFound("missing"), Mock()],
         )
+        # Missing runtime images must go through the bandwidth-capped pull
+        # path (pull_image_result), never a direct uncapped images.pull.
+        manager.pull_image_result = AsyncMock(return_value={"ok": True})
 
         await _launch(manager)
 
-        manager.client.images.pull.assert_called_once_with(DEFAULT_STRATA_IMAGE)
+        manager.pull_image_result.assert_awaited_once_with(
+            DEFAULT_STRATA_IMAGE, None, None,
+        )
+        manager.client.images.pull.assert_not_called()
         manager._run_managed_container.assert_called_once()
 
     async def test_launch_failure_is_reported_without_leaking_the_token(self):

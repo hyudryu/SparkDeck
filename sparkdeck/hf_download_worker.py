@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 
+from sparkdeck.download_throttle import install_socket_throttle
 from sparkdeck.virtual_nas import _enable_hf_xet_high_performance, validate_model_id, validate_revision, _is_commit_sha
 
 
@@ -45,10 +46,33 @@ def main() -> None:
     revision = validate_revision(payload["revision"])
     if not _is_commit_sha(revision):
         raise ValueError("download revision must be immutable")
-    _enable_hf_xet_high_performance()
+    files = payload.get("files")
+    files = [str(filename) for filename in files] if files else None
+    bytes_per_second = float(payload.get("bytes_per_second") or 0)
+    # The optional rate file lets a settings change re-rate this download
+    # while it runs; see download_throttle.install_socket_throttle.
+    rate_file = payload.get("rate_file")
+    if bytes_per_second > 0 and install_socket_throttle(
+        bytes_per_second, rate_file,
+    ):
+        # The socket throttle only governs Python reads; the Xet client
+        # streams through its own Rust HTTP stack. A capped download must
+        # fall back to plain Hub HTTP, otherwise the limit is not real.
+        os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        _enable_hf_xet_high_performance()
+    cache_dir = payload["cache_dir"]
+    token = payload["token"] or None
+    if files is not None:
+        from huggingface_hub import hf_hub_download
+        for filename in files:
+            hf_hub_download(repo_id=model_id, filename=filename,
+                            revision=revision, cache_dir=cache_dir, token=token)
+        return
     from huggingface_hub import snapshot_download
     snapshot_download(repo_id=model_id, revision=revision,
-                      cache_dir=payload["cache_dir"], token=payload["token"] or None)
+                      cache_dir=cache_dir, token=token)
 
 
 if __name__ == "__main__":

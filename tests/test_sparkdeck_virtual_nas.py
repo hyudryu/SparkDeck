@@ -6,6 +6,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -22,6 +23,7 @@ from manager import (
 from sparkdeck import virtual_nas
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
@@ -5085,6 +5087,547 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         job["status"] = "completed"
         self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 701.0))
         self.assertEqual(manager._virtual_nas_rate_samples, {})
+
+
+class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
+    """max_download_bandwidth_mbps must reach the writer process, never other
+    sockets, and only be sent to agents that understand it."""
+
+    def selective_hub(self, name="MODEL.GGUF", size=8):
+        api = Mock()
+        api.model_info.return_value = Mock(
+            sha=RESOLVED_REVISION,
+            siblings=[
+                Mock(rfilename=name, size=size),
+                Mock(rfilename="README.md", size=500_000_000),
+            ],
+        )
+        return Mock(
+            HfApi=Mock(return_value=api),
+            hf_hub_download=Mock(),
+            snapshot_download=Mock(),
+        )
+
+    def snapshot_writer(self, nas):
+        """Stand in for whichever fetcher runs: leave real bytes on disk."""
+        def write(_model_id=None, _revision=None, files=None, _token=None,
+                  _bps=0.0, **kwargs):
+            # The selective runner passes files positionally; the Hub
+            # downloader passes a single filename as a keyword.
+            filename = kwargs.get("filename") or (files[0] if files else None)
+            snapshot = nas._model_path("org/model") / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / filename).write_bytes(b"12345678")
+        return write
+
+    async def test_explicit_cap_dispatches_selective_subset_to_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock(side_effect=self.snapshot_writer(nas))
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                result = await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main", bandwidth_mbps=4,
+                )
+            self.assertTrue(result["ok"])
+            # 4 Mbps = 500 KB/s, and the bytes move in the worker process.
+            runner.assert_called_once_with(
+                "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 500_000.0,
+                cluster_bandwidth_mbps=None,
+            )
+            hub.hf_hub_download.assert_not_called()
+
+    async def test_node_provider_cap_applies_without_explicit_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 16,
+            )
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock(side_effect=self.snapshot_writer(nas))
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main",
+                )
+            runner.assert_called_once_with(
+                "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 2_000_000.0,
+                cluster_bandwidth_mbps=None,
+            )
+
+    async def test_invalid_persisted_cap_downloads_unlimited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: "nonsense",
+            )
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock()
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main",
+                )
+            # Unparseable settings must not block the download nor throttle.
+            runner.assert_not_called()
+            hub.hf_hub_download.assert_called_once()
+
+    async def _worker_payload(self, directory, provider=8, **call_kwargs):
+        payload_path = Path(directory) / "payload.json"
+        nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                         Mock(), lambda: True,
+                         download_bandwidth_provider=lambda: provider)
+        nas._save = Mock()
+        actual = asyncio.create_subprocess_exec
+
+        async def launch(*_args, **kwargs):
+            return await actual(
+                sys.executable, "-c",
+                "import sys; open(sys.argv[1],'wb').write(sys.stdin.buffer.read())",
+                str(payload_path), **kwargs,
+            )
+
+        with patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                   side_effect=launch):
+            # The fake worker performs no download, so the inventory check
+            # that follows fails; the payload was already handed to it.
+            with self.assertRaises(RuntimeError):
+                await nas._download_model_process(
+                    "org/model", RESOLVED_REVISION, **call_kwargs,
+                )
+        return json.loads(payload_path.read_text(encoding="utf-8"))
+
+    async def test_full_snapshot_payload_carries_converted_byte_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, requested_revision="main", bandwidth_mbps=8,
+            )
+            self.assertEqual(payload["model_id"], "org/model")
+            self.assertEqual(payload["bytes_per_second"], 1_000_000.0)
+            self.assertNotIn("files", payload)
+            # A capped worker gets a live-cap file to watch; it is cleaned up
+            # when the operation finishes.
+            self.assertTrue(payload.get("rate_file"))
+            self.assertFalse(Path(payload["rate_file"]).exists())
+
+    async def test_full_snapshot_payload_applies_node_provider_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, requested_revision="main",
+            )
+            # No explicit override: the node-local provider applies.
+            self.assertEqual(payload["bytes_per_second"], 1_000_000.0)
+
+    async def test_full_snapshot_payload_defaults_to_unlimited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, provider=0, requested_revision="main",
+            )
+            self.assertEqual(payload["bytes_per_second"], 0.0)
+            # Unlimited starts cannot adopt a later cap mid-run (the worker
+            # chose Xet), so they carry no live-cap file.
+            self.assertNotIn("rate_file", payload)
+
+    def test_weight_rate_file_lives_only_while_the_worker_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                path = Path(payload["rate_file"])
+                captured["content"] = path.read_text(encoding="utf-8")
+                captured["path"] = path
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 500_000.0,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+            self.assertFalse(captured["path"].exists())
+
+    def test_apply_download_bandwidth_cap_rewrites_registered_rate_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            rate_file = nas._register_download_rate_file("op-1", 500_000.0)
+            self.assertIsNotNone(rate_file)
+            self.assertEqual(rate_file.read_text(encoding="utf-8"), "500000.0")
+            # The cap is removed while the download runs; the watcher picks
+            # up the 0 and stops delaying.
+            nas.apply_download_bandwidth_cap(0.0)
+            self.assertEqual(rate_file.read_text(encoding="utf-8"), "0.0")
+            nas._release_download_rate_file("op-1")
+            self.assertFalse(rate_file.exists())
+
+    def test_member_share_rerates_by_its_share_of_the_new_cap(self):
+        # A dispatched member share must re-rate as share * new_cluster_cap,
+        # never the full new cluster value per member (a 4-node fan-out would
+        # otherwise run at 4x the cap after one settings change).
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            # Worker at 50 Mbps out of a 200 Mbps cluster cap = factor 0.25.
+            rate_file = nas._register_download_rate_file(
+                "op-1", 6_250_000.0, cluster_bytes_per_second=25_000_000.0,
+            )
+            self.assertIsNotNone(rate_file)
+            nas.apply_download_bandwidth_cap(50_000_000.0)  # cap -> 400 Mbps
+            self.assertEqual(rate_file.read_text(encoding="utf-8"),
+                             "12500000.0")
+            nas._release_download_rate_file("op-1")
+
+    def test_selective_dispatch_records_share_against_node_cap(self):
+        # The selective path registers against the node's own setting (which
+        # the settings route keeps synced with the controller), so a
+        # dispatched half-cap stays a half after the re-rate.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True,
+                             download_bandwidth_provider=lambda: 4)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                # Node cap 4 Mbps = 500000 B/s; this worker was dispatched
+                # with half of it, so a new 8 Mbps cluster cap lands at 500k.
+                nas.apply_download_bandwidth_cap(1_000_000.0)
+                captured["content"] = Path(
+                    payload["rate_file"],
+                ).read_text(encoding="utf-8")
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 250_000.0,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+
+    def test_selective_dispatch_rerates_against_the_dispatched_anchor(self):
+        # The node's local setting is stale (unlimited), so the share
+        # factor must come from the cluster cap the dispatch carried; a
+        # factor of 1.0 from the stale 0 would hand this one member the
+        # full new cluster cap on the next settings change.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True,
+                             download_bandwidth_provider=lambda: 0)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                # Dispatched anchor 4 Mbps = 500000 B/s; this worker holds
+                # half of it, so the new 8 Mbps cluster cap lands at 500k.
+                nas.apply_download_bandwidth_cap(1_000_000.0)
+                captured["content"] = Path(
+                    payload["rate_file"],
+                ).read_text(encoding="utf-8")
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 250_000.0, cluster_bandwidth_mbps=4,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+
+    def test_uncapped_weight_start_has_no_rate_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            self.assertIsNone(nas._register_download_rate_file("op", 0.0))
+            nas.apply_download_bandwidth_cap(500_000.0)  # no-op, must not raise
+
+    def test_selective_worker_subprocess_receives_files_and_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       return_value=Mock(returncode=0)) as run:
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf", "b.gguf"],
+                    "tok", 500_000.0,
+                )
+            self.assertEqual(run.call_args.args[0][:3],
+                             [sys.executable, "-m", "sparkdeck.hf_download_worker"])
+            payload = json.loads(run.call_args.kwargs["input"].decode())
+            self.assertEqual(payload["files"], ["a.gguf", "b.gguf"])
+            self.assertEqual(payload["bytes_per_second"], 500_000.0)
+            self.assertEqual(payload["token"], "tok")
+            self.assertEqual(payload["model_id"], "org/model")
+
+    def test_selective_worker_nonzero_exit_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       return_value=Mock(returncode=1)):
+                with self.assertRaisesRegex(RuntimeError, "Hugging Face download"):
+                    nas._run_selective_download_process(
+                        "org/model", RESOLVED_REVISION, ["a.gguf"], "", 1.0,
+                    )
+
+    async def test_remote_dispatch_sends_cap_only_when_agent_supports_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            bodies = []
+
+            async def request(node_id, method, path, **kwargs):
+                bodies.append(kwargs["json_body"])
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            job = {"id": "job-1", "model_id": "org/model",
+                   "revision": RESOLVED_REVISION, "requested_revision": "main",
+                   "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                   "bytes_total": 8, "status": "queued", "kind": "download"}
+
+            nas._validate_download_node = AsyncMock(
+                return_value={"capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY]},
+            )
+            await nas._download_selected_files(job, "")
+            self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 10.0)
+            # The dispatched re-rate anchor is the controller's own cap,
+            # never the agent's (possibly stale) node-local value.
+            self.assertEqual(bodies[-1]["cluster_bandwidth_mbps"], 10.0)
+
+            # With a cap configured, an older agent that would pull uncapped
+            # must be refused outright instead of silently violating the cap.
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
+            with self.assertRaisesRegex(
+                RuntimeError, "cannot enforce the download bandwidth",
+            ):
+                await nas._download_selected_files(job, "")
+            self.assertEqual(len(bodies), 1)
+
+    async def test_unlimited_cap_sends_explicit_zero_to_capable_agents(self):
+        # Omitting the field means "keep the node-local cap", so a worker
+        # left with a stale nonzero limit could never be set free. A capable
+        # agent must receive the explicit 0; old agents keep it omitted.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            nas._save = Mock()
+            bodies = []
+
+            async def request(node_id, method, path, **kwargs):
+                bodies.append(kwargs["json_body"])
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            nas._validate_download_node = AsyncMock(
+                return_value={"capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY]},
+            )
+            job = {"id": "job-1", "model_id": "org/model",
+                   "revision": RESOLVED_REVISION, "requested_revision": "main",
+                   "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                   "bytes_total": 8, "status": "queued", "kind": "download"}
+            await nas._download_selected_files(job, "")
+            self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 0.0)
+
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
+            await nas._download_selected_files(job, "")
+            self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
+
+    async def test_full_repo_dispatch_rejects_legacy_agent_when_capped(self):
+        # The whole-repository runner must refuse an old agent under a cap
+        # the same way the selected-file branch does (it would pull uncapped
+        # using node-local settings).
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": 10 * 1024 * 1024 * 1024,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=8)
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
+            nas.node_registry.request = AsyncMock()
+            job = {"id": "job-1", "kind": "download", "model_id": "org/model",
+                   "target_node_id": "ws1", "revision": RESOLVED_REVISION,
+                   "requested_revision": "main", "status": "queued",
+                   "bytes_total": 8, "download_cache_baseline_bytes": None}
+            await nas._run_download(job)
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("cannot enforce the download", job["error"])
+            nas.node_registry.request.assert_not_awaited()
+
+    async def test_selected_file_dispatches_serialize_under_one_lock(self):
+        # Every capped dispatched download is sent the full node-wide cap,
+        # so the controller may only run one cluster-wide at a time.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "model_id": "org/model",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                "bytes_total": 8, "status": "queued", "kind": "download",
+            } for index in range(3)]
+            await asyncio.gather(*(
+                nas._download_selected_files(job, "") for job in jobs
+            ))
+            self.assertEqual(peak, 1)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
+
+    async def test_full_repo_dispatches_serialize_under_one_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": 10 * 1024 * 1024 * 1024,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=8)
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "kind": "download",
+                "model_id": "org/model", "target_node_id": "ws1",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "status": "queued", "bytes_total": 8,
+                "download_cache_baseline_bytes": None,
+            } for index in range(3)]
+            await asyncio.gather(*(nas._run_download(job) for job in jobs))
+            self.assertEqual(peak, 1)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
+
+    async def test_unlimited_dispatches_keep_their_parallelism(self):
+        # With the cap disabled there is no cluster budget to protect; the
+        # dispatcher must keep running jobs for independent nodes at once
+        # instead of queueing them behind one unconditional lock.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True,
+            )
+            nas._save = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": 10 * 1024 * 1024 * 1024,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=8)
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "kind": "download",
+                "model_id": "org/model", "target_node_id": "ws1",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "status": "queued", "bytes_total": 8,
+                "download_cache_baseline_bytes": None,
+            } for index in range(3)]
+            await asyncio.gather(*(nas._run_download(job) for job in jobs))
+            self.assertEqual(peak, 3)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
+
+    async def test_unlimited_selected_file_dispatches_stay_parallel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True,
+            )
+            nas._save = Mock()
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "model_id": "org/model",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                "bytes_total": 8, "status": "queued", "kind": "download",
+            } for index in range(3)]
+            await asyncio.gather(*(
+                nas._download_selected_files(job, "") for job in jobs
+            ))
+            self.assertEqual(peak, 3)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
 
 
 if __name__ == "__main__":

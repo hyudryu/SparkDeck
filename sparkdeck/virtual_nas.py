@@ -28,7 +28,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -36,6 +36,13 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
 from .catalog import quantization_from_text
+from .download_throttle import (
+    acquire_dispatch_slot,
+    bandwidth_bytes_per_second,
+    capped_transfer_timeout_seconds,
+    dispatch_slot_held,
+    parse_bandwidth_mbps,
+)
 from .embeddings import CachedEmbedding, embedding_descriptor
 
 
@@ -48,6 +55,10 @@ VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY = "virtual-nas-download-cancel-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
+# The download endpoint accepts ``max_download_bandwidth_mbps``. Agents
+# without it reject unknown download request fields, so the controller may
+# only send the field when the probed agent health advertises this capability.
+VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY = "virtual-nas-download-bandwidth-v1"
 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-file-transfer-v2"
 FILE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
 FILE_STREAM_CONTENT_TYPE = "application/vnd.sparkdeck.file-stream"
@@ -683,12 +694,34 @@ class VirtualNAS:
         token_provider: Callable[[], str] | None = None,
         external_model_roots_provider: Callable[[], list[Path]] | None = None,
         ownership_reclaimer: Callable[[Path], bool] | None = None,
+        download_bandwidth_provider: Callable[[], Any] | None = None,
+        internet_transfer_lock: asyncio.Lock | None = None,
+        dispatched_download_lock: asyncio.Lock | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
         self.node_registry = node_registry
         self._enabled_provider = enabled_provider
         self._token_provider = token_provider or (lambda: "")
+        # Node-local megabits-per-second cap for Hub downloads started
+        # without an explicit value. The controller supplies its configured
+        # cap on every request it dispatches to another node, so on agents
+        # this provider is only the fallback for direct calls.
+        self._download_bandwidth_provider = (
+            download_bandwidth_provider or (lambda: 0)
+        )
+        # Shared with the Manager so every capped internet transfer on this
+        # node (Hub weights and Docker image pulls) queues behind one budget.
+        self._internet_transfer_lock = internet_transfer_lock
+        # Every controller-dispatched download is sent the full node-wide
+        # cap, and a per-node lock cannot coordinate separate agents, so
+        # downloads run one at a time cluster-wide while this lock is held
+        # across each dispatched operation. The Manager passes its own
+        # instance so controller dispatches outside the queue (image
+        # fan-outs, GGUF seed dispatches) share the same budget.
+        self._dispatched_download_lock = (
+            dispatched_download_lock or asyncio.Lock()
+        )
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
@@ -715,6 +748,10 @@ class VirtualNAS:
         ] = {}
         self._queue_lock = asyncio.Lock()
         self._download_operations: dict[str, dict[str, Any]] = {}
+        # key -> (rate file, its directory) for capped workers in flight;
+        # apply_download_bandwidth_cap rewrites these when the setting moves,
+        # scaled by each worker's share factor of the cluster cap.
+        self._download_rate_files: dict[str, tuple[Path, Path, float]] = {}
         self._process_download_locks: dict[str, asyncio.Lock] = {}
         self._download_tombstone_path = self.data_dir / "virtual_nas_canceled_downloads.json"
         self._download_tombstone_error = False
@@ -1087,12 +1124,200 @@ class VirtualNAS:
 
         return await asyncio.to_thread(inspect)
 
+    def _download_bandwidth_bytes_per_second(
+        self, bandwidth_mbps: float | None = None,
+    ) -> float:
+        """Resolve a megabits-per-second cap to bytes per second.
+
+        ``None`` falls back to the node-local provider. An unparseable
+        persisted value must never block a download, so it is treated as
+        unlimited.
+        """
+        value = bandwidth_mbps if bandwidth_mbps is not None else (
+            self._download_bandwidth_provider()
+        )
+        try:
+            return bandwidth_bytes_per_second(value)
+        except ValueError:
+            return 0.0
+
+    def _download_bandwidth_mbps(self) -> float:
+        """The node-local cap in megabits per second; unlimited reads as 0."""
+        try:
+            return parse_bandwidth_mbps(self._download_bandwidth_provider())
+        except ValueError:
+            return 0.0
+
+    def _register_download_rate_file(
+        self, key: str, bytes_per_second: float,
+        cluster_bytes_per_second: float | None = None,
+    ) -> Path | None:
+        """The live-cap file a capped worker watches, or None when uncapped.
+
+        The parent rewrites the file through apply_download_bandwidth_cap
+        when the setting changes; the worker's throttle watcher re-reads it.
+        The registration records the worker's SHARE of the cluster cap
+        (worker/cluster, 1.0 when the worker runs the full local cap), so a
+        re-rate of a dispatched member share stays a share of the new
+        cluster value instead of becoming the full new cluster value per
+        member. The cluster reference is this node's own setting value,
+        which the settings route forwards on every save, so it tracks the
+        controller's cap; a node whose local file is stale re-rates by a
+        slightly off share but never multiplies the cluster budget by the
+        member count. A worker that started unlimited has no file: its
+        socket throttle (and the Xet disable that goes with it) is decided
+        at start, so enabling a cap can only apply to subsequent transfers.
+        """
+        if bytes_per_second <= 0:
+            return None
+        factor = 1.0
+        try:
+            cluster = float(cluster_bytes_per_second or 0)
+        except (TypeError, ValueError):
+            cluster = 0.0
+        if cluster > 0:
+            factor = max(min(float(bytes_per_second) / cluster, 1.0), 1e-9)
+        rate_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-dl-rate-"))
+        rate_file = rate_dir / "rate.txt"
+        try:
+            rate_file.write_text(str(float(bytes_per_second)), encoding="utf-8")
+        except OSError:
+            shutil.rmtree(rate_dir, ignore_errors=True)
+            return None
+        self._download_rate_files[key] = (rate_file, rate_dir, factor)
+        return rate_file
+
+    def _release_download_rate_file(self, key: str) -> None:
+        entry = self._download_rate_files.pop(key, None)
+        if entry is not None:
+            shutil.rmtree(entry[1], ignore_errors=True)
+
+    def apply_download_bandwidth_cap(self, bytes_per_second: float) -> None:
+        """Re-rate the capped Hub weight downloads running on this node.
+
+        The value is the new CLUSTER cap; each registered worker takes its
+        share of it (1.0 for workers running the full local cap). Weight
+        transfers that started without a cap finish uncapped: the socket
+        throttle and the Xet fallback are chosen at worker start and cannot
+        be retrofitted onto a running Xet client, so the newly enabled limit
+        applies from the next transfer.
+        """
+        cluster = float(bytes_per_second)
+        for rate_file, _directory, factor in self._download_rate_files.values():
+            value = str(cluster * factor)
+            try:
+                tmp = rate_file.with_name("rate.txt.tmp")
+                tmp.write_text(value, encoding="utf-8")
+                os.replace(tmp, rate_file)
+            except OSError:
+                pass
+
+    @asynccontextmanager
+    async def _capped_internet_transfer(self, bytes_per_second: float):
+        """Serialize one node's capped internet transfers behind one budget.
+
+        The dispatcher runs transfer jobs concurrently, so N capped jobs each
+        throttled to the node cap would multiply the real uplink usage. When
+        a cap is active, only one capped transfer may hold the wire at a
+        time; unlimited transfers keep running concurrently as before.
+        """
+        lock = (
+            self._internet_transfer_lock
+            if bytes_per_second > 0 and self._internet_transfer_lock is not None
+            else None
+        )
+        if lock is None:
+            yield
+            return
+        async with lock:
+            yield
+
+    @asynccontextmanager
+    async def dispatched_download_slot(self, capped: bool):
+        """Hold the cluster-wide dispatch budget for one capped operation.
+
+        Every controller dispatch (queued weight download, GGUF seed, image
+        fan-out) carries the full node-wide cap, so only one may run at a
+        time while a cap is active; unlimited dispatches keep the pre-cap
+        parallel behavior. async with owns the release: a caller cancelled
+        while queued never frees a holder's lock. The slot is reentrant
+        within one holder's task tree (the same lock is shared with the
+        manager helpers), so a deployment launch that already reserved the
+        budget passes through instead of deadlocking on its nested seeds.
+        """
+        async with acquire_dispatch_slot(self._dispatched_download_lock, capped):
+            yield
+
+    @asynccontextmanager
+    async def _cancellable_dispatch_slot(self, capped: bool, event):
+        """Hold the cluster dispatch slot, abortable via a job cancel event.
+
+        A cancelable job is already marked running when it reaches the slot
+        wait, but nothing has been dispatched yet (the worker future is only
+        created inside the slot), so pressing Stop during the wait must end
+        the job rather than leave it stuck in canceling — and holding a node
+        busy — for the duration of another holder's multi-day transfer.
+        Race the lock acquisition against the event; cancellation before
+        acquisition has no remote writer to confirm. The reservation itself
+        is identical to dispatched_download_slot, including task-tree
+        reentrancy.
+        """
+        lock = self._dispatched_download_lock
+        if not capped or lock is None or dispatch_slot_held.get():
+            yield
+            return
+        acquire = asyncio.ensure_future(lock.acquire())
+        stop = asyncio.ensure_future(event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {acquire, stop}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire not in done:
+                # The cancel won: abandon the pending acquisition (asyncio.Lock
+                # removes a cancelled waiter and hands the lock to the next
+                # one) and end the job — nothing was dispatched, so there is
+                # no remote writer to confirm.
+                raise TransferCanceled()
+            # The lock is ours now; if the cancel also landed, give the slot
+            # back before ending the job.
+            stop.cancel()
+            await asyncio.gather(stop, return_exceptions=True)
+            if event.is_set():
+                raise TransferCanceled()
+            token = dispatch_slot_held.set(True)
+            try:
+                yield
+            finally:
+                dispatch_slot_held.reset(token)
+        finally:
+            # The owner task can also be cancelled while it waits (Virtual
+            # NAS disabled or stopped mid-queue), which does not reach the
+            # separately spawned waiter tasks: an orphaned acquire would later
+            # consume the lock handed over by the current holder and exit
+            # without a release, permanently blocking every later capped
+            # dispatch. Cancel both waiters and drain them on every exit, and
+            # release the lock whenever this call actually obtained it, body
+            # completed or not.
+            acquire.cancel()
+            stop.cancel()
+            await asyncio.gather(acquire, stop, return_exceptions=True)
+            got = False
+            if acquire.done() and not acquire.cancelled():
+                try:
+                    got = bool(acquire.result())
+                except (Exception, asyncio.CancelledError):
+                    got = False
+            if got:
+                lock.release()
+
     @_transfer_operation
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
         requested_revision: str | None = None,
         download_cache_baseline_bytes: int | None = None,
+        bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Agent-side capacity gate using only this cache filesystem."""
@@ -1130,6 +1355,8 @@ class VirtualNAS:
                 )
         return await self._download_model_process(
             model_id, revision, explicit_token, requested_revision,
+            bandwidth_mbps=bandwidth_mbps,
+            cluster_bandwidth_mbps=cluster_bandwidth_mbps,
             operation_id=operation_id,
         )
 
@@ -1167,23 +1394,86 @@ class VirtualNAS:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("download worker did not confirm exit; cancellation is not complete") from exc
 
+    def _run_selective_download_process(
+        self, model_id: str, revision: str, files: list[str], token: str,
+        bytes_per_second: float = 0.0,
+        cluster_bandwidth_mbps: float | None = None,
+    ) -> None:
+        """Fetch one capped file subset through the supervised download worker.
+
+        A bandwidth-limited subset runs in the worker subprocess (rather
+        than this thread) so the socket throttle is installed only in the
+        writer: the agent's transfer, registry, and API sockets stay
+        unthrottled while a capped pull is in flight.
+        """
+        launch_options = (
+            {"creationflags": subprocess.CREATE_NO_WINDOW}
+            if os.name == "nt" else {"start_new_session": True}
+        )
+        rate_key = uuid.uuid4().hex
+        # The denominator is the CLUSTER cap the dispatching controller
+        # carried alongside this share (falling back to the node-local
+        # setting for local launches): a later settings re-rate scales the
+        # worker by its dispatched share of THAT value, so a stale
+        # node-local setting (or 0, which would make the factor 1.0) can
+        # never turn a member share back into the full cluster rate.
+        rate_file = self._register_download_rate_file(
+            rate_key, bytes_per_second,
+            cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(
+                cluster_bandwidth_mbps,
+            ),
+        )
+        payload_fields = {
+            "model_id": model_id, "revision": revision,
+            "parent_pid": os.getpid(), "cache_dir": str(self._hub()),
+            "files": files, "bytes_per_second": bytes_per_second,
+            "token": token,
+        }
+        if rate_file is not None:
+            payload_fields["rate_file"] = str(rate_file)
+        payload = json.dumps(payload_fields)
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "sparkdeck.hf_download_worker"],
+                input=payload.encode(), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                check=False, **launch_options,
+            )
+        finally:
+            self._release_download_rate_file(rate_key)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Hugging Face download failed; verify repository access, "
+                "revision, credentials, and network"
+            )
+
     async def _download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
-        requested_revision: str | None = None, *, operation_id: str | None = None,
+        requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
         # Retain this per-repository reservation through process teardown,
         # including failed stop attempts; another writer must never overlap.
         async with lock:
-            return await self._supervised_download_model_process(
-                model_id, revision, explicit_token, requested_revision,
-                operation_id=operation_id,
-            )
+            async with self._capped_internet_transfer(
+                self._download_bandwidth_bytes_per_second(bandwidth_mbps),
+            ):
+                return await self._supervised_download_model_process(
+                    model_id, revision, explicit_token, requested_revision,
+                    bandwidth_mbps=bandwidth_mbps,
+                    cluster_bandwidth_mbps=cluster_bandwidth_mbps,
+                    operation_id=operation_id,
+                )
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
-        requested_revision: str | None = None, *, operation_id: str | None = None,
+        requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Run Hub's writer in an owned process; never cancel a writer thread."""
         model_id = validate_model_id(model_id)
@@ -1231,10 +1521,31 @@ class VirtualNAS:
                 process = await self._await_uncancelable(launch)
                 state["cancel"].set()
                 raise
-            payload = json.dumps({"model_id": model_id, "revision": revision,
-                                  "parent_pid": os.getpid(),
-                                  "cache_dir": str(self._hub()),
-                                  "token": explicit_token if explicit_token is not None else self._token_provider() or ""})
+            worker_bps = self._download_bandwidth_bytes_per_second(
+                bandwidth_mbps,
+            )
+            # Share of the dispatched CLUSTER cap (see the selective
+            # worker above): the re-rate scales by the controller's value,
+            # never this node's possibly stale local setting.
+            rate_file = self._register_download_rate_file(
+                operation_id, worker_bps,
+                cluster_bytes_per_second=(
+                    self._download_bandwidth_bytes_per_second(
+                        cluster_bandwidth_mbps,
+                    )
+                ),
+            )
+            payload_fields = {
+                "model_id": model_id, "revision": revision,
+                "parent_pid": os.getpid(),
+                "cache_dir": str(self._hub()),
+                "bytes_per_second": worker_bps,
+                "token": (explicit_token if explicit_token is not None
+                          else self._token_provider() or ""),
+            }
+            if rate_file is not None:
+                payload_fields["rate_file"] = str(rate_file)
+            payload = json.dumps(payload_fields)
             completion = asyncio.create_task(process.communicate(payload.encode()))
             cancel_wait = asyncio.create_task(state["cancel"].wait())
             await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
@@ -1255,6 +1566,7 @@ class VirtualNAS:
             return {"ok": True, "model_id": model_id, "revision": revision,
                     "size_bytes": _nonnegative_int(model.get("size_bytes"))}
         finally:
+            self._release_download_rate_file(operation_id)
             try:
                 async def finish_writer():
                     while process is not None and process.returncode is None:
@@ -1285,6 +1597,8 @@ class VirtualNAS:
         self, model_id: str, revision: str, filenames: list[str],
         explicit_token: str | None = None,
         requested_revision: str | None = None,
+        bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
     ) -> dict[str, Any]:
         """Download an exact subset of one immutable Hub revision.
 
@@ -1372,13 +1686,16 @@ class VirtualNAS:
         sizes, repository_files, blob_keys = await asyncio.to_thread(inspect)
 
         def download_selected() -> dict[str, Any]:
-            _enable_hf_xet_high_performance()
             try:
                 from huggingface_hub import hf_hub_download
             except ImportError as exc:
                 raise RuntimeError(
                     "huggingface-hub is required to download model weights"
                 ) from exc
+            # A capped subset is fetched by the download worker subprocess,
+            # whose socket throttle is scoped to that process; an unlimited
+            # subset downloads here exactly as before.
+            bytes_per_second = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
             with self._download_locks_guard:
                 download_lock = self._download_locks.setdefault(model_id, threading.Lock())
             with download_lock:
@@ -1439,14 +1756,21 @@ class VirtualNAS:
                     )
                 if missing:
                     try:
-                        for filename in missing:
-                            hf_hub_download(
-                                repo_id=model_id,
-                                filename=filename,
-                                revision=revision,
-                                cache_dir=str(self._hub()),
-                                token=token or None,
+                        if bytes_per_second > 0:
+                            self._run_selective_download_process(
+                                model_id, revision, missing, token,
+                                bytes_per_second,
+                                cluster_bandwidth_mbps=cluster_bandwidth_mbps,
                             )
+                        else:
+                            for filename in missing:
+                                hf_hub_download(
+                                    repo_id=model_id,
+                                    filename=filename,
+                                    revision=revision,
+                                    cache_dir=str(self._hub()),
+                                    token=token or None,
+                                )
                     except Exception as exc:
                         raise RuntimeError(
                             "Hugging Face download failed; verify repository access, revision, credentials, and network"
@@ -1474,9 +1798,12 @@ class VirtualNAS:
                     "files": selected,
                 }
 
-        return await self._await_uncancelable(
-            asyncio.to_thread(download_selected),
-        )
+        async with self._capped_internet_transfer(
+            self._download_bandwidth_bytes_per_second(bandwidth_mbps),
+        ):
+            return await self._await_uncancelable(
+                asyncio.to_thread(download_selected),
+            )
 
     def has_model_files(
         self, model_id: str, revision: str, filenames: list[str],
@@ -3842,24 +4169,55 @@ class VirtualNAS:
             ):
                 raise LookupError("partial model cache no longer exists")
         requested_revision = job.get("requested_revision") or revision
+        bandwidth_mbps = self._download_bandwidth_mbps()
         if job["target_node_id"] == LOCAL_NODE_ID:
             operation = self.download_model_files_checked(
                 job["model_id"], revision, selected,
                 explicit_token=token, requested_revision=requested_revision,
             )
         else:
+            download_status = await self._validate_download_node(
+                job["target_node_id"],
+            )
+            json_body = {
+                "revision": revision,
+                "requested_revision": requested_revision,
+                "hf_token": token,
+                "files": selected,
+            }
+            if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+                download_status.get("capabilities") or []
+            ):
+                # An explicit 0 overrides a stale node-local cap; omitting the
+                # field (old agents that would reject it) keeps node-local.
+                json_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+                # The full controller cap rides along as the re-rate
+                # denominator: the agent scales this dispatch by its share
+                # of THAT value, not of its own (possibly stale) setting.
+                json_body["cluster_bandwidth_mbps"] = bandwidth_mbps
+            elif bandwidth_mbps > 0:
+                # An older agent would apply its node-local (usually
+                # unlimited) setting and silently bypass the cluster cap.
+                raise RuntimeError(
+                    "cluster node cannot enforce the download bandwidth "
+                    f"limit; upgrade the agent on node {job['target_node_id']} "
+                    "or set the limit to 0"
+                )
             operation = self.node_registry.request(
                 job["target_node_id"], "POST",
                 self._model_agent_path(job["model_id"], "download"),
-                json_body={
-                    "revision": revision,
-                    "requested_revision": requested_revision,
-                    "hf_token": token,
-                    "files": selected,
-                },
-                timeout=24 * 60 * 60,
+                json_body=json_body,
+                timeout=capped_transfer_timeout_seconds(
+                    bandwidth_mbps, job.get("bytes_total"),
+                    default=24 * 60 * 60, floor=24 * 60 * 60,
+                ),
             )
-        result = await self._await_uncancelable(operation)
+        # Every dispatched download carries the full node-wide cap, so only
+        # one may run cluster-wide at a time (see the constructor lock note).
+        # Unlimited dispatches take no slot: serializing them would regress
+        # the per-node parallelism the dispatcher is built for.
+        async with self.dispatched_download_slot(bandwidth_mbps > 0):
+            result = await self._await_uncancelable(operation)
         if (result or {}).get("status") == "canceled":
             raise TransferCanceled()
         if not (result or {}).get("ok"):
@@ -3980,6 +4338,7 @@ class VirtualNAS:
                 return
             if event.is_set():
                 raise TransferCanceled()
+            bandwidth_mbps = self._download_bandwidth_mbps()
             if job["target_node_id"] == LOCAL_NODE_ID:
                 operation = self._download_model_process(
                     job["model_id"],
@@ -3998,6 +4357,23 @@ class VirtualNAS:
                     ),
                     "hf_token": token,
                 }
+                if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+                    download_status.get("capabilities") or []
+                ):
+                    # Explicit 0 overrides a stale node-local cap; old agents
+                    # reject the field, so only they keep it omitted.
+                    download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+                    # Re-rate denominator: the controller's cap, not the
+                    # agent's stale local value.
+                    download_body["cluster_bandwidth_mbps"] = bandwidth_mbps
+                elif bandwidth_mbps > 0:
+                    # An older agent would apply its node-local (usually
+                    # unlimited) setting and silently bypass the cluster cap.
+                    raise RuntimeError(
+                        "cluster node cannot enforce the download bandwidth "
+                        f"limit; upgrade the agent on node "
+                        f"{job['target_node_id']} or set the limit to 0"
+                    )
                 job["download_cancelable"] = VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY in (
                     download_status.get("capabilities") or []
                 )
@@ -4022,7 +4398,10 @@ class VirtualNAS:
                     job["target_node_id"], "POST",
                     self._model_agent_path(job["model_id"], "download"),
                     json_body=download_body,
-                    timeout=24 * 60 * 60,
+                    timeout=capped_transfer_timeout_seconds(
+                        bandwidth_mbps, job.get("bytes_total"),
+                        default=24 * 60 * 60, floor=24 * 60 * 60,
+                    ),
                 )
             job["download_attempt_start_bytes"] = (
                 _nonnegative_int(immutable_complete.get("size_bytes"))
@@ -4040,10 +4419,23 @@ class VirtualNAS:
             self._save()
             if event.is_set() and not job["download_cancelable"]:
                 raise TransferCanceled()
-            result = await (
-                self._await_download_with_cancel(operation, event, cancel_writer, job)
-                if job["download_cancelable"] else self._await_uncancelable(operation)
-            )
+            # Every dispatched download carries the full node-wide cap, so
+            # only one may run cluster-wide at a time (see the constructor
+            # lock note). Unlimited dispatches take no slot. A cancelable
+            # job also races the slot wait against its cancel event: the
+            # worker has not been dispatched yet, so Stop during the wait
+            # ends the job instead of parking it in canceling beside a
+            # holder's multi-day transfer.
+            if job["download_cancelable"]:
+                async with self._cancellable_dispatch_slot(
+                    bandwidth_mbps > 0, event,
+                ):
+                    result = await self._await_download_with_cancel(
+                        operation, event, cancel_writer, job,
+                    )
+            else:
+                async with self.dispatched_download_slot(bandwidth_mbps > 0):
+                    result = await self._await_uncancelable(operation)
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             if (result or {}).get("status") == "canceled":

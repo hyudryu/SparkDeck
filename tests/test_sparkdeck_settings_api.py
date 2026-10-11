@@ -67,6 +67,9 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "history_enabled": True,
             "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
             "vllm_image": server.manager.settings["vllm_image"],
+            "max_download_bandwidth_mbps": server.manager.settings.get(
+                "max_download_bandwidth_mbps", 0,
+            ),
             "hf_token_configured": True,
         })
         # The node name must never ride the settings response: on joined
@@ -103,6 +106,9 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "history_enabled": True,
             "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
             "vllm_image": server.manager.settings["vllm_image"],
+            "max_download_bandwidth_mbps": server.manager.settings.get(
+                "max_download_bandwidth_mbps", 0,
+            ),
             "hf_token_configured": True,
         })
         self.assertNotIn(sentinel, response.text)
@@ -144,6 +150,38 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
             response = await self.client.get("/api/v1/settings")
             self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
+
+    async def test_bandwidth_cap_validated_before_writes_and_forwarded(self):
+        update_settings = AsyncMock()
+        with (
+            patch.object(server.sparkdeck.store, "set_setting") as set_setting,
+            patch.object(server.manager, "update_settings", update_settings),
+        ):
+            for bad in ("fast", -5, True, 10 ** 9):
+                response = await self.client.put("/api/v1/settings", json={
+                    "max_download_bandwidth_mbps": bad,
+                })
+                self.assertEqual(response.status_code, 400, bad)
+            set_setting.assert_not_called()
+            update_settings.assert_not_awaited()
+
+            response = await self.client.put("/api/v1/settings", json={
+                "max_download_bandwidth_mbps": 42.5,
+            })
+        self.assertEqual(response.status_code, 200)
+        update_settings.assert_awaited_once_with(
+            {"max_download_bandwidth_mbps": 42.5},
+        )
+
+    async def test_legacy_settings_rejects_invalid_bandwidth(self):
+        failure = ValueError("max_download_bandwidth_mbps must be a number")
+        with patch.object(server.manager, "update_settings",
+                          AsyncMock(side_effect=failure)):
+            response = await self.client.post(
+                "/api/settings", json={"max_download_bandwidth_mbps": "fast"},
+            )
+        self.assertEqual(response.status_code, 400)
+
 
     async def test_invalid_deployment_defaults_are_rejected_without_saving(self):
         with patch.object(server.sparkdeck.store, "set_setting") as set_setting:
@@ -513,3 +551,39 @@ class ClusterCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             json.loads(requests[0].content)["hf_token"], "hf_forwarded_secret",
         )
+
+
+class ManagerSettingsWriteTests(unittest.IsolatedAsyncioTestCase):
+    """update_settings must reject an invalid cap without applying any key."""
+
+    def bare_manager(self):
+        manager = Manager.__new__(Manager)
+        manager.lock = asyncio.Lock()
+        manager.settings = {
+            "max_concurrent_models": 2, "max_download_bandwidth_mbps": 2.0,
+        }
+        manager._save_settings = Mock()
+        manager._resolved_hf_token = Mock(return_value="")
+        manager.virtual_nas = Mock(start=Mock(), stop=AsyncMock())
+        manager.is_joined_worker = Mock(return_value=True)
+        return manager
+
+    async def test_invalid_bandwidth_applies_no_other_key(self):
+        manager = self.bare_manager()
+        with self.assertRaises(ValueError):
+            await manager.update_settings({
+                "max_concurrent_models": 9, "max_download_bandwidth_mbps": "fast",
+            })
+        # The request 400s, so nothing may have changed in the live settings.
+        self.assertEqual(manager.settings["max_concurrent_models"], 2)
+        self.assertEqual(manager.settings["max_download_bandwidth_mbps"], 2.0)
+        manager._save_settings.assert_not_called()
+
+    async def test_valid_bandwidth_is_parsed_and_persisted(self):
+        manager = self.bare_manager()
+        await manager.update_settings({
+            "max_concurrent_models": 9, "max_download_bandwidth_mbps": 3.5,
+        })
+        self.assertEqual(manager.settings["max_concurrent_models"], 9)
+        self.assertEqual(manager.settings["max_download_bandwidth_mbps"], 3.5)
+        manager._save_settings.assert_called_once()

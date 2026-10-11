@@ -3176,10 +3176,17 @@ class SparkDeckService:
                 home_node_ids, download_node_id, revision,
             )
         else:
-            await virtual_nas.download_model_files_checked(
-                repository, resolved_revision, selected_files,
-                requested_revision=revision,
-            )
+            # The controller-local seed bypasses the dispatch paths that
+            # reserve the cluster bandwidth budget, so reserve it here: while
+            # capped, this Hub download competes with every other capped
+            # transfer, and the worker would otherwise re-rate against a
+            # budget nobody else was told to share.
+            capped = virtual_nas._download_bandwidth_mbps() > 0
+            async with self.manager._dispatched_download_slot(capped):
+                await virtual_nas.download_model_files_checked(
+                    repository, resolved_revision, selected_files,
+                    requested_revision=revision,
+                )
         model_root = virtual_nas._model_path(repository).resolve()
         snapshot_root = model_root / "snapshots" / resolved_revision
         candidate = snapshot_root

@@ -1,6 +1,7 @@
 """Saved-deployment bookmarks: save, prepare weights via Virtual NAS, launch."""
 
 import asyncio
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,9 @@ def node(node_id: str, name: str, *, local: bool = False) -> dict:
 class FakeBookmarkManager:
     def __init__(self, nodes):
         self.http = httpx.AsyncClient()
+        # A capped controller-local GGUF seed reserves the cluster dispatch
+        # slot; the double runs the body without reservation.
+        self._dispatched_download_slot = contextlib.nullcontext
         self.nodes = nodes
         self.deployments = []
         self.create_deployment = AsyncMock(return_value={
@@ -976,6 +980,7 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": revision,
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._download_bandwidth_mbps = Mock(return_value=0.0)
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
         launch = AsyncMock(return_value={

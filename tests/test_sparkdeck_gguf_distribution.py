@@ -10,6 +10,7 @@ import httpx
 from manager import Manager
 from sparkdeck.service import SparkDeckService
 from sparkdeck.virtual_nas import (
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
     VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
     VirtualNAS,
     _is_complete_repository,
@@ -207,6 +208,82 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manager.node_registry.request.await_args.kwargs["json_body"]["hf_token"],
             "hf-controller-token",
+        )
+
+    async def test_remote_seed_forwards_controller_bandwidth_cap(self):
+        manager = Manager.__new__(Manager)
+        manager.virtual_nas = VirtualNAS(
+            Path(self.temp.name), lambda: Path(self.temp.name) / "hub",
+            Mock(), lambda: True,
+            download_bandwidth_provider=lambda: 12.5,
+        )
+        manager.node_registry = Mock()
+        manager.node_registry.get = Mock(return_value={"id": "worker-1"})
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+                             VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+        }])
+        manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        manager._resolved_hf_token = Mock(return_value="hf-controller-token")
+
+        await manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
+        )
+        self.assertEqual(
+            manager.node_registry.request.await_args.kwargs["json_body"][
+                "max_download_bandwidth_mbps"], 12.5,
+        )
+
+        # With a cap configured, an agent that predates the field must be
+        # refused outright: it cannot apply the limit, and the endpoint
+        # rejects the unknown request key anyway.
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY],
+        }])
+        manager.node_registry.request.reset_mock()
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot enforce the download bandwidth limit",
+        ):
+            await manager.node_download_model_files(
+                "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
+            )
+        manager.node_registry.request.assert_not_awaited()
+
+    async def test_unlimited_controller_forwards_explicit_zero(self):
+        manager = Manager.__new__(Manager)
+        manager.virtual_nas = self.nas  # default provider: 0 = unlimited
+        manager.node_registry = Mock()
+        manager.node_registry.get = Mock(return_value={"id": "worker-1"})
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+                             VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+        }])
+        manager.node_registry.request = AsyncMock(return_value={"ok": True})
+        manager._resolved_hf_token = Mock(return_value=None)
+
+        await manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["model.gguf"],
+        )
+        # The explicit 0 overrides a stale node-local cap; an omitted field
+        # would mean "keep node-local" and leave a capped worker throttled.
+        self.assertEqual(
+            manager.node_registry.request.await_args.kwargs["json_body"][
+                "max_download_bandwidth_mbps"], 0.0,
+        )
+
+        manager.cluster_nodes = AsyncMock(return_value=[{
+            "id": "worker-1", "online": True,
+            "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY],
+        }])
+        await manager.node_download_model_files(
+            "worker-1", "org/model", "a" * 40, ["model.gguf"],
+        )
+        self.assertNotIn(
+            "max_download_bandwidth_mbps",
+            manager.node_registry.request.await_args.kwargs["json_body"],
         )
 
     def remote_manager(self, request):

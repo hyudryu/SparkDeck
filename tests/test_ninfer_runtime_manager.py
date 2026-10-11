@@ -336,13 +336,19 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         manager.client.images.get = Mock(
             side_effect=[docker.errors.ImageNotFound("missing"), image]
         )
+        # Missing runtime images must go through the bandwidth-capped pull
+        # path (pull_image_result), never a direct uncapped images.pull.
+        manager.pull_image_result = AsyncMock(return_value={"ok": True})
 
         await _launch(
             manager, image="registry.test/ninfer:1", name="ninfer-pull",
             ninfer_artifact=self.cache.artifact,
         )
 
-        manager.client.images.pull.assert_called_once_with("registry.test/ninfer:1")
+        manager.pull_image_result.assert_awaited_once_with(
+            "registry.test/ninfer:1", None, None,
+        )
+        manager.client.images.pull.assert_not_called()
 
     async def test_launch_failure_is_reported_without_leaking_the_token(self):
         manager = _manager()
@@ -363,7 +369,9 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         manager.client.images.get = Mock(
             side_effect=docker.errors.ImageNotFound("missing")
         )
-        manager.client.images.pull = Mock(side_effect=RuntimeError("pull failed"))
+        manager.pull_image_result = AsyncMock(
+            side_effect=RuntimeError("pull failed"),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "pull failed"):
             await _launch(manager, ninfer_artifact=self.cache.artifact)

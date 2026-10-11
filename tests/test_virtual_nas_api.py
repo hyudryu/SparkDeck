@@ -431,9 +431,13 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_bandwidth_push_re_rates_in_flight_transfers(self):
         applied = Mock()
+        preinstall = Mock()
         with (
             patch.object(server, "_require_agent"),
             patch.object(server.manager, "apply_bandwidth_cap_live", applied),
+            patch.object(
+                server.manager, "_prefetch_pull_helper_images", preinstall,
+            ),
         ):
             response = await self.client.post(
                 "/api/agent/bandwidth",
@@ -441,9 +445,30 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 200)
         applied.assert_called_once_with(25.0)
+        # Accepting a positive cap means this node will run capped pulls:
+        # the uncapped helper bootstrap must happen now, not mid-pull.
+        preinstall.assert_called_once_with()
         self.assertEqual(
             response.json(), {"max_download_bandwidth_mbps": 25.0},
         )
+
+    async def test_agent_bandwidth_zero_skips_the_helper_preinstall(self):
+        applied = Mock()
+        preinstall = Mock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager, "apply_bandwidth_cap_live", applied),
+            patch.object(
+                server.manager, "_prefetch_pull_helper_images", preinstall,
+            ),
+        ):
+            response = await self.client.post(
+                "/api/agent/bandwidth",
+                json={"max_download_bandwidth_mbps": 0},
+            )
+        self.assertEqual(response.status_code, 200)
+        applied.assert_called_once_with(0.0)
+        preinstall.assert_not_called()
 
     async def test_agent_bandwidth_push_rejects_invalid_values(self):
         applied = Mock()
@@ -585,13 +610,17 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
                     "revision": resolved, "hf_token": "ephemeral",
                     "files": ["q4/model.gguf"],
                     "max_download_bandwidth_mbps": 10,
+                    "cluster_bandwidth_mbps": 40,
                 },
             )
         self.assertEqual(response.status_code, 200)
+        # The dispatched share AND the controller's re-rate anchor reach
+        # the worker; without the anchor a stale node-local setting would
+        # mis-scale the share on the next settings change.
         checked_files.assert_awaited_once_with(
             "org/model", resolved, ["q4/model.gguf"],
             explicit_token="ephemeral", requested_revision=resolved,
-            bandwidth_mbps=10.0,
+            bandwidth_mbps=10.0, cluster_bandwidth_mbps=40.0,
         )
 
     async def test_agent_download_forwards_full_snapshot_bandwidth_cap(self):
@@ -602,11 +631,13 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             response = await self.client.post(
                 "/api/agent/virtual-nas/models/org/model/download",
-                json={"revision": "a" * 40, "max_download_bandwidth_mbps": 2.5},
+                json={"revision": "a" * 40, "max_download_bandwidth_mbps": 2.5,
+                      "cluster_bandwidth_mbps": 10},
             )
         self.assertEqual(response.status_code, 200)
         checked.assert_awaited_once_with(
-            "org/model", "a" * 40, "", "a" * 40, bandwidth_mbps=2.5,
+            "org/model", "a" * 40, "", "a" * 40,
+            bandwidth_mbps=2.5, cluster_bandwidth_mbps=10.0,
         )
 
     async def test_agent_download_rejects_invalid_bandwidth_caps(self):
@@ -655,11 +686,11 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         # An omitted field keeps the node-local cap (None); an explicit 0
         # overrides it for a node with stale persisted settings.
         self.assertEqual(pull.await_args_list[0].args,
-                         ("ghcr.io/example/vllm:latest", 25.0))
+                         ("ghcr.io/example/vllm:latest", 25.0, None))
         self.assertEqual(pull.await_args_list[1].args,
-                         ("ghcr.io/example/vllm:latest", None))
+                         ("ghcr.io/example/vllm:latest", None, None))
         self.assertEqual(pull.await_args_list[2].args,
-                         ("ghcr.io/example/vllm:latest", 0.0))
+                         ("ghcr.io/example/vllm:latest", 0.0, None))
 
     async def test_agent_files_check_reports_selected_file_presence(self):
         has_files = Mock(return_value={

@@ -1317,6 +1317,7 @@ class VirtualNAS:
         requested_revision: str | None = None,
         download_cache_baseline_bytes: int | None = None,
         bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Agent-side capacity gate using only this cache filesystem."""
@@ -1354,7 +1355,9 @@ class VirtualNAS:
                 )
         return await self._download_model_process(
             model_id, revision, explicit_token, requested_revision,
-            bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
+            bandwidth_mbps=bandwidth_mbps,
+            cluster_bandwidth_mbps=cluster_bandwidth_mbps,
+            operation_id=operation_id,
         )
 
     async def cancel_download_operation(self, operation_id: str) -> dict[str, Any]:
@@ -1394,6 +1397,7 @@ class VirtualNAS:
     def _run_selective_download_process(
         self, model_id: str, revision: str, files: list[str], token: str,
         bytes_per_second: float = 0.0,
+        cluster_bandwidth_mbps: float | None = None,
     ) -> None:
         """Fetch one capped file subset through the supervised download worker.
 
@@ -1407,9 +1411,17 @@ class VirtualNAS:
             if os.name == "nt" else {"start_new_session": True}
         )
         rate_key = uuid.uuid4().hex
+        # The denominator is the CLUSTER cap the dispatching controller
+        # carried alongside this share (falling back to the node-local
+        # setting for local launches): a later settings re-rate scales the
+        # worker by its dispatched share of THAT value, so a stale
+        # node-local setting (or 0, which would make the factor 1.0) can
+        # never turn a member share back into the full cluster rate.
         rate_file = self._register_download_rate_file(
             rate_key, bytes_per_second,
-            cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(None),
+            cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(
+                cluster_bandwidth_mbps,
+            ),
         )
         payload_fields = {
             "model_id": model_id, "revision": revision,
@@ -1439,6 +1451,7 @@ class VirtualNAS:
     async def _download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
@@ -1451,12 +1464,15 @@ class VirtualNAS:
             ):
                 return await self._supervised_download_model_process(
                     model_id, revision, explicit_token, requested_revision,
-                    bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
+                    bandwidth_mbps=bandwidth_mbps,
+                    cluster_bandwidth_mbps=cluster_bandwidth_mbps,
+                    operation_id=operation_id,
                 )
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Run Hub's writer in an owned process; never cancel a writer thread."""
@@ -1508,9 +1524,16 @@ class VirtualNAS:
             worker_bps = self._download_bandwidth_bytes_per_second(
                 bandwidth_mbps,
             )
+            # Share of the dispatched CLUSTER cap (see the selective
+            # worker above): the re-rate scales by the controller's value,
+            # never this node's possibly stale local setting.
             rate_file = self._register_download_rate_file(
                 operation_id, worker_bps,
-                cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(None),
+                cluster_bytes_per_second=(
+                    self._download_bandwidth_bytes_per_second(
+                        cluster_bandwidth_mbps,
+                    )
+                ),
             )
             payload_fields = {
                 "model_id": model_id, "revision": revision,
@@ -1575,6 +1598,7 @@ class VirtualNAS:
         explicit_token: str | None = None,
         requested_revision: str | None = None,
         bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
     ) -> dict[str, Any]:
         """Download an exact subset of one immutable Hub revision.
 
@@ -1736,6 +1760,7 @@ class VirtualNAS:
                             self._run_selective_download_process(
                                 model_id, revision, missing, token,
                                 bytes_per_second,
+                                cluster_bandwidth_mbps=cluster_bandwidth_mbps,
                             )
                         else:
                             for filename in missing:
@@ -4166,6 +4191,10 @@ class VirtualNAS:
                 # An explicit 0 overrides a stale node-local cap; omitting the
                 # field (old agents that would reject it) keeps node-local.
                 json_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+                # The full controller cap rides along as the re-rate
+                # denominator: the agent scales this dispatch by its share
+                # of THAT value, not of its own (possibly stale) setting.
+                json_body["cluster_bandwidth_mbps"] = bandwidth_mbps
             elif bandwidth_mbps > 0:
                 # An older agent would apply its node-local (usually
                 # unlimited) setting and silently bypass the cluster cap.
@@ -4334,6 +4363,9 @@ class VirtualNAS:
                     # Explicit 0 overrides a stale node-local cap; old agents
                     # reject the field, so only they keep it omitted.
                     download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+                    # Re-rate denominator: the controller's cap, not the
+                    # agent's stale local value.
+                    download_body["cluster_bandwidth_mbps"] = bandwidth_mbps
                 elif bandwidth_mbps > 0:
                     # An older agent would apply its node-local (usually
                     # unlimited) setting and silently bypass the cluster cap.

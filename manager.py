@@ -8731,6 +8731,7 @@ class Manager:
         # controller's cap across this fan-out so concurrent member pulls
         # cannot multiply the configured cluster-wide download budget.
         pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        cluster_pull_mbps = self._image_pull_cluster_cap_mbps()
         self._require_bandwidth_capable_nodes(node_ids, available)
         tasks: list = []
         member_specs: list[dict] = []
@@ -8771,6 +8772,11 @@ class Manager:
                         "fabric_ip": fabric_ip,
                         "fabric_interface": fabric_interface,
                         "image_pull_bandwidth_mbps": pull_share_mbps,
+                        # Re-rate anchor for the member's runtime-image
+                        # pull: the controller's full cap, so a settings
+                        # change mid-launch scales the member share of
+                        # the new cap, not the agent's own setting.
+                        "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
                     },
                 })
                 if engine == "vllm":
@@ -8925,6 +8931,7 @@ class Manager:
         # Non-grouped fan-out: divide the controller cap across members just
         # like the grouped builder does above.
         pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        cluster_pull_mbps = self._image_pull_cluster_cap_mbps()
         self._require_bandwidth_capable_nodes(node_ids, available)
         for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
@@ -8946,6 +8953,7 @@ class Manager:
                     "fabric_ip": fabric_ip,
                     "fabric_interface": fabric_interface,
                     "image_pull_bandwidth_mbps": pull_share_mbps,
+                    "cluster_pull_bandwidth_mbps": cluster_pull_mbps,
                 },
             })
             if mode == "sharded":
@@ -20090,6 +20098,7 @@ class Manager:
 
     async def pull_image_stream(
         self, image: str, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
     ):
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
@@ -20117,7 +20126,9 @@ class Manager:
             # from doubling this node's internet rate. async with keeps the
             # release owned: a request cancelled while queued to acquire
             # never frees the holder's lock.
-            cluster_bytes_per_second = self._image_pull_bytes_per_second(None)
+            cluster_bytes_per_second = self._image_pull_bytes_per_second(
+                cluster_bandwidth_mbps,
+            )
             lock = getattr(self, "internet_transfer_lock", None)
             try:
                 if lock is None:
@@ -20187,18 +20198,22 @@ class Manager:
                 "limit; upgrade the agent on: " + ", ".join(unsupported)
             )
 
+    def _image_pull_cluster_cap_mbps(self) -> float:
+        """The controller's max download bandwidth setting, in Mbps."""
+        try:
+            return max(0.0, parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            ))
+        except ValueError:
+            return 0.0
+
     def _cluster_image_pull_share_mbps(self, fanout_width: int) -> float:
         """Controller cap divided across the members of one launch fan-out.
 
         Always explicit (0 = unlimited) so a member agent applies the
         controller's decision instead of a stale node-local setting.
         """
-        try:
-            cap = parse_bandwidth_mbps(
-                self.settings.get("max_download_bandwidth_mbps", 0),
-            )
-        except ValueError:
-            cap = 0.0
+        cap = self._image_pull_cluster_cap_mbps()
         if cap <= 0:
             return 0.0
         return cap / max(1, int(fanout_width))
@@ -20217,6 +20232,20 @@ class Manager:
         if isinstance(share, bool) or not isinstance(share, (int, float)):
             return None
         return float(share)
+
+    def _cluster_pull_bandwidth_mbps(
+        self, cluster_member: dict | None = None,
+    ) -> float | None:
+        """The controller cap stamped on a launch member's payload.
+
+        This is the re-rate denominator for the member's dispatched share;
+        None (no stamp, e.g. a standalone local launch) falls back to the
+        node's own settings reading at the use sites.
+        """
+        cluster = (cluster_member or {}).get("cluster_pull_bandwidth_mbps")
+        if isinstance(cluster, bool) or not isinstance(cluster, (int, float)):
+            return None
+        return float(cluster)
 
     async def _ensure_runtime_image(
         self, image: str, name: str | None = None, model: str | None = None,
@@ -20266,8 +20295,9 @@ class Manager:
                 )
             except ValueError:
                 effective_mbps = 0.0
+        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
         async with self._dispatched_download_slot(effective_mbps > 0):
-            await self.pull_image_result(image, share_mbps)
+            await self.pull_image_result(image, share_mbps, cluster_mbps)
 
     # Launch arguments whose VALUE is a Hugging Face repository other than
     # the primary model. The runtime resolves these inside the container, so
@@ -20349,6 +20379,7 @@ class Manager:
         capped.
         """
         share = self._image_pull_share_mbps(cluster_member)
+        cluster_mbps = self._cluster_pull_bandwidth_mbps(cluster_member)
         if share is None:
             try:
                 share = parse_bandwidth_mbps(
@@ -20450,14 +20481,18 @@ class Manager:
                 )
                 await nas._download_model_process(
                     repo_id, resolved, token, want, bandwidth_mbps=share,
+                    cluster_bandwidth_mbps=cluster_mbps,
                 )
 
     async def pull_image_result(
         self, image: str, bandwidth_mbps: float | None = None,
+        cluster_bandwidth_mbps: float | None = None,
     ) -> dict:
         """Pull one image locally and collapse Docker progress into a result."""
         error = None
-        async for event in self.pull_image_stream(image, bandwidth_mbps):
+        async for event in self.pull_image_stream(
+            image, bandwidth_mbps, cluster_bandwidth_mbps,
+        ):
             try:
                 payload = json.loads(event.removeprefix("data:").strip())
             except (AttributeError, json.JSONDecodeError):
@@ -20512,12 +20547,15 @@ class Manager:
 
         async def pull(node: dict) -> dict:
             if node["id"] == LOCAL_NODE_ID:
-                return await self.pull_image_result(image, share_mbps)
+                return await self.pull_image_result(
+                    image, share_mbps, cap_mbps,
+                )
             return await self.node_registry.request(
                 node["id"], "POST", "/api/agent/images/pull",
                 json_body={
                     "image": image,
                     "max_download_bandwidth_mbps": share_mbps,
+                    "cluster_bandwidth_mbps": cap_mbps,
                 },
                 timeout=capped_transfer_timeout_seconds(
                     share_mbps, default=1800,

@@ -346,7 +346,7 @@ class NinferContainerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         manager.pull_image_result.assert_awaited_once_with(
-            "registry.test/ninfer:1", None,
+            "registry.test/ninfer:1", None, None,
         )
         manager.client.images.pull.assert_not_called()
 

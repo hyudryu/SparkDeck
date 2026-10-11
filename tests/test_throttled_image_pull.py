@@ -24,10 +24,12 @@ from sparkdeck.throttled_image_pull import (
     _read_counter,
     daemon_proxy_config,
     helper_credentials,
+    insecure_registry_entries,
     is_loopback_registry_image,
     matches_insecure_registry,
     normalize_image_reference,
     registry_ca_binds,
+    registry_mirrors_config,
     select_docker_config,
     split_authority,
     skopeo_copy_args,
@@ -682,6 +684,31 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             if list(c.get("command") or [])[:1] == ["inspect"]
         )
         self.assertIn("--tls-verify=false", inspect["command"])
+
+    async def test_indexconfig_insecure_named_host_turns_verification_off(self):
+        # Named insecure hosts live in IndexConfigs (Secure:false), not in
+        # InsecureRegistryCIDRs: a helper consulting only the CIDRs keeps
+        # TLS verification on and fails a pull the daemon itself completes.
+        api = FakeDockerApi(registry_config={
+            "InsecureRegistryCIDRs": [],
+            "IndexConfigs": {
+                "reg.corp:5000": {"Name": "reg.corp:5000", "Secure": False},
+                "other.corp": {"Name": "other.corp", "Secure": True},
+            },
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        await self.collect(api, image="reg.corp:5000/team/img:1", staging=staging)
+        self.assertIsNotNone(api.loaded)
+        copy = next(
+            c for c in api.created if list(c.get("command") or [])[:1] == ["copy"]
+        )
+        self.assertIn("--src-tls-verify=false", copy["command"])
 
     async def test_secure_pull_still_verifies_tls(self):
         api = FakeDockerApi(registry_config={
@@ -1767,6 +1794,53 @@ class RegistryTrustTests(unittest.TestCase):
         self.assertFalse(matches_insecure_registry("ghcr.io/org/model:1", insecure))
         self.assertFalse(matches_insecure_registry("nginx:latest", insecure))
         self.assertFalse(matches_insecure_registry("bad:99999/x", ["::1/128"]))
+
+    def test_insecure_registry_entries_merge_indexconfigs(self):
+        # Docker records named insecure hosts only under IndexConfigs with
+        # Secure:false; consulting the CIDRs alone misses them entirely.
+        entries = insecure_registry_entries({
+            "InsecureRegistryCIDRs": ["10.0.0.0/8"],
+            "IndexConfigs": {
+                "reg.corp:5000": {"Name": "reg.corp:5000", "Secure": False},
+                "plain.corp": {
+                    "Name": "https://plain.corp/v1/", "Secure": False,
+                },
+                "secure.corp": {"Name": "secure.corp", "Secure": True},
+            },
+        })
+        self.assertIn("10.0.0.0/8", entries)
+        self.assertIn("reg.corp:5000", entries)
+        self.assertIn("plain.corp", entries)
+        self.assertNotIn("https://plain.corp/v1/", entries)
+        self.assertNotIn("secure.corp", entries)
+        # The named entry drives the same verification-off match as a CIDR.
+        self.assertTrue(matches_insecure_registry("plain.corp/team/img", entries))
+        self.assertFalse(matches_insecure_registry("secure.corp/team/img", entries))
+
+    def test_http_hub_mirror_is_marked_insecure_in_the_dropin(self):
+        # The scheme is transport configuration, not decoration: a plain
+        # HTTP mirror only works through containers/image when the entry is
+        # marked insecure; dropping the scheme without the mark turns the
+        # working mirror into a failing TLS handshake.
+        text = registry_mirrors_config(
+            {"RegistryConfig": {"Mirrors": [
+                "http://mirror.lan:5000/", "https://cache.lan",
+            ]}},
+            "docker.io",
+        )
+        self.assertIn('location = "mirror.lan:5000"', text)
+        self.assertIn('location = "cache.lan"', text)
+        # Only the plain-HTTP mirror carries the insecure mark.
+        self.assertEqual(text.count("insecure = true"), 1)
+        self.assertLess(
+            text.index('location = "mirror.lan:5000"'),
+            text.index("insecure = true"),
+        )
+
+    def test_all_empty_mirrors_produce_no_dropin(self):
+        self.assertEqual(registry_mirrors_config(
+            {"RegistryConfig": {"Mirrors": ["/", "   "]}}, "docker.io",
+        ), "")
 
     def test_split_authority_handles_ipv6_brackets(self):
         self.assertEqual(split_authority("[2001:db8::1]:5000"), ("2001:db8::1", "5000"))

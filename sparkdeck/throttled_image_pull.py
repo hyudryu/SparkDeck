@@ -433,6 +433,35 @@ def matches_insecure_registry(image: str, insecure: list[str]) -> bool:
     return False
 
 
+def insecure_registry_entries(registry_config: dict) -> list[str]:
+    """Every entry the daemon treats as transport-insecure.
+
+    Docker splits its trust settings across two keys: ``InsecureRegistryCIDRs``
+    carries the CIDR networks, while named host entries such as
+    ``reg.corp:5000`` only appear under ``IndexConfigs`` with
+    ``Secure: false``. A helper consulting just the CIDRs would keep TLS
+    verification on for the common named-registry configuration and fail
+    pulls the daemon itself completes.
+    """
+    config = registry_config or {}
+    entries = [str(entry) for entry in (config.get("InsecureRegistryCIDRs") or [])]
+    index_configs = config.get("IndexConfigs")
+    if isinstance(index_configs, dict):
+        for key, info in index_configs.items():
+            if not isinstance(info, dict) or info.get("Secure") is not False:
+                continue
+            name = str(info.get("Name") or key or "").strip().lower()
+            for scheme in ("https://", "http://"):
+                if name.startswith(scheme):
+                    name = name[len(scheme):]
+            name = name.strip("/")
+            if name.endswith("/v1"):
+                name = name[:-3]
+            if name:
+                entries.append(name)
+    return entries
+
+
 def is_loopback_registry_image(image: str) -> bool:
     """True when the reference's registry host is this machine's loopback.
 
@@ -567,16 +596,30 @@ def registry_mirrors_config(daemon_info: dict, registry_host: str) -> str:
         return ""
     registry_config = (daemon_info or {}).get("RegistryConfig") or {}
     lines = ['[[registry]]', 'prefix = "docker.io"', 'location = "docker.io"', ""]
+    configured = 0
     for mirror in registry_config.get("Mirrors") or []:
         value = str(mirror or "").strip().lower()
-        for scheme in ("https://", "http://"):
-            if value.startswith(scheme):
-                value = value[len(scheme):]
+        # The scheme is transport configuration, not decoration: a mirror
+        # spelled http:// serves plain HTTP, and containers/image only
+        # falls back to HTTP for entries marked insecure. Dropping the
+        # scheme without marking the mirror insecure turns an intentionally
+        # plain-HTTP internal mirror into a TLS handshake that hangs or
+        # fails, where dockerd itself succeeds.
+        insecure = False
+        if value.startswith("https://"):
+            value = value[len("https://"):]
+        elif value.startswith("http://"):
+            value = value[len("http://"):]
+            insecure = True
         value = value.rstrip("/")
         if not value:
             continue
-        lines += ["[[registry.mirror]]", 'location = "' + value + '"', ""]
-    if len(lines) == 4:
+        configured += 1
+        lines += ["[[registry.mirror]]", 'location = "' + value + '"']
+        if insecure:
+            lines.append("insecure = true")
+        lines.append("")
+    if not configured:
         return ""
     return "\n".join(lines)
 
@@ -952,8 +995,7 @@ async def throttled_image_pull_events(
         # locality, so this registry stays inside the limiter; the helpers
         # simply skip TLS verification exactly like the daemon would.
         tls_verify = not matches_insecure_registry(
-            image,
-            [str(e) for e in (registry_config.get("InsecureRegistryCIDRs") or [])],
+            image, insecure_registry_entries(registry_config),
         )
         # Same candidate order as docker-py: $DOCKER_CONFIG first, then the
         # root and user home defaults the SDK falls back to.

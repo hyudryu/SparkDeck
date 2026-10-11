@@ -48,7 +48,7 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["node_ids"], ["remote-1", "local"])
         self.manager.pull_image_result.assert_awaited_once_with(
-            "ghcr.io/example/vllm:latest", 0.0,
+            "ghcr.io/example/vllm:latest", 0.0, 0.0,
         )
         self.manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/images/pull",
@@ -57,6 +57,9 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
                 # 0 is sent explicitly so a controller-side "unlimited"
                 # cannot be overridden by stale node-local settings.
                 "max_download_bandwidth_mbps": 0.0,
+                # The re-rate anchor rides along: the member scales by its
+                # share of the controller value, not its own stale setting.
+                "cluster_bandwidth_mbps": 0.0,
             },
             timeout=1800,
         )
@@ -72,10 +75,14 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.nodes[1]["capabilities"] = [IMAGE_PULL_BANDWIDTH_CAPABILITY]
         self.manager.settings["max_download_bandwidth_mbps"] = 100
         await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
-        self.manager.pull_image_result.assert_awaited_once_with("example/image", 50.0)
+        self.manager.pull_image_result.assert_awaited_once_with(
+            "example/image", 50.0, 100.0,
+        )
         self.manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/images/pull",
-            json_body={"image": "example/image", "max_download_bandwidth_mbps": 50.0},
+            json_body={"image": "example/image",
+                       "max_download_bandwidth_mbps": 50.0,
+                       "cluster_bandwidth_mbps": 100.0},
             timeout=capped_transfer_timeout_seconds(50.0, default=1800),
         )
 

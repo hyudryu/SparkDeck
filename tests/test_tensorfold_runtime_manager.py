@@ -208,7 +208,7 @@ class TensorfoldContainerTests(unittest.IsolatedAsyncioTestCase):
         await _launch(manager, image="registry.test/tensorfold:1", name="tensorfold-pull")
 
         manager.pull_image_result.assert_awaited_once_with(
-            "registry.test/tensorfold:1", None,
+            "registry.test/tensorfold:1", None, None,
         )
         manager.client.images.pull.assert_not_called()
 

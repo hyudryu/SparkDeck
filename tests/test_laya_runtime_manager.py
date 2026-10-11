@@ -274,7 +274,7 @@ class LayaContainerTests(unittest.IsolatedAsyncioTestCase):
         await _launch(manager, image="registry.test/laya:1", name="laya-pull")
 
         manager.pull_image_result.assert_awaited_once_with(
-            "registry.test/laya:1", None,
+            "registry.test/laya:1", None, None,
         )
         manager.client.images.pull.assert_not_called()
 

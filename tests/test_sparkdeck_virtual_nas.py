@@ -5140,6 +5140,7 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             # 4 Mbps = 500 KB/s, and the bytes move in the worker process.
             runner.assert_called_once_with(
                 "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 500_000.0,
+                cluster_bandwidth_mbps=None,
             )
             hub.hf_hub_download.assert_not_called()
 
@@ -5163,6 +5164,7 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
                 )
             runner.assert_called_once_with(
                 "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 2_000_000.0,
+                cluster_bandwidth_mbps=None,
             )
 
     async def test_invalid_persisted_cap_downloads_unlimited(self):
@@ -5324,6 +5326,35 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(captured["content"], "500000.0")
 
+    def test_selective_dispatch_rerates_against_the_dispatched_anchor(self):
+        # The node's local setting is stale (unlimited), so the share
+        # factor must come from the cluster cap the dispatch carried; a
+        # factor of 1.0 from the stale 0 would hand this one member the
+        # full new cluster cap on the next settings change.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True,
+                             download_bandwidth_provider=lambda: 0)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                # Dispatched anchor 4 Mbps = 500000 B/s; this worker holds
+                # half of it, so the new 8 Mbps cluster cap lands at 500k.
+                nas.apply_download_bandwidth_cap(1_000_000.0)
+                captured["content"] = Path(
+                    payload["rate_file"],
+                ).read_text(encoding="utf-8")
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 250_000.0, cluster_bandwidth_mbps=4,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+
     def test_uncapped_weight_start_has_no_rate_file(self):
         with tempfile.TemporaryDirectory() as directory:
             nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
@@ -5384,6 +5415,9 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             )
             await nas._download_selected_files(job, "")
             self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 10.0)
+            # The dispatched re-rate anchor is the controller's own cap,
+            # never the agent's (possibly stale) node-local value.
+            self.assertEqual(bodies[-1]["cluster_bandwidth_mbps"], 10.0)
 
             # With a cap configured, an older agent that would pull uncapped
             # must be refused outright instead of silently violating the cap.

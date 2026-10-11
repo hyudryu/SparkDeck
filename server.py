@@ -1132,8 +1132,19 @@ async def agent_pull_image(req: Request):
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Controller's full cap: the re-rate anchor for this dispatched share.
+    raw_cluster = body.get("cluster_bandwidth_mbps")
     try:
-        return await manager.pull_image_result(image, bandwidth_mbps)
+        cluster_bandwidth_mbps = (
+            parse_bandwidth_mbps(raw_cluster)
+            if raw_cluster is not None else None
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        return await manager.pull_image_result(
+            image, bandwidth_mbps, cluster_bandwidth_mbps,
+        )
     except Exception as exc:
         raise HTTPException(502, str(exc)[:500]) from exc
 
@@ -1155,6 +1166,12 @@ async def agent_apply_bandwidth_cap(req: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     manager.apply_bandwidth_cap_live(bandwidth_mbps)
+    if bandwidth_mbps > 0:
+        # Accepting a cap here means this node will run capped pulls, whose
+        # proxy/Skopeo helper bootstrap cannot itself be rate limited. Do the
+        # one-time uncapped preinstall now, at settings-accept time, instead
+        # of mid-pull at the first capped request.
+        manager._prefetch_pull_helper_images()
     return {"max_download_bandwidth_mbps": bandwidth_mbps}
 
 
@@ -1233,12 +1250,12 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
             "download_cache_baseline_bytes", "files", "operation_id",
-            "max_download_bandwidth_mbps",
+            "max_download_bandwidth_mbps", "cluster_bandwidth_mbps",
         }:
             raise ValueError(
                 "request may contain only revision, requested_revision, hf_token, "
-                "download_cache_baseline_bytes, files, operation_id, and "
-                "max_download_bandwidth_mbps"
+                "download_cache_baseline_bytes, files, operation_id, "
+                "max_download_bandwidth_mbps, and cluster_bandwidth_mbps"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
@@ -1250,6 +1267,17 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             try:
                 bandwidth_mbps = parse_bandwidth_mbps(
                     body["max_download_bandwidth_mbps"],
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        # The controller's own cap, dispatched alongside the share so a
+        # live settings re-rate scales this transfer by its share of the
+        # cluster value instead of a stale node-local setting.
+        cluster_bandwidth_mbps: float | None = None
+        if "cluster_bandwidth_mbps" in body:
+            try:
+                cluster_bandwidth_mbps = parse_bandwidth_mbps(
+                    body["cluster_bandwidth_mbps"],
                 )
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
@@ -1282,6 +1310,8 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
             bandwidth_kwargs = (
                 {"bandwidth_mbps": bandwidth_mbps} if bandwidth_mbps is not None else {}
             )
+            if cluster_bandwidth_mbps is not None:
+                bandwidth_kwargs["cluster_bandwidth_mbps"] = cluster_bandwidth_mbps
             result = await manager.virtual_nas.download_model_files_checked(
                 model_id, revision or "main",
                 [item.strip() for item in files],
@@ -1299,6 +1329,8 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         operation_kwargs = {"operation_id": operation_id} if operation_id is not None else {}
         if bandwidth_mbps is not None:
             operation_kwargs["bandwidth_mbps"] = bandwidth_mbps
+        if cluster_bandwidth_mbps is not None:
+            operation_kwargs["cluster_bandwidth_mbps"] = cluster_bandwidth_mbps
         result = await manager.virtual_nas.download_model_checked(*download_args, **operation_kwargs)
         return _public_storage_payload(result)
     except TransferCanceled:

@@ -68,14 +68,14 @@ class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
             "img:1", cluster_member={"image_pull_bandwidth_mbps": 25.0},
             runtime="llama",
         )
-        m.pull_image_result.assert_awaited_once_with("img:1", 25.0)
+        m.pull_image_result.assert_awaited_once_with("img:1", 25.0, None)
 
     async def test_missing_image_without_a_share_uses_the_node_setting(self):
         m = bare_manager(100.0)
         m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
         m.pull_image_result = AsyncMock(return_value={"ok": True})
         await m._ensure_runtime_image("img:1", runtime="vllm")
-        m.pull_image_result.assert_awaited_once_with("img:1", None)
+        m.pull_image_result.assert_awaited_once_with("img:1", None, None)
 
     async def test_other_docker_errors_propagate(self):
         m = bare_manager(100.0)
@@ -83,6 +83,22 @@ class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
         m.pull_image_result = AsyncMock()
         with self.assertRaises(docker.errors.APIError):
             await m._ensure_runtime_image("img:1", runtime="vllm")
+
+    async def test_member_launch_pull_forwards_the_cluster_anchor(self):
+        # The launch payload stamps the controller's full cap alongside the
+        # member share so a live settings change re-rates the pull by its
+        # share of THAT value, not of the agent's stale node-local setting.
+        m = bare_manager(100.0)
+        m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
+        m.pull_image_result = AsyncMock(return_value={"ok": True})
+        await m._ensure_runtime_image(
+            "img:1", cluster_member={
+                "image_pull_bandwidth_mbps": 25.0,
+                "cluster_pull_bandwidth_mbps": 100.0,
+            },
+            runtime="llama",
+        )
+        m.pull_image_result.assert_awaited_once_with("img:1", 25.0, 100.0)
 
     async def test_capped_pull_holds_the_cluster_dispatch_slot(self):
         # The launch-time image pull is a controller-dispatched capped
@@ -93,7 +109,7 @@ class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
         m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
         observed = []
 
-        async def fake_pull(image, mbps):
+        async def fake_pull(image, mbps, cluster_mbps=None):
             observed.append(lock.locked())
             return {"ok": True}
 
@@ -108,7 +124,7 @@ class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
         m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
         observed = []
 
-        async def fake_pull(image, mbps):
+        async def fake_pull(image, mbps, cluster_mbps=None):
             observed.append(lock.locked())
 
         m.pull_image_result = fake_pull
@@ -194,6 +210,29 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
             await self.collect(m, "10.1.2.3:5000/team/img:1")
         self.assertEqual(used, ["10.1.2.3:5000/team/img:1"])
         m.client.api.pull.assert_not_called()
+
+    async def test_dispatched_cluster_anchor_overrides_the_node_reading(self):
+        # The node's own setting is stale (100 Mbps here) while the
+        # dispatch carries the controller's real cap (50 Mbps): the helper
+        # must register the share against the ANCHOR, so a live re-rate
+        # lands at new_cap/2 instead of a fraction of the stale value.
+        m = bare_manager(100.0)
+        seen = {}
+
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
+            seen["bps"] = bps
+            seen["cluster"] = cluster_bytes_per_second
+            yield {"status": "ok"}
+
+        with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
+                   fake_events):
+            out = []
+            async for chunk in m.pull_image_stream(
+                "ghcr.io/org/model:1", 12.5, 50.0,
+            ):
+                out.append(chunk)
+        self.assertEqual(seen["bps"], 1_562_500.0)       # 12.5 Mbps share
+        self.assertEqual(seen["cluster"], 6_250_000.0)   # dispatched 50 Mbps
 
     async def test_fanout_member_stream_forwards_the_cluster_reference(self):
         # A member dispatched cap/4 must re-rate to new_cap/4 on a settings
@@ -325,6 +364,7 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
             )
         m.virtual_nas._download_model_process.assert_awaited_once_with(
             "org/model", self.SHA, "tok", "main", bandwidth_mbps=100.0,
+            cluster_bandwidth_mbps=None,
         )
         phases = [call.args[1] for call in m._cluster_launch_update.call_args_list]
         self.assertIn("downloading_weights", phases)
@@ -338,6 +378,24 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
             )
         m.virtual_nas._download_model_process.assert_awaited_once_with(
             "org/model", self.SHA, "tok", "main", bandwidth_mbps=25.0,
+            cluster_bandwidth_mbps=None,
+        )
+
+    async def test_member_cluster_stamp_becomes_the_rerate_anchor(self):
+        # A launched member carries the controller's cap on its payload;
+        # the weights worker registers its share against that anchor so a
+        # settings change mid-launch re-rates member shares of the new cap.
+        m = self.harness(0.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", cluster_member={
+                    "image_pull_bandwidth_mbps": 25.0,
+                    "cluster_pull_bandwidth_mbps": 100.0,
+                }, runtime="sglang",
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "main",
+            bandwidth_mbps=25.0, cluster_bandwidth_mbps=100.0,
         )
 
     async def test_cached_model_skips_the_worker(self):
@@ -372,7 +430,8 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
             "org/model", revision="feature-branch",
         )
         m.virtual_nas._download_model_process.assert_awaited_once_with(
-            "org/model", self.SHA, "tok", "feature-branch", bandwidth_mbps=100.0,
+            "org/model", self.SHA, "tok", "feature-branch",
+            bandwidth_mbps=100.0, cluster_bandwidth_mbps=None,
         )
 
     async def test_pinned_commit_sha_skips_resolution(self):
@@ -384,7 +443,8 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
             )
         factory.assert_not_called()
         m.virtual_nas._download_model_process.assert_awaited_once_with(
-            "org/model", "b" * 40, "tok", "b" * 40, bandwidth_mbps=100.0,
+            "org/model", "b" * 40, "tok", "b" * 40,
+            bandwidth_mbps=100.0, cluster_bandwidth_mbps=None,
         )
 
     async def test_secondary_repos_ride_the_same_capped_worker(self):
@@ -404,7 +464,8 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
         observed = []
 
         async def fake_download(model_id, revision, token, requested,
-                                bandwidth_mbps=None):
+                                bandwidth_mbps=None,
+                                cluster_bandwidth_mbps=None):
             observed.append(m.dispatched_download_lock.locked())
             return {"ok": True}
 

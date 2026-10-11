@@ -802,7 +802,7 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
         await _launch(manager)
 
         manager.pull_image_result.assert_awaited_once_with(
-            DEFAULT_STRATA_IMAGE, None,
+            DEFAULT_STRATA_IMAGE, None, None,
         )
         manager.client.images.pull.assert_not_called()
         manager._run_managed_container.assert_called_once()

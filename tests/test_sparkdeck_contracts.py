@@ -1,3 +1,4 @@
+import contextlib
 import os
 import tempfile
 import unittest
@@ -26,6 +27,11 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.manager = FakeManager()
+        # A capped controller-local GGUF seed reserves the cluster dispatch
+        # slot; the double just runs the body without reservation.
+        self.manager._dispatched_download_slot = (
+            lambda capped: contextlib.nullcontext()
+        )
         self.service = SparkDeckService(self.manager, Path(self.temp.name))
 
     async def asyncTearDown(self):
@@ -134,6 +140,51 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(launch.await_args.args[5]["revision"], "revision-abc")
 
+    async def test_local_gguf_seed_holds_the_cluster_dispatch_slot(self):
+        # A controller-local GGUF seed dispatches its own Hub download, so
+        # while capped it must reserve the cluster bandwidth budget: beside
+        # a capped transfer on another node it would move two full rates.
+        revision = "f" * 40
+        model_root = Path(self.temp.name) / "models--org--model"
+        artifact = model_root / "snapshots" / revision / "model-F16.gguf"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"gguf")
+        virtual_nas = Mock()
+        virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "resolved_revision": revision,
+        })
+        virtual_nas._model_path = Mock(return_value=model_root)
+        virtual_nas._download_bandwidth_mbps = Mock(return_value=40.0)
+        self.manager.virtual_nas = virtual_nas
+        held = {"during": False}
+
+        async def checked(*_args, **_kwargs):
+            held["during"] = self.slot_held
+            return {"ok": True}
+
+        virtual_nas.download_model_files_checked = checked
+        reservations = []
+
+        @contextlib.asynccontextmanager
+        async def slot(capped):
+            reservations.append(capped)
+            self.slot_held = True
+            try:
+                yield
+            finally:
+                self.slot_held = False
+
+        self.slot_held = False
+        self.manager._dispatched_download_slot = slot
+        prepared = await self.service._prepare_public_gguf_artifact(
+            "org/model", "model-F16.gguf", "main", None,
+        )
+        self.assertTrue(Path(prepared).exists())
+        # Reserved exactly once, capped, and held across the download.
+        self.assertEqual(reservations, [True])
+        self.assertTrue(held["during"])
+        self.assertFalse(self.slot_held)
+
     async def test_repo_relative_gguf_is_prepared_and_resolved_before_launch(self):
         revision = "a" * 40
         model_root = Path(self.temp.name) / "models--org--model"
@@ -145,6 +196,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": revision,
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._download_bandwidth_mbps = Mock(return_value=0.0)
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
         launch = AsyncMock(return_value={
@@ -311,6 +363,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": revision,
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._download_bandwidth_mbps = Mock(return_value=0.0)
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
 
@@ -344,6 +397,7 @@ class SparkDeckContractTests(unittest.IsolatedAsyncioTestCase):
             "resolved_revision": revision,
         })
         virtual_nas.download_model_files_checked = AsyncMock(return_value={"ok": True})
+        virtual_nas._download_bandwidth_mbps = Mock(return_value=0.0)
         virtual_nas._model_path = Mock(return_value=model_root)
         self.manager.virtual_nas = virtual_nas
 

@@ -204,7 +204,8 @@ class FakeDockerApi:
 
     def __init__(self, *, copy_exit=0, proxy_dies=False, stderr_tail=b"fatal: copy failed",
                  load_events=None, verify_fails=False, inspect_size=100,
-                 helpers_missing=False):
+                 helpers_missing=False, security_options=None):
+        self.security_options = security_options or []
         self.copy_exit = copy_exit
         self.proxy_dies = proxy_dies
         self.stderr_tail = stderr_tail
@@ -229,6 +230,9 @@ class FakeDockerApi:
     # -- API surface used by the module (dispatched via asyncio.to_thread) --
     def version(self):
         return {"Arch": "amd64"}
+
+    def info(self):
+        return {"SecurityOptions": list(self.security_options)}
 
     def inspect_image(self, ref):
         # Helper images always exist (no pull); the requested image resolves
@@ -494,7 +498,7 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             "u:s",
         )
         copy = copy_kwargs(api)
-        self.assertTrue(any(bind.endswith(":/auth/config.json:ro")
+        self.assertTrue(any(bind.endswith(":/auth/config.json:ro,z")
                             for bind in copy["host_config"]["Binds"]))
         self.assertIn("--authfile", copy["command"])
 
@@ -566,6 +570,64 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(SKOPEO_IMAGE, notices[1])
         self.assertEqual(api.pulls, [PROXY_IMAGE, SKOPEO_IMAGE])
         self.assertIsNotNone(api.loaded)
+
+    async def test_staging_binds_carry_the_shared_selinux_label(self):
+        api = FakeDockerApi()
+        await self.collect(api)
+        proxy = next(c for c in api.created if c.get("image") == PROXY_IMAGE)
+        copy = copy_kwargs(api)
+        # The proxy and copy containers are different containers sharing one
+        # staging directory, so both mounts need the shared ":z" label; a
+        # private ":Z" would relabel away the peer's access on SELinux hosts.
+        self.assertTrue(
+            copy["host_config"]["Binds"][0].endswith(":/archive:z"),
+            copy["host_config"]["Binds"],
+        )
+        self.assertEqual(
+            proxy["host_config"]["Binds"], [copy["host_config"]["Binds"][0]],
+        )
+
+    async def test_rootless_daemon_omits_the_host_uid_user_override(self):
+        # Rootless Docker runs the daemon as this user already, so container
+        # root maps straight to it. The host-UID override instead maps to an
+        # unprivileged subuid that cannot write the 0700 staging directory or
+        # read the 0600 auth file.
+        api = FakeDockerApi(security_options=[
+            "name=rootless", "name=seccomp,profile=default",
+        ])
+        with (
+            patch.object(tip.os, "name", "posix"),
+            patch.object(tip.os, "getuid", return_value=1000, create=True),
+            patch.object(tip.os, "getgid", return_value=1000, create=True),
+        ):
+            await self.collect(api)
+        self.assertIsNone(copy_kwargs(api).get("user"))
+
+    async def test_rootful_daemon_keeps_the_host_uid_user_override(self):
+        api = FakeDockerApi(security_options=["name=seccomp,profile=default"])
+        with (
+            patch.object(tip.os, "name", "posix"),
+            patch.object(tip.os, "getuid", return_value=1000, create=True),
+            patch.object(tip.os, "getgid", return_value=1000, create=True),
+        ):
+            await self.collect(api)
+        self.assertEqual(copy_kwargs(api).get("user"), "1000:1000")
+
+    async def test_daemon_info_failure_falls_back_to_the_uid_override(self):
+        api = FakeDockerApi()
+
+        def broken_info():
+            raise RuntimeError("daemon unreachable")
+
+        api.info = broken_info
+        with (
+            patch.object(tip.os, "name", "posix"),
+            patch.object(tip.os, "getuid", return_value=4242, create=True),
+            patch.object(tip.os, "getgid", return_value=4242, create=True),
+        ):
+            await self.collect(api)
+        # Unknown daemon mode must behave exactly like today's rootful path.
+        self.assertEqual(copy_kwargs(api).get("user"), "4242:4242")
 
 
 class HelperBootstrapTests(unittest.IsolatedAsyncioTestCase):

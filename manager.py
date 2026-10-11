@@ -66,6 +66,7 @@ from sparkdeck.runtime_environment import (
     normalize_runtime_environment,
 )
 from sparkdeck.download_throttle import (
+    IMAGE_PULL_BANDWIDTH_CAPABILITY,
     bandwidth_bytes_per_second,
     capped_transfer_timeout_seconds,
     parse_bandwidth_mbps,
@@ -102,11 +103,6 @@ from sparkdeck.workload_ownership import ManagedWorkloadLedger
 LEGACY_DEFAULT_HF_CACHE = "/home/hyudryu/.cache/huggingface"
 LEGACY_ROOT_HF_CACHE = "/root/.cache/huggingface"
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
-
-# Agents advertising this honor max_download_bandwidth_mbps on
-# /api/agent/images/pull. Older agents accept the field but pull uncapped,
-# so the controller refuses capped fan-outs to nodes without it.
-IMAGE_PULL_BANDWIDTH_CAPABILITY = "image-pull-bandwidth-v1"
 
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
@@ -3306,16 +3302,29 @@ class Manager:
             "files": list(filenames),
         }
         bandwidth_mbps = self.virtual_nas._download_bandwidth_mbps()
-        if await self.node_supports_download_bandwidth(node_id):
+        supports_bandwidth = await self.node_supports_download_bandwidth(node_id)
+        if supports_bandwidth:
             # Explicit 0 overrides a stale node-local cap; old agents reject
             # the field, so only they keep it omitted.
             download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+        elif bandwidth_mbps > 0:
+            # An older agent would apply its node-local (usually unlimited)
+            # setting and silently bypass the cluster cap.
+            raise RuntimeError(
+                f"node '{node_id}' cannot enforce the download bandwidth "
+                "limit; upgrade its SparkDeck agent or set the limit to 0"
+            )
         with self.virtual_nas.transfer_operation(model_id):
             return await self.virtual_nas._await_uncancelable(self.node_registry.request(
                 node_id, "POST",
                 f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
                 json_body=download_body,
-                timeout=24 * 60 * 60,
+                # A fixed 24 h would fail ordinary GGUF artifacts at the
+                # smallest supported cap (~1 GB at 0.1 Mbps); scale the
+                # deadline with the rate like the queued paths do.
+                timeout=capped_transfer_timeout_seconds(
+                    bandwidth_mbps, default=24 * 60 * 60, floor=24 * 60 * 60,
+                ),
             ))
 
     async def node_transfer_model_files(
@@ -8640,6 +8649,7 @@ class Manager:
         # controller's cap across this fan-out so concurrent member pulls
         # cannot multiply the configured cluster-wide download budget.
         pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        self._require_bandwidth_capable_nodes(node_ids, available)
         tasks: list = []
         member_specs: list[dict] = []
         existing_by_node = {
@@ -8833,6 +8843,7 @@ class Manager:
         # Non-grouped fan-out: divide the controller cap across members just
         # like the grouped builder does above.
         pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
+        self._require_bandwidth_capable_nodes(node_ids, available)
         for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
             member_port = local_port if node_id == LOCAL_NODE_ID else None
@@ -19803,6 +19814,37 @@ class Manager:
                 yield "data: {\"done\": true}\n\n"
                 break
             yield f"data: {json.dumps(item)}\n\n"
+
+    def _require_bandwidth_capable_nodes(
+        self, node_ids: list[str], available: dict[str, dict],
+    ) -> None:
+        """Refuse a capped cluster launch on agents that cannot enforce it.
+
+        Members carry their bandwidth share in the launch payload; an older
+        same-protocol agent accepts the container request but ignores the
+        nested value and follows its previous uncapped image and weight
+        paths, so a mixed-version cluster would silently violate the cap.
+        """
+        try:
+            cap_mbps = parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            )
+        except ValueError:
+            cap_mbps = 0.0
+        if cap_mbps <= 0:
+            return
+        unsupported = [
+            str((available.get(node_id) or {}).get("name") or node_id)
+            for node_id in node_ids
+            if node_id != LOCAL_NODE_ID
+            and IMAGE_PULL_BANDWIDTH_CAPABILITY
+            not in ((available.get(node_id) or {}).get("capabilities") or [])
+        ]
+        if unsupported:
+            raise ValueError(
+                "cluster node(s) cannot enforce the download bandwidth "
+                "limit; upgrade the agent on: " + ", ".join(unsupported)
+            )
 
     def _cluster_image_pull_share_mbps(self, fanout_width: int) -> float:
         """Controller cap divided across the members of one launch fan-out.

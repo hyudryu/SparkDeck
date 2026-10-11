@@ -525,5 +525,102 @@ class CappedTimeoutTests(unittest.TestCase):
         )
 
 
+class NodeDownloadModelFilesTests(unittest.IsolatedAsyncioTestCase):
+    """manager.node_download_model_files: the GGUF seed dispatch."""
+
+    class _NasStub:
+        def __init__(self, cap_mbps):
+            self._cap = cap_mbps
+
+        def _download_bandwidth_mbps(self):
+            return self._cap
+
+        def transfer_operation(self, model_id):
+            import contextlib
+            return contextlib.nullcontext()
+
+        async def _await_uncancelable(self, awaitable):
+            return await awaitable
+
+    def _manager(self, cap_mbps, supports_bandwidth):
+        m = bare_manager(cap_mbps)
+        m.node_supports_selective_downloads = AsyncMock(return_value=True)
+        m.node_supports_download_bandwidth = AsyncMock(
+            return_value=supports_bandwidth,
+        )
+        m._resolved_hf_token = Mock(return_value="tok")
+        m.node_registry = Mock()
+        m.node_registry.request = AsyncMock(return_value={"ok": True})
+        m.virtual_nas = self._NasStub(float(cap_mbps))
+        return m
+
+    async def test_legacy_agent_refused_when_a_cap_is_set(self):
+        m = self._manager(50.0, supports_bandwidth=False)
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot enforce the download bandwidth",
+        ):
+            await m.node_download_model_files(
+                "ws1", "org/model", "r" * 40, ["q.gguf"],
+            )
+        m.node_registry.request.assert_not_awaited()
+
+    async def test_uncapped_dispatch_to_legacy_agent_is_allowed(self):
+        m = self._manager(0.0, supports_bandwidth=False)
+        await m.node_download_model_files("ws1", "org/model", "r" * 40, ["q.gguf"])
+        kwargs = m.node_registry.request.await_args.kwargs
+        self.assertNotIn("max_download_bandwidth_mbps", kwargs["json_body"])
+        # Unlimited keeps the historical fixed day timeout.
+        self.assertEqual(kwargs["timeout"], 24 * 60 * 60)
+
+    async def test_capped_dispatch_stamps_cap_and_scales_request_timeout(self):
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        m = self._manager(50.0, supports_bandwidth=True)
+        await m.node_download_model_files("ws1", "org/model", "r" * 40, ["q.gguf"])
+        kwargs = m.node_registry.request.await_args.kwargs
+        self.assertEqual(kwargs["json_body"]["max_download_bandwidth_mbps"], 50.0)
+        # A capped download can legitimately run far past the fixed day
+        # timeout; the request deadline must follow the rate, not stay fixed.
+        self.assertEqual(
+            kwargs["timeout"],
+            capped_transfer_timeout_seconds(
+                50.0, default=24 * 60 * 60, floor=24 * 60 * 60,
+            ),
+        )
+        self.assertGreater(kwargs["timeout"], 24 * 60 * 60 - 1)
+
+
+class RequireBandwidthCapableNodesTests(unittest.TestCase):
+    """Launch-time gate for members whose agents cannot enforce the cap."""
+
+    def test_uncapped_launch_ignores_missing_capability(self):
+        m = bare_manager(0.0)
+        m._require_bandwidth_capable_nodes(
+            ["ws1"], {"ws1": {"name": "WS1", "capabilities": []}},
+        )
+
+    def test_capped_launch_refuses_agent_without_the_capability(self):
+        m = bare_manager(100.0)
+        with self.assertRaisesRegex(
+            ValueError, "cannot enforce the download bandwidth limit",
+        ):
+            m._require_bandwidth_capable_nodes(["local", "ws1"], {
+                "local": {"name": "Coordinator", "capabilities": []},
+                "ws1": {"name": "WS1", "capabilities": []},
+            })
+
+    def test_capped_launch_passes_with_capable_nodes_and_ignores_local(self):
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
+
+        m = bare_manager(100.0)
+        # The local node enforces the cap in-process, so its advertised
+        # capabilities are irrelevant here.
+        m._require_bandwidth_capable_nodes(["local", "ws1"], {
+            "local": {"name": "Coordinator", "capabilities": []},
+            "ws1": {"name": "WS1",
+                    "capabilities": [IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

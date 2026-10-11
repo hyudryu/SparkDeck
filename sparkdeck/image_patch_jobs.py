@@ -11,6 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cluster import NodeAgentResponseError
+from sparkdeck.download_throttle import (
+    IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    parse_bandwidth_mbps,
+)
 from sparkdeck.image_patches import build_patched_image, normalize_patch_request, valid_base_image_identity
 
 CAPABILITY = "patched-images-v1"
@@ -113,7 +117,19 @@ class ImagePatchJobs:
     async def start(self, payload, *, agent=False):
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
-        request = normalize_patch_request({k: v for k, v in payload.items() if k not in {"node_ids", "job_id"}})
+        request = normalize_patch_request(
+            {k: v for k, v in payload.items()
+             if k not in {"node_ids", "job_id", "max_download_bandwidth_mbps"}}
+        )
+        bandwidth = payload.get("max_download_bandwidth_mbps")
+        if bandwidth is not None:
+            if not agent:
+                raise ValueError(
+                    "max_download_bandwidth_mbps is reserved for cluster coordination"
+                )
+            # The controller's forwarded cap is authoritative on this node:
+            # its own setting may still be the unlimited default.
+            request["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(bandwidth)
         job_id = payload.get("job_id")
         if "job_id" in payload:
             if not agent:
@@ -139,6 +155,31 @@ class ImagePatchJobs:
             unsupported = [n["name"] for n in selected if n["id"] != "local" and CAPABILITY not in n.get("capabilities", [])]
             if unsupported:
                 raise ValueError("Update SparkDeck before building patched images on: " + ", ".join(unsupported))
+            # A remote build's base pull happens on that node with its local
+            # settings; forward this controller's cap instead and refuse the
+            # dispatch to agents that could not honor it.
+            try:
+                cap_mbps = parse_bandwidth_mbps(
+                    (getattr(self.manager, "settings", None) or {}).get(
+                        "max_download_bandwidth_mbps", 0,
+                    )
+                )
+            except (AttributeError, ValueError):
+                cap_mbps = 0.0
+            missing_bandwidth = [
+                n["name"] for n in selected
+                if n["id"] != "local"
+                and IMAGE_PULL_BANDWIDTH_CAPABILITY not in n.get("capabilities", [])
+            ]
+            if cap_mbps > 0 and missing_bandwidth:
+                raise ValueError(
+                    "Update SparkDeck before enforcing the download limit on: "
+                    + ", ".join(missing_bandwidth)
+                )
+            if not missing_bandwidth:
+                # Explicit 0 overrides a stale node-local cap; omit the field
+                # for old agents that would reject it.
+                request["max_download_bandwidth_mbps"] = cap_mbps
         if any(j["status"] in ACTIVE for j in self.jobs):
             raise ValueError("An image patch build is already active. Wait for it to finish.")
         job = {
@@ -171,11 +212,19 @@ class ImagePatchJobs:
         # The build runs in a worker thread with a synchronous docker
         # client, and its images.pull ignores the bandwidth setting. Fetch
         # a missing base through the capped pull API first when capped.
-        resolver = getattr(self.manager, "_image_pull_bytes_per_second", None)
-        try:
-            capped = bool(resolver) and resolver(None) > 0
-        except TypeError:
-            capped = False
+        forwarded = request.get("max_download_bandwidth_mbps")
+        pull_kwargs: dict = {}
+        if forwarded is not None:
+            # The controller forwarded its cap: it is authoritative here
+            # because this node's own setting may still be unlimited.
+            capped = float(forwarded) > 0
+            pull_kwargs = {"bandwidth_mbps": float(forwarded)}
+        else:
+            resolver = getattr(self.manager, "_image_pull_bytes_per_second", None)
+            try:
+                capped = bool(resolver) and resolver(None) > 0
+            except TypeError:
+                capped = False
         if capped:
             try:
                 def _base_missing():
@@ -188,7 +237,9 @@ class ImagePatchJobs:
                         return True
                 if await asyncio.to_thread(_base_missing):
                     log("Pulling base image (bandwidth-limited)…")
-                    await self.manager.pull_image_result(request["base_image"])
+                    await self.manager.pull_image_result(
+                        request["base_image"], **pull_kwargs,
+                    )
             except Exception as exc:
                 self._log(node, f"Base image pull failed: {exc}")
                 raise

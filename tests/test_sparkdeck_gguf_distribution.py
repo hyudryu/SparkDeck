@@ -235,19 +235,21 @@ class ManagerSelectiveDownloadTests(unittest.IsolatedAsyncioTestCase):
                 "max_download_bandwidth_mbps"], 12.5,
         )
 
-        # An agent that predates the field must not receive it: that
-        # endpoint rejects unknown request keys outright.
+        # With a cap configured, an agent that predates the field must be
+        # refused outright: it cannot apply the limit, and the endpoint
+        # rejects the unknown request key anyway.
         manager.cluster_nodes = AsyncMock(return_value=[{
             "id": "worker-1", "online": True,
             "capabilities": [VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY],
         }])
-        await manager.node_download_model_files(
-            "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
-        )
-        self.assertNotIn(
-            "max_download_bandwidth_mbps",
-            manager.node_registry.request.await_args.kwargs["json_body"],
-        )
+        manager.node_registry.request.reset_mock()
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot enforce the download bandwidth limit",
+        ):
+            await manager.node_download_model_files(
+                "worker-1", "org/model", "a" * 40, ["q8/model.gguf"], "main",
+            )
+        manager.node_registry.request.assert_not_awaited()
 
     async def test_unlimited_controller_forwards_explicit_zero(self):
         manager = Manager.__new__(Manager)

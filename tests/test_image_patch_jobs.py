@@ -13,7 +13,9 @@ import httpx
 with patch("docker.from_env", return_value=Mock()):
     import server
 
-from sparkdeck.image_patch_jobs import CAPABILITY, ImagePatchJobs
+from sparkdeck.image_patch_jobs import (
+    CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY, ImagePatchJobs,
+)
 from cluster import NodeAgentResponseError
 
 
@@ -103,6 +105,104 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
             outcome = await self.jobs._local({"logs": []}, request())
         self.manager.client.images.get.assert_not_called()
         self.assertEqual(outcome, result())
+
+    async def test_local_build_forwards_nonzero_share_over_local_unlimited(self):
+        import docker
+
+        # The forwarded controller share is authoritative in both directions:
+        # this node's own setting is unlimited, yet the dispatched 25 Mbps
+        # share must still cap the base pull.
+        self.manager._image_pull_bytes_per_second = Mock(return_value=0.0)
+        self.manager.client.images.get = Mock(
+            side_effect=docker.errors.ImageNotFound("gone"),
+        )
+        self.manager.pull_image_result = AsyncMock()
+        with patch(
+            "sparkdeck.image_patch_jobs.build_patched_image",
+            side_effect=lambda *args: result(),
+        ):
+            await self.jobs._local(
+                {"logs": []},
+                {**request(), "max_download_bandwidth_mbps": 25.0},
+            )
+        self.manager.pull_image_result.assert_awaited_once_with(
+            "runtime/base:stable", bandwidth_mbps=25.0,
+        )
+
+    async def test_local_build_forwards_explicit_zero_as_uncapped(self):
+        # An explicit 0 share overrides a stale node-local cap, exactly like
+        # the image-pull path: no capped-fetch dance at all.
+        self.manager._image_pull_bytes_per_second = Mock(return_value=1_000_000)
+        self.manager.pull_image_result = AsyncMock()
+        with patch(
+            "sparkdeck.image_patch_jobs.build_patched_image",
+            side_effect=lambda *args: result(),
+        ):
+            await self.jobs._local(
+                {"logs": []},
+                {**request(), "max_download_bandwidth_mbps": 0.0},
+            )
+        self.manager.client.images.get.assert_not_called()
+        self.manager.pull_image_result.assert_not_awaited()
+
+    async def test_controller_forwards_settings_cap_to_capable_agents(self):
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        captured: dict = {}
+
+        async def fake_run(job, payload, *, agent):
+            captured.update(payload)
+
+        with patch.object(ImagePatchJobs, "_run", side_effect=fake_run):
+            job = await self.jobs.start(request(["worker"]))
+            await self.finish(job)
+        self.assertEqual(captured["max_download_bandwidth_mbps"], 40.0)
+
+    async def test_controller_refuses_cap_when_agent_lacks_pull_capability(self):
+        # A node that understands patched-images-v1 but not
+        # image-pull-bandwidth-v1 would run the base pull uncapped.
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker", "capabilities": [CAPABILITY]},
+        ])
+        with self.assertRaisesRegex(
+            ValueError, "Update SparkDeck before enforcing the download limit",
+        ):
+            await self.jobs.start(request(["worker"]))
+
+    async def test_controller_omits_bandwidth_for_legacy_agents_when_uncapped(self):
+        captured: dict = {}
+
+        async def fake_run(job, payload, *, agent):
+            captured.update(payload)
+
+        # Default setUp worker advertises only patched-images-v1; with the
+        # controller uncapped the field must stay omitted so the old agent
+        # does not reject the POST as having unsupported fields.
+        with patch.object(ImagePatchJobs, "_run", side_effect=fake_run):
+            job = await self.jobs.start(request(["worker"]))
+            await self.finish(job)
+        self.assertNotIn("max_download_bandwidth_mbps", captured)
+
+    async def test_agent_stamps_forwarded_cap_but_gui_caller_may_not_supply_it(self):
+        captured: dict = {}
+
+        async def fake_run(job, payload, *, agent):
+            captured.update(payload)
+
+        with patch.object(ImagePatchJobs, "_run", side_effect=fake_run):
+            job = await self.jobs.start(
+                {**request(), "max_download_bandwidth_mbps": 25}, agent=True,
+            )
+            await self.finish(job)
+        self.assertEqual(captured["max_download_bandwidth_mbps"], 25.0)
+        with self.assertRaisesRegex(
+            ValueError, "reserved for cluster coordination",
+        ):
+            await self.jobs.start({**request(), "max_download_bandwidth_mbps": 25})
 
     async def test_remote_builds_are_sequential_and_pin_first_resolved_base(self):
         calls = []

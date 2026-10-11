@@ -710,6 +710,11 @@ class VirtualNAS:
         # Shared with the Manager so every capped internet transfer on this
         # node (Hub weights and Docker image pulls) queues behind one budget.
         self._internet_transfer_lock = internet_transfer_lock
+        # Every controller-dispatched download is sent the full node-wide
+        # cap, and a per-node lock cannot coordinate separate agents, so
+        # downloads run one at a time cluster-wide while this lock is held
+        # across each dispatched operation.
+        self._dispatched_download_lock = asyncio.Lock()
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
@@ -3985,6 +3990,14 @@ class VirtualNAS:
                 # An explicit 0 overrides a stale node-local cap; omitting the
                 # field (old agents that would reject it) keeps node-local.
                 json_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+            elif bandwidth_mbps > 0:
+                # An older agent would apply its node-local (usually
+                # unlimited) setting and silently bypass the cluster cap.
+                raise RuntimeError(
+                    "cluster node cannot enforce the download bandwidth "
+                    f"limit; upgrade the agent on node {job['target_node_id']} "
+                    "or set the limit to 0"
+                )
             operation = self.node_registry.request(
                 job["target_node_id"], "POST",
                 self._model_agent_path(job["model_id"], "download"),
@@ -3994,7 +4007,10 @@ class VirtualNAS:
                     default=24 * 60 * 60, floor=24 * 60 * 60,
                 ),
             )
-        result = await self._await_uncancelable(operation)
+        # Every dispatched download carries the full node-wide cap, so only
+        # one may run cluster-wide at a time (see the constructor lock note).
+        async with self._dispatched_download_lock:
+            result = await self._await_uncancelable(operation)
         if (result or {}).get("status") == "canceled":
             raise TransferCanceled()
         if not (result or {}).get("ok"):
@@ -4140,6 +4156,14 @@ class VirtualNAS:
                     # Explicit 0 overrides a stale node-local cap; old agents
                     # reject the field, so only they keep it omitted.
                     download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
+                elif bandwidth_mbps > 0:
+                    # An older agent would apply its node-local (usually
+                    # unlimited) setting and silently bypass the cluster cap.
+                    raise RuntimeError(
+                        "cluster node cannot enforce the download bandwidth "
+                        f"limit; upgrade the agent on node "
+                        f"{job['target_node_id']} or set the limit to 0"
+                    )
                 job["download_cancelable"] = VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY in (
                     download_status.get("capabilities") or []
                 )
@@ -4185,10 +4209,16 @@ class VirtualNAS:
             self._save()
             if event.is_set() and not job["download_cancelable"]:
                 raise TransferCanceled()
-            result = await (
-                self._await_download_with_cancel(operation, event, cancel_writer, job)
-                if job["download_cancelable"] else self._await_uncancelable(operation)
-            )
+            # Every dispatched download carries the full node-wide cap, so
+            # only one may run cluster-wide at a time (see the constructor
+            # lock note).
+            async with self._dispatched_download_lock:
+                result = await (
+                    self._await_download_with_cancel(
+                        operation, event, cancel_writer, job,
+                    )
+                    if job["download_cancelable"] else self._await_uncancelable(operation)
+                )
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             if (result or {}).get("status") == "canceled":

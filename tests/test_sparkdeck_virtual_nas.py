@@ -5290,10 +5290,14 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             await nas._download_selected_files(job, "")
             self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 10.0)
 
-            # An older agent that rejects unknown fields must not receive one.
+            # With a cap configured, an older agent that would pull uncapped
+            # must be refused outright instead of silently violating the cap.
             nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
-            await nas._download_selected_files(job, "")
-            self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
+            with self.assertRaisesRegex(
+                RuntimeError, "cannot enforce the download bandwidth",
+            ):
+                await nas._download_selected_files(job, "")
+            self.assertEqual(len(bodies), 1)
 
     async def test_unlimited_cap_sends_explicit_zero_to_capable_agents(self):
         # Omitting the field means "keep the node-local cap", so a worker
@@ -5323,6 +5327,104 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
             await nas._download_selected_files(job, "")
             self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
+
+    async def test_full_repo_dispatch_rejects_legacy_agent_when_capped(self):
+        # The whole-repository runner must refuse an old agent under a cap
+        # the same way the selected-file branch does (it would pull uncapped
+        # using node-local settings).
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": 10 * 1024 * 1024 * 1024,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=8)
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
+            nas.node_registry.request = AsyncMock()
+            job = {"id": "job-1", "kind": "download", "model_id": "org/model",
+                   "target_node_id": "ws1", "revision": RESOLVED_REVISION,
+                   "requested_revision": "main", "status": "queued",
+                   "bytes_total": 8, "download_cache_baseline_bytes": None}
+            await nas._run_download(job)
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("cannot enforce the download", job["error"])
+            nas.node_registry.request.assert_not_awaited()
+
+    async def test_selected_file_dispatches_serialize_under_one_lock(self):
+        # Every dispatched download is sent the full node-wide cap, so the
+        # controller may only run one cluster-wide at a time.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True,
+            )
+            nas._save = Mock()
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "model_id": "org/model",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                "bytes_total": 8, "status": "queued", "kind": "download",
+            } for index in range(3)]
+            await asyncio.gather(*(
+                nas._download_selected_files(job, "") for job in jobs
+            ))
+            self.assertEqual(peak, 1)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
+
+    async def test_full_repo_dispatches_serialize_under_one_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True,
+            )
+            nas._save = Mock()
+            nas._node_storage = AsyncMock(return_value={
+                "models": [], "free_size": 10 * 1024 * 1024 * 1024,
+            })
+            nas.estimate_download_size = AsyncMock(return_value=8)
+            nas._validate_download_node = AsyncMock(return_value={
+                "capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY],
+            })
+            active = 0
+            peak = 0
+
+            async def request(node_id, method, path, **kwargs):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+                return {"ok": True, "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            jobs = [{
+                "id": f"job-{index}", "kind": "download",
+                "model_id": "org/model", "target_node_id": "ws1",
+                "revision": RESOLVED_REVISION, "requested_revision": "main",
+                "status": "queued", "bytes_total": 8,
+                "download_cache_baseline_bytes": None,
+            } for index in range(3)]
+            await asyncio.gather(*(nas._run_download(job) for job in jobs))
+            self.assertEqual(peak, 1)
+            self.assertTrue(all(job["status"] == "completed" for job in jobs))
 
 
 if __name__ == "__main__":

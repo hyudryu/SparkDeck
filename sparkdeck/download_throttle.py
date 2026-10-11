@@ -183,3 +183,11 @@ def install_socket_throttle(bytes_per_second: float) -> bool:
     _bucket = bucket
     _installed = True
     return True
+
+
+# Agents advertising this honor max_download_bandwidth_mbps on
+# /api/agent/images/pull and on forwarded image-patch builds. Older agents
+# accept the field but pull uncapped, so the controller refuses capped
+# dispatch to nodes without it. Lives in this leaf module so manager.py and
+# sparkdeck/image_patch_jobs.py can import it without circular imports.
+IMAGE_PULL_BANDWIDTH_CAPABILITY = "image-pull-bandwidth-v1"

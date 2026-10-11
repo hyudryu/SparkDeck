@@ -469,7 +469,7 @@ async def _image_total_bytes(
     command = ["inspect", "--tls-verify=true"]
     if arch:
         command += ["--override-os", "linux", "--override-arch", arch]
-    has_authfile = any(b.endswith(":/auth/config.json:ro") for b in copy_binds)
+    has_authfile = any(":/auth/config.json:ro" in b for b in copy_binds)
     if has_authfile:
         command += ["--authfile", "/auth/config.json"]
     command.append(source_ref)
@@ -618,12 +618,16 @@ async def throttled_image_pull_events(
                 docker_config = loaded if isinstance(loaded, dict) else {}
             except (OSError, json.JSONDecodeError):
                 docker_config = {}
-        copy_binds = [f"{staging}:/archive"]
+        # ":z" (shared) because the proxy and copy containers are different
+        # containers that both write into staging; a private ":Z" label would
+        # relabel away the peer's access on SELinux hosts and is ignored
+        # everywhere else.
+        copy_binds = [f"{staging}:/archive:z"]
         has_authfile = False
         entry = _auth_entry(docker_config, registry_host)
         if entry is not None:
             has_authfile = True
-            copy_binds.append(f"{authfile}:/auth/config.json:ro")
+            copy_binds.append(f"{authfile}:/auth/config.json:ro,z")
         else:
             helper_auth = helper_credentials(docker_config, registry_host)
             if helper_auth is not None:
@@ -638,7 +642,7 @@ async def throttled_image_pull_events(
                 except OSError:
                     pass
                 has_authfile = True
-                copy_binds.append(f"{written}:/auth/config.json:ro")
+                copy_binds.append(f"{written}:/auth/config.json:ro,z")
         proxy = await _run_docker(
             client, "create_container",
             image=PROXY_IMAGE,
@@ -655,7 +659,7 @@ async def throttled_image_pull_events(
                 ),
             },
             host_config={
-                "Binds": [f"{staging}:/archive"],
+                "Binds": [f"{staging}:/archive:z"],
                 "NetworkMode": network_id,
             },
         )
@@ -681,7 +685,22 @@ async def throttled_image_pull_events(
         capacity = staging_capacity_error(staging, total_bytes)
         if capacity:
             raise ThrottledPullError(capacity)
-        user = None if os.name == "nt" else f"{os.getuid()}:{os.getgid()}"
+        user = None
+        if os.name != "nt":
+            # Running the copy as the SparkDeck host user keeps the archive
+            # and progress files owned by it. Under rootless Docker the daemon
+            # already runs as that user, so container root maps straight to it
+            # while an explicit host UID maps to an unprivileged subuid that
+            # cannot write the 0700 staging directory or read the 0600 auth
+            # file; there the override must be omitted.
+            try:
+                security = (await _run_docker(client, "info") or {}).get(
+                    "SecurityOptions",
+                ) or []
+            except Exception:
+                security = []
+            if "name=rootless" not in [str(item) for item in security]:
+                user = f"{os.getuid()}:{os.getgid()}"
         copy = await _run_docker(
             client, "create_container",
             image=SKOPEO_IMAGE,

@@ -67,7 +67,9 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         # Two selected nodes at a 100 Mbps setting each pull at 50 Mbps, and
         # the capped request timeout is derived from the rate, not fixed.
         from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
 
+        self.nodes[1]["capabilities"] = [IMAGE_PULL_BANDWIDTH_CAPABILITY]
         self.manager.settings["max_download_bandwidth_mbps"] = 100
         await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
         self.manager.pull_image_result.assert_awaited_once_with("example/image", 50.0)
@@ -76,6 +78,15 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
             json_body={"image": "example/image", "max_download_bandwidth_mbps": 50.0},
             timeout=capped_transfer_timeout_seconds(50.0, default=1800),
         )
+
+    async def test_capped_pull_rejects_agents_without_the_capability(self):
+        # An older agent accepts max_download_bandwidth_mbps but pulls
+        # uncapped; the fan-out must fail instead of silently violating it.
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        with self.assertRaisesRegex(ValueError, "cannot enforce the download"):
+            await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
+        self.manager.pull_image_result.assert_not_awaited()
+        self.manager.node_registry.request.assert_not_awaited()
 
     async def test_pull_reports_per_node_partial_failure(self):
         self.manager.node_registry.request.side_effect = RuntimeError("agent unavailable")

@@ -60,10 +60,11 @@ PROGRESS_NAME = "proxy_bytes"
 # importable. Only the download direction (registry → client) is charged,
 # and the running total is reported for progress.
 _PROXY_SCRIPT = """
-import os, socket, threading, time
+import base64, os, socket, threading, time
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
 PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
+UPSTREAM = os.environ.get("SPARKDECK_UPSTREAM_PROXY") or ""
 DUE = [0.0]
 LOCK = threading.Lock()
 TOTAL = [0]
@@ -114,6 +115,49 @@ def pump(src, dst, charge):
         except OSError:
             pass
 
+def split_authority(value):
+    # Bracketed IPv6 authorities like [2001:db8::1]:5000.
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        return host, rest.lstrip(":")
+    host, _, port = value.partition(":")
+    return host, port
+
+def parse_upstream(url):
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    auth = ""
+    if "@" in url:
+        auth, _, url = url.rpartition("@")
+    host, port = split_authority(url)
+    return auth, host, int(port or "80")
+
+def connect_target(authority):
+    # Without an upstream, dial the registry directly; with one (corporate
+    # proxy-only hosts), send the CONNECT to the proxy and chain through.
+    if not UPSTREAM:
+        host, port = split_authority(authority)
+        return socket.create_connection((host, int(port or "443")), 10)
+    auth, host, port = parse_upstream(UPSTREAM)
+    sock = socket.create_connection((host, port), 10)
+    request = "CONNECT %%s HTTP/1.1\\r\\nHost: %%s\\r\\n" %% (authority, authority)
+    if auth:
+        token = base64.b64encode(auth.encode("latin-1")).decode("ascii")
+        request += "Proxy-Authorization: Basic %%s\\r\\n" %% token
+    sock.sendall((request + "\\r\\n").encode("latin-1"))
+    response = b""
+    while b"\\r\\n\\r\\n" not in response and len(response) < 65536:
+        chunk = sock.recv(4096)
+        if not chunk:
+            sock.close()
+            raise OSError("upstream proxy closed the connection")
+        response += chunk
+    status = response.partition(b"\\r\\n")[0]
+    if b" 200" not in status:
+        sock.close()
+        raise OSError("upstream proxy refused CONNECT: " + status.decode("latin-1"))
+    return sock
+
 def handle(client):
     upstream = None
     try:
@@ -128,8 +172,7 @@ def handle(client):
         if len(parts) < 3 or parts[0].upper() != "CONNECT":
             client.sendall(b"HTTP/1.1 405 Method Not Allowed\\r\\n\\r\\n")
             return
-        host, _, port = parts[1].partition(":")
-        upstream = socket.create_connection((host, int(port or "443")), 10)
+        upstream = connect_target(parts[1])
         client.sendall(b"HTTP/1.1 200 Connection established\\r\\n\\r\\n")
         if rest:
             upstream.sendall(rest)
@@ -148,7 +191,7 @@ def handle(client):
 
 listener = socket.socket()
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("0.0.0.0", %d))
+listener.bind(("0.0.0.0", int(os.environ.get("SPARKDECK_PROXY_PORT") or %d)))
 listener.listen(128)
 while True:
     connection, _ = listener.accept()
@@ -196,6 +239,66 @@ def normalize_image_reference(image: str) -> tuple[str, str]:
 _LOOPBACK_HOSTS = frozenset({"localhost", "::1", "ip6-localhost", "ip6-loopback"})
 
 
+def registry_head(image: str) -> str | None:
+    """Lower-cased ``host[:port]`` of a qualified reference, else None."""
+    reference = str(image or "").strip().removeprefix("docker://")
+    head, slash, _rest = reference.partition("/")
+    if not slash:
+        return None
+    head = head.lower()
+    if "@" in head:  # userinfo is never a registry name
+        return None
+    if not ("." in head or ":" in head or head == "localhost"):
+        return None
+    return head
+
+
+def split_authority(authority: str) -> tuple[str, str]:
+    """Split ``host:port``, including bracketed IPv6 forms."""
+    value = str(authority or "")
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        return host, rest.lstrip(":")
+    host, _, port = value.partition(":")
+    return host, port
+
+
+def matches_insecure_registry(image: str, insecure: list[str]) -> bool:
+    """True when the image's registry matches a daemon insecure entry.
+
+    Docker's ``InsecureRegistryCIDRs`` mixes CIDR networks with plain
+    ``host[:port]`` entries; a hit means only the daemon (which holds the
+    trust configuration and locally installed CA) can reach the registry,
+    so the capped helper must not take over the pull.
+    """
+    head = registry_head(image)
+    if not head:
+        return False
+    host, port = split_authority(head)
+    if head.startswith("["):
+        bare = "[" + host + "]"
+    else:
+        bare = head.partition(":")[0]
+    for entry in insecure:
+        candidate = str(entry or "").strip().lower()
+        if not candidate:
+            continue
+        if "/" in candidate:
+            try:
+                network = ipaddress.ip_network(candidate, strict=False)
+                if ipaddress.ip_address(host) in network:
+                    return True
+            except ValueError:
+                pass
+            continue
+        if candidate == head or candidate == bare:
+            return True
+        entry_host, entry_port = split_authority(candidate)
+        if entry_port and not port and entry_host == host:
+            return True
+    return False
+
+
 def is_loopback_registry_image(image: str) -> bool:
     """True when the reference's registry host is this machine's loopback.
 
@@ -203,21 +306,11 @@ def is_loopback_registry_image(image: str) -> bool:
     inside a container network where loopback reaches the container itself,
     not the host. Callers pull such references with the daemon instead.
     """
-    reference = str(image or "").strip().removeprefix("docker://")
-    head, slash, _rest = reference.partition("/")
-    if not slash:
+    head = registry_head(image)
+    if not head:
         return False
-    # Hostnames are case-insensitive; qualify against the lowered head.
-    head = head.lower()
-    if not ("." in head or ":" in head or head == "localhost"):
-        return False
-    if "@" in head:  # userinfo is never a registry name worth bypassing for
-        return False
-    if head.startswith("["):
-        host = head[1:].partition("]")[0]
-    else:
-        host = head.partition(":")[0]
-    host = host.rstrip(".").lower()
+    host, _ = split_authority(head)
+    host = host.rstrip(".")
     if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
         return True
     try:
@@ -486,7 +579,11 @@ async def throttled_image_pull_events(
         )
         network_id = str(network["Id"])
         registry_host = source_ref.removeprefix("docker://").partition("/")[0]
+        # Same candidate order as docker-py: $DOCKER_CONFIG first, then the
+        # root and user home defaults the SDK falls back to.
+        docker_config_dir = os.environ.get("DOCKER_CONFIG") or ""
         authfile = select_docker_config([
+            os.path.join(docker_config_dir, "config.json") if docker_config_dir else "",
             "/root/.docker/config.json",
             os.path.expanduser("~/.docker/config.json"),
         ])
@@ -528,6 +625,11 @@ async def throttled_image_pull_events(
                 "SPARKDECK_DOWNLOAD_BPS": repr(float(bytes_per_second)),
                 "SPARKDECK_BANDWIDTH_PROGRESS": f"/archive/{PROGRESS_NAME}",
                 "PYTHONUNBUFFERED": "1",
+                # Proxy-only hosts reach registries via the corporate proxy;
+                # the limiter chains CONNECT through it when configured.
+                "SPARKDECK_UPSTREAM_PROXY": os.environ.get(
+                    "HTTPS_PROXY", os.environ.get("https_proxy", ""),
+                ),
             },
             host_config={
                 "Binds": [f"{staging}:/archive"],

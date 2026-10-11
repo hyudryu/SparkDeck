@@ -1,7 +1,12 @@
+import base64
 import json
 import os
+import socket
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from collections import namedtuple
 from pathlib import Path
@@ -17,8 +22,10 @@ from sparkdeck.throttled_image_pull import (
     _read_counter,
     helper_credentials,
     is_loopback_registry_image,
+    matches_insecure_registry,
     normalize_image_reference,
     select_docker_config,
+    split_authority,
     skopeo_copy_args,
     staging_parent,
     throttled_image_pull_events,
@@ -535,6 +542,212 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIn("SPARKDECK_IMAGE_STAGING_DIR", events[-1]["error"])
         self.assertIn("download limit to 0", events[-1]["error"])
+
+
+class LimiterProxyTests(unittest.TestCase):
+    """End-to-end CONNECT tests against the embedded limiter script."""
+
+    def free_port(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    def start_proxy(self, port, env_extra=None):
+        env = os.environ.copy()
+        env.update({
+            "SPARKDECK_DOWNLOAD_BPS": "10000000",
+            "SPARKDECK_BANDWIDTH_PROGRESS": "",
+            "SPARKDECK_PROXY_PORT": str(port),
+        })
+        env.update(env_extra or {})
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", tip._PROXY_SCRIPT], env=env,
+        )
+        try:
+            for _ in range(100):
+                try:
+                    probe = socket.create_connection(("127.0.0.1", port), 0.1)
+                    probe.close()
+                    return process
+                except OSError:
+                    time.sleep(0.05)
+            raise AssertionError("limiter proxy never started")
+        except Exception:
+            process.kill()
+            raise
+
+    def echo_server(self, host):
+        listener = socket.socket(
+            socket.AF_INET6 if ":" in host else socket.AF_INET,
+        )
+        listener.bind((host, 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    connection, _ = listener.accept()
+                except OSError:
+                    return
+                def echo(sock=connection):
+                    try:
+                        while True:
+                            data = sock.recv(4096)
+                            if not data:
+                                break
+                            sock.sendall(data)
+                    except OSError:
+                        pass
+                    finally:
+                        sock.close()
+                threading.Thread(target=echo, daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        return listener, port
+
+    def connect(self, proxy_port, authority):
+        client = socket.create_connection(("127.0.0.1", proxy_port), 5)
+        request = f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+        client.sendall(request.encode())
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        return client, response
+
+    def test_ipv6_bracketed_authority_is_dialed_correctly(self):
+        listener, echo_port = self.echo_server("::1")
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port)
+        try:
+            client, response = self.connect(proxy_port, f"[::1]:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-v6")
+            self.assertEqual(client.recv(64), b"ping-v6")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+
+    def test_upstream_proxy_chaining_with_authorization(self):
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+        captured = {}
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            captured["request"] = request
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"http://user:pass@127.0.0.1:{upstream_port}",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-chain")
+            self.assertEqual(client.recv(64), b"ping-chain")
+            client.close()
+            request = captured.get("request", b"")
+            self.assertIn(b"CONNECT 127.0.0.1:%d HTTP/1.1" % echo_port, request)
+            expected = base64.b64encode(b"user:pass")
+            self.assertIn(b"Proxy-Authorization: Basic " + expected, request)
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
+
+class RegistryTrustTests(unittest.TestCase):
+    def test_insecure_entries_match_cidr_hosts_and_ports(self):
+        insecure = ["127.0.0.0/8", "::1/128", "private.registry:5000", "lan.registry"]
+        self.assertTrue(
+            matches_insecure_registry("private.registry:5000/team/img:1", insecure),
+        )
+        self.assertTrue(matches_insecure_registry("lan.registry/team/img", insecure))
+        self.assertTrue(matches_insecure_registry("10.1.2.3:5000/img", ["10.0.0.0/8"]))
+        self.assertTrue(
+            matches_insecure_registry("[fd00::2]:5000/img", ["fd00::/64"]),
+        )
+        self.assertFalse(matches_insecure_registry("ghcr.io/org/model:1", insecure))
+        self.assertFalse(matches_insecure_registry("nginx:latest", insecure))
+        self.assertFalse(matches_insecure_registry("bad:99999/x", ["::1/128"]))
+
+    def test_split_authority_handles_ipv6_brackets(self):
+        self.assertEqual(split_authority("[2001:db8::1]:5000"), ("2001:db8::1", "5000"))
+        self.assertEqual(split_authority("[::1]"), ("::1", ""))
+        self.assertEqual(split_authority("host:5000"), ("host", "5000"))
+        self.assertEqual(split_authority("host"), ("host", ""))
+
+
+class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_docker_config_env_is_the_first_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / "docker-config"
+            config_dir.mkdir()
+            config = config_dir / "config.json"
+            config.write_text(
+                json.dumps({"auths": {"docker.io": {"auth": "dTpz"}}}),
+                encoding="utf-8",
+            )
+            api = FakeDockerApi()
+            staging = Path(tempfile.mkdtemp())
+
+            def on_start(container_id):
+                if container_id == "copy-1":
+                    staging.joinpath("image.tar").write_bytes(b"tar")
+
+            api.on_start = on_start
+            client = Mock()
+            client.api = api
+            events = []
+            with (
+                patch.object(
+                    tip.tempfile, "mkdtemp", side_effect=[str(staging)],
+                ),
+                patch.object(
+                    tip.shutil, "disk_usage",
+                    return_value=_USAGE(10 ** 15, 0, 10 ** 15),
+                ),
+                patch.dict(os.environ, {"DOCKER_CONFIG": str(config_dir)}),
+            ):
+                async for event in throttled_image_pull_events(
+                    client, "nginx", 1000.0,
+                ):
+                    events.append(event)
+            self.assertEqual(events[-1], {"status": "Successfully pulled nginx"})
+            copy = copy_kwargs(api)
+            self.assertTrue(any(
+                str(config) in bind for bind in copy["host_config"]["Binds"]
+            ), copy["host_config"]["Binds"])
+            self.assertIn("--authfile", copy["command"])
 
 
 class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):

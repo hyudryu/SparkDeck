@@ -168,6 +168,30 @@ class ImagePatchJobs:
         loop = asyncio.get_running_loop()
         def log(line):
             loop.call_soon_threadsafe(self._log, node, line)
+        # The build runs in a worker thread with a synchronous docker
+        # client, and its images.pull ignores the bandwidth setting. Fetch
+        # a missing base through the capped pull API first when capped.
+        resolver = getattr(self.manager, "_image_pull_bytes_per_second", None)
+        try:
+            capped = bool(resolver) and resolver(None) > 0
+        except TypeError:
+            capped = False
+        if capped:
+            try:
+                def _base_missing():
+                    try:
+                        self.manager.client.images.get(request["base_image"])
+                        return False
+                    except Exception as exc:
+                        if exc.__class__.__name__ != "ImageNotFound":
+                            raise
+                        return True
+                if await asyncio.to_thread(_base_missing):
+                    log("Pulling base image (bandwidth-limited)…")
+                    await self.manager.pull_image_result(request["base_image"])
+            except Exception as exc:
+                self._log(node, f"Base image pull failed: {exc}")
+                raise
         result = await asyncio.to_thread(build_patched_image, self.manager.client, request, log)
         self.manager._images_cache = []
         self.manager._images_ts = 0

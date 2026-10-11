@@ -140,6 +140,57 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m.client.api.pull.assert_called_once()
         self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
 
+    async def test_daemon_insecure_registry_uses_the_daemon(self):
+        m = bare_manager(100.0)
+        m.client.api.info.return_value = {"RegistryConfig": {
+            "InsecureRegistryCIDRs": ["10.0.0.0/8"],
+        }}
+        m.client.api.pull.return_value = [{"status": "ok"}]
+        chunks = await self.collect(m, "10.1.2.3:5000/team/img:1")
+        m.client.api.pull.assert_called_once()
+        self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
+
+    async def test_daemon_info_failure_still_uses_the_capped_helper(self):
+        m = bare_manager(100.0)
+        m.client.api.info.side_effect = RuntimeError("daemon unreachable")
+        used = []
+
+        async def fake_events(client, image, bps):
+            used.append(image)
+            yield {"status": "Downloading"}
+
+        with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
+                   fake_events):
+            chunks = await self.collect(m, "ghcr.io/org/model:1")
+        self.assertEqual(used, ["ghcr.io/org/model:1"])
+        m.client.api.pull.assert_not_called()
+
+
+class PullImageStreamLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_queued_pull_does_not_release_the_holders_lock(
+        self,
+    ):
+        m = bare_manager(100.0)
+        await m.internet_transfer_lock.acquire()  # an active transfer
+
+        async def fake_events(client, image, bps):
+            yield {"status": "x"}
+
+        with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
+                   fake_events):
+            stream = m.pull_image_stream("ghcr.io/org/model:1")
+            task = asyncio.create_task(stream.__anext__())
+            await asyncio.sleep(0.05)  # let the queued pull reach acquire
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await stream.aclose()
+        # The holder still owns the lock; the cancelled waiter must not
+        # have freed it, and the holder can still release it cleanly.
+        self.assertTrue(m.internet_transfer_lock.locked())
+        m.internet_transfer_lock.release()
+        self.assertFalse(m.internet_transfer_lock.locked())
+
 
 def bare_vnas(internet_transfer_lock):
     directory = Path(tempfile.mkdtemp())

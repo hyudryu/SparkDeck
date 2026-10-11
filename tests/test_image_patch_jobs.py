@@ -78,6 +78,32 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         job["nodes"][0]["logs"].append("mutated")
         self.assertNotIn("mutated", self.jobs.get(job["id"])["nodes"][0]["logs"])
 
+    async def test_local_build_pulls_missing_base_through_capped_api_when_capped(self):
+        import docker
+
+        self.manager._image_pull_bytes_per_second = Mock(return_value=1_000_000)
+        self.manager.client.images.get = Mock(
+            side_effect=docker.errors.ImageNotFound("gone"),
+        )
+        self.manager.pull_image_result = AsyncMock()
+
+        def build(client, payload, log):
+            return result()
+
+        with patch("sparkdeck.image_patch_jobs.build_patched_image", side_effect=build):
+            outcome = await self.jobs._local({"logs": []}, request())
+        self.manager.pull_image_result.assert_awaited_once_with("runtime/base:stable")
+        self.assertEqual(outcome, result())
+
+    async def test_local_build_skips_base_fetch_when_not_capped(self):
+        def build(client, payload, log):
+            return result()
+
+        with patch("sparkdeck.image_patch_jobs.build_patched_image", side_effect=build):
+            outcome = await self.jobs._local({"logs": []}, request())
+        self.manager.client.images.get.assert_not_called()
+        self.assertEqual(outcome, result())
+
     async def test_remote_builds_are_sequential_and_pin_first_resolved_base(self):
         calls = []
 

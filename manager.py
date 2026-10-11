@@ -103,6 +103,11 @@ LEGACY_DEFAULT_HF_CACHE = "/home/hyudryu/.cache/huggingface"
 LEGACY_ROOT_HF_CACHE = "/root/.cache/huggingface"
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 
+# Agents advertising this honor max_download_bandwidth_mbps on
+# /api/agent/images/pull. Older agents accept the field but pull uncapped,
+# so the controller refuses capped fan-outs to nodes without it.
+IMAGE_PULL_BANDWIDTH_CAPABILITY = "image-pull-bandwidth-v1"
+
 DEFAULT_SETTINGS = {
     "max_concurrent_models": 2,
     "max_retries": 2,
@@ -1421,6 +1426,7 @@ class Manager:
                 VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
+                IMAGE_PULL_BANDWIDTH_CAPABILITY,
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
@@ -19679,25 +19685,33 @@ class Manager:
         from sparkdeck.throttled_image_pull import (
             is_loopback_registry_image, throttled_image_pull_events,
         )
-        if bytes_per_second > 0 and not is_loopback_registry_image(image):
+        if (
+            bytes_per_second > 0
+            and not is_loopback_registry_image(image)
+            and not await self._registry_is_insecure(image)
+        ):
             # The daemon does registry I/O outside this process, so a capped
             # pull runs through the throttled helper instead (see
             # sparkdeck.throttled_image_pull) and feeds the same SSE contract.
             # The node-wide transfer lock stops a concurrent Hub download
-            # from doubling this node's internet rate.
+            # from doubling this node's internet rate. async with keeps the
+            # release owned: a request cancelled while queued to acquire
+            # never frees the holder's lock.
             lock = getattr(self, "internet_transfer_lock", None)
             try:
-                if lock is not None:
-                    await lock.acquire()
-                async for event in throttled_image_pull_events(
-                    self.client, image, bytes_per_second,
-                ):
-                    yield f"data: {json.dumps(event)}\n\n"
+                if lock is None:
+                    async for event in throttled_image_pull_events(
+                        self.client, image, bytes_per_second,
+                    ):
+                        yield f"data: {json.dumps(event)}\n\n"
+                else:
+                    async with lock:
+                        async for event in throttled_image_pull_events(
+                            self.client, image, bytes_per_second,
+                        ):
+                            yield f"data: {json.dumps(event)}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            finally:
-                if lock is not None:
-                    lock.release()
             yield "data: {\"done\": true}\n\n"
             return
 
@@ -19749,6 +19763,27 @@ class Manager:
         if isinstance(share, bool) or not isinstance(share, (int, float)):
             return None
         return float(share)
+
+    async def _registry_is_insecure(self, image: str) -> bool:
+        """True when the Docker daemon trusts this image's registry
+        without a publicly verifiable certificate (``insecure-registries``
+        or a locally installed CA recorded in the daemon's registry
+        config).
+
+        The capped helper runs skopeo in an isolated container without the
+        daemon's trust configuration, so such registries must keep using the
+        daemon pull instead of failing TLS verification.
+        """
+        from sparkdeck.throttled_image_pull import matches_insecure_registry
+        try:
+            info = await asyncio.to_thread(self.client.api.info)
+            registry_config = (info or {}).get("RegistryConfig") or {}
+            insecure = registry_config.get("InsecureRegistryCIDRs") or []
+            return bool(insecure) and matches_insecure_registry(
+                image, [str(entry) for entry in insecure],
+            )
+        except Exception:
+            return False
 
     async def _ensure_runtime_image(
         self, image: str, name: str | None = None, model: str | None = None,
@@ -19901,6 +19936,21 @@ class Manager:
             )
         except ValueError:
             cap_mbps = 0.0
+        if cap_mbps > 0:
+            # An older agent accepts max_download_bandwidth_mbps but pulls
+            # uncapped, which would silently violate the setting. Fail the
+            # whole request instead of dispatching unenforceable caps.
+            unsupported = [
+                str(node.get("name") or node["id"]) for node in selected
+                if node["id"] != LOCAL_NODE_ID
+                and IMAGE_PULL_BANDWIDTH_CAPABILITY
+                not in (node.get("capabilities") or [])
+            ]
+            if unsupported:
+                raise ValueError(
+                    "cluster node(s) cannot enforce the download bandwidth "
+                    "limit; upgrade the agent on: " + ", ".join(unsupported)
+                )
         # Concurrent capped pulls across N nodes would each move the full
         # configured rate, multiplying the cluster total past the setting.
         # Divide the rate across the selected nodes so the cluster stays

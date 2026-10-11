@@ -36,6 +36,7 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.nodes = [node("local", "Coordinator", local=True), node("remote-1", "Worker")]
         self.manager.cluster_nodes = AsyncMock(return_value=self.nodes)
         self.manager.pull_image_result = AsyncMock(return_value={"ok": True})
+        self.manager.settings = {"max_download_bandwidth_mbps": 0}
         self.manager.node_registry = Mock()
         self.manager.node_registry.request = AsyncMock(return_value={"ok": True})
 
@@ -49,7 +50,13 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
         self.manager.pull_image_result.assert_awaited_once_with("ghcr.io/example/vllm:latest")
         self.manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/images/pull",
-            json_body={"image": "ghcr.io/example/vllm:latest"}, timeout=1800,
+            json_body={
+                "image": "ghcr.io/example/vllm:latest",
+                # 0 is sent explicitly so a controller-side "unlimited"
+                # cannot be overridden by stale node-local settings.
+                "max_download_bandwidth_mbps": 0,
+            },
+            timeout=1800,
         )
         self.assertNotIn("agent_url", result["selected_nodes"][0])
         self.assertNotIn("fabric_ip", result["selected_nodes"][0])

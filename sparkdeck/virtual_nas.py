@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
 from .catalog import quantization_from_text
+from .download_throttle import bandwidth_bytes_per_second, parse_bandwidth_mbps
 from .embeddings import CachedEmbedding, embedding_descriptor
 
 
@@ -48,6 +49,10 @@ VIRTUAL_NAS_DOWNLOAD_CAPABILITY = "virtual-nas-download-v1"
 VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY = "virtual-nas-download-cancel-v1"
 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY = "virtual-nas-download-baseline-v1"
 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY = "virtual-nas-files-download-v1"
+# The download endpoint accepts ``max_download_bandwidth_mbps``. Agents
+# without it reject unknown download request fields, so the controller may
+# only send the field when the probed agent health advertises this capability.
+VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY = "virtual-nas-download-bandwidth-v1"
 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY = "virtual-nas-direct-file-transfer-v2"
 FILE_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
 FILE_STREAM_CONTENT_TYPE = "application/vnd.sparkdeck.file-stream"
@@ -683,12 +688,20 @@ class VirtualNAS:
         token_provider: Callable[[], str] | None = None,
         external_model_roots_provider: Callable[[], list[Path]] | None = None,
         ownership_reclaimer: Callable[[Path], bool] | None = None,
+        download_bandwidth_provider: Callable[[], Any] | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
         self.node_registry = node_registry
         self._enabled_provider = enabled_provider
         self._token_provider = token_provider or (lambda: "")
+        # Node-local megabits-per-second cap for Hub downloads started
+        # without an explicit value. The controller supplies its configured
+        # cap on every request it dispatches to another node, so on agents
+        # this provider is only the fallback for direct calls.
+        self._download_bandwidth_provider = (
+            download_bandwidth_provider or (lambda: 0)
+        )
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
@@ -1087,12 +1100,37 @@ class VirtualNAS:
 
         return await asyncio.to_thread(inspect)
 
+    def _download_bandwidth_bytes_per_second(
+        self, bandwidth_mbps: float | None = None,
+    ) -> float:
+        """Resolve a megabits-per-second cap to bytes per second.
+
+        ``None`` falls back to the node-local provider. An unparseable
+        persisted value must never block a download, so it is treated as
+        unlimited.
+        """
+        value = bandwidth_mbps if bandwidth_mbps is not None else (
+            self._download_bandwidth_provider()
+        )
+        try:
+            return bandwidth_bytes_per_second(value)
+        except ValueError:
+            return 0.0
+
+    def _download_bandwidth_mbps(self) -> float:
+        """The node-local cap in megabits per second; unlimited reads as 0."""
+        try:
+            return parse_bandwidth_mbps(self._download_bandwidth_provider())
+        except ValueError:
+            return 0.0
+
     @_transfer_operation
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
         explicit_token: str | None = None,
         requested_revision: str | None = None,
         download_cache_baseline_bytes: int | None = None,
+        bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Agent-side capacity gate using only this cache filesystem."""
@@ -1130,7 +1168,7 @@ class VirtualNAS:
                 )
         return await self._download_model_process(
             model_id, revision, explicit_token, requested_revision,
-            operation_id=operation_id,
+            bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
         )
 
     async def cancel_download_operation(self, operation_id: str) -> dict[str, Any]:
@@ -1167,9 +1205,44 @@ class VirtualNAS:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("download worker did not confirm exit; cancellation is not complete") from exc
 
+    def _run_selective_download_process(
+        self, model_id: str, revision: str, files: list[str], token: str,
+        bytes_per_second: float = 0.0,
+    ) -> None:
+        """Fetch one capped file subset through the supervised download worker.
+
+        A bandwidth-limited subset runs in the worker subprocess (rather
+        than this thread) so the socket throttle is installed only in the
+        writer: the agent's transfer, registry, and API sockets stay
+        unthrottled while a capped pull is in flight.
+        """
+        launch_options = (
+            {"creationflags": subprocess.CREATE_NO_WINDOW}
+            if os.name == "nt" else {"start_new_session": True}
+        )
+        payload = json.dumps({
+            "model_id": model_id, "revision": revision,
+            "parent_pid": os.getpid(), "cache_dir": str(self._hub()),
+            "files": files, "bytes_per_second": bytes_per_second,
+            "token": token,
+        })
+        completed = subprocess.run(
+            [sys.executable, "-m", "sparkdeck.hf_download_worker"],
+            input=payload.encode(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            check=False, **launch_options,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Hugging Face download failed; verify repository access, "
+                "revision, credentials, and network"
+            )
+
     async def _download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
-        requested_revision: str | None = None, *, operation_id: str | None = None,
+        requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
@@ -1178,12 +1251,13 @@ class VirtualNAS:
         async with lock:
             return await self._supervised_download_model_process(
                 model_id, revision, explicit_token, requested_revision,
-                operation_id=operation_id,
+                bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
             )
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
-        requested_revision: str | None = None, *, operation_id: str | None = None,
+        requested_revision: str | None = None, bandwidth_mbps: float | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Run Hub's writer in an owned process; never cancel a writer thread."""
         model_id = validate_model_id(model_id)
@@ -1234,6 +1308,9 @@ class VirtualNAS:
             payload = json.dumps({"model_id": model_id, "revision": revision,
                                   "parent_pid": os.getpid(),
                                   "cache_dir": str(self._hub()),
+                                  "bytes_per_second": self._download_bandwidth_bytes_per_second(
+                                      bandwidth_mbps,
+                                  ),
                                   "token": explicit_token if explicit_token is not None else self._token_provider() or ""})
             completion = asyncio.create_task(process.communicate(payload.encode()))
             cancel_wait = asyncio.create_task(state["cancel"].wait())
@@ -1285,6 +1362,7 @@ class VirtualNAS:
         self, model_id: str, revision: str, filenames: list[str],
         explicit_token: str | None = None,
         requested_revision: str | None = None,
+        bandwidth_mbps: float | None = None,
     ) -> dict[str, Any]:
         """Download an exact subset of one immutable Hub revision.
 
@@ -1372,13 +1450,16 @@ class VirtualNAS:
         sizes, repository_files, blob_keys = await asyncio.to_thread(inspect)
 
         def download_selected() -> dict[str, Any]:
-            _enable_hf_xet_high_performance()
             try:
                 from huggingface_hub import hf_hub_download
             except ImportError as exc:
                 raise RuntimeError(
                     "huggingface-hub is required to download model weights"
                 ) from exc
+            # A capped subset is fetched by the download worker subprocess,
+            # whose socket throttle is scoped to that process; an unlimited
+            # subset downloads here exactly as before.
+            bytes_per_second = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
             with self._download_locks_guard:
                 download_lock = self._download_locks.setdefault(model_id, threading.Lock())
             with download_lock:
@@ -1439,14 +1520,20 @@ class VirtualNAS:
                     )
                 if missing:
                     try:
-                        for filename in missing:
-                            hf_hub_download(
-                                repo_id=model_id,
-                                filename=filename,
-                                revision=revision,
-                                cache_dir=str(self._hub()),
-                                token=token or None,
+                        if bytes_per_second > 0:
+                            self._run_selective_download_process(
+                                model_id, revision, missing, token,
+                                bytes_per_second,
                             )
+                        else:
+                            for filename in missing:
+                                hf_hub_download(
+                                    repo_id=model_id,
+                                    filename=filename,
+                                    revision=revision,
+                                    cache_dir=str(self._hub()),
+                                    token=token or None,
+                                )
                     except Exception as exc:
                         raise RuntimeError(
                             "Hugging Face download failed; verify repository access, revision, credentials, and network"
@@ -3848,15 +3935,24 @@ class VirtualNAS:
                 explicit_token=token, requested_revision=requested_revision,
             )
         else:
+            download_status = await self._validate_download_node(
+                job["target_node_id"],
+            )
+            json_body = {
+                "revision": revision,
+                "requested_revision": requested_revision,
+                "hf_token": token,
+                "files": selected,
+            }
+            bandwidth_mbps = self._download_bandwidth_mbps()
+            if bandwidth_mbps > 0 and VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+                download_status.get("capabilities") or []
+            ):
+                json_body["max_download_bandwidth_mbps"] = bandwidth_mbps
             operation = self.node_registry.request(
                 job["target_node_id"], "POST",
                 self._model_agent_path(job["model_id"], "download"),
-                json_body={
-                    "revision": revision,
-                    "requested_revision": requested_revision,
-                    "hf_token": token,
-                    "files": selected,
-                },
+                json_body=json_body,
                 timeout=24 * 60 * 60,
             )
         result = await self._await_uncancelable(operation)
@@ -3998,6 +4094,11 @@ class VirtualNAS:
                     ),
                     "hf_token": token,
                 }
+                bandwidth_mbps = self._download_bandwidth_mbps()
+                if bandwidth_mbps > 0 and VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
+                    download_status.get("capabilities") or []
+                ):
+                    download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
                 job["download_cancelable"] = VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY in (
                     download_status.get("capabilities") or []
                 )

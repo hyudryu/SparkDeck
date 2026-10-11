@@ -6,6 +6,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -22,6 +23,7 @@ from manager import (
 from sparkdeck import virtual_nas
 from sparkdeck.virtual_nas import (
     DOWNLOAD_STAGING_RESERVE_BYTES,
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
@@ -5085,6 +5087,235 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         job["status"] = "completed"
         self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 701.0))
         self.assertEqual(manager._virtual_nas_rate_samples, {})
+
+
+class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
+    """max_download_bandwidth_mbps must reach the writer process, never other
+    sockets, and only be sent to agents that understand it."""
+
+    def selective_hub(self, name="MODEL.GGUF", size=8):
+        api = Mock()
+        api.model_info.return_value = Mock(
+            sha=RESOLVED_REVISION,
+            siblings=[
+                Mock(rfilename=name, size=size),
+                Mock(rfilename="README.md", size=500_000_000),
+            ],
+        )
+        return Mock(
+            HfApi=Mock(return_value=api),
+            hf_hub_download=Mock(),
+            snapshot_download=Mock(),
+        )
+
+    def snapshot_writer(self, nas):
+        """Stand in for whichever fetcher runs: leave real bytes on disk."""
+        def write(_model_id=None, _revision=None, files=None, _token=None,
+                  _bps=0.0, **kwargs):
+            # The selective runner passes files positionally; the Hub
+            # downloader passes a single filename as a keyword.
+            filename = kwargs.get("filename") or (files[0] if files else None)
+            snapshot = nas._model_path("org/model") / "snapshots" / RESOLVED_REVISION
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / filename).write_bytes(b"12345678")
+        return write
+
+    async def test_explicit_cap_dispatches_selective_subset_to_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock(side_effect=self.snapshot_writer(nas))
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                result = await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main", bandwidth_mbps=4,
+                )
+            self.assertTrue(result["ok"])
+            # 4 Mbps = 500 KB/s, and the bytes move in the worker process.
+            runner.assert_called_once_with(
+                "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 500_000.0,
+            )
+            hub.hf_hub_download.assert_not_called()
+
+    async def test_node_provider_cap_applies_without_explicit_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 16,
+            )
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock(side_effect=self.snapshot_writer(nas))
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main",
+                )
+            runner.assert_called_once_with(
+                "org/model", RESOLVED_REVISION, ["MODEL.GGUF"], "", 2_000_000.0,
+            )
+
+    async def test_invalid_persisted_cap_downloads_unlimited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: "nonsense",
+            )
+            nas.free_bytes = Mock(return_value=10 ** 12)
+            hub = self.selective_hub()
+            hub.hf_hub_download.side_effect = self.snapshot_writer(nas)
+            runner = Mock()
+            with (
+                patch.dict("sys.modules", {"huggingface_hub": hub}),
+                patch.object(nas, "_run_selective_download_process", runner),
+            ):
+                await nas.download_model_files_checked(
+                    "org/model", RESOLVED_REVISION, ["MODEL.GGUF"],
+                    requested_revision="main",
+                )
+            # Unparseable settings must not block the download nor throttle.
+            runner.assert_not_called()
+            hub.hf_hub_download.assert_called_once()
+
+    async def _worker_payload(self, directory, provider=8, **call_kwargs):
+        payload_path = Path(directory) / "payload.json"
+        nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                         Mock(), lambda: True,
+                         download_bandwidth_provider=lambda: provider)
+        nas._save = Mock()
+        actual = asyncio.create_subprocess_exec
+
+        async def launch(*_args, **kwargs):
+            return await actual(
+                sys.executable, "-c",
+                "import sys; open(sys.argv[1],'wb').write(sys.stdin.buffer.read())",
+                str(payload_path), **kwargs,
+            )
+
+        with patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                   side_effect=launch):
+            # The fake worker performs no download, so the inventory check
+            # that follows fails; the payload was already handed to it.
+            with self.assertRaises(RuntimeError):
+                await nas._download_model_process(
+                    "org/model", RESOLVED_REVISION, **call_kwargs,
+                )
+        return json.loads(payload_path.read_text(encoding="utf-8"))
+
+    async def test_full_snapshot_payload_carries_converted_byte_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, requested_revision="main", bandwidth_mbps=8,
+            )
+            self.assertEqual(payload["model_id"], "org/model")
+            self.assertEqual(payload["bytes_per_second"], 1_000_000.0)
+            self.assertNotIn("files", payload)
+
+    async def test_full_snapshot_payload_applies_node_provider_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, requested_revision="main",
+            )
+            # No explicit override: the node-local provider applies.
+            self.assertEqual(payload["bytes_per_second"], 1_000_000.0)
+
+    async def test_full_snapshot_payload_defaults_to_unlimited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = await self._worker_payload(
+                directory, provider=0, requested_revision="main",
+            )
+            self.assertEqual(payload["bytes_per_second"], 0.0)
+
+    def test_selective_worker_subprocess_receives_files_and_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       return_value=Mock(returncode=0)) as run:
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf", "b.gguf"],
+                    "tok", 500_000.0,
+                )
+            self.assertEqual(run.call_args.args[0][:3],
+                             [sys.executable, "-m", "sparkdeck.hf_download_worker"])
+            payload = json.loads(run.call_args.kwargs["input"].decode())
+            self.assertEqual(payload["files"], ["a.gguf", "b.gguf"])
+            self.assertEqual(payload["bytes_per_second"], 500_000.0)
+            self.assertEqual(payload["token"], "tok")
+            self.assertEqual(payload["model_id"], "org/model")
+
+    def test_selective_worker_nonzero_exit_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       return_value=Mock(returncode=1)):
+                with self.assertRaisesRegex(RuntimeError, "Hugging Face download"):
+                    nas._run_selective_download_process(
+                        "org/model", RESOLVED_REVISION, ["a.gguf"], "", 1.0,
+                    )
+
+    async def test_remote_dispatch_sends_cap_only_when_agent_supports_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(
+                Path(directory), lambda: Path(directory) / "hub", Mock(),
+                lambda: True, download_bandwidth_provider=lambda: 10,
+            )
+            nas._save = Mock()
+            bodies = []
+
+            async def request(node_id, method, path, **kwargs):
+                bodies.append(kwargs["json_body"])
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            job = {"id": "job-1", "model_id": "org/model",
+                   "revision": RESOLVED_REVISION, "requested_revision": "main",
+                   "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                   "bytes_total": 8, "status": "queued", "kind": "download"}
+
+            nas._validate_download_node = AsyncMock(
+                return_value={"capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY]},
+            )
+            await nas._download_selected_files(job, "")
+            self.assertEqual(bodies[-1]["max_download_bandwidth_mbps"], 10.0)
+
+            # An older agent that rejects unknown fields must not receive one.
+            nas._validate_download_node = AsyncMock(return_value={"capabilities": []})
+            await nas._download_selected_files(job, "")
+            self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
+
+    async def test_unlimited_cap_omits_the_remote_field(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            nas._save = Mock()
+            bodies = []
+
+            async def request(node_id, method, path, **kwargs):
+                bodies.append(kwargs["json_body"])
+                return {"ok": True, "model_id": "org/model", "size_bytes": 8}
+
+            nas.node_registry.request = AsyncMock(side_effect=request)
+            nas._validate_download_node = AsyncMock(
+                return_value={"capabilities": [VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY]},
+            )
+            job = {"id": "job-1", "model_id": "org/model",
+                   "revision": RESOLVED_REVISION, "requested_revision": "main",
+                   "target_node_id": "ws1", "selected_files": ["q.gguf"],
+                   "bytes_total": 8, "status": "queued", "kind": "download"}
+            await nas._download_selected_files(job, "")
+            self.assertNotIn("max_download_bandwidth_mbps", bodies[-1])
 
 
 if __name__ == "__main__":

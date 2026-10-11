@@ -65,10 +65,12 @@ from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
 )
+from sparkdeck.download_throttle import bandwidth_bytes_per_second, parse_bandwidth_mbps
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY,
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
     VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
     VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
     VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
@@ -106,6 +108,11 @@ DEFAULT_SETTINGS = {
     # Stored server-side and never returned by the settings/state APIs. An
     # empty value falls back to the process environment or the HF cache token.
     "hf_token": "",
+    # Cluster-wide cap for pulling weights and images from the internet, in
+    # megabits per second; 0 disables limiting. The controller sends this to
+    # agent-side download jobs, and image pulls run through a throttled
+    # helper path when it is set.
+    "max_download_bandwidth_mbps": 0.0,
     "port_range_start": 8000,
     "port_range_end": 8099,
     "shm_size": "16g",
@@ -976,6 +983,9 @@ class Manager:
             lambda: bool(self.settings.get("virtual_nas_enabled", False)),
             self._resolved_hf_token,
             ownership_reclaimer=self._reclaim_model_cache_ownership,
+            download_bandwidth_provider=lambda: self.settings.get(
+                "max_download_bandwidth_mbps", 0,
+            ),
         )
         # Embedding inference keeps its own virtual environment and worker
         # processes: the controller's dependency set stays untouched, and a
@@ -1400,6 +1410,7 @@ class Manager:
                 VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_CANCEL_CAPABILITY,
                 VIRTUAL_NAS_DOWNLOAD_BASELINE_CAPABILITY,
+                VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
                 VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
                 VIRTUAL_NAS_DIRECT_TRANSFER_CAPABILITY,
                 FAN_TEMPERATURE_OVERRIDE_CAPABILITY,
@@ -3203,8 +3214,8 @@ class Manager:
         cleaned = [str(value) for value in files if isinstance(value, str) and value]
         return cleaned or None
 
-    async def node_supports_selective_downloads(self, node_id: str) -> bool:
-        """Report whether one node's live agent advertises selective downloads.
+    async def node_supports_capability(self, node_id: str, capability: str) -> bool:
+        """Report whether one node's live agent advertises one capability.
 
         Capability advertisements only exist in the agent's health response;
         the persisted pairing record never carries them, so the check must
@@ -3219,7 +3230,17 @@ class Manager:
         ), None)
         if node is None:
             return False
-        return VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY in (node.get("capabilities") or [])
+        return capability in (node.get("capabilities") or [])
+
+    async def node_supports_selective_downloads(self, node_id: str) -> bool:
+        return await self.node_supports_capability(
+            node_id, VIRTUAL_NAS_FILES_DOWNLOAD_CAPABILITY,
+        )
+
+    async def node_supports_download_bandwidth(self, node_id: str) -> bool:
+        return await self.node_supports_capability(
+            node_id, VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
+        )
 
     async def node_has_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
@@ -3262,16 +3283,20 @@ class Manager:
         # to whatever worker-local token exists.
         # Track controller-dispatched downloads even when the destination
         # still runs an older agent without its own update admission guard.
+        download_body = {
+            "revision": revision,
+            "requested_revision": requested_revision or revision,
+            "hf_token": self._resolved_hf_token() or "",
+            "files": list(filenames),
+        }
+        bandwidth_mbps = self.virtual_nas._download_bandwidth_mbps()
+        if bandwidth_mbps > 0 and await self.node_supports_download_bandwidth(node_id):
+            download_body["max_download_bandwidth_mbps"] = bandwidth_mbps
         with self.virtual_nas.transfer_operation(model_id):
             return await self.virtual_nas._await_uncancelable(self.node_registry.request(
                 node_id, "POST",
                 f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
-                json_body={
-                    "revision": revision,
-                    "requested_revision": requested_revision or revision,
-                    "hf_token": self._resolved_hf_token() or "",
-                    "files": list(filenames),
-                },
+                json_body=download_body,
                 timeout=24 * 60 * 60,
             ))
 
@@ -12085,6 +12110,11 @@ class Manager:
                     # token should remain unchanged.
                     if k == "hf_token" and not str(v or "").strip():
                         continue
+                    if k == "max_download_bandwidth_mbps":
+                        # Enforce the unit range at the write path so every
+                        # reader (download workers, image pull) can trust the
+                        # persisted value.
+                        v = parse_bandwidth_mbps(v)
                     self.settings[k] = v
             self._save_settings()
         if self.settings.get("virtual_nas_enabled") and not self.is_joined_worker():
@@ -19649,9 +19679,42 @@ class Manager:
             "results": results,
         }
 
-    async def pull_image_stream(self, image: str):
+    def _image_pull_bytes_per_second(
+        self, bandwidth_mbps: float | None = None,
+    ) -> float:
+        """Resolve the effective image-pull cap to bytes per second.
+
+        ``None`` falls back to this node's setting; an unparseable persisted
+        value reads as unlimited rather than failing the pull.
+        """
+        value = bandwidth_mbps if bandwidth_mbps is not None else (
+            self.settings.get("max_download_bandwidth_mbps", 0)
+        )
+        try:
+            return bandwidth_bytes_per_second(value)
+        except ValueError:
+            return 0.0
+
+    async def pull_image_stream(
+        self, image: str, bandwidth_mbps: float | None = None,
+    ):
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
+        bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
+        if bytes_per_second > 0:
+            # The daemon does registry I/O outside this process, so a capped
+            # pull runs through the throttled helper instead (see
+            # sparkdeck.throttled_image_pull) and feeds the same SSE contract.
+            from sparkdeck.throttled_image_pull import throttled_image_pull_events
+            try:
+                async for event in throttled_image_pull_events(
+                    self.client, image, bytes_per_second,
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: {\"done\": true}\n\n"
+            return
 
         def producer():
             try:
@@ -19671,10 +19734,12 @@ class Manager:
                 break
             yield f"data: {json.dumps(item)}\n\n"
 
-    async def pull_image_result(self, image: str) -> dict:
+    async def pull_image_result(
+        self, image: str, bandwidth_mbps: float | None = None,
+    ) -> dict:
         """Pull one image locally and collapse Docker progress into a result."""
         error = None
-        async for event in self.pull_image_stream(image):
+        async for event in self.pull_image_stream(image, bandwidth_mbps):
             try:
                 payload = json.loads(event.removeprefix("data:").strip())
             except (AttributeError, json.JSONDecodeError):
@@ -19696,13 +19761,27 @@ class Manager:
         if not image:
             raise ValueError("image is required")
         selected = await self.selected_cluster_nodes(node_ids)
+        # Agents validate the cap themselves; sending 0 explicitly keeps a
+        # controller-side "unlimited" from being overridden by stale
+        # node-local settings. Capped pulls need the download-style 24 h
+        # ceiling instead of the 30-minute uncapped one.
+        try:
+            cap_mbps = parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            )
+        except ValueError:
+            cap_mbps = 0.0
 
         async def pull(node: dict) -> dict:
             if node["id"] == LOCAL_NODE_ID:
                 return await self.pull_image_result(image)
             return await self.node_registry.request(
                 node["id"], "POST", "/api/agent/images/pull",
-                json_body={"image": image}, timeout=1800,
+                json_body={
+                    "image": image,
+                    "max_download_bandwidth_mbps": cap_mbps,
+                },
+                timeout=24 * 60 * 60 if cap_mbps > 0 else 1800,
             )
 
         pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)

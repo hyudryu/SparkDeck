@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from sparkdeck.onboarding import is_forwardable_path
-from sparkdeck.virtual_nas import TransferCanceled, VirtualNAS
+from sparkdeck.virtual_nas import (
+    TransferCanceled,
+    VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
+    VirtualNAS,
+)
 
 
 with patch("docker.from_env", return_value=Mock()):
@@ -530,6 +534,103 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
             explicit_token="ephemeral", requested_revision="main",
         )
         self.assertNotIn("ephemeral", response.text)
+
+    async def test_agent_health_advertises_download_bandwidth_cap(self):
+        with patch.object(server, "_require_agent"):
+            response = await self.client.get("/api/agent/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY, response.json()["capabilities"],
+        )
+
+    async def test_agent_download_forwards_selective_bandwidth_cap(self):
+        resolved = "b" * 40
+        checked_files = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_files_checked", checked_files),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={
+                    "revision": resolved, "hf_token": "ephemeral",
+                    "files": ["q4/model.gguf"],
+                    "max_download_bandwidth_mbps": 10,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        checked_files.assert_awaited_once_with(
+            "org/model", resolved, ["q4/model.gguf"],
+            explicit_token="ephemeral", requested_revision=resolved,
+            bandwidth_mbps=10.0,
+        )
+
+    async def test_agent_download_forwards_full_snapshot_bandwidth_cap(self):
+        checked = AsyncMock(return_value={"ok": True})
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+        ):
+            response = await self.client.post(
+                "/api/agent/virtual-nas/models/org/model/download",
+                json={"revision": "a" * 40, "max_download_bandwidth_mbps": 2.5},
+            )
+        self.assertEqual(response.status_code, 200)
+        checked.assert_awaited_once_with(
+            "org/model", "a" * 40, "", "a" * 40, bandwidth_mbps=2.5,
+        )
+
+    async def test_agent_download_rejects_invalid_bandwidth_caps(self):
+        checked = AsyncMock()
+        checked_files = AsyncMock()
+        with (
+            patch.object(server, "_require_agent"),
+            patch.object(server.manager.virtual_nas, "download_model_checked", checked),
+            patch.object(server.manager.virtual_nas, "download_model_files_checked", checked_files),
+        ):
+            for value in ("fast", -1, True, 10 ** 9, None):
+                response = await self.client.post(
+                    "/api/agent/virtual-nas/models/org/model/download",
+                    json={"revision": "a" * 40, "max_download_bandwidth_mbps": value},
+                )
+                self.assertEqual(response.status_code, 400, (value, response.text))
+        checked.assert_not_awaited()
+        checked_files.assert_not_awaited()
+
+    async def test_agent_image_pull_forwards_and_validates_bandwidth_cap(self):
+        pull = AsyncMock(return_value={"ok": True})
+        with patch.object(server, "_require_agent"), \
+                patch.object(server.manager, "pull_image_result", pull):
+            capped = await self.client.post(
+                "/api/agent/images/pull",
+                json={"image": "ghcr.io/example/vllm:latest",
+                      "max_download_bandwidth_mbps": 25},
+            )
+            uncapped = await self.client.post(
+                "/api/agent/images/pull", json={"image": "ghcr.io/example/vllm:latest"},
+            )
+            explicit_zero = await self.client.post(
+                "/api/agent/images/pull",
+                json={"image": "ghcr.io/example/vllm:latest",
+                      "max_download_bandwidth_mbps": 0},
+            )
+            bad = await self.client.post(
+                "/api/agent/images/pull",
+                json={"image": "ghcr.io/example/vllm:latest",
+                      "max_download_bandwidth_mbps": "fast"},
+            )
+        self.assertEqual(capped.status_code, 200)
+        self.assertEqual(uncapped.status_code, 200)
+        self.assertEqual(explicit_zero.status_code, 200)
+        self.assertEqual(bad.status_code, 400)
+        # An omitted field keeps the node-local cap (None); an explicit 0
+        # overrides it for a node with stale persisted settings.
+        self.assertEqual(pull.await_args_list[0].args,
+                         ("ghcr.io/example/vllm:latest", 25.0))
+        self.assertEqual(pull.await_args_list[1].args,
+                         ("ghcr.io/example/vllm:latest", None))
+        self.assertEqual(pull.await_args_list[2].args,
+                         ("ghcr.io/example/vllm:latest", 0.0))
 
     async def test_agent_files_check_reports_selected_file_presence(self):
         has_files = Mock(return_value={

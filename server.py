@@ -39,6 +39,7 @@ from cluster import (
 from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
 from sparkdeck.benchmark_runner import BenchmarkRunnerError, BenchmarkRunnerService
+from sparkdeck.download_throttle import parse_bandwidth_mbps
 from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
@@ -1120,8 +1121,19 @@ async def agent_pull_image(req: Request):
     image = str(body.get("image") or "").strip()
     if not image:
         raise HTTPException(400, "image is required")
+    # Older controllers omit the field, which keeps the node-local cap.
+    # An explicit 0 from the controller means "unlimited", overriding a
+    # node that still has a stale cap persisted.
+    raw_bandwidth = body.get("max_download_bandwidth_mbps")
     try:
-        return await manager.pull_image_result(image)
+        bandwidth_mbps = (
+            parse_bandwidth_mbps(raw_bandwidth)
+            if raw_bandwidth is not None else None
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        return await manager.pull_image_result(image, bandwidth_mbps)
     except Exception as exc:
         raise HTTPException(502, str(exc)[:500]) from exc
 
@@ -1201,16 +1213,26 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         if not isinstance(body, dict) or set(body) - {
             "revision", "requested_revision", "hf_token",
             "download_cache_baseline_bytes", "files", "operation_id",
+            "max_download_bandwidth_mbps",
         }:
             raise ValueError(
                 "request may contain only revision, requested_revision, hf_token, "
-                "download_cache_baseline_bytes, files, and operation_id"
+                "download_cache_baseline_bytes, files, operation_id, and "
+                "max_download_bandwidth_mbps"
             )
         revision = body.get("revision")
         requested_revision = body.get("requested_revision")
         token = body.get("hf_token")
         files = body.get("files")
         operation_id = body.get("operation_id")
+        bandwidth_mbps: float | None = None
+        if "max_download_bandwidth_mbps" in body:
+            try:
+                bandwidth_mbps = parse_bandwidth_mbps(
+                    body["max_download_bandwidth_mbps"],
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
         if operation_id is not None:
             operation_id = _download_operation_id(operation_id)
         if revision is not None and not isinstance(revision, str):
@@ -1237,11 +1259,15 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
                 raise ValueError(
                     "download_cache_baseline_bytes cannot be combined with files"
                 )
+            bandwidth_kwargs = (
+                {"bandwidth_mbps": bandwidth_mbps} if bandwidth_mbps is not None else {}
+            )
             result = await manager.virtual_nas.download_model_files_checked(
                 model_id, revision or "main",
                 [item.strip() for item in files],
                 explicit_token=token if token is not None else None,
                 requested_revision=requested_revision or revision or "main",
+                **bandwidth_kwargs,
             )
             return _public_storage_payload(result)
         download_args = [
@@ -1251,6 +1277,8 @@ async def agent_virtual_nas_download(model_id: str, req: Request):
         if baseline is not None:
             download_args.append(baseline)
         operation_kwargs = {"operation_id": operation_id} if operation_id is not None else {}
+        if bandwidth_mbps is not None:
+            operation_kwargs["bandwidth_mbps"] = bandwidth_mbps
         result = await manager.virtual_nas.download_model_checked(*download_args, **operation_kwargs)
         return _public_storage_payload(result)
     except TransferCanceled:
@@ -2151,7 +2179,10 @@ async def get_settings():
 
 @app.post("/api/settings")
 async def update_settings(req: Request):
-    return await manager.update_settings(await req.json())
+    try:
+        return await manager.update_settings(await req.json())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ---------- containers ----------
@@ -3089,6 +3120,9 @@ async def v1_settings():
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
     values["vllm_image"] = manager.settings.get("vllm_image")
+    values["max_download_bandwidth_mbps"] = manager.settings.get(
+        "max_download_bandwidth_mbps", 0,
+    )
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     # cluster_node_name is deliberately absent: this response is forwarded to
     # the controller on joined workers, so it would name the controller rather
@@ -3160,12 +3194,27 @@ async def v1_update_settings(req: Request):
         if credential:
             if len(credential) > 4096 or any(char.isspace() for char in credential):
                 raise HTTPException(400, "hf_token is not valid")
+    forwarded_settings: dict = {}
+    if "max_download_bandwidth_mbps" in body:
+        # The cap is authoritative in manager settings (download workers read
+        # it there), so the v1 route validates and forwards it like hf_token.
+        try:
+            forwarded_settings["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(
+                body["max_download_bandwidth_mbps"],
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
     sparkdeck.prompt_gate.refresh()
     if credential:
-        await manager.update_settings({"hf_token": credential})
+        forwarded_settings["hf_token"] = credential
+    if forwarded_settings:
+        await manager.update_settings(forwarded_settings)
     values["vllm_image"] = manager.settings.get("vllm_image")
+    values["max_download_bandwidth_mbps"] = manager.settings.get(
+        "max_download_bandwidth_mbps", 0,
+    )
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
@@ -3178,6 +3227,9 @@ async def v1_clear_hf_token():
         for key, default in _APP_SETTING_DEFAULTS.items()
     }
     values["vllm_image"] = manager.settings.get("vllm_image")
+    values["max_download_bandwidth_mbps"] = manager.settings.get(
+        "max_download_bandwidth_mbps", 0,
+    )
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 

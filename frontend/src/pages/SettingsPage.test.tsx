@@ -79,6 +79,59 @@ describe('settings page', () => {
     await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Concurrent prompt processing streams per group' })).toHaveValue(3))
   })
 
+  it('saves the download bandwidth cap and restores it on the next visit', async () => {
+    let cap = 0
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') {
+          const saved = JSON.parse(String(init.body))
+          if ('max_download_bandwidth_mbps' in saved) {
+            cap = saved.max_download_bandwidth_mbps
+          }
+        }
+        body = { theme: 'system', max_concurrent_prompt_processing: 1,
+                 max_download_bandwidth_mbps: cap }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    const bandwidth = { name: 'Maximum download bandwidth in megabits per second' }
+    const visit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton', bandwidth)
+    // Unlimited is the displayed default, and nothing is dirty on arrival.
+    expect(field).toHaveValue(0)
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+    await user.clear(field)
+    await waitFor(() => expect(field).toHaveValue(null))
+    await user.type(field, '25')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(cap).toBe(25))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())
+    visit.unmount()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByRole('spinbutton', bandwidth)).toHaveValue(25))
+  })
+
+  it('treats a cleared bandwidth field as unlimited when saving', async () => {
+    const update = vi.spyOn(api.settings, 'update').mockResolvedValue({
+      theme: 'system', max_download_bandwidth_mbps: 0,
+    })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ theme: 'system', max_download_bandwidth_mbps: 30 }),
+        { headers: { 'Content-Type': 'application/json' } })))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton',
+      { name: 'Maximum download bandwidth in megabits per second' })
+    await waitFor(() => expect(field).toHaveValue(30))
+    await user.clear(field)
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(update).toHaveBeenCalled())
+    expect(update.mock.calls[0][0]).toMatchObject({ max_download_bandwidth_mbps: 0 })
+  })
+
   it('rejects empty, zero, and fractional prompt-processing limits before saving', async () => {
     const update = vi.spyOn(api.settings, 'update')
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>

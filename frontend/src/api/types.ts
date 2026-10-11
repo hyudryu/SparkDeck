@@ -692,6 +692,8 @@ export interface AppSettings {
   vllm_image?: string
   hf_token?: string
   hf_token_configured?: boolean
+  /** Cluster-wide internet download cap in megabits per second; 0 = unlimited. */
+  max_download_bandwidth_mbps?: number
   telemetry_interval_seconds?: number
   [key: string]: unknown
 }

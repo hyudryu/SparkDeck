@@ -92,7 +92,7 @@ def apply_bandwidth_cap(bytes_per_second: float) -> None:
 # and the running total is reported for progress.
 _PROXY_SCRIPT = """
 import base64, os, socket, ssl, threading, time
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
 PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
@@ -180,17 +180,25 @@ def split_authority(value):
     return host, port
 
 def parse_upstream(url):
-    secure = False
-    if "://" in url:
-        scheme, _, url = url.partition("://")
-        secure = scheme.strip().lower() == "https"
+    # Parse the proxy setting as a URL, not by splitting on colons: valid
+    # settings carry a path or trailing slash (http://proxy.corp:8080/), and
+    # a naive authority split turns the port into "8080/".
+    if "://" not in url:
+        url = "http://" + url
+    parsed = urlparse(url)
+    secure = (parsed.scheme or "http").strip().lower() == "https"
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
     auth = ""
-    if "@" in url:
-        auth, _, url = url.rpartition("@")
+    if parsed.username:
         # Proxy URLs percent-encode userinfo delimiters (@ : %%); the Basic
         # credential must carry the decoded username and password.
-        auth = unquote(auth)
-    host, port = split_authority(url)
+        auth = unquote(parsed.username)
+        if parsed.password:
+            auth += ":" + unquote(parsed.password)
     return auth, host, int(port or ("443" if secure else "80")), secure
 
 def no_proxy_direct(authority):

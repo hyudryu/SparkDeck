@@ -244,10 +244,12 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_download_bandwidth_mbps", records["legacy"])
         self.assertEqual(records["capable"]["max_download_bandwidth_mbps"], 0.0)
 
-    async def test_capped_remote_build_holds_the_cluster_dispatch_slot(self):
-        # The base pull runs on the remote node at the forwarded cap; while
-        # it is under way the shared budget slot must be reserved, or a
-        # concurrent capped download on another node doubles the uplink.
+    async def test_capped_remote_build_holds_the_slot_only_for_base_pull(self):
+        # The bandwidth budget is consumed only while the node pulls an
+        # uncached base image. The node-targeted prefetch pull runs under the
+        # cluster dispatch slot; the (possibly hours-long) build poll runs
+        # WITHOUT it, so a long build no longer blocks every other capped
+        # transfer for disk/CPU work that moves no registry bytes.
         self.manager.settings = {"max_download_bandwidth_mbps": 40}
         self.manager.dispatched_download_lock = asyncio.Lock()
         self.manager.selected_cluster_nodes = AsyncMock(return_value=[
@@ -256,15 +258,52 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         ])
         held: list = []
 
+        async def fake_pull_request(node_id, method, path, **kwargs):
+            held.append(("pull", self.manager.dispatched_download_lock.locked()))
+            self.assertEqual(path, "/api/agent/images/pull")
+            self.assertEqual(
+                kwargs["json_body"]["max_download_bandwidth_mbps"], 40.0,
+            )
+            return {"ok": True}
+
+        self.manager.node_registry = Mock()
+        self.manager.node_registry.request = fake_pull_request
+
         async def fake_remote(node, request):
-            held.append(self.manager.dispatched_download_lock.locked())
+            held.append(("build", self.manager.dispatched_download_lock.locked()))
             return result()
 
         with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
             await self.finish(
                 await self.jobs.start(request(["worker"])),
             )
-        self.assertEqual(held, [True])
+        self.assertEqual(held, [("pull", True), ("build", False)])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_capped_local_build_pre_pulls_base_under_the_slot(self):
+        # Same contract for controller-local builds: one prefetch pull under
+        # the reservation; the builder itself then finds the base present
+        # (the client Mock) and pulls nothing, without holding the slot.
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "local",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        observed: list = []
+
+        async def fake_pull(image, bandwidth_mbps=None):
+            observed.append((image, bandwidth_mbps,
+                             self.manager.dispatched_download_lock.locked()))
+            return {"ok": True}
+
+        self.manager.pull_image_result = fake_pull
+        with patch(
+            "sparkdeck.image_patch_jobs.build_patched_image",
+            side_effect=lambda *args: result(),
+        ):
+            await self.finish(await self.jobs.start(request(["local"])))
+        self.assertEqual(observed, [("runtime/base:stable", 40.0, True)])
         self.assertFalse(self.manager.dispatched_download_lock.locked())
 
     async def test_uncapped_remote_build_never_holds_the_slot(self):

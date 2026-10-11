@@ -17689,6 +17689,7 @@ class Manager:
                 model, name=name, cluster_member=cluster_member,
                 runtime="laya", hf_token=hf_token,
                 revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                extra_args=list(extra_args or []),
             )
             return await asyncio.to_thread(_create)
         except Exception as exc:
@@ -17823,6 +17824,7 @@ class Manager:
             await self._prefetch_runtime_weights(
                 model, name=name, cluster_member=cluster_member,
                 runtime="tensorfold", hf_token=hf_token,
+                extra_args=list(extra_args or []),
             )
             return await asyncio.to_thread(_create)
         except Exception as exc:
@@ -18827,6 +18829,7 @@ class Manager:
                     model, name=name, cluster_member=cluster_member,
                     runtime="sglang", hf_token=hf_token,
                     revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                    extra_args=list(extra_args or []),
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -18993,6 +18996,7 @@ class Manager:
                     model, name=name, cluster_member=cluster_member,
                     runtime="vllm", hf_token=hf_token,
                     revision=self._cli_option(list(extra_args or []), {"--revision"}),
+                    extra_args=list(extra_args or []),
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -20212,22 +20216,74 @@ class Manager:
             image, self._image_pull_share_mbps(cluster_member),
         )
 
+    # Launch arguments whose VALUE is a Hugging Face repository other than
+    # the primary model. The runtime resolves these inside the container, so
+    # while a cap is active they must go through the capped worker too.
+    _SECONDARY_REPO_FLAGS = (
+        "--tokenizer", "--tokenizer-path", "--speculative-draft-model-path",
+    )
+    # Keys inside --speculative-config (a JSON argument) naming a draft model.
+    _SPECULATIVE_MODEL_KEYS = ("model", "draft_model", "draft_model_path")
+
+    def _secondary_repo_ids(self, extra_args, primary: set[str]) -> list[str]:
+        """HF repositories named by the launch args beyond the primary model.
+
+        A --tokenizer copy or a speculative draft model would otherwise be
+        fetched by the online container outside every SparkDeck throttle.
+        Values that are not repository ids (local directories, JSON blobs)
+        are skipped: the container reads local files without a download.
+        """
+        args = [str(item) for item in (extra_args or [])]
+        found: list[str] = []
+
+        def _add(value) -> None:
+            value = str(value or "").strip()
+            if not value or value in primary or value in found:
+                return
+            from sparkdeck.virtual_nas import validate_model_id
+            try:
+                validate_model_id(value)
+            except ValueError:
+                return
+            found.append(value)
+
+        for flag in self._SECONDARY_REPO_FLAGS:
+            _add(self._cli_option(args, {flag}))
+        spec = self._cli_option(args, {"--speculative-config"})
+        if spec:
+            try:
+                config = json.loads(str(spec))
+            except (TypeError, ValueError):
+                config = None
+            if isinstance(config, dict):
+                for key in self._SPECULATIVE_MODEL_KEYS:
+                    _add(config.get(key))
+        return found
+
     async def _prefetch_runtime_weights(
         self, model: str, name: str | None = None,
         cluster_member: dict | None = None, runtime: str = "",
         hf_token: str | None = None, revision: str | None = None,
+        extra_args: list | None = None,
     ) -> None:
         """Prepare missing HF weights through the capped worker pre-launch.
 
         vLLM, SGLang, Laya, and TensorFold resolve the model inside the
         runtime container, so an uncached deployment would fetch the weights
         over the uplink outside every SparkDeck throttle. When a download cap
-        is active, the snapshot is downloaded first through the same capped
+        is active, each snapshot is downloaded first through the same capped
         worker (and the node-wide transfer lock) that the Transfer queue
         uses, into the hub directory the container mounts, so the container
-        starts offline. Strata is not covered here: its entrypoint picks the
-        checkpoint repository itself and stages it into a private volume, so
-        its launcher refuses first launches while capped.
+        starts offline. Repositories the launch arguments name beyond the
+        primary model (a --tokenizer copy, a speculative draft model) ride
+        the same capped path, or the online container would download them
+        past the limit. The cluster-wide dispatch slot is reserved across the
+        prefetch: a standalone local launch is a controller-dispatched capped
+        transfer, and running it beside a capped remote transfer would move
+        two full rates through one capped uplink. Strata is not covered here:
+        its entrypoint picks the checkpoint repository itself and stages it
+        into a private volume, so its launcher refuses first launches while
+        capped.
         """
         share = self._image_pull_share_mbps(cluster_member)
         if share is None:
@@ -20250,49 +20306,71 @@ class Manager:
             return
         token = self._resolved_hf_token(hf_token)
         requested = str(revision or "").strip() or "main"
+        targets = [(model_id, requested)]
+        for secondary in self._secondary_repo_ids(extra_args, {model_id}):
+            # Secondary repositories carry no revision flag; the runtimes
+            # fetch their default branch.
+            targets.append((secondary, "main"))
 
-        def _resolve_revision() -> str:
-            if _is_commit_sha(requested):
-                return requested
+        def _resolve_revision(repo_id: str, want: str) -> str:
+            if _is_commit_sha(want):
+                return want
             from huggingface_hub import HfApi
             info = HfApi(token=token or None).model_info(
-                model_id, revision=requested,
+                repo_id, revision=want,
             )
             return str(getattr(info, "sha", "") or "").strip()
 
-        try:
-            revision = await asyncio.to_thread(_resolve_revision)
-        except Exception as exc:
-            raise RuntimeError(
-                f"could not resolve {model_id} on Hugging Face while the "
-                "download limit is active; set the limit to 0 to let the "
-                "runtime container download the weights itself"
-            ) from exc
-        if not _is_commit_sha(revision):
-            raise RuntimeError(
-                f"Hugging Face did not report an immutable revision for "
-                f"{model_id} while the download limit is active"
-            )
+        pending: list[tuple[str, str, str]] = []
+        for repo_id, want in targets:
+            try:
+                resolved = await asyncio.to_thread(
+                    _resolve_revision, repo_id, want,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not resolve {repo_id} on Hugging Face while the "
+                    "download limit is active; set the limit to 0 to let the "
+                    "runtime container download the weights itself"
+                ) from exc
+            if not _is_commit_sha(resolved):
+                raise RuntimeError(
+                    f"Hugging Face did not report an immutable revision for "
+                    f"{repo_id} while the download limit is active"
+                )
 
-        def _cached() -> bool:
-            return any(
-                item.get("model_id") == model_id
-                and nas._has_revision(item, revision, requested)
-                for item in nas.inventory()
-            )
+            def _cached(
+                repo_id=repo_id, resolved=resolved, want=want,
+            ) -> bool:
+                return any(
+                    item.get("model_id") == repo_id
+                    and nas._has_revision(item, resolved, want)
+                    for item in nas.inventory()
+                )
 
-        if await asyncio.to_thread(_cached):
+            if await asyncio.to_thread(_cached):
+                continue
+            pending.append((repo_id, resolved, want))
+        if not pending:
             return
-        if name is not None:
-            self._cluster_launch_update(
-                name, "downloading_weights",
-                f"Downloading model weights {model_id}; this can take a while",
-                model=model, cluster_member=cluster_member,
-            )
-        print(f"[{runtime}] prefetching weights: {model_id}@{revision[:12]}")
-        await nas._download_model_process(
-            model_id, revision, token, requested, bandwidth_mbps=share,
-        )
+        # One reservation across the whole prefetch; the slot is reentrant,
+        # so a launch already holding it (cluster fan-out) passes through.
+        async with self._dispatched_download_slot(True):
+            for repo_id, resolved, want in pending:
+                if name is not None:
+                    self._cluster_launch_update(
+                        name, "downloading_weights",
+                        f"Downloading model weights {repo_id}; "
+                        "this can take a while",
+                        model=model, cluster_member=cluster_member,
+                    )
+                print(
+                    f"[{runtime}] prefetching weights: "
+                    f"{repo_id}@{resolved[:12]}"
+                )
+                await nas._download_model_process(
+                    repo_id, resolved, token, want, bandwidth_mbps=share,
+                )
 
     async def pull_image_result(
         self, image: str, bandwidth_mbps: float | None = None,

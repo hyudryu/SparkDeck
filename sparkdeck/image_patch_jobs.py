@@ -225,6 +225,37 @@ class ImagePatchJobs:
         node["logs"] = [*node["logs"], str(line)[:2000]][-200:]
         self._schedule_log_flush()
 
+    async def _prefetch_base_image(self, node, request):
+        """Pull the build's base image under the cluster dispatch slot.
+
+        The reservation covers ONLY this pull phase: the capped base pull is
+        the sole bandwidth consumer of a capped patch build, and a cached
+        base comes back from the daemon pull as a manifest check in seconds.
+        A node-targeted pull is used (not the Images fan-out) so a mixed
+        fleet pulls at this node's recorded cap, which is the authority the
+        build was dispatched with.
+        """
+        base = str(request.get("base_image") or "").strip()
+        if not base:
+            return
+        cap_mbps = float(request.get("max_download_bandwidth_mbps") or 0)
+        async with acquire_dispatch_slot(
+            getattr(self.manager, "dispatched_download_lock", None), True,
+        ):
+            if node["node_id"] == "local":
+                await self.manager.pull_image_result(base, cap_mbps)
+            else:
+                await self.manager.node_registry.request(
+                    node["node_id"], "POST", "/api/agent/images/pull",
+                    json_body={
+                        "image": base,
+                        "max_download_bandwidth_mbps": cap_mbps,
+                    },
+                    timeout=capped_transfer_timeout_seconds(
+                        cap_mbps, default=1800,
+                    ),
+                )
+
     async def _local(self, node, request):
         loop = asyncio.get_running_loop()
         def log(line):
@@ -368,16 +399,19 @@ class ImagePatchJobs:
                     build_capped = float(
                         node_request.get("max_download_bandwidth_mbps") or 0,
                     ) > 0
-                    # The build pulls its uncached base at the node it runs
-                    # on, so it must respect the cluster dispatch budget like
-                    # every other capped operation: hold the same slot while
-                    # the base pull (controller-local or remote) is under
-                    # way. Uncapped builds keep the pre-cap parallel behavior.
-                    async with acquire_dispatch_slot(
-                        getattr(self.manager, "dispatched_download_lock", None),
-                        build_capped,
-                    ):
-                        result = await (self._local(node, node_request) if agent or node["node_id"] == "local" else self._remote(node, node_request))
+                    # The bandwidth budget is consumed ONLY while pulling an
+                    # uncached base image; the build itself is disk/CPU work.
+                    # Pre-pull the base under the cluster dispatch slot, then
+                    # release the slot before building: holding the budget
+                    # across a long docker build (or the entire remote job
+                    # poll) would block every other capped transfer for work
+                    # that moves no registry bytes. A cached base makes the
+                    # pull a quick manifest round-trip, and the builder then
+                    # finds the image present and pulls nothing. Uncapped
+                    # builds keep the pre-cap parallel behavior.
+                    if build_capped:
+                        await self._prefetch_base_image(node, node_request)
+                    result = await (self._local(node, node_request) if agent or node["node_id"] == "local" else self._remote(node, node_request))
                     if result["files"] != job["files"]:
                         raise RuntimeError("Built image file hashes do not match the submitted patch")
                     if request.get("expected_base_id") and request["expected_base_id"] != result["base_id"]:

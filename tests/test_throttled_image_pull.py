@@ -990,6 +990,56 @@ class LimiterProxyTests(unittest.TestCase):
             listener.close()
             upstream.close()
 
+    def test_upstream_url_with_trailing_slash_and_path_is_parsed(self):
+        # Proxy settings copied from browser/system configs often carry a
+        # trailing slash or PAC path (http://proxy.corp:8080/). Splitting the
+        # authority on ':' turns the port into "8080/" and every capped pull
+        # would die on int(); the value must parse as a URL.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY":
+                f"http://127.0.0.1:{upstream_port}/pac/proxy.pac",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-path")
+            self.assertEqual(client.recv(64), b"ping-path")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
     def tls_proxy_listener(self, cert_file, key_file):
         """A TLS-terminated CONNECT proxy for the HTTPS upstream tests."""
         import ssl

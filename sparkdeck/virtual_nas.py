@@ -40,6 +40,7 @@ from .download_throttle import (
     acquire_dispatch_slot,
     bandwidth_bytes_per_second,
     capped_transfer_timeout_seconds,
+    dispatch_slot_held,
     parse_bandwidth_mbps,
 )
 from .embeddings import CachedEmbedding, embedding_descriptor
@@ -1226,6 +1227,52 @@ class VirtualNAS:
         """
         async with acquire_dispatch_slot(self._dispatched_download_lock, capped):
             yield
+
+    @asynccontextmanager
+    async def _cancellable_dispatch_slot(self, capped: bool, event):
+        """Hold the cluster dispatch slot, abortable via a job cancel event.
+
+        A cancelable job is already marked running when it reaches the slot
+        wait, but nothing has been dispatched yet (the worker future is only
+        created inside the slot), so pressing Stop during the wait must end
+        the job rather than leave it stuck in canceling — and holding a node
+        busy — for the duration of another holder's multi-day transfer.
+        Race the lock acquisition against the event; cancellation before
+        acquisition has no remote writer to confirm. The reservation itself
+        is identical to dispatched_download_slot, including task-tree
+        reentrancy.
+        """
+        lock = self._dispatched_download_lock
+        if not capped or lock is None or dispatch_slot_held.get():
+            yield
+            return
+        acquire = asyncio.ensure_future(lock.acquire())
+        stop = asyncio.ensure_future(event.wait())
+        done, _ = await asyncio.wait(
+            {acquire, stop}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if acquire not in done:
+            # The cancel won: abandon the pending acquisition (asyncio.Lock
+            # removes a cancelled waiter and hands the lock to the next one)
+            # and end the job — nothing was dispatched, so there is no
+            # remote writer to confirm.
+            acquire.cancel()
+            stop.cancel()
+            await asyncio.gather(acquire, stop, return_exceptions=True)
+            raise TransferCanceled()
+        # The lock is ours now; if the cancel also landed, give the slot back
+        # before ending the job.
+        stop.cancel()
+        await asyncio.gather(stop, return_exceptions=True)
+        if event.is_set():
+            lock.release()
+            raise TransferCanceled()
+        token = dispatch_slot_held.set(True)
+        try:
+            yield
+        finally:
+            dispatch_slot_held.reset(token)
+            lock.release()
 
     @_transfer_operation
     async def download_model_checked(
@@ -4302,14 +4349,21 @@ class VirtualNAS:
                 raise TransferCanceled()
             # Every dispatched download carries the full node-wide cap, so
             # only one may run cluster-wide at a time (see the constructor
-            # lock note). Unlimited dispatches take no slot.
-            async with self.dispatched_download_slot(bandwidth_mbps > 0):
-                result = await (
-                    self._await_download_with_cancel(
+            # lock note). Unlimited dispatches take no slot. A cancelable
+            # job also races the slot wait against its cancel event: the
+            # worker has not been dispatched yet, so Stop during the wait
+            # ends the job instead of parking it in canceling beside a
+            # holder's multi-day transfer.
+            if job["download_cancelable"]:
+                async with self._cancellable_dispatch_slot(
+                    bandwidth_mbps > 0, event,
+                ):
+                    result = await self._await_download_with_cancel(
                         operation, event, cancel_writer, job,
                     )
-                    if job["download_cancelable"] else self._await_uncancelable(operation)
-                )
+            else:
+                async with self.dispatched_download_slot(bandwidth_mbps > 0):
+                    result = await self._await_uncancelable(operation)
             if event.is_set() or job["status"] == "canceled":
                 raise TransferCanceled()
             if (result or {}).get("status") == "canceled":

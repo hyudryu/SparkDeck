@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import docker
 
 from manager import Manager
-from sparkdeck.virtual_nas import VirtualNAS
+from sparkdeck.virtual_nas import TransferCanceled, VirtualNAS
 
 
 def bare_manager(cap_mbps=0.0):
@@ -324,6 +324,71 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
         m.virtual_nas._download_model_process.assert_awaited_once_with(
             "org/model", "b" * 40, "tok", "b" * 40, bandwidth_mbps=100.0,
         )
+
+    async def test_secondary_repos_ride_the_same_capped_worker(self):
+        # A vLLM --tokenizer copy or a speculative-config draft model is
+        # resolved by the online container: while capped it must be prefetched
+        # through the same worker (default branch), or the container saturates
+        # the uplink past the limit. A local-path tokenizer is not a repo.
+        m = self.harness(100.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+        second_sha = "b" * 40
+
+        def model_info(repo_id, revision="main"):
+            return Mock(sha=self.SHA if repo_id == "org/model" else second_sha)
+
+        api = Mock()
+        api.model_info.side_effect = model_info
+        observed = []
+
+        async def fake_download(model_id, revision, token, requested,
+                                bandwidth_mbps=None):
+            observed.append(m.dispatched_download_lock.locked())
+            return {"ok": True}
+
+        m.virtual_nas._download_model_process = AsyncMock(
+            side_effect=fake_download,
+        )
+        with patch("huggingface_hub.HfApi", Mock(return_value=api)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm", name="launch-1", extra_args=[
+                    "--tokenizer", "org/tok-copy",
+                    "--tokenizer-path", "/models/local-tokenizer",
+                    "--speculative-config",
+                    json.dumps({"method": "draft_model",
+                                "model": "org/draft"}),
+                ],
+            )
+        self.assertEqual(
+            [call.args for call in
+             m.virtual_nas._download_model_process.await_args_list],
+            [
+                ("org/model", self.SHA, "tok", "main"),
+                ("org/tok-copy", second_sha, "tok", "main"),
+                ("org/draft", second_sha, "tok", "main"),
+            ],
+        )
+        # The whole prefetch ran under the cluster dispatch slot (QrNR): a
+        # standalone local launch must not race a capped remote transfer.
+        self.assertEqual(observed, [True, True, True])
+        self.assertFalse(lock.locked())
+
+    async def test_secondary_repo_resolution_failure_aborts_the_launch(self):
+        # Proceeding would let the container download the draft model
+        # uncapped, so the same fail-loud rule as the primary model applies.
+        m = self.harness(100.0)
+        def model_info(repo_id, revision="main"):
+            if repo_id == "org/model":
+                return Mock(sha=self.SHA)
+            raise ConnectionError("offline")
+        api = Mock()
+        api.model_info.side_effect = model_info
+        with patch("huggingface_hub.HfApi", Mock(return_value=api)):
+            with self.assertRaisesRegex(RuntimeError, "org/tok-copy"):
+                await m._prefetch_runtime_weights(
+                    "org/model", runtime="vllm",
+                    extra_args=["--tokenizer", "org/tok-copy"],
+                )
 
 
 class CacheExternalRuntimeWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -998,6 +1063,66 @@ class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):
         other = asyncio.create_task(sibling())
         await asyncio.gather(outer, other)
         self.assertEqual(order, ["holder", "sibling"])
+
+    async def test_cancellable_slot_races_the_wait_against_cancellation(self):
+        # A cancelable job waiting for the slot has dispatched nothing yet.
+        # Pressing Stop during that wait must end the job immediately instead
+        # of parking it in "canceling" (with its node held busy) for the
+        # duration of the holder's transfer, and the abort must not disturb
+        # the holder's reservation.
+        lock = asyncio.Lock()
+        await lock.acquire()
+        nas = bare_vnas(asyncio.Lock(), lock)
+        event = asyncio.Event()
+
+        async def waiter():
+            async with nas._cancellable_dispatch_slot(True, event):
+                self.fail("must not enter while the slot is held")
+
+        task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        event.set()
+        with self.assertRaises(TransferCanceled):
+            await asyncio.wait_for(task, 1.0)
+        self.assertTrue(lock.locked())
+        lock.release()
+        self.assertFalse(lock.locked())
+
+    async def test_cancellable_slot_aborts_when_cancel_lands_with_the_slot(self):
+        # The event may fire while the lock is being handed over; the slot is
+        # then given straight back so the next dispatch is not blocked.
+        lock = asyncio.Lock()
+        nas = bare_vnas(asyncio.Lock(), lock)
+        event = asyncio.Event()
+        event.set()
+        with self.assertRaises(TransferCanceled):
+            async with nas._cancellable_dispatch_slot(True, event):
+                self.fail("a canceled job must not enter its dispatch body")
+        self.assertFalse(lock.locked())
+
+    async def test_cancellable_slot_acquires_normally_when_not_canceled(self):
+        lock = asyncio.Lock()
+        nas = bare_vnas(asyncio.Lock(), lock)
+        event = asyncio.Event()
+        async with nas._cancellable_dispatch_slot(True, event):
+            self.assertTrue(lock.locked())
+        self.assertFalse(lock.locked())
+
+    async def test_cancellable_slot_passes_through_for_uncapped_and_holders(self):
+        # Unlimited dispatches never take the budget, and a task inside an
+        # existing holder's task tree passes through (same reentrancy as
+        # dispatched_download_slot).
+        lock = asyncio.Lock()
+        m = bare_manager(100.0)
+        m.dispatched_download_lock = lock
+        nas = bare_vnas(m.internet_transfer_lock, lock)
+        event = asyncio.Event()
+        async with nas._cancellable_dispatch_slot(False, event):
+            self.assertFalse(lock.locked())
+        async with m._dispatched_download_slot(True):
+            async with nas._cancellable_dispatch_slot(True, event):
+                pass
 
 
 class DeploymentLaunchDispatchSlotTests(unittest.IsolatedAsyncioTestCase):

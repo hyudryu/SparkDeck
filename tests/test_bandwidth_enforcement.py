@@ -84,6 +84,38 @@ class EnsureRuntimeImageTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(docker.errors.APIError):
             await m._ensure_runtime_image("img:1", runtime="vllm")
 
+    async def test_capped_pull_holds_the_cluster_dispatch_slot(self):
+        # The launch-time image pull is a controller-dispatched capped
+        # transfer: running it beside a capped NAS or member operation on
+        # another node would move two full rates through one capped uplink.
+        m = bare_manager(100.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+        m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
+        observed = []
+
+        async def fake_pull(image, mbps):
+            observed.append(lock.locked())
+            return {"ok": True}
+
+        m.pull_image_result = fake_pull
+        await m._ensure_runtime_image("img:1", runtime="vllm")
+        self.assertEqual(observed, [True])
+        self.assertFalse(lock.locked())
+
+    async def test_uncapped_pull_skips_the_slot(self):
+        m = bare_manager(0.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+        m.client.images.get.side_effect = docker.errors.ImageNotFound("gone")
+        observed = []
+
+        async def fake_pull(image, mbps):
+            observed.append(lock.locked())
+
+        m.pull_image_result = fake_pull
+        await m._ensure_runtime_image("img:1", runtime="vllm")
+        self.assertEqual(observed, [False])
+        self.assertFalse(lock.locked())
+
 
 class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
     async def collect(self, m, image, bandwidth_mbps=None):
@@ -420,6 +452,78 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
                     extra_args=["--tokenizer", "org/tok-copy"],
                 )
 
+    async def test_hf_cache_or_endpoint_override_is_refused_while_capped(self):
+        # The runtime environment reaches the container, so a silent
+        # HF_HOME/HF_ENDPOINT override would make the online container
+        # re-download past the cap from a cache the prefetch never wrote.
+        for key in (
+            "HF_HOME", "HF_HUB_CACHE", "HF_ENDPOINT",
+            "HUGGINGFACE_HUB_CACHE", "hf_endpoint",
+        ):
+            m = self.harness(100.0)
+            with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+                with self.assertRaisesRegex(
+                    RuntimeError, "download bandwidth limit cannot be enforced",
+                ) as ctx:
+                    await m._prefetch_runtime_weights(
+                        "org/model", runtime="vllm",
+                        environment={key: "https://hf.internal"},
+                    )
+            self.assertIn(key.upper(), str(ctx.exception))
+            m.virtual_nas._download_model_process.assert_not_awaited()
+
+    async def test_conflict_refusal_lets_uncapped_launch_proceed(self):
+        # Only the capped path refuses: unlimited launches use the daemon
+        # and the container's own endpoint/cache, which the override governs
+        # legitimately.
+        m = self.harness(0.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm",
+                environment={"HF_HOME": "/data/hf"},
+            )
+        m.virtual_nas._download_model_process.assert_not_awaited()
+
+    async def test_unrelated_environment_does_not_trigger_the_guard(self):
+        m = self.harness(100.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm",
+                environment={"VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"},
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once()
+
+    async def test_env_backed_speculative_config_resolves_to_the_draft_repo(self):
+        # The vLLM launcher passes the RESOLVED launch args (--speculative-
+        # config ${ENV_VAR} expanded from the runtime environment); raw
+        # references would skip the draft repository in the scan and the
+        # container would download it past the cap. This mirrors the call
+        # site: resolve, then prefetch with the resolved args.
+        m = self.harness(100.0)
+        environment = {"SPEC_CONFIG": json.dumps({"model": "org/draft"})}
+        resolved = m._resolve_environment_backed_speculative_args(
+            ["--speculative-config", "${SPEC_CONFIG}"], environment,
+        )
+        self.assertNotIn("${SPEC_CONFIG}", resolved)
+        second_sha = "b" * 40
+        api = Mock()
+        api.model_info.side_effect = lambda repo_id, revision="main": Mock(
+            sha=self.SHA if repo_id == "org/model" else second_sha,
+        )
+        with patch("huggingface_hub.HfApi", Mock(return_value=api)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm",
+                extra_args=resolved, environment=environment,
+            )
+        self.assertEqual(
+            [call.args for call in
+             m.virtual_nas._download_model_process.await_args_list],
+            [
+                ("org/model", self.SHA, "tok", "main"),
+                ("org/draft", second_sha, "tok", "main"),
+            ],
+        )
+
 
 class CacheExternalRuntimeWiringTests(unittest.IsolatedAsyncioTestCase):
     """Laya and TensorFold must prefetch weights before the container starts.
@@ -652,6 +756,48 @@ class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
         m.virtual_nas.estimate_download_size.assert_not_awaited()
         self.assertEqual(
             m.node_registry.request.await_args.kwargs["timeout"], 1800,
+        )
+
+    async def test_capped_member_deadline_budgets_secondary_repos(self):
+        # The agent prefetches secondary repositories before answering, and
+        # it resolves environment-backed --speculative-config itself: the
+        # deadline must budget those bytes (draft resolved from ${SPEC},
+        # tokenizer copy) or a healthy draft download past the allowance is
+        # reported as a failed launch.
+        from sparkdeck.download_throttle import (
+            CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+            capped_transfer_timeout_seconds,
+        )
+
+        m = self._manager()
+        sizes = {
+            "org/model": 70 * 1024 ** 3,
+            "org/tok-copy": 2 * 1024 ** 3,
+            "org/draft": 8 * 1024 ** 3,
+        }
+        m.virtual_nas.estimate_download_size = AsyncMock(
+            side_effect=lambda repo, revision, explicit_token=None: sizes[repo],
+        )
+        await m._create_member("ws1", {
+            "model": "org/model",
+            "extra_args": [
+                "--tokenizer", "org/tok-copy",
+                "--speculative-config", "${SPEC_CONFIG}",
+            ],
+            "environment": {"SPEC_CONFIG": json.dumps({"model": "org/draft"})},
+            "cluster_member": {"image_pull_bandwidth_mbps": 25.0},
+        })
+        self.assertEqual(
+            {c.args[0] for c in m.virtual_nas.estimate_download_size.await_args_list},
+            {"org/model", "org/tok-copy", "org/draft"},
+        )
+        self.assertEqual(
+            m.node_registry.request.await_args.kwargs["timeout"],
+            capped_transfer_timeout_seconds(
+                25.0,
+                80 * 1024 ** 3 + CAPPED_UNKNOWN_BYTES_ALLOWANCE,
+                default=1800,
+            ),
         )
 
     async def test_unknown_size_falls_back_to_the_allowance(self):
@@ -1143,6 +1289,59 @@ class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lock.locked())
         lock.release()
         self.assertFalse(lock.locked())
+
+    async def test_owner_cancellation_after_handover_releases_the_lock(self):
+        # The owner (VirtualNAS shutdown, job eviction) can be cancelled
+        # while waiting for the slot. If the current holder's release had
+        # just delivered the lock to this waiter's acquire task, exiting
+        # without a release consumes the handover permanently: every later
+        # capped dispatch then queues behind a ghost.
+        lock = asyncio.Lock()
+        await lock.acquire()
+        nas = bare_vnas(asyncio.Lock(), lock)
+        event = asyncio.Event()
+
+        async def waiter():
+            async with nas._cancellable_dispatch_slot(True, event):
+                self.fail("must not enter the body after cancellation")
+
+        task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.05)  # waiter parks in the lock queue
+        lock.release()  # handover: the acquire task is given the lock
+        await asyncio.sleep(0)  # let the acquire task take delivery
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(lock.locked())
+        # A later dispatch must be able to reserve the slot.
+        async with lock:
+            pass
+
+    async def test_owner_cancellation_before_delivery_orphans_nothing(self):
+        # Cancelling while still queued must abandon the pending
+        # acquisition cleanly: no release for a lock never taken, and the
+        # holder's reservation untouched.
+        lock = asyncio.Lock()
+        await lock.acquire()
+        nas = bare_vnas(asyncio.Lock(), lock)
+        event = asyncio.Event()
+
+        async def waiter():
+            async with nas._cancellable_dispatch_slot(True, event):
+                self.fail("must not enter the body after cancellation")
+
+        task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        # The holder's reservation is untouched: the waiter never obtained
+        # the lock, so it must not (and did not) release it either — only
+        # the explicit release below frees the slot.
+        self.assertTrue(lock.locked())
+        lock.release()
+        async with lock:
+            pass
 
     async def test_cancellable_slot_aborts_when_cancel_lands_with_the_slot(self):
         # The event may fire while the lock is being handed over; the slot is

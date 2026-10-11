@@ -1268,31 +1268,47 @@ class VirtualNAS:
             return
         acquire = asyncio.ensure_future(lock.acquire())
         stop = asyncio.ensure_future(event.wait())
-        done, _ = await asyncio.wait(
-            {acquire, stop}, return_when=asyncio.FIRST_COMPLETED,
-        )
-        if acquire not in done:
-            # The cancel won: abandon the pending acquisition (asyncio.Lock
-            # removes a cancelled waiter and hands the lock to the next one)
-            # and end the job — nothing was dispatched, so there is no
-            # remote writer to confirm.
+        try:
+            done, _ = await asyncio.wait(
+                {acquire, stop}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire not in done:
+                # The cancel won: abandon the pending acquisition (asyncio.Lock
+                # removes a cancelled waiter and hands the lock to the next
+                # one) and end the job — nothing was dispatched, so there is
+                # no remote writer to confirm.
+                raise TransferCanceled()
+            # The lock is ours now; if the cancel also landed, give the slot
+            # back before ending the job.
+            stop.cancel()
+            await asyncio.gather(stop, return_exceptions=True)
+            if event.is_set():
+                raise TransferCanceled()
+            token = dispatch_slot_held.set(True)
+            try:
+                yield
+            finally:
+                dispatch_slot_held.reset(token)
+        finally:
+            # The owner task can also be cancelled while it waits (Virtual
+            # NAS disabled or stopped mid-queue), which does not reach the
+            # separately spawned waiter tasks: an orphaned acquire would later
+            # consume the lock handed over by the current holder and exit
+            # without a release, permanently blocking every later capped
+            # dispatch. Cancel both waiters and drain them on every exit, and
+            # release the lock whenever this call actually obtained it, body
+            # completed or not.
             acquire.cancel()
             stop.cancel()
             await asyncio.gather(acquire, stop, return_exceptions=True)
-            raise TransferCanceled()
-        # The lock is ours now; if the cancel also landed, give the slot back
-        # before ending the job.
-        stop.cancel()
-        await asyncio.gather(stop, return_exceptions=True)
-        if event.is_set():
-            lock.release()
-            raise TransferCanceled()
-        token = dispatch_slot_held.set(True)
-        try:
-            yield
-        finally:
-            dispatch_slot_held.reset(token)
-            lock.release()
+            got = False
+            if acquire.done() and not acquire.cancelled():
+                try:
+                    got = bool(acquire.result())
+                except (Exception, asyncio.CancelledError):
+                    got = False
+            if got:
+                lock.release()
 
     @_transfer_operation
     async def download_model_checked(

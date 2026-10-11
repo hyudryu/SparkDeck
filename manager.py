@@ -7224,15 +7224,35 @@ class Manager:
         except (TypeError, ValueError):
             capped = False
         if capped:
+            model = str(payload.get("model") or "")
+            launch_args = list(payload.get("extra_args") or [])
             try:
                 model_bytes = await self.virtual_nas.estimate_download_size(
-                    str(payload.get("model") or ""),
-                    self._cli_option(payload.get("extra_args") or [], {"--revision"})
-                    or "main",
+                    model,
+                    self._cli_option(launch_args, {"--revision"}) or "main",
                     explicit_token=self._resolved_hf_token(),
                 )
             except Exception:
                 model_bytes = 0
+            # The agent also prefetches secondary repositories (--tokenizer
+            # copy, speculative draft) before answering, and it resolves
+            # environment-backed --speculative-config the same way, so the
+            # deadline must budget those too or a healthy draft download past
+            # the allowance gets reported as a failed launch.
+            try:
+                scannable = self._resolve_environment_backed_speculative_args(
+                    launch_args, dict(payload.get("environment") or {}),
+                )
+            except Exception:
+                scannable = launch_args
+            for secondary in self._secondary_repo_ids(scannable, {model}):
+                try:
+                    model_bytes += await self.virtual_nas.estimate_download_size(
+                        secondary, "main",
+                        explicit_token=self._resolved_hf_token(),
+                    )
+                except Exception:
+                    pass
             # The launch also pulls a missing runtime image (multi-GiB CUDA
             # runtimes dwarf small models), so keep the unknown-size image
             # allowance on top of the model's own bytes.
@@ -17688,6 +17708,7 @@ class Manager:
                 runtime="laya", hf_token=hf_token,
                 revision=self._cli_option(list(extra_args or []), {"--revision"}),
                 extra_args=list(extra_args or []),
+                environment=dict(environment or {}),
             )
             return await asyncio.to_thread(_create)
         except Exception as exc:
@@ -17823,6 +17844,7 @@ class Manager:
                 model, name=name, cluster_member=cluster_member,
                 runtime="tensorfold", hf_token=hf_token,
                 extra_args=list(extra_args or []),
+                environment=dict(environment or {}),
             )
             return await asyncio.to_thread(_create)
         except Exception as exc:
@@ -18828,6 +18850,7 @@ class Manager:
                     runtime="sglang", hf_token=hf_token,
                     revision=self._cli_option(list(extra_args or []), {"--revision"}),
                     extra_args=list(extra_args or []),
+                    environment=runtime_environment,
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -18994,7 +19017,13 @@ class Manager:
                     model, name=name, cluster_member=cluster_member,
                     runtime="vllm", hf_token=hf_token,
                     revision=self._cli_option(list(extra_args or []), {"--revision"}),
-                    extra_args=list(extra_args or []),
+                    # Pass the RESOLVED launch args: with
+                    # --speculative-config ${ENV_VAR} the raw value is the
+                    # reference, so the secondary-repo scan would skip the
+                    # draft repository and the container would download it
+                    # outside the cap.
+                    extra_args=list(extra),
+                    environment=runtime_environment,
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -20223,9 +20252,22 @@ class Manager:
         if on_pull is not None:
             on_pull()
         print(f"[{runtime}] pulling missing image: {image}")
-        await self.pull_image_result(
-            image, self._image_pull_share_mbps(cluster_member),
-        )
+        # Like the weight prefetch that follows, a standalone controller-local
+        # launch dispatches this pull itself, and it holds only the node-local
+        # internet lock otherwise. The cluster-wide dispatch slot must cover it
+        # too, or a capped image download runs at the full configured rate
+        # beside a capped NAS, patch, or member operation on another node.
+        share_mbps = self._image_pull_share_mbps(cluster_member)
+        effective_mbps = share_mbps
+        if effective_mbps is None:
+            try:
+                effective_mbps = parse_bandwidth_mbps(
+                    self.settings.get("max_download_bandwidth_mbps", 0),
+                )
+            except ValueError:
+                effective_mbps = 0.0
+        async with self._dispatched_download_slot(effective_mbps > 0):
+            await self.pull_image_result(image, share_mbps)
 
     # Launch arguments whose VALUE is a Hugging Face repository other than
     # the primary model. The runtime resolves these inside the container, so
@@ -20235,6 +20277,16 @@ class Manager:
     )
     # Keys inside --speculative-config (a JSON argument) naming a draft model.
     _SPECULATIVE_MODEL_KEYS = ("model", "draft_model", "draft_model_path")
+    # Operator environment variables that move the container's Hugging Face
+    # endpoint or cache location. Prefetching downloads from the default
+    # endpoint into the hub directory mounted at the image-declared default
+    # path, so while a cap is active these overrides would send the container
+    # to a different server or directory and it would re-download past the
+    # limit; the launch must refuse instead.
+    _CAP_CONFLICTING_HF_ENV_KEYS = frozenset({
+        "HF_HOME", "HF_HUB_CACHE", "HF_ENDPOINT",
+        "HUGGINGFACE_HUB_CACHE", "HUGGINGFACE_HUB_ENDPOINT",
+    })
 
     def _secondary_repo_ids(self, extra_args, primary: set[str]) -> list[str]:
         """HF repositories named by the launch args beyond the primary model.
@@ -20275,7 +20327,7 @@ class Manager:
         self, model: str, name: str | None = None,
         cluster_member: dict | None = None, runtime: str = "",
         hf_token: str | None = None, revision: str | None = None,
-        extra_args: list | None = None,
+        extra_args: list | None = None, environment: dict | None = None,
     ) -> None:
         """Prepare missing HF weights through the capped worker pre-launch.
 
@@ -20306,6 +20358,23 @@ class Manager:
                 share = 0.0
         if share <= 0:
             return
+        conflicts = sorted(
+            str(key).strip().upper() for key in (environment or {})
+            if str(key).strip().upper() in self._CAP_CONFLICTING_HF_ENV_KEYS
+        )
+        if conflicts:
+            # Not silently ignored: accepting the override would launch a
+            # container that re-downloads from the operator-chosen endpoint
+            # or cache directory, outside every throttle.
+            raise RuntimeError(
+                "the download bandwidth limit cannot be enforced together "
+                "with the runtime environment override(s) "
+                + ", ".join(conflicts)
+                + ": SparkDeck prefetches from the default Hugging Face "
+                "endpoint into the cache directory the container mounts at "
+                "its declared default path. Remove the override, or set the "
+                "download limit to 0 to let the container download directly."
+            )
         nas = getattr(self, "virtual_nas", None)
         if nas is None:
             return

@@ -393,6 +393,9 @@ export function SettingsPage() {
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  // Set when a settings save reports that transfers already in flight
+  // started uncapped and will finish without the new limit.
+  const [bandwidthNote, setBandwidthNote] = useState<string>()
   const [error, setError] = useState<string>()
   const [signingOut, setSigningOut] = useState(false)
   const [communitySharingBusy, setCommunitySharingBusy] = useState(false)
@@ -470,11 +473,17 @@ export function SettingsPage() {
     setSaved(false)
     setError(undefined)
     try {
-      const savedSettings = await api.settings.update({
+      const {
+        bandwidth_running_note: runningNote,
+        ...savedSettings
+      } = await api.settings.update({
         ...form,
         max_download_bandwidth_mbps: bandwidthMbpsSetting(form.max_download_bandwidth_mbps),
         hf_token: huggingFaceApiKey.trim() || undefined,
       })
+      // The response note is transient advice, not a setting: surface it in
+      // the Downloads panel instead of letting it ride in the form state.
+      setBandwidthNote(typeof runningNote === 'string' && runningNote ? runningNote : undefined)
       const savedForm = { ...form, ...savedSettings, hf_token: '' }
       setForm(savedForm)
       setHuggingFaceApiKey('')
@@ -560,6 +569,7 @@ export function SettingsPage() {
           <div className="settings-heading"><span><DownloadCloud size={18} /></span><div><h2 id="downloads-title">Downloads</h2><p>Keep model weight and runtime image pulls from saturating the site's internet uplink.</p></div></div>
           <div className="settings-fields">
             <label className="field wide-field"><span>Max download bandwidth</span><input aria-label="Maximum download bandwidth in megabits per second" type="number" min="0" step="0.1" inputMode="decimal" value={Number.isNaN(form.max_download_bandwidth_mbps) ? '' : form.max_download_bandwidth_mbps ?? 0} onChange={(event) => setForm({ ...form, max_download_bandwidth_mbps: event.target.valueAsNumber })} aria-describedby="download-bandwidth-help" /><small id="download-bandwidth-help">Mbps (megabits per second). The cap bounds Hugging Face weight pulls and Docker image pulls on every cluster node; a limited image pull runs through a throttled helper that adds a small setup delay. Enter 0 for unlimited. Inference traffic and node-to-node transfers are never limited; a deployment's first launch can take longer at low values because missing weights and runtime images prefetch under this cap.</small></label>
+            {bandwidthNote && <p className="inline-warning wide-field" role="status">{bandwidthNote}</p>}
           </div>
         </Panel>
         <Panel className="settings-section">

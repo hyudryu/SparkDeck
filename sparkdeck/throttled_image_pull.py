@@ -103,9 +103,14 @@ from urllib.parse import unquote, urlparse
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
 PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
-UPSTREAM = os.environ.get("SPARKDECK_UPSTREAM_PROXY") or ""
+# A proxy set only in daemon.json never reaches this process's environment;
+# the owner passes it as the SPARKDECK_DAEMON_* fallback. The process env
+# wins so a host-level proxy policy keeps precedence over the daemon's.
+UPSTREAM = (os.environ.get("SPARKDECK_UPSTREAM_PROXY")
+            or os.environ.get("SPARKDECK_DAEMON_PROXY") or "")
 UPSTREAM_CA = os.environ.get("SPARKDECK_UPSTREAM_PROXY_CA") or ""
-NO_PROXY = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+NO_PROXY = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+            or os.environ.get("SPARKDECK_DAEMON_NO_PROXY") or "")
 RATE_FILE = os.environ.get("SPARKDECK_BANDWIDTH_RATE_FILE") or ""
 DUE = [0.0]
 LOCK = threading.Lock()
@@ -521,9 +526,15 @@ def registry_ca_binds(
             try:
                 if not os.path.isdir(directory):
                     continue
+                # containers/image reads the same per-registry directory the
+                # daemon does: CA .crt files plus the mutual-TLS identity
+                # under the exact names client.cert/client.key. Copying only
+                # the CA would let a TLS-authenticated registry reject the
+                # helper's handshake with no client certificate.
                 names = [
                     name for name in os.listdir(directory)
                     if name.lower().endswith(".crt")
+                    or name in ("client.cert", "client.key")
                 ]
                 if not names:
                     continue
@@ -568,6 +579,47 @@ def registry_mirrors_config(daemon_info: dict, registry_host: str) -> str:
     if len(lines) == 4:
         return ""
     return "\n".join(lines)
+
+
+def daemon_proxy_config(daemon_info: dict) -> tuple[str, str]:
+    """The daemon's own (proxy, no_proxy) settings, as host-env spellings.
+
+    Proxy-only hosts often configure the proxy only in daemon.json, where
+    no host process can see it: the SparkDeck process env is empty, and a
+    limiter built from process env alone would try to dial registries the
+    network only reaches through the proxy. Docker reports the daemon's
+    proxy under RegistryConfig (older APIs) or a top-level Proxies object,
+    with the same key spellings, so read both. HTTPS proxy wins where both
+    are set, matching how the proxy-aware host clients treat registry
+    (HTTPS) traffic.
+    """
+    sources = []
+    info = daemon_info or {}
+    registry_config = info.get("RegistryConfig")
+    if isinstance(registry_config, dict):
+        sources.append(registry_config)
+    proxies = info.get("Proxies")
+    if isinstance(proxies, dict):
+        sources.append(proxies)
+    proxy = ""
+    for key in ("HTTPSProxy", "HttpsProxy", "HTTPProxy", "HttpProxy"):
+        for source in sources:
+            value = str(source.get(key) or "").strip()
+            if value:
+                proxy = value
+                break
+        if proxy:
+            break
+    entries: list[str] = []
+    for source in sources:
+        value = source.get("NoProxy")
+        if isinstance(value, str):
+            value = value.split(",")
+        if isinstance(value, list):
+            entries.extend(str(item).strip() for item in value if str(item).strip())
+        if entries:
+            break
+    return proxy, ",".join(entries)
 
 
 def _registry_aliases(registry_host: str) -> list[str]:
@@ -877,6 +929,7 @@ async def throttled_image_pull_events(
         except Exception:
             daemon_info = {}
         registry_config = daemon_info.get("RegistryConfig") or {}
+        daemon_proxy, daemon_no_proxy = daemon_proxy_config(daemon_info)
         for helper in (PROXY_IMAGE, SKOPEO_IMAGE):
             try:
                 await _run_docker(client, "inspect_image", helper)
@@ -987,6 +1040,11 @@ async def throttled_image_pull_events(
             "NO_PROXY": os.environ.get(
                 "NO_PROXY", os.environ.get("no_proxy", ""),
             ),
+            # Hosts that configure the proxy only in daemon.json have an
+            # empty process env above; the daemon's own settings are the
+            # fallback inside the script (process env still wins).
+            "SPARKDECK_DAEMON_PROXY": daemon_proxy,
+            "SPARKDECK_DAEMON_NO_PROXY": daemon_no_proxy,
             "SPARKDECK_UPSTREAM_PROXY_CA": "",
         }
         proxy_binds = [f"{staging}:/archive:z"]

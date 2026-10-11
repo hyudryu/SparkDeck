@@ -225,18 +225,50 @@ class ImagePatchJobs:
         node["logs"] = [*node["logs"], str(line)[:2000]][-200:]
         self._schedule_log_flush()
 
+    async def _base_image_present(self, node, base: str) -> bool:
+        """Whether the target daemon already caches the base image.
+
+        The capped pull is a skopeo copy into a fresh archive, not a manifest
+        check: unconditionally prefetching a cached base would re-download
+        the entire image and break offline builds. A failed or ambiguous
+        check counts as missing, keeping the pull-first behavior.
+        """
+        if node.get("node_id") == "local":
+            def _present():
+                try:
+                    self.manager.client.images.get(base)
+                    return True
+                except Exception:
+                    return False
+            try:
+                return await asyncio.to_thread(_present)
+            except Exception:
+                return False
+        try:
+            payload = await self.manager.node_registry.request(
+                node["node_id"], "POST", "/api/agent/images/identity",
+                json_body={"image": base}, timeout=30,
+            )
+        except Exception:
+            return False
+        return isinstance(payload, dict) and bool(
+            str(payload.get("id") or "").strip()
+        )
+
     async def _prefetch_base_image(self, node, request):
         """Pull the build's base image under the cluster dispatch slot.
 
         The reservation covers ONLY this pull phase: the capped base pull is
-        the sole bandwidth consumer of a capped patch build, and a cached
-        base comes back from the daemon pull as a manifest check in seconds.
-        A node-targeted pull is used (not the Images fan-out) so a mixed
-        fleet pulls at this node's recorded cap, which is the authority the
-        build was dispatched with.
+        the sole bandwidth consumer of a capped patch build. The pull runs
+        only when the target daemon actually lacks the base; a cached base
+        must not be recopied. A node-targeted pull is used (not the Images
+        fan-out) so a mixed fleet pulls at this node's recorded cap, which is
+        the authority the build was dispatched with.
         """
         base = str(request.get("base_image") or "").strip()
         if not base:
+            return
+        if await self._base_image_present(node, base):
             return
         cap_mbps = float(request.get("max_download_bandwidth_mbps") or 0)
         async with acquire_dispatch_slot(

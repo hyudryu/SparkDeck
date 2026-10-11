@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import json
 import os
 import socket
@@ -21,6 +22,7 @@ from sparkdeck.throttled_image_pull import (
     ThrottledPullError,
     _auth_entry,
     _read_counter,
+    daemon_proxy_config,
     helper_credentials,
     is_loopback_registry_image,
     matches_insecure_registry,
@@ -345,6 +347,24 @@ class FakeDockerApi:
 
 
 class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
+    @contextlib.contextmanager
+    def proxy_env(self, **values):
+        # The flow reads proxy policy from the process environment. Windows
+        # collapses env-key case, so setting HTTPS_PROXY and https_proxy as
+        # separate entries would collide (the empty one wins); strip every
+        # spelling variant first, then write the intended values.
+        variants = ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy")
+        saved = {key: os.environ.pop(key, None) for key in variants}
+        os.environ.update({key: str(value) for key, value in values.items()})
+        try:
+            yield
+        finally:
+            for key in variants:
+                os.environ.pop(key, None)
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+
     async def collect(self, api, image="nginx", bps=1_000_000.0,
                       staging=None, authfile=None, auth_dir=None,
                       disk_free=10 ** 15, cluster_bps=None, mirror_dir=None):
@@ -743,6 +763,53 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.collect(api, image="ghcr.io/org/model:1", staging=staging)
         self.assertIsNotNone(api.loaded)
 
+    async def test_daemon_proxy_settings_reach_the_limiter_as_fallback(self):
+        # Proxy-only hosts configure the proxy in daemon.json only: the
+        # process env is empty and the daemon's own proxy/no-proxy must be
+        # handed to the limiter, or every capped pull dials a network it
+        # cannot reach directly. The process env keeps the primary slot.
+        api = FakeDockerApi(registry_config={
+            "HTTPSProxy": "http://proxy.corp:8080",
+            "NoProxy": ["localhost", ".intra", ""],
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        with self.proxy_env():
+            await self.collect(api, staging=staging)
+        proxy = next(c for c in api.created if c.get("image") == PROXY_IMAGE)
+        env = proxy["environment"]
+        self.assertEqual(env["SPARKDECK_DAEMON_PROXY"], "http://proxy.corp:8080")
+        self.assertEqual(env["SPARKDECK_DAEMON_NO_PROXY"], "localhost,.intra")
+        self.assertEqual(env["SPARKDECK_UPSTREAM_PROXY"], "")
+        self.assertEqual(env["NO_PROXY"], "")
+
+    async def test_process_proxy_env_wins_over_the_daemon_fallback(self):
+        # The daemon value still rides along as SPARKDECK_DAEMON_PROXY; the
+        # script prefers the non-empty process value (covered in
+        # LimiterProxyTests). The flow only has to keep the two slots
+        # distinct.
+        api = FakeDockerApi(registry_config={
+            "HTTPSProxy": "http://daemon.proxy:8080",
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        with self.proxy_env(HTTPS_PROXY="http://host.proxy:3128"):
+            await self.collect(api, staging=staging)
+        proxy = next(c for c in api.created if c.get("image") == PROXY_IMAGE)
+        env = proxy["environment"]
+        self.assertEqual(env["SPARKDECK_UPSTREAM_PROXY"], "http://host.proxy:3128")
+        self.assertEqual(env["SPARKDECK_DAEMON_PROXY"], "http://daemon.proxy:8080")
+
     async def test_persistent_copy_inspect_failure_aborts_the_wait(self):
         # A copy container removed externally must end the poll loop: it
         # holds the node and cluster download budgets, so spinning on a
@@ -966,12 +1033,18 @@ class LimiterProxyTests(unittest.TestCase):
 
     def start_proxy(self, port, env_extra=None):
         env = os.environ.copy()
+        # The developer machine's own proxy policy must not decide whether
+        # these scripted tests chain or dial directly. Windows collapses
+        # env-key case, so every spelling variant present in the inherited
+        # environment is stripped before the test-controlled NO_PROXY is
+        # written: a coexisting lowercase no_proxy would clobber NO_PROXY
+        # in the child.
+        for stale in [k for k in env if k.upper() == "NO_PROXY"]:
+            env.pop(stale)
         env.update({
             "SPARKDECK_DOWNLOAD_BPS": "10000000",
             "SPARKDECK_BANDWIDTH_PROGRESS": "",
             "SPARKDECK_PROXY_PORT": str(port),
-            # The developer machine's own proxy policy must not decide
-            # whether these scripted tests chain or dial directly.
             "NO_PROXY": "",
         })
         env.update(env_extra or {})
@@ -1145,6 +1218,127 @@ class LimiterProxyTests(unittest.TestCase):
             process.kill()
             listener.close()
             upstream.close()
+
+    def test_daemon_proxy_is_the_fallback_when_upstream_is_empty(self):
+        # daemon.json-only proxy: the flow sends the daemon value in
+        # SPARKDECK_DAEMON_PROXY with an empty upstream, and the limiter
+        # must still chain CONNECT through it.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            self.assertIn(b"CONNECT", request)
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": "",
+            "SPARKDECK_DAEMON_PROXY": f"http://127.0.0.1:{upstream_port}",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-daemon")
+            self.assertEqual(client.recv(64), b"ping-daemon")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
+    def test_process_upstream_wins_over_the_daemon_fallback(self):
+        # The daemon proxy points at a dead port; only correct precedence
+        # (process env first) can complete the CONNECT.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        dead_port = self.free_port()  # never bound
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"http://127.0.0.1:{upstream_port}",
+            "SPARKDECK_DAEMON_PROXY": f"http://127.0.0.1:{dead_port}",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-precedence")
+            self.assertEqual(client.recv(64), b"ping-precedence")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
+    def test_daemon_no_proxy_fallback_dials_the_target_directly(self):
+        # The daemon's no-proxy list is proxy policy: the matching target is
+        # dialed directly (still capped), proven by the daemon proxy sitting
+        # on a dead port the chain would have to use otherwise.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        dead_port = self.free_port()  # never bound
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": "",
+            "SPARKDECK_DAEMON_PROXY": f"http://127.0.0.1:{dead_port}",
+            "SPARKDECK_DAEMON_NO_PROXY": "127.0.0.1",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-nop")
+            self.assertEqual(client.recv(64), b"ping-nop")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
 
     def test_upstream_url_with_trailing_slash_and_path_is_parsed(self):
         # Proxy settings copied from browser/system configs often carry a
@@ -1817,6 +2011,52 @@ class RegistryCaBindsTests(unittest.TestCase):
                 registry_ca_binds("other.corp", staging, bases=[source]), [],
             )
 
+    def test_mtls_client_identity_is_copied_with_the_ca(self):
+        # A TLS-authenticated registry keeps the client identity under the
+        # exact names containers/image reads: client.cert/client.key. A
+        # directory holding only those (or CA + identity) must stage them
+        # all, or the helper's handshake presents no client certificate.
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            directory = os.path.join(source, "reg.corp")
+            os.mkdir(directory)
+            for name in ("ca.crt", "client.cert", "client.key"):
+                with open(os.path.join(directory, name), "w") as handle:
+                    handle.write("x")
+            binds = registry_ca_binds("reg.corp", staging, bases=[source])
+            self.assertEqual(
+                binds, [f"{staging}:/etc/containers/certs.d:ro,z"],
+            )
+            staged = sorted(os.listdir(os.path.join(staging, "reg.corp")))
+            self.assertEqual(staged, ["ca.crt", "client.cert", "client.key"])
+
+    def test_identity_only_directory_still_qualifies(self):
+        # No CA at all (public root-signed registry) but mTLS required:
+        # the identity files alone must produce the bind.
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            directory = os.path.join(source, "reg.corp")
+            os.mkdir(directory)
+            for name in ("client.cert", "client.key"):
+                with open(os.path.join(directory, name), "w") as handle:
+                    handle.write("x")
+            binds = registry_ca_binds("reg.corp", staging, bases=[source])
+            self.assertEqual(
+                binds, [f"{staging}:/etc/containers/certs.d:ro,z"],
+            )
+            self.assertTrue(os.path.isfile(
+                os.path.join(staging, "reg.corp", "client.key"),
+            ))
+
+    def test_unrelated_files_do_not_qualify_a_directory(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
+            directory = os.path.join(source, "reg.corp")
+            os.mkdir(directory)
+            for name in ("README.md", "client.pem"):
+                with open(os.path.join(directory, name), "w") as handle:
+                    handle.write("x")
+            self.assertEqual(
+                registry_ca_binds("reg.corp", staging, bases=[source]), [],
+            )
+
     def test_missing_directories_yield_no_binds(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as staging:
             self.assertEqual(
@@ -1831,6 +2071,40 @@ class RegistryCaBindsTests(unittest.TestCase):
         # must return nothing rather than raising.
         with tempfile.TemporaryDirectory() as staging:
             self.assertEqual(registry_ca_binds("reg.corp", staging), [])
+
+
+class DaemonProxyConfigTests(unittest.TestCase):
+    """docker info proxy settings mapped to host-env spellings (both APIs)."""
+
+    def test_registry_config_shape_prefers_https_proxy(self):
+        proxy, no_proxy = daemon_proxy_config({"RegistryConfig": {
+            "HTTPProxy": "http://a:1", "HTTPSProxy": "http://b:2",
+            "NoProxy": ["localhost", " .intra "],
+        }})
+        self.assertEqual(proxy, "http://b:2")
+        self.assertEqual(no_proxy, "localhost,.intra")
+
+    def test_top_level_proxies_shape(self):
+        proxy, no_proxy = daemon_proxy_config({
+            "Proxies": {"HTTPProxy": "http://a:1", "NoProxy": "x,y"},
+        })
+        self.assertEqual(proxy, "http://a:1")
+        # NoProxy as a comma string is accepted too.
+        self.assertEqual(no_proxy, "x,y")
+
+    def test_httpsonly_spelling_variants(self):
+        proxy, _ = daemon_proxy_config({
+            "RegistryConfig": {"HttpProxy": "http://legacy:80"},
+        })
+        self.assertEqual(proxy, "http://legacy:80")
+
+    def test_empty_daemon_reports_no_proxy(self):
+        self.assertEqual(daemon_proxy_config({}), ("", ""))
+        self.assertEqual(daemon_proxy_config(None), ("", ""))
+        self.assertEqual(
+            daemon_proxy_config({"RegistryConfig": {"NoProxy": [""]}}),
+            ("", ""),
+        )
 
 
 class StagingParentTests(unittest.TestCase):

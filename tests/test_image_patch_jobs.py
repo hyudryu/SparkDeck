@@ -259,6 +259,12 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         held: list = []
 
         async def fake_pull_request(node_id, method, path, **kwargs):
+            if path == "/api/agent/images/identity":
+                # No cached identity on the node: the capped pull must run.
+                held.append(
+                    ("identity", self.manager.dispatched_download_lock.locked()),
+                )
+                return {}
             held.append(("pull", self.manager.dispatched_download_lock.locked()))
             self.assertEqual(path, "/api/agent/images/pull")
             self.assertEqual(
@@ -277,13 +283,73 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
             await self.finish(
                 await self.jobs.start(request(["worker"])),
             )
-        self.assertEqual(held, [("pull", True), ("build", False)])
+        # The presence check itself runs OUTSIDE the reservation: it moves
+        # no bytes, and holding the slot for it would serialize on other
+        # holders for a cheap identity lookup.
+        self.assertEqual(
+            held, [("identity", False), ("pull", True), ("build", False)],
+        )
         self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_cached_remote_base_skips_the_capped_recopy(self):
+        # The capped pull is a full skopeo copy, not a manifest check: a
+        # node that already caches the base must not re-download it (and an
+        # offline node must still be able to build).
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        paths: list = []
+
+        async def fake_request(node_id, method, path, **kwargs):
+            paths.append(path)
+            return {"id": "sha256:cached"}
+
+        self.manager.node_registry = Mock()
+        self.manager.node_registry.request = fake_request
+
+        async def fake_remote(node, request):
+            return result()
+
+        with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
+            await self.finish(await self.jobs.start(request(["worker"])))
+        self.assertEqual(paths, ["/api/agent/images/identity"])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_unreachable_agent_still_pulls_the_base(self):
+        # A failed identity check counts as missing (pull-first), never as
+        # cached: the capped path must remain the default.
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "worker", "name": "worker",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        pulled: list = []
+
+        async def fake_request(node_id, method, path, **kwargs):
+            if path == "/api/agent/images/identity":
+                raise RuntimeError("agent unreachable")
+            pulled.append(path)
+            return {"ok": True}
+
+        self.manager.node_registry = Mock()
+        self.manager.node_registry.request = fake_request
+
+        async def fake_remote(node, request):
+            return result()
+
+        with patch.object(ImagePatchJobs, "_remote", side_effect=fake_remote):
+            await self.finish(await self.jobs.start(request(["worker"])))
+        self.assertEqual(pulled, ["/api/agent/images/pull"])
 
     async def test_capped_local_build_pre_pulls_base_under_the_slot(self):
         # Same contract for controller-local builds: one prefetch pull under
-        # the reservation; the builder itself then finds the base present
-        # (the client Mock) and pulls nothing, without holding the slot.
+        # the reservation when the daemon lacks the base; the builder then
+        # finds it present and pulls nothing itself, without the slot.
+        import docker
         self.manager.settings = {"max_download_bandwidth_mbps": 40}
         self.manager.dispatched_download_lock = asyncio.Lock()
         self.manager.selected_cluster_nodes = AsyncMock(return_value=[
@@ -291,19 +357,47 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
              "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
         ])
         observed: list = []
+        state = {"cached": False}
 
         async def fake_pull(image, bandwidth_mbps=None):
             observed.append((image, bandwidth_mbps,
                              self.manager.dispatched_download_lock.locked()))
+            state["cached"] = True  # the pull leaves the image on the daemon
             return {"ok": True}
 
+        def get_image(image):
+            if state["cached"]:
+                return Mock()
+            raise docker.errors.ImageNotFound("uncached")
+
         self.manager.pull_image_result = fake_pull
+        self.manager.client.images.get.side_effect = get_image
         with patch(
             "sparkdeck.image_patch_jobs.build_patched_image",
             side_effect=lambda *args: result(),
         ):
             await self.finish(await self.jobs.start(request(["local"])))
         self.assertEqual(observed, [("runtime/base:stable", 40.0, True)])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_cached_local_base_skips_the_prefetch_pull(self):
+        # A locally cached base must not be recopied: the capped pull is a
+        # full archive copy, and an air-gapped controller with a cached base
+        # would otherwise fail its build.
+        self.manager.settings = {"max_download_bandwidth_mbps": 40}
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.manager.selected_cluster_nodes = AsyncMock(return_value=[
+            {"id": "local", "name": "local",
+             "capabilities": [CAPABILITY, IMAGE_PULL_BANDWIDTH_CAPABILITY]},
+        ])
+        self.manager.pull_image_result = AsyncMock()
+        self.manager.client.images.get.return_value = Mock()
+        with patch(
+            "sparkdeck.image_patch_jobs.build_patched_image",
+            side_effect=lambda *args: result(),
+        ):
+            await self.finish(await self.jobs.start(request(["local"])))
+        self.manager.pull_image_result.assert_not_awaited()
         self.assertFalse(self.manager.dispatched_download_lock.locked())
 
     async def test_uncapped_remote_build_never_holds_the_slot(self):

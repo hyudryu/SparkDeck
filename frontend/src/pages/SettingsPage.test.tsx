@@ -132,6 +132,40 @@ describe('settings page', () => {
     expect(update.mock.calls[0][0]).toMatchObject({ max_download_bandwidth_mbps: 0 })
   })
 
+  it('surfaces the running-transfer note returned by a bandwidth save', async () => {
+    // Transfers already in flight started uncapped: the settings response
+    // carries a transient note that must reach the user instead of being
+    // swallowed by the generic "Saved" state.
+    const note = '3 transfer(s) already in flight started without a limit '
+      + 'and finish uncapped; the new limit applies from the next transfer onward.'
+    const update = vi.spyOn(api.settings, 'update')
+      .mockResolvedValueOnce({
+        theme: 'system', max_download_bandwidth_mbps: 25, bandwidth_running_note: note,
+      })
+      .mockResolvedValue({ theme: 'system', max_download_bandwidth_mbps: 10 })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify({ theme: 'system', max_download_bandwidth_mbps: 0 }),
+        { headers: { 'Content-Type': 'application/json' } })))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const field = await screen.findByRole('spinbutton',
+      { name: 'Maximum download bandwidth in megabits per second' })
+    await waitFor(() => expect(field).toHaveValue(0))
+    await user.clear(field)
+    await user.type(field, '25')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('already in flight')
+    // The note is transient advice, not a setting: a later save must not
+    // round-trip it back to the controller, and once the controller stops
+    // returning it, it disappears.
+    await user.clear(field)
+    await user.type(field, '10')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2))
+    expect(update.mock.calls[1][0]).not.toHaveProperty('bandwidth_running_note')
+    await waitFor(() => expect(screen.queryByText('already in flight')).toBeNull())
+  })
+
   it('rejects empty, zero, and fractional prompt-processing limits before saving', async () => {
     const update = vi.spyOn(api.settings, 'update')
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () =>

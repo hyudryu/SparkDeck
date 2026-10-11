@@ -18509,6 +18509,10 @@ class Manager:
                         "phase": "Downloading SGLang image", "image": image,
                     })) if recipe_launch is not None else None,
                 )
+                await self._prefetch_runtime_weights(
+                    model, name=name, cluster_member=cluster_member,
+                    runtime="sglang", hf_token=hf_token,
+                )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
                 safe_error = self._redact_hf_secret(exc, hf_token)
@@ -18669,6 +18673,10 @@ class Manager:
                 await self._ensure_runtime_image(
                     image, name, model=model, cluster_member=cluster_member,
                     runtime="vllm",
+                )
+                await self._prefetch_runtime_weights(
+                    model, name=name, cluster_member=cluster_member,
+                    runtime="vllm", hf_token=hf_token,
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -19778,6 +19786,82 @@ class Manager:
         print(f"[{runtime}] pulling missing image: {image}")
         await self.pull_image_result(
             image, self._image_pull_share_mbps(cluster_member),
+        )
+
+    async def _prefetch_runtime_weights(
+        self, model: str, name: str | None = None,
+        cluster_member: dict | None = None, runtime: str = "",
+        hf_token: str | None = None,
+    ) -> None:
+        """Prepare missing HF weights through the capped worker pre-launch.
+
+        vLLM and SGLang resolve the model inside the runtime container, so
+        an uncached deployment would fetch the weights over the uplink
+        outside every SparkDeck throttle. When a download cap is active, the
+        snapshot is downloaded first through the same capped worker (and the
+        node-wide transfer lock) that the Transfer queue uses, into the hub
+        directory the container mounts, so the container starts offline.
+        """
+        share = self._image_pull_share_mbps(cluster_member)
+        if share is None:
+            try:
+                share = parse_bandwidth_mbps(
+                    self.settings.get("max_download_bandwidth_mbps", 0),
+                )
+            except ValueError:
+                share = 0.0
+        if share <= 0:
+            return
+        nas = getattr(self, "virtual_nas", None)
+        if nas is None:
+            return
+        from sparkdeck.virtual_nas import _is_commit_sha, validate_model_id
+        try:
+            model_id = validate_model_id(model)
+        except ValueError:
+            # A local directory path; the container reads files directly.
+            return
+        token = self._resolved_hf_token(hf_token)
+
+        def _resolve_revision() -> str:
+            from huggingface_hub import HfApi
+            info = HfApi(token=token or None).model_info(
+                model_id, revision="main",
+            )
+            return str(getattr(info, "sha", "") or "").strip()
+
+        try:
+            revision = await asyncio.to_thread(_resolve_revision)
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not resolve {model_id} on Hugging Face while the "
+                "download limit is active; set the limit to 0 to let the "
+                "runtime container download the weights itself"
+            ) from exc
+        if not _is_commit_sha(revision):
+            raise RuntimeError(
+                f"Hugging Face did not report an immutable revision for "
+                f"{model_id} while the download limit is active"
+            )
+
+        def _cached() -> bool:
+            return any(
+                item.get("model_id") == model_id
+                and nas._has_revision(item, revision, "main")
+                for item in nas.inventory()
+            )
+
+        if await asyncio.to_thread(_cached):
+            return
+        if name is not None:
+            self._cluster_launch_update(
+                name, "downloading_weights",
+                f"Downloading model weights {model_id}; this can take a while",
+                model=model, cluster_member=cluster_member,
+            )
+        print(f"[{runtime}] prefetching weights: {model_id}@{revision[:12]}")
+        await nas._download_model_process(
+            model_id, revision, token, "main", bandwidth_mbps=share,
         )
 
     async def pull_image_result(

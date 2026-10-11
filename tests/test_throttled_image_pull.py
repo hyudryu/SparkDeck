@@ -294,7 +294,8 @@ class FakeDockerApi:
             self._containers.get(container_id) == "inspect"
             and stdout and not stderr
         ):
-            return json.dumps({"Size": self.inspect_size}).encode()
+            # Registry images report size per layer, not at the top level.
+            return json.dumps({"LayersData": [{"Size": self.inspect_size}]}).encode()
         return self.stderr_tail
 
     def load_image(self, stream):
@@ -534,6 +535,39 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIn("SPARKDECK_IMAGE_STAGING_DIR", events[-1]["error"])
         self.assertIn("download limit to 0", events[-1]["error"])
+
+
+class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
+    async def total(self, payload):
+        api = FakeDockerApi()
+        base_logs = api.container_logs
+
+        def logs(container_id, stderr=True, stdout=False, tail=12):
+            if stdout and not stderr:
+                return json.dumps(payload).encode()
+            return base_logs(container_id, stderr=stderr, stdout=stdout, tail=tail)
+
+        api.container_logs = logs
+        client = Mock()
+        client.api = api
+        return await tip._image_total_bytes(
+            client, "net-1", "docker.io/library/nginx:latest", "amd64", [],
+        )
+
+    async def test_layers_data_sizes_are_aggregated(self):
+        self.assertEqual(
+            await self.total({"LayersData": [
+                {"Size": 60, "Digest": "sha256:x"}, {"Size": 40}, {"Digest": "y"},
+            ]}),
+            100,
+        )
+
+    async def test_top_level_size_is_the_fallback(self):
+        self.assertEqual(await self.total({"Size": 77}), 77)
+
+    async def test_missing_sizes_read_as_unknown(self):
+        self.assertEqual(await self.total({"LayersData": [{"Digest": "x"}]}), 0)
+        self.assertEqual(await self.total({}), 0)
 
 
 class StagingParentTests(unittest.TestCase):

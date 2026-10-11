@@ -152,6 +152,80 @@ def bare_vnas(internet_transfer_lock):
     )
 
 
+class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
+    SHA = "a" * 40
+
+    def harness(self, cap_mbps, cluster_member=None):
+        m = bare_manager(cap_mbps)
+        m._resolved_hf_token = Mock(return_value="tok")
+        m._cluster_launch_update = Mock()
+        nas = Mock()
+        nas.inventory = Mock(return_value=[])
+        nas._has_revision = Mock(return_value=False)
+        nas._download_model_process = AsyncMock(return_value={"ok": True})
+        m.virtual_nas = nas
+        return m
+
+    def hf(self, sha=None, error=None):
+        api = Mock()
+        if error is not None:
+            api.model_info.side_effect = error
+        else:
+            api.model_info.return_value.sha = sha
+        return Mock(return_value=api)
+
+    async def test_uncapped_skips_the_worker(self):
+        m = self.harness(0.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm", name="launch-1",
+            )
+        m.virtual_nas._download_model_process.assert_not_awaited()
+
+    async def test_capped_uncached_model_downloads_through_the_worker(self):
+        m = self.harness(100.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm", name="launch-1",
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "main", bandwidth_mbps=100.0,
+        )
+        phases = [call.args[1] for call in m._cluster_launch_update.call_args_list]
+        self.assertIn("downloading_weights", phases)
+
+    async def test_member_share_overrides_the_local_setting(self):
+        m = self.harness(0.0)
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights(
+                "org/model", cluster_member={"image_pull_bandwidth_mbps": 25.0},
+                runtime="sglang",
+            )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "main", bandwidth_mbps=25.0,
+        )
+
+    async def test_cached_model_skips_the_worker(self):
+        m = self.harness(100.0)
+        m.virtual_nas.inventory.return_value = [{"model_id": "org/model"}]
+        m.virtual_nas._has_revision.return_value = True
+        with patch("huggingface_hub.HfApi", self.hf(self.SHA)):
+            await m._prefetch_runtime_weights("org/model", runtime="vllm")
+        m.virtual_nas._download_model_process.assert_not_awaited()
+
+    async def test_local_path_model_skips_the_worker(self):
+        m = self.harness(100.0)
+        await m._prefetch_runtime_weights("/models/local-weights", runtime="vllm")
+        m.virtual_nas._download_model_process.assert_not_awaited()
+
+    async def test_resolution_failure_aborts_instead_of_uncapped_launch(self):
+        m = self.harness(100.0)
+        with patch("huggingface_hub.HfApi", self.hf(error=ConnectionError("offline"))):
+            with self.assertRaisesRegex(RuntimeError, "download limit is active"):
+                await m._prefetch_runtime_weights("org/model", runtime="vllm")
+        m.virtual_nas._download_model_process.assert_not_awaited()
+
+
 class CappedInternetTransferGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_capped_sections_serialize_behind_one_lock(self):
         order = []

@@ -396,8 +396,23 @@ async def _image_total_bytes(
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
         payload = json.loads(str(output or ""))
-        if isinstance(payload, dict) and isinstance(payload.get("Size"), int):
-            return max(0, payload["Size"])
+        if not isinstance(payload, dict):
+            return 0
+        # Registry manifests report the archive size per layer; the
+        # top-level Size only exists for schema 2 / docker-archive
+        # sources, so LayersData is the primary source.
+        layers = payload.get("LayersData")
+        if isinstance(layers, list):
+            total = sum(
+                entry["Size"] for entry in layers
+                if isinstance(entry, dict) and isinstance(entry.get("Size"), int)
+                and not isinstance(entry.get("Size"), bool)
+            )
+            if total > 0:
+                return total
+        size = payload.get("Size")
+        if isinstance(size, int) and not isinstance(size, bool):
+            return max(0, size)
         return 0
     except Exception:
         return 0

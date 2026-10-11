@@ -383,16 +383,168 @@ class StrataCappedLaunchGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot cover"):
             m._require_strata_weights_prepared("dep-1", {"MODEL": "IQ2_XS"}, "imgid")
 
-    def test_prepared_volume_allows_a_capped_relaunch(self):
+    def test_completion_marker_allows_a_capped_relaunch(self):
         m = bare_manager(100.0)
         m.client.volumes.get.return_value = Mock()
+        m.client.containers.run.return_value = b""  # test -f exits 0
         m._require_strata_weights_prepared("dep-1", {"MODEL": "IQ2_XS"}, "imgid")
-        m.client.volumes.get.assert_called_once()
+        kwargs = m.client.containers.run.call_args.kwargs
+        self.assertEqual(kwargs["entrypoint"], ["sh"])
+        self.assertIn("test -f /data/.sparkdeck-prepared", kwargs["command"][1])
+        self.assertEqual(
+            list(kwargs["volumes"].values()), [{"bind": "/data", "mode": "ro"}],
+        )
+
+    def test_volume_without_the_marker_is_refused(self):
+        # Volume existence alone is not proof: _strata_data_volume creates
+        # the volume before the container ever runs, so an interrupted
+        # launch leaves an empty one behind.
+        m = bare_manager(100.0)
+        m.client.volumes.get.return_value = Mock()
+        m.client.containers.run.side_effect = RuntimeError("exit code 1")
+        with self.assertRaisesRegex(RuntimeError, "finished preparing"):
+            m._require_strata_weights_prepared("dep-1", {"MODEL": "IQ2_XS"}, "imgid")
+
+    def test_marker_probe_errors_fail_closed(self):
+        m = bare_manager(100.0)
+        m.client.volumes.get.return_value = Mock()
+        m.client.containers.run.side_effect = docker.errors.APIError("no sh")
+        with self.assertRaisesRegex(RuntimeError, "finished preparing"):
+            m._require_strata_weights_prepared("dep-1", {}, "imgid")
+
+    def test_stamped_share_caps_an_agent_whose_local_setting_is_unlimited(self):
+        m = bare_manager(0.0)
+        m.client.volumes.get.side_effect = docker.errors.NotFound("gone")
+        with self.assertRaisesRegex(RuntimeError, "cannot cover"):
+            m._require_strata_weights_prepared(
+                "dep-1", {"MODEL": "IQ2_XS"}, "imgid",
+                {"image_pull_bandwidth_mbps": 25.0},
+            )
+
+    def test_stamped_zero_overrides_a_capped_local_setting(self):
+        m = bare_manager(100.0)
+        m._require_strata_weights_prepared(
+            "dep-1", {}, "imgid", {"image_pull_bandwidth_mbps": 0.0},
+        )
+        m.client.volumes.get.assert_not_called()
 
     def test_uncapped_never_probes(self):
         m = bare_manager(0.0)
         m._require_strata_weights_prepared("dep-1", {}, "imgid")
         m.client.volumes.get.assert_not_called()
+
+
+_REAL_SLEEP = asyncio.sleep
+
+
+class StrataPreparedMarkerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    async def _yield_sleep(_seconds):
+        # Replaces the watcher's 30-second poll without recursing into the
+        # patched module attribute: the still-real sleep is captured above.
+        await _REAL_SLEEP(0)
+
+    async def _drain(self, task):
+        for _ in range(80):
+            await _REAL_SLEEP(0)
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_marker_written_once_the_engine_serves(self):
+        m = bare_manager(0.0)
+        m.inference_target_health = AsyncMock(side_effect=[False, True])
+        m.client.api.exec_create = Mock(return_value={"Id": "exec-1"})
+        m.client.api.exec_start = Mock()
+        m.client.api.exec_inspect = Mock(return_value={"ExitCode": 0})
+        with patch("manager.asyncio.sleep", new=self._yield_sleep):
+            m._begin_strata_prepared_marker("strata-1", "org/model", "vol-1")
+            await self._drain(next(iter(m._strata_marker_tasks)))
+        m.client.api.exec_create.assert_called_once_with(
+            "strata-1", ["sh", "-c", "touch /data/.sparkdeck-prepared"],
+        )
+
+    async def test_never_serving_writes_nothing(self):
+        m = bare_manager(0.0)
+        m.inference_target_health = AsyncMock(return_value=False)
+        m.client.api.exec_create = Mock()
+        with patch("manager.asyncio.sleep", new=self._yield_sleep):
+            m._begin_strata_prepared_marker("strata-1", "org/model", "vol-1")
+            task = next(iter(m._strata_marker_tasks))
+            for _ in range(50):
+                await _REAL_SLEEP(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        m.client.api.exec_create.assert_not_called()
+
+    async def test_failed_exec_is_swallowed(self):
+        # A broken marker write must not break the launch: it only means
+        # the next capped launch asks for one uncapped run instead of
+        # guessing that setup finished.
+        m = bare_manager(0.0)
+        m.inference_target_health = AsyncMock(return_value=True)
+        m.client.api.exec_create = Mock(side_effect=RuntimeError("no sh"))
+        with patch("manager.asyncio.sleep", new=self._yield_sleep):
+            m._begin_strata_prepared_marker("strata-1", "org/model", "vol-1")
+            await self._drain(next(iter(m._strata_marker_tasks)))
+        self.assertTrue(m.client.api.exec_create.called)
+
+
+class CreateMemberLaunchTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    def _manager(self):
+        m = bare_manager(100.0)
+        m.node_registry = Mock()
+        m.node_registry.request = AsyncMock(return_value={"ok": True})
+        m.virtual_nas = Mock()
+        m.virtual_nas.estimate_download_size = AsyncMock(
+            return_value=70 * 1024 ** 3,
+        )
+        m._resolved_hf_token = Mock(return_value="tok")
+        return m
+
+    async def test_capped_member_deadline_covers_the_model_bytes(self):
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        m = self._manager()
+        await m._create_member("ws1", {
+            "model": "org/model",
+            "extra_args": ["--revision", "v2.0"],
+            "cluster_member": {"image_pull_bandwidth_mbps": 25.0},
+        })
+        m.virtual_nas.estimate_download_size.assert_awaited_once_with(
+            "org/model", "v2.0", explicit_token="tok",
+        )
+        self.assertEqual(
+            m.node_registry.request.await_args.kwargs["timeout"],
+            capped_transfer_timeout_seconds(
+                25.0, 70 * 1024 ** 3, default=1800,
+            ),
+        )
+
+    async def test_uncapped_member_skips_model_sizing(self):
+        m = self._manager()
+        await m._create_member("ws1", {
+            "model": "org/model", "extra_args": [],
+            "cluster_member": {"image_pull_bandwidth_mbps": 0.0},
+        })
+        m.virtual_nas.estimate_download_size.assert_not_awaited()
+        self.assertEqual(
+            m.node_registry.request.await_args.kwargs["timeout"], 1800,
+        )
+
+    async def test_unknown_size_falls_back_to_the_allowance(self):
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        m = self._manager()
+        m.virtual_nas.estimate_download_size = AsyncMock(
+            side_effect=RuntimeError("hub unreachable"),
+        )
+        await m._create_member("ws1", {
+            "model": "org/model", "extra_args": [],
+            "cluster_member": {"image_pull_bandwidth_mbps": 25.0},
+        })
+        self.assertEqual(
+            m.node_registry.request.await_args.kwargs["timeout"],
+            capped_transfer_timeout_seconds(25.0, 0, default=1800),
+        )
 
 
 class HelperPrefetchOnSettingsTests(unittest.IsolatedAsyncioTestCase):

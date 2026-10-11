@@ -480,6 +480,10 @@ STRATA_VOLUME_LABEL = "io.sparkdeck.strata-deployment"
 # stamped on the container so teardown can find the volume even though a
 # cluster member's DEPLOYMENT_LABEL is the per-launch Manager deployment id.
 STRATA_VOLUME_KEY_LABEL = "io.sparkdeck.strata-volume-key"
+# Stamped inside the /data volume by _begin_strata_prepared_marker once the
+# engine first serves; a capped relaunch requires it as proof that the
+# entrypoint's uncappable setup pass finished (volume existence is not).
+STRATA_PREPARED_MARKER = "/data/.sparkdeck-prepared"
 SERVED_MODEL_LABEL = "io.sparkdeck.served-model"
 SERVICE_PORT_LABEL = "io.sparkdeck.service-port"
 MODE_LABEL = "io.sparkdeck.deployment-mode"
@@ -7172,9 +7176,28 @@ class Manager:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
         # The member launch may pull its runtime image at the stamped cap
-        # share; the request deadline scales with that rate instead of a
-        # fixed 30 minutes.
+        # share, and the agent prefetches the complete model snapshot before
+        # the request returns. Size the deadline with the model's expected
+        # bytes: the unknown-size allowance only covers ~32 GiB at the
+        # configured rate, which would cancel a normal 70B prefetch that is
+        # still making progress.
         member = payload.get("cluster_member") or {}
+        share_mbps = member.get("image_pull_bandwidth_mbps")
+        expected_bytes = 0
+        try:
+            capped = float(share_mbps) > 0
+        except (TypeError, ValueError):
+            capped = False
+        if capped:
+            try:
+                expected_bytes = await self.virtual_nas.estimate_download_size(
+                    str(payload.get("model") or ""),
+                    self._cli_option(payload.get("extra_args") or [], {"--revision"})
+                    or "main",
+                    explicit_token=self._resolved_hf_token(),
+                )
+            except Exception:
+                expected_bytes = 0
         try:
             return await self.node_registry.request(
                 node_id,
@@ -7182,7 +7205,7 @@ class Manager:
                 "/api/agent/containers",
                 json_body=payload,
                 timeout=capped_transfer_timeout_seconds(
-                    member.get("image_pull_bandwidth_mbps"), default=1800,
+                    share_mbps, expected_bytes, default=1800,
                 ),
             )
         finally:
@@ -18038,31 +18061,121 @@ class Manager:
 
     def _require_strata_weights_prepared(
         self, deployment_key: str, environment, image_identity: str,
+        cluster_member: dict | None = None,
     ) -> None:
-        """Refuse a capped first launch; Strata's download is uncappable.
+        """Refuse a capped launch unless the model pack's setup is done.
 
         A first launch (or any config change, which lands in a fresh
         fingerprinted volume) downloads the pinned checkpoint inside the
         container from a repository only the upstream entrypoint knows, so
-        SparkDeck can prefetch it under the cap the way it does for the
-        cache-resolving runtimes, and cannot shape the container's egress.
-        Refuse instead of silently overrunning the limit; a volume that
-        already exists means the setup ran and a restart skips it.
+        SparkDeck can neither prefetch it under the cap nor shape the
+        container's egress. Refuse instead of silently overrunning the
+        limit. Two things decide "capped": the controller's stamped share
+        (authoritative when present — an agent still at the unlimited
+        default must not wave a capped launch through) and the node-local
+        setting otherwise. Volume existence is NOT proof of a completed
+        setup — ``_strata_data_volume`` creates the volume before the
+        container ever runs, so an interrupted launch leaves an empty one —
+        the proof is the completion marker that a prior launch stamps
+        inside the volume once the engine first serves.
         """
-        if self._image_pull_bytes_per_second(None) <= 0:
+        share = self._image_pull_share_mbps(cluster_member)
+        if share is not None:
+            if share <= 0:
+                return
+        elif self._image_pull_bytes_per_second(None) <= 0:
             return
-        probe = (
+        name = (
             f"{self._strata_volume_prefix(deployment_key)}-"
             f"{self._strata_setup_fingerprint(environment, image_identity)}"
         )
         try:
-            self.client.volumes.get(probe)
+            self.client.volumes.get(name)
         except docker.errors.NotFound:
             raise RuntimeError(
                 "Strata downloads its model pack inside the container on "
                 "first launch, which the bandwidth limit cannot cover; set "
                 "the download limit to 0 for this launch, then restore it"
             )
+        if not self._strata_prepared_marker_present(image_identity, name):
+            raise RuntimeError(
+                "Strata cannot confirm this model pack finished preparing, "
+                "so a resumed checkpoint download might overrun the "
+                "bandwidth limit; set the download limit to 0 for one "
+                "launch, then restore it"
+            )
+
+    def _strata_prepared_marker_present(self, image: str, volume_name: str) -> bool:
+        """Probe the completion marker with a one-shot helper container.
+
+        The marker proves a previous launch's setup pass completed; a probe
+        error is treated as "not proven", because under a cap the only safe
+        default is to refuse and tell the user to run once uncapped.
+        """
+        try:
+            self.client.containers.run(
+                image,
+                command=["-c", f"test -f {STRATA_PREPARED_MARKER}"],
+                entrypoint=["sh"],
+                volumes={volume_name: {"bind": "/data", "mode": "ro"}},
+                detach=False, stream=False, remove=True,
+                network_disabled=True,
+                labels={CONTROLLER_LABEL: "1"},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _begin_strata_prepared_marker(
+        self, container_name: str, model: str, volume_name: str,
+    ) -> None:
+        """Stamp the in-volume completion marker once the engine serves.
+
+        Readiness is the only proof the upstream entrypoint finished its
+        setup pass: the server binds only after the pack is complete. The
+        write is best-effort (exec ``touch`` in the live container); a
+        failed write simply means the next capped relaunch asks for one
+        uncapped launch instead of guessing.
+        """
+        async def watch():
+            try:
+                # Capped first launches of multi-hundred-GB packs on a
+                # shaped uplink can run for a day or more; poll until the
+                # engine answers or the task outlives its usefulness.
+                for _ in range(48 * 60 * 2):
+                    try:
+                        if await self.inference_target_health(
+                            model, container_name=container_name,
+                            single_target=True,
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(30)
+                else:
+                    return
+                await asyncio.to_thread(
+                    self._write_strata_prepared_marker, container_name,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        tasks = getattr(self, "_strata_marker_tasks", None)
+        if tasks is None:
+            tasks = self._strata_marker_tasks = set()
+        task = asyncio.create_task(watch())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _write_strata_prepared_marker(self, container_name: str) -> None:
+        exec_handle = self.client.api.exec_create(
+            container_name, ["sh", "-c", f"touch {STRATA_PREPARED_MARKER}"],
+        )
+        self.client.api.exec_start(exec_handle["Id"], demux=True)
+        if self.client.api.exec_inspect(exec_handle["Id"]).get("ExitCode") != 0:
+            raise RuntimeError("Strata marker exec exited nonzero")
 
     def _strata_data_volume(
         self, deployment_key: str, environment, image: str | None = None,
@@ -18229,6 +18342,11 @@ class Manager:
             model=model, cluster_member=cluster_member,
         )
 
+        # _create runs in a worker thread; this holder carries the created
+        # volume back so the async scope can start the completion-marker
+        # watcher once the container is live.
+        prepared_watch: dict[str, str] = {}
+
         def _create():
             # The image is guaranteed present by the capped
             # _ensure_runtime_image step below.
@@ -18274,7 +18392,7 @@ class Manager:
             # fresh volume whose setup runs with the new settings, while an
             # unchanged relaunch reuses the prepared pack.
             self._require_strata_weights_prepared(
-                deployment_key, environment, image_identity,
+                deployment_key, environment, image_identity, cluster_member,
             )
             data_volume = self._strata_data_volume(
                 deployment_key, environment, image_identity,
@@ -18327,6 +18445,7 @@ class Manager:
             # The old fingerprint's volume is now unreachable; reclaim its
             # disk once the replacement container is live.
             self._prune_strata_data_volumes(deployment_key, data_volume)
+            prepared_watch["volume"] = data_volume
             summary = self._container_summary(container)
             if summary is not None:
                 summary["model_source"] = "public_repository"
@@ -18337,7 +18456,12 @@ class Manager:
                 image, name, model=model, cluster_member=cluster_member,
                 runtime="strata",
             )
-            return await asyncio.to_thread(_create)
+            summary = await asyncio.to_thread(_create)
+            if prepared_watch.get("volume"):
+                self._begin_strata_prepared_marker(
+                    name, model, prepared_watch["volume"],
+                )
+            return summary
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
             self._cluster_launch_update(

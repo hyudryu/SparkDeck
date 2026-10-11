@@ -25,6 +25,7 @@ from sparkdeck.throttled_image_pull import (
     matches_insecure_registry,
     no_proxy_matches_image,
     normalize_image_reference,
+    registry_ca_binds,
     select_docker_config,
     split_authority,
     skopeo_copy_args,
@@ -731,6 +732,43 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ProxyTrustWiringTests(unittest.IsolatedAsyncioTestCase):
+    """SSL_CERT_FILE forwarding into the limiter container (PozT/PozP)."""
+
+    def proxy_kwargs(self, api):
+        return next(
+            c for c in api.created if c.get("image") == PROXY_IMAGE
+        )
+
+    async def test_host_ca_file_is_mounted_and_pointed_to(self):
+        api = FakeDockerApi()
+        ca_file = "/etc/ssl/certs/corp-proxy-ca.pem"
+        with (
+            patch.dict(os.environ, {"SSL_CERT_FILE": ca_file}),
+            patch.object(
+                tip.os.path, "isfile",
+                side_effect=lambda path: path == ca_file,
+            ),
+        ):
+            await ThrottledPullFlowTests.collect(self, api)
+        proxy = self.proxy_kwargs(api)
+        self.assertEqual(proxy["environment"]["SPARKDECK_UPSTREAM_PROXY_CA"], ca_file)
+        self.assertIn(
+            f"{ca_file}:{ca_file}:ro,z", proxy["host_config"]["Binds"],
+        )
+
+    async def test_no_host_ca_leaves_the_override_empty(self):
+        api = FakeDockerApi()
+        env = {k: v for k, v in os.environ.items() if k != "SSL_CERT_FILE"}
+        with patch.dict(os.environ, env, clear=True):
+            await ThrottledPullFlowTests.collect(self, api)
+        proxy = self.proxy_kwargs(api)
+        self.assertEqual(proxy["environment"]["SPARKDECK_UPSTREAM_PROXY_CA"], "")
+        self.assertTrue(all(
+            ":/etc/ssl" not in bind for bind in proxy["host_config"]["Binds"]
+        ))
+
+
 class HelperBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_preinstall_pulls_only_missing_helpers(self):
         client = Mock()
@@ -884,6 +922,152 @@ class LimiterProxyTests(unittest.TestCase):
             listener.close()
             upstream.close()
 
+    def tls_proxy_listener(self, cert_file, key_file):
+        """A TLS-terminated CONNECT proxy for the HTTPS upstream tests."""
+        import ssl
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_file, key_file)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        captured = {}
+
+        def serve():
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                tls = context.wrap_socket(connection, server_side=True)
+            except OSError:
+                captured["tls"] = "handshake-failed"
+                connection.close()
+                return
+            captured["tls"] = "handshake-ok"
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    captured["request"] = request
+                    return
+                request += chunk
+            captured["request"] = request
+            tls.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+            def pipe():
+                target = None
+                try:
+                    while True:
+                        data = tls.recv(4096)
+                        if not data:
+                            break
+                        if target is None:
+                            authority = request.split(b" ")[1].decode("latin-1")
+                            host, _, port_text = authority.rpartition(":")
+                            target = socket.create_connection(
+                                (host, int(port_text)), 5,
+                            )
+                        target.sendall(data)
+                        reply = target.recv(4096)
+                        if reply:
+                            tls.sendall(reply)
+                except OSError:
+                    pass
+                finally:
+                    if target is not None:
+                        target.close()
+                    tls.close()
+            pipe()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return listener, port, captured
+
+    def make_localhost_cert(self):
+        import ipaddress
+        from datetime import datetime, timedelta, timezone
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.now(timezone.utc)
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))],
+                ), critical=False,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        directory = tempfile.mkdtemp()
+        cert_file = Path(directory) / "proxy.crt"
+        key_file = Path(directory) / "proxy.key"
+        cert_file.write_bytes(certificate.public_bytes(
+            serialization.Encoding.PEM,
+        ))
+        key_file.write_bytes(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        return str(cert_file), str(key_file)
+
+    def test_https_upstream_proxy_gets_tls_before_connect(self):
+        listener, echo_port = self.echo_server("127.0.0.1")
+        cert_file, key_file = self.make_localhost_cert()
+        tls_listener, tls_port, captured = self.tls_proxy_listener(
+            cert_file, key_file,
+        )
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"https://127.0.0.1:{tls_port}",
+            "SPARKDECK_UPSTREAM_PROXY_CA": cert_file,
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-tls")
+            self.assertEqual(client.recv(64), b"ping-tls")
+            client.close()
+            self.assertEqual(captured.get("tls"), "handshake-ok")
+            self.assertIn(b"CONNECT 127.0.0.1:%d" % echo_port, captured["request"])
+        finally:
+            process.kill()
+            listener.close()
+            tls_listener.close()
+
+    def test_https_upstream_without_trust_is_refused_not_plaintext(self):
+        # Without the CA file, the default trust store cannot verify the
+        # private proxy certificate: the limiter must fail closed instead of
+        # falling back to a plaintext CONNECT that a TLS listener rejects.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        cert_file, key_file = self.make_localhost_cert()
+        tls_listener, tls_port, captured = self.tls_proxy_listener(
+            cert_file, key_file,
+        )
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"https://127.0.0.1:{tls_port}",
+        })
+        try:
+            _client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertNotIn(b"200", response.split(b"\r\n", 1)[0])
+        finally:
+            process.kill()
+            listener.close()
+            tls_listener.close()
+
 
 class RegistryTrustTests(unittest.TestCase):
     def test_insecure_entries_match_cidr_hosts_and_ports(self):
@@ -950,8 +1134,17 @@ class DockerConfigSelectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--authfile", copy["command"])
 
 
+def inspect_kwargs(api):
+    """The size-preflight inspect container kwargs."""
+    return next(
+        c for c in api.created
+        if c.get("image") == SKOPEO_IMAGE
+        and list(c.get("command") or [])[:1] == ["inspect"]
+    )
+
+
 class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
-    async def total(self, payload):
+    async def total(self, payload, copy_binds=None):
         api = FakeDockerApi()
         base_logs = api.container_logs
 
@@ -963,8 +1156,10 @@ class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
         api.container_logs = logs
         client = Mock()
         client.api = api
+        self.api = api
         return await tip._image_total_bytes(
-            client, "net-1", "docker.io/library/nginx:latest", "amd64", [],
+            client, "net-1", "http://sparkdeck-proxy:8899",
+            "docker.io/library/nginx:latest", "amd64", copy_binds or [],
         )
 
     async def test_layers_data_sizes_are_aggregated(self):
@@ -981,6 +1176,70 @@ class ImageTotalBytesTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_sizes_read_as_unknown(self):
         self.assertEqual(await self.total({"LayersData": [{"Digest": "x"}]}), 0)
         self.assertEqual(await self.total({}), 0)
+
+    async def test_preflight_dials_through_the_limiter_proxy(self):
+        # The preflight shares the copy container's proxy environment: on
+        # proxy-only hosts a direct connect cannot reach the registry, and
+        # a direct one would also bypass the token bucket.
+        await self.total({"Size": 10})
+        created = inspect_kwargs(self.api)
+        environment = created["environment"]
+        self.assertEqual(environment["HTTPS_PROXY"], "http://sparkdeck-proxy:8899")
+        self.assertEqual(environment["HTTP_PROXY"], "http://sparkdeck-proxy:8899")
+        self.assertEqual(environment["NO_PROXY"], "localhost,127.0.0.1")
+
+    async def test_preflight_keeps_credentials_and_ca_binds_only(self):
+        # The staging archive must stay out of the preflight, but the
+        # registry CA bind must come along for --tls-verify=true.
+        binds = [
+            "/staging:/archive:z",
+            "/host/config.json:/auth/config.json:ro,z",
+            "/etc/docker/certs.d/reg.corp:5443:/etc/containers/certs.d/reg.corp:5443:ro,z",
+        ]
+        await self.total({"Size": 10}, copy_binds=binds)
+        created = inspect_kwargs(self.api)
+        self.assertEqual(created["host_config"]["Binds"], [binds[1], binds[2]])
+
+
+class RegistryCaBindsTests(unittest.TestCase):
+    """Daemon certs.d directories exposed to the skopeo helpers (PozP)."""
+
+    def test_ca_directory_becomes_a_readonly_bind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ca_dir = os.path.join(directory, "reg.corp")
+            os.mkdir(ca_dir)
+            with open(os.path.join(ca_dir, "ca.crt"), "w") as handle:
+                handle.write("-----CERT-----")
+            binds = registry_ca_binds("reg.corp", bases=[directory])
+        self.assertEqual(
+            binds, [f"{ca_dir}:/etc/containers/certs.d/reg.corp:ro,z"],
+        )
+
+    def test_portless_key_fallback_and_cert_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ca_dir = os.path.join(directory, "reg.corp")
+            os.mkdir(ca_dir)
+            with open(os.path.join(ca_dir, "ca.crt"), "w") as handle:
+                handle.write("-----CERT-----")
+            # host:port registry matches the operator's port-less directory,
+            # while the bind target keeps the full registry key skopeo uses.
+            binds = registry_ca_binds("reg.corp:5443", bases=[directory])
+            self.assertEqual(
+                binds, [f"{ca_dir}:/etc/containers/certs.d/reg.corp:5443:ro,z"],
+            )
+            other = os.path.join(directory, "other.corp")
+            os.mkdir(other)  # exists but contains no certificate
+            self.assertEqual(registry_ca_binds("other.corp", [directory]), [])
+
+    def test_missing_directories_yield_no_binds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(registry_ca_binds("nowhere.corp", [directory]), [])
+            self.assertEqual(registry_ca_binds("", [directory]), [])
+
+    def test_system_base_lookup_is_safe_when_absent(self):
+        # Windows dev boxes have no /etc/docker/certs.d; the real-base call
+        # must return nothing rather than raising.
+        self.assertEqual(registry_ca_binds("reg.corp"), [])
 
 
 class StagingParentTests(unittest.TestCase):

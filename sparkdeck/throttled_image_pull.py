@@ -60,11 +60,12 @@ PROGRESS_NAME = "proxy_bytes"
 # importable. Only the download direction (registry → client) is charged,
 # and the running total is reported for progress.
 _PROXY_SCRIPT = """
-import base64, os, socket, threading, time
+import base64, os, socket, ssl, threading, time
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
 PROGRESS = os.environ.get("SPARKDECK_BANDWIDTH_PROGRESS") or ""
 UPSTREAM = os.environ.get("SPARKDECK_UPSTREAM_PROXY") or ""
+UPSTREAM_CA = os.environ.get("SPARKDECK_UPSTREAM_PROXY_CA") or ""
 DUE = [0.0]
 LOCK = threading.Lock()
 TOTAL = [0]
@@ -124,13 +125,26 @@ def split_authority(value):
     return host, port
 
 def parse_upstream(url):
+    secure = False
     if "://" in url:
-        url = url.split("://", 1)[1]
+        scheme, _, url = url.partition("://")
+        secure = scheme.strip().lower() == "https"
     auth = ""
     if "@" in url:
         auth, _, url = url.rpartition("@")
     host, port = split_authority(url)
-    return auth, host, int(port or "80")
+    return auth, host, int(port or ("443" if secure else "80")), secure
+
+def upstream_context(host):
+    # A TLS-protected corporate endpoint needs a real TLS handshake before
+    # CONNECT; a plaintext handshake against a TLS listener just hangs. The
+    # CA-file override covers proxies certified by a private CA, mirroring
+    # SSL_CERT_FILE for the host's own proxy-aware clients.
+    if UPSTREAM_CA:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(UPSTREAM_CA)
+        return context
+    return ssl.create_default_context()
 
 def connect_target(authority):
     # Without an upstream, dial the registry directly; with one (corporate
@@ -138,8 +152,10 @@ def connect_target(authority):
     if not UPSTREAM:
         host, port = split_authority(authority)
         return socket.create_connection((host, int(port or "443")), 10)
-    auth, host, port = parse_upstream(UPSTREAM)
+    auth, host, port, secure = parse_upstream(UPSTREAM)
     sock = socket.create_connection((host, port), 10)
+    if secure:
+        sock = upstream_context(host).wrap_socket(sock, server_hostname=host)
     request = "CONNECT %%s HTTP/1.1\\r\\nHost: %%s\\r\\n" %% (authority, authority)
     if auth:
         token = base64.b64encode(auth.encode("latin-1")).decode("ascii")
@@ -418,6 +434,52 @@ def select_docker_config(auth_paths: list[str]) -> str | None:
     return None
 
 
+# Registry certificate directories, in Docker's own lookup order. A registry
+# whose CA lives here (a private secure registry) verifies fine through the
+# daemon but fails inside the isolated skopeo helper unless the same
+# directory is mounted into it.
+DOCKER_CERTS_D_BASES = ("/etc/docker/certs.d", "~/.docker/certs.d")
+CONTAINERS_CERTS_D = "/etc/containers/certs.d"
+
+
+def registry_ca_binds(
+    registry_host: str, bases: list[str] | None = None,
+) -> list[str]:
+    """Bind mounts exposing the daemon's per-registry CA to the helpers.
+
+    ``containers/image`` (skopeo) reads ``/etc/containers/certs.d/<registry>``
+    exactly like dockerd reads ``/etc/docker/certs.d/<registry>``, so a
+    read-only bind of the daemon's directory keeps private-CA registries
+    verifiable on the capped path. The registry key keeps its port (Docker
+    keys the directory by ``host[:port]``), falling back to the port-less
+    spelling the operator may have used. Only certificates are exposed.
+    """
+    if not registry_host:
+        return []
+    keys = [registry_host]
+    host, _, port = registry_host.partition(":")
+    if port:
+        keys.append(host)
+    for base in bases if bases is not None else DOCKER_CERTS_D_BASES:
+        base = os.path.expanduser(str(base))
+        for key in keys:
+            directory = os.path.join(base, key)
+            try:
+                if not os.path.isdir(directory):
+                    continue
+                if not any(
+                    name.lower().endswith(".crt")
+                    for name in os.listdir(directory)
+                ):
+                    continue
+            except OSError:
+                continue
+            return [
+                f"{directory}:{CONTAINERS_CERTS_D}/{registry_host}:ro,z",
+            ]
+    return []
+
+
 def _registry_aliases(registry_host: str) -> list[str]:
     if registry_host == "docker.io":
         return ["docker.io", "index.docker.io"]
@@ -530,14 +592,29 @@ async def _exec_ok(client: Any, container: str, command: list[str]) -> bool:
     return isinstance(result, dict) and result.get("ExitCode") == 0
 
 
+def _preflight_binds(copy_binds: list[str]) -> list[str]:
+    """The binds the inspect preflight needs: credentials and registry CAs.
+
+    Same isolation as the copy container (no staging archive), but the
+    private-CA directories must be present or ``--tls-verify=true`` fails.
+    """
+    return [
+        bind for bind in copy_binds
+        if ":/auth/config.json" in bind or f":{CONTAINERS_CERTS_D}/" in bind
+    ]
+
+
 async def _image_total_bytes(
-    client: Any, network_id: str, source_ref: str,
+    client: Any, network_id: str, proxy_url: str, source_ref: str,
     arch: str, copy_binds: list[str],
 ) -> int:
     """Fetch the image's compressed size via a ``skopeo inspect`` preflight.
 
     Runs one short-lived skopeo container before the copy starts so the
     caller can capacity-check the staging filesystem before any bytes move.
+    It talks through the same limiter proxy as the copy: on proxy-only hosts
+    a direct connection cannot reach the registry at all, and a direct one
+    would also dodge the token bucket for the manifest traffic.
     The progress total and the capacity check are both a convenience: every
     failure path returns 0 (unknown size) and lets the copy itself surface
     real errors.
@@ -555,9 +632,14 @@ async def _image_total_bytes(
             client, "create_container",
             image=SKOPEO_IMAGE,
             command=command,
-            environment={"HOME": "/tmp"},
+            environment={
+                "HOME": "/tmp",
+                "HTTPS_PROXY": proxy_url,
+                "HTTP_PROXY": proxy_url,
+                "NO_PROXY": "localhost,127.0.0.1",
+            },
             host_config={
-                "Binds": [b for b in copy_binds if ":/auth/config.json" in b],
+                "Binds": _preflight_binds(copy_binds),
                 "NetworkMode": network_id,
             },
         )
@@ -719,23 +801,37 @@ async def throttled_image_pull_events(
                     pass
                 has_authfile = True
                 copy_binds.append(f"{written}:/auth/config.json:ro,z")
+        # Private secure registries keep their CA in the daemon's certs.d,
+        # which the isolated skopeo containers cannot see without a bind;
+        # inherit it so the capped path verifies like the daemon does.
+        copy_binds += registry_ca_binds(registry_host)
+        proxy_environment = {
+            "SPARKDECK_DOWNLOAD_BPS": repr(float(bytes_per_second)),
+            "SPARKDECK_BANDWIDTH_PROGRESS": f"/archive/{PROGRESS_NAME}",
+            "PYTHONUNBUFFERED": "1",
+            # Proxy-only hosts reach registries via the corporate proxy;
+            # the limiter chains CONNECT through it when configured.
+            "SPARKDECK_UPSTREAM_PROXY": os.environ.get(
+                "HTTPS_PROXY", os.environ.get("https_proxy", ""),
+            ),
+            "SPARKDECK_UPSTREAM_PROXY_CA": "",
+        }
+        proxy_binds = [f"{staging}:/archive:z"]
+        proxy_ca = str(os.environ.get("SSL_CERT_FILE") or "")
+        if proxy_ca.startswith("/") and os.path.isfile(proxy_ca):
+            # The proxy image has no copy of the host trust store, so a
+            # corporate HTTPS proxy on a private CA needs the host's
+            # CA-file override, mounted at its own path inside.
+            proxy_binds.append(f"{proxy_ca}:{proxy_ca}:ro,z")
+            proxy_environment["SPARKDECK_UPSTREAM_PROXY_CA"] = proxy_ca
         proxy = await _run_docker(
             client, "create_container",
             image=PROXY_IMAGE,
             name=proxy_name,
             command=["python", "-u", "-c", _PROXY_SCRIPT],
-            environment={
-                "SPARKDECK_DOWNLOAD_BPS": repr(float(bytes_per_second)),
-                "SPARKDECK_BANDWIDTH_PROGRESS": f"/archive/{PROGRESS_NAME}",
-                "PYTHONUNBUFFERED": "1",
-                # Proxy-only hosts reach registries via the corporate proxy;
-                # the limiter chains CONNECT through it when configured.
-                "SPARKDECK_UPSTREAM_PROXY": os.environ.get(
-                    "HTTPS_PROXY", os.environ.get("https_proxy", ""),
-                ),
-            },
+            environment=proxy_environment,
             host_config={
-                "Binds": [f"{staging}:/archive:z"],
+                "Binds": proxy_binds,
                 "NetworkMode": network_id,
             },
         )
@@ -756,7 +852,8 @@ async def throttled_image_pull_events(
         # Preflight the compressed size before the archive can start filling
         # the staging filesystem, then capacity-check before bytes move.
         total_bytes = await _image_total_bytes(
-            client, network_id, source_ref, arch, copy_binds,
+            client, network_id, f"http://{proxy_name}:{_PROXY_PORT}",
+            source_ref, arch, copy_binds,
         )
         capacity = staging_capacity_error(staging, total_bytes)
         if capacity:

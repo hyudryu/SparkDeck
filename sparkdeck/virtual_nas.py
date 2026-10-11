@@ -749,8 +749,9 @@ class VirtualNAS:
         self._queue_lock = asyncio.Lock()
         self._download_operations: dict[str, dict[str, Any]] = {}
         # key -> (rate file, its directory) for capped workers in flight;
-        # apply_download_bandwidth_cap rewrites these when the setting moves.
-        self._download_rate_files: dict[str, tuple[Path, Path]] = {}
+        # apply_download_bandwidth_cap rewrites these when the setting moves,
+        # scaled by each worker's share factor of the cluster cap.
+        self._download_rate_files: dict[str, tuple[Path, Path, float]] = {}
         self._process_download_locks: dict[str, asyncio.Lock] = {}
         self._download_tombstone_path = self.data_dir / "virtual_nas_canceled_downloads.json"
         self._download_tombstone_error = False
@@ -1149,17 +1150,33 @@ class VirtualNAS:
 
     def _register_download_rate_file(
         self, key: str, bytes_per_second: float,
+        cluster_bytes_per_second: float | None = None,
     ) -> Path | None:
         """The live-cap file a capped worker watches, or None when uncapped.
 
         The parent rewrites the file through apply_download_bandwidth_cap
         when the setting changes; the worker's throttle watcher re-reads it.
-        A worker that started unlimited has no file: its socket throttle (and
-        the Xet disable that goes with it) is decided at start, so enabling a
-        cap can only apply to subsequent transfers.
+        The registration records the worker's SHARE of the cluster cap
+        (worker/cluster, 1.0 when the worker runs the full local cap), so a
+        re-rate of a dispatched member share stays a share of the new
+        cluster value instead of becoming the full new cluster value per
+        member. The cluster reference is this node's own setting value,
+        which the settings route forwards on every save, so it tracks the
+        controller's cap; a node whose local file is stale re-rates by a
+        slightly off share but never multiplies the cluster budget by the
+        member count. A worker that started unlimited has no file: its
+        socket throttle (and the Xet disable that goes with it) is decided
+        at start, so enabling a cap can only apply to subsequent transfers.
         """
         if bytes_per_second <= 0:
             return None
+        factor = 1.0
+        try:
+            cluster = float(cluster_bytes_per_second or 0)
+        except (TypeError, ValueError):
+            cluster = 0.0
+        if cluster > 0:
+            factor = max(min(float(bytes_per_second) / cluster, 1.0), 1e-9)
         rate_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-dl-rate-"))
         rate_file = rate_dir / "rate.txt"
         try:
@@ -1167,7 +1184,7 @@ class VirtualNAS:
         except OSError:
             shutil.rmtree(rate_dir, ignore_errors=True)
             return None
-        self._download_rate_files[key] = (rate_file, rate_dir)
+        self._download_rate_files[key] = (rate_file, rate_dir, factor)
         return rate_file
 
     def _release_download_rate_file(self, key: str) -> None:
@@ -1178,13 +1195,16 @@ class VirtualNAS:
     def apply_download_bandwidth_cap(self, bytes_per_second: float) -> None:
         """Re-rate the capped Hub weight downloads running on this node.
 
-        Weight transfers that started without a cap finish uncapped: the
-        socket throttle and the Xet fallback are chosen at worker start and
-        cannot be retrofitted onto a running Xet client, so the newly enabled
-        limit applies from the next transfer.
+        The value is the new CLUSTER cap; each registered worker takes its
+        share of it (1.0 for workers running the full local cap). Weight
+        transfers that started without a cap finish uncapped: the socket
+        throttle and the Xet fallback are chosen at worker start and cannot
+        be retrofitted onto a running Xet client, so the newly enabled limit
+        applies from the next transfer.
         """
-        value = str(float(bytes_per_second))
-        for rate_file, _directory in list(self._download_rate_files.values()):
+        cluster = float(bytes_per_second)
+        for rate_file, _directory, factor in self._download_rate_files.values():
+            value = str(cluster * factor)
             try:
                 tmp = rate_file.with_name("rate.txt.tmp")
                 tmp.write_text(value, encoding="utf-8")
@@ -1371,7 +1391,10 @@ class VirtualNAS:
             if os.name == "nt" else {"start_new_session": True}
         )
         rate_key = uuid.uuid4().hex
-        rate_file = self._register_download_rate_file(rate_key, bytes_per_second)
+        rate_file = self._register_download_rate_file(
+            rate_key, bytes_per_second,
+            cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(None),
+        )
         payload_fields = {
             "model_id": model_id, "revision": revision,
             "parent_pid": os.getpid(), "cache_dir": str(self._hub()),
@@ -1471,6 +1494,7 @@ class VirtualNAS:
             )
             rate_file = self._register_download_rate_file(
                 operation_id, worker_bps,
+                cluster_bytes_per_second=self._download_bandwidth_bytes_per_second(None),
             )
             payload_fields = {
                 "model_id": model_id, "revision": revision,

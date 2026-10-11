@@ -217,8 +217,9 @@ class FakeDockerApi:
     def __init__(self, *, copy_exit=0, proxy_dies=False, stderr_tail=b"fatal: copy failed",
                  load_events=None, verify_fails=False, inspect_size=100,
                  helpers_missing=False, security_options=None,
-                 copy_inspect_fails=False):
+                 copy_inspect_fails=False, registry_config=None):
         self.security_options = security_options or []
+        self.registry_config = registry_config
         self.copy_exit = copy_exit
         self.proxy_dies = proxy_dies
         self.copy_inspect_fails = copy_inspect_fails
@@ -246,7 +247,10 @@ class FakeDockerApi:
         return {"Arch": "amd64"}
 
     def info(self):
-        return {"SecurityOptions": list(self.security_options)}
+        payload = {"SecurityOptions": list(self.security_options)}
+        if self.registry_config is not None:
+            payload["RegistryConfig"] = self.registry_config
+        return payload
 
     def inspect_image(self, ref):
         # Helper images always exist (no pull); the requested image resolves
@@ -343,17 +347,19 @@ class FakeDockerApi:
 class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
     async def collect(self, api, image="nginx", bps=1_000_000.0,
                       staging=None, authfile=None, auth_dir=None,
-                      disk_free=10 ** 15):
+                      disk_free=10 ** 15, cluster_bps=None, mirror_dir=None):
         client = Mock()
         client.api = api
         staging = staging or Path(tempfile.mkdtemp())
         # The flow creates staging, the optional single-registry auth dir,
-        # and the always-created colon-safe CA staging dir, in that order.
+        # the always-created colon-safe CA staging dir, and (Hub mirrors
+        # configured) the registries.conf.d dir, in that order.
         ca_dir = tempfile.mkdtemp(prefix="sparkdeck-test-cas-")
         mkdtemp_values = (
             [str(staging)]
             + ([str(auth_dir)] if auth_dir else [])
             + [ca_dir]
+            + ([str(mirror_dir)] if mirror_dir else [])
         )
         events = []
         with (
@@ -367,7 +373,9 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
                 return_value=_USAGE(10 ** 15, 0, disk_free),
             ),
         ):
-            async for event in throttled_image_pull_events(client, image, bps):
+            async for event in throttled_image_pull_events(
+                client, image, bps, cluster_bytes_per_second=cluster_bps,
+            ):
                 events.append(event)
         return events, staging
 
@@ -602,6 +610,139 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(rate_key, tip._ACTIVE_RATE_FILES)
         self.assertFalse(os.path.exists(rate_key))
 
+    async def test_fanout_member_registers_its_share_for_live_rerating(self):
+        # A member of a 4-node fan-out runs at cap/4; the live re-rate must
+        # scale that share, so the registration carries the factor, not a
+        # flag that would re-apply the full cluster cap on every member.
+        api = FakeDockerApi()
+        staging = Path(tempfile.mkdtemp())
+        captured = {}
+
+        def on_start(container_id):
+            if container_id != "copy-1":
+                return
+            rate_key = os.path.join(str(staging), RATE_NAME)
+            captured["factor"] = tip._ACTIVE_RATE_FILES.get(rate_key)
+            captured["initial"] = (staging / RATE_NAME).read_text(encoding="utf-8")
+            staging.joinpath(PROGRESS_NAME).write_bytes(b"50")
+            staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        # 25 Mbps out of a 100 Mbps cluster cap.
+        await self.collect(
+            api, staging=staging, bps=3_125_000.0, cluster_bps=12_500_000.0,
+        )
+        self.assertEqual(captured["initial"], repr(3_125_000.0))
+        self.assertAlmostEqual(captured["factor"], 0.25)
+        # Cleanup unregisters the pull like before.
+        self.assertNotIn(os.path.join(str(staging), RATE_NAME), tip._ACTIVE_RATE_FILES)
+
+    async def test_insecure_registry_stays_capped_with_verification_off(self):
+        # insecure-registries is transport trust, not locality: the capped
+        # flow keeps the pull and mirrors the daemon's TLS behavior instead
+        # of falling back to the unthrottled daemon pull.
+        api = FakeDockerApi(registry_config={
+            "InsecureRegistryCIDRs": ["10.0.0.0/8", "reg.corp"],
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        await self.collect(api, image="10.1.2.3:5000/team/img:1", staging=staging)
+        self.assertIsNotNone(api.loaded)
+        copy = next(
+            c for c in api.created if list(c.get("command") or [])[:1] == ["copy"]
+        )
+        self.assertIn("--src-tls-verify=false", copy["command"])
+        inspect = next(
+            c for c in api.created
+            if list(c.get("command") or [])[:1] == ["inspect"]
+        )
+        self.assertIn("--tls-verify=false", inspect["command"])
+
+    async def test_secure_pull_still_verifies_tls(self):
+        api = FakeDockerApi(registry_config={
+            "InsecureRegistryCIDRs": ["10.0.0.0/8"],
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        await self.collect(api, image="ghcr.io/org/model:1", staging=staging)
+        copy = next(
+            c for c in api.created if list(c.get("command") or [])[:1] == ["copy"]
+        )
+        self.assertIn("--src-tls-verify=true", copy["command"])
+
+    async def test_daemon_registry_mirrors_are_replayed_into_the_helpers(self):
+        # Isolated skopeo ignores dockerd's registry-mirrors: without the
+        # drop-in a mirror-only LAN fails the capped pull entirely, and
+        # elsewhere the internal pull-through cache is silently skipped.
+        api = FakeDockerApi(registry_config={
+            "Mirrors": ["https://mirror.corp:5443/"],
+        })
+        staging = Path(tempfile.mkdtemp())
+        mirror_dir = Path(tempfile.mkdtemp())
+        captured = {}
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                # The drop-in is removed with staging after the flow.
+                captured["conf"] = (
+                    mirror_dir / "sparkdeck.conf"
+                ).read_text(encoding="utf-8")
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        await self.collect(
+            api, image="nginx", staging=staging, mirror_dir=mirror_dir,
+        )
+        conf = captured["conf"]
+        self.assertIn('prefix = "docker.io"', conf)
+        self.assertIn('location = "mirror.corp:5443"', conf)
+        copy = next(
+            c for c in api.created if list(c.get("command") or [])[:1] == ["copy"]
+        )
+        self.assertIn(
+            f"{mirror_dir}:/etc/containers/registries.conf.d:ro,z",
+            copy["host_config"]["Binds"],
+        )
+        # The preflight inspect must see the mirrors too, or it inspects the
+        # Hub directly while the copy goes through the mirror.
+        inspect = next(
+            c for c in api.created
+            if list(c.get("command") or [])[:1] == ["inspect"]
+        )
+        self.assertTrue(
+            any(
+                str(bind).endswith(":/etc/containers/registries.conf.d:ro,z")
+                for bind in inspect["host_config"]["Binds"]
+            ),
+            inspect["host_config"]["Binds"],
+        )
+
+    async def test_registry_mirrors_are_not_invented_for_foreign_registries(self):
+        # registry-mirrors applies to Docker Hub only; a ghcr pull must not
+        # even allocate the drop-in directory.
+        api = FakeDockerApi(registry_config={
+            "Mirrors": ["https://mirror.corp/"],
+        })
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        await self.collect(api, image="ghcr.io/org/model:1", staging=staging)
+        self.assertIsNotNone(api.loaded)
+
     async def test_persistent_copy_inspect_failure_aborts_the_wait(self):
         # A copy container removed externally must end the poll loop: it
         # holds the node and cluster download budgets, so spinning on a
@@ -628,20 +769,35 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             key = os.path.join(directory, RATE_NAME)
             with open(key, "w", encoding="utf-8") as handle:
                 handle.write("1000.0")
-            tip._ACTIVE_RATE_FILES.add(key)
+            tip._ACTIVE_RATE_FILES[key] = 1.0
             try:
                 tip.apply_bandwidth_cap(500_000.0)
             finally:
-                tip._ACTIVE_RATE_FILES.discard(key)
+                tip._ACTIVE_RATE_FILES.pop(key, None)
             with open(key, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "500000.0")
             # The atomic replace leaves no temp file behind.
             self.assertFalse(os.path.exists(key + ".tmp"))
 
+    def test_apply_bandwidth_cap_scales_registered_rate_by_share(self):
+        # A fan-out member registered its share (cap/4); the new CLUSTER cap
+        # must land at one quarter per member, not the full value.
+        with tempfile.TemporaryDirectory() as directory:
+            key = os.path.join(directory, RATE_NAME)
+            with open(key, "w", encoding="utf-8") as handle:
+                handle.write("12500000.0")
+            tip._ACTIVE_RATE_FILES[key] = 0.25
+            try:
+                tip.apply_bandwidth_cap(40_000_000.0)
+            finally:
+                tip._ACTIVE_RATE_FILES.pop(key, None)
+            with open(key, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "10000000.0")
+
     def test_apply_bandwidth_cap_survives_a_vanished_file(self):
-        tip._ACTIVE_RATE_FILES.add(
-            os.path.join(tempfile.gettempdir(), "sparkdeck-no-such-dir", RATE_NAME),
-        )
+        tip._ACTIVE_RATE_FILES[
+            os.path.join(tempfile.gettempdir(), "sparkdeck-no-such-dir", RATE_NAME)
+        ] = 1.0
         tip.apply_bandwidth_cap(10.0)  # must not raise
 
     async def test_helper_bootstrap_is_surfaced_as_uncapped_one_time_pull(self):
@@ -1034,6 +1190,77 @@ class LimiterProxyTests(unittest.TestCase):
             self.assertIn(b"200", response.split(b"\r\n", 1)[0])
             client.sendall(b"ping-path")
             self.assertEqual(client.recv(64), b"ping-path")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+            upstream.close()
+
+    def test_no_proxy_cidr_entry_matches_the_target_ip(self):
+        # NO_PROXY entries commonly name a subnet (127.0.0.0/8, 10.0.0.0/8).
+        # The hostname suffix rules cannot see networks, so the CIDR must be
+        # parsed and matched by containment; a hit dials the target directly
+        # (still capped), never chains through the excluded upstream.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            # A dead upstream: if the CIDR entry fails to match, the proxy
+            # chains there and the CONNECT cannot succeed.
+            "SPARKDECK_UPSTREAM_PROXY": f"http://127.0.0.1:{self.free_port()}",
+            "NO_PROXY": "127.0.0.0/8, example.internal",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-cidr")
+            self.assertEqual(client.recv(64), b"ping-cidr")
+            client.close()
+        finally:
+            process.kill()
+            listener.close()
+
+    def test_no_proxy_cidr_miss_still_chains_through_upstream(self):
+        # Containment, not resemblance: 127.0.0.1 is outside 10.0.0.0/8, so
+        # the corporate upstream must still serve the CONNECT.
+        listener, echo_port = self.echo_server("127.0.0.1")
+        upstream = socket.socket()
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(8)
+        upstream_port = upstream.getsockname()[1]
+
+        def upstream_serve():
+            connection, _ = upstream.accept()
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            target = socket.create_connection(("127.0.0.1", echo_port), 5)
+            def pipe(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+            threading.Thread(target=pipe, args=(connection, target), daemon=True).start()
+            pipe(target, connection)
+
+        threading.Thread(target=upstream_serve, daemon=True).start()
+        proxy_port = self.free_port()
+        process = self.start_proxy(proxy_port, {
+            "SPARKDECK_UPSTREAM_PROXY": f"http://127.0.0.1:{upstream_port}",
+            "NO_PROXY": "10.0.0.0/8",
+        })
+        try:
+            client, response = self.connect(proxy_port, f"127.0.0.1:{echo_port}")
+            self.assertIn(b"200", response.split(b"\r\n", 1)[0])
+            client.sendall(b"ping-miss")
+            self.assertEqual(client.recv(64), b"ping-miss")
             client.close()
         finally:
             process.kill()

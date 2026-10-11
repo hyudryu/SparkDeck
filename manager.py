@@ -12268,9 +12268,7 @@ class Manager:
                 # rate file) and push the new cap to agents so their own
                 # in-flight transfers re-rate as well.
                 self.apply_bandwidth_cap_live(new_bandwidth_mbps)
-                self._bandwidth_notify_task = asyncio.create_task(
-                    self._notify_agents_bandwidth_cap(new_bandwidth_mbps),
-                )
+                self._schedule_agents_bandwidth_notify(new_bandwidth_mbps)
                 if old_bandwidth_mbps <= 0 < new_bandwidth_mbps:
                     # A transfer that started unlimited cannot adopt the cap
                     # mid-run (its worker chose Xet and skipped the socket
@@ -20033,6 +20031,34 @@ class Manager:
             except Exception:
                 pass
 
+    def _schedule_agents_bandwidth_notify(self, bandwidth_mbps: float) -> None:
+        """Queue a cap broadcast, coalescing rapid successive saves.
+
+        Two settings saves in quick succession must not race as two
+        independent notification tasks: whichever finished last could be
+        the OLDER value, leaving every agent parked at a stale cap. The
+        newest value is stashed in a pending slot and a single delivery
+        loop owns the wire: it sends whatever is pending, and if a newer
+        save landed while it was sending, it re-reads the slot and sends
+        again. Broadcasts therefore reach agents in save order, last one
+        always winning.
+        """
+        self._bandwidth_notify_pending = float(bandwidth_mbps)
+        task = getattr(self, "_bandwidth_notify_task", None)
+        if task is not None and not task.done():
+            return
+        self._bandwidth_notify_task = asyncio.create_task(
+            self._notify_agents_bandwidth_loop(),
+        )
+
+    async def _notify_agents_bandwidth_loop(self) -> None:
+        while True:
+            value = getattr(self, "_bandwidth_notify_pending", None)
+            if value is None:
+                return
+            self._bandwidth_notify_pending = None
+            await self._notify_agents_bandwidth_cap(value)
+
     async def pull_image_stream(
         self, image: str, bandwidth_mbps: float | None = None,
     ):
@@ -20045,31 +20071,37 @@ class Manager:
         # NO_PROXY is NOT exempted here: it is proxy policy, not an uplink
         # exemption, and the daemon path it would fall to is unthrottled.
         # The limiter dials NO_PROXY hosts directly instead (forwarded to
-        # the helper below). Only genuinely off-uplink registries — loopback
-        # and daemon-trusted insecure ones — keep the daemon path.
-        if (
-            bytes_per_second > 0
-            and not is_loopback_registry_image(image)
-            and not await self._registry_is_insecure(image)
-        ):
+        # the helper below). An insecure-registries entry is not an
+        # exemption either: it sets transport TRUST (plain HTTP / unverified
+        # TLS), not locality, so the helper keeps the pull and turns its own
+        # TLS verification off for exactly that registry. Only loopback
+        # registries are provably off the uplink and keep the daemon path.
+        if bytes_per_second > 0 and not is_loopback_registry_image(image):
             # The daemon does registry I/O outside this process, so a capped
             # pull runs through the throttled helper instead (see
             # sparkdeck.throttled_image_pull) and feeds the same SSE contract.
+            # The cluster-wide cap rides along so a live settings change
+            # re-rates this pull by its allocated share: a fan-out of N
+            # members pulling at cap/N must re-rate to new_cap/N each, not
+            # to new_cap per member.
             # The node-wide transfer lock stops a concurrent Hub download
             # from doubling this node's internet rate. async with keeps the
             # release owned: a request cancelled while queued to acquire
             # never frees the holder's lock.
+            cluster_bytes_per_second = self._image_pull_bytes_per_second(None)
             lock = getattr(self, "internet_transfer_lock", None)
             try:
                 if lock is None:
                     async for event in throttled_image_pull_events(
                         self.client, image, bytes_per_second,
+                        cluster_bytes_per_second=cluster_bytes_per_second,
                     ):
                         yield f"data: {json.dumps(event)}\n\n"
                 else:
                     async with lock:
                         async for event in throttled_image_pull_events(
                             self.client, image, bytes_per_second,
+                            cluster_bytes_per_second=cluster_bytes_per_second,
                         ):
                             yield f"data: {json.dumps(event)}\n\n"
             except Exception as e:
@@ -20156,27 +20188,6 @@ class Manager:
         if isinstance(share, bool) or not isinstance(share, (int, float)):
             return None
         return float(share)
-
-    async def _registry_is_insecure(self, image: str) -> bool:
-        """True when the Docker daemon trusts this image's registry
-        without a publicly verifiable certificate (``insecure-registries``
-        or a locally installed CA recorded in the daemon's registry
-        config).
-
-        The capped helper runs skopeo in an isolated container without the
-        daemon's trust configuration, so such registries must keep using the
-        daemon pull instead of failing TLS verification.
-        """
-        from sparkdeck.throttled_image_pull import matches_insecure_registry
-        try:
-            info = await asyncio.to_thread(self.client.api.info)
-            registry_config = (info or {}).get("RegistryConfig") or {}
-            insecure = registry_config.get("InsecureRegistryCIDRs") or []
-            return bool(insecure) and matches_insecure_registry(
-                image, [str(entry) for entry in insecure],
-            )
-        except Exception:
-            return False
 
     async def _ensure_runtime_image(
         self, image: str, name: str | None = None, model: str | None = None,

@@ -59,25 +59,32 @@ PROGRESS_NAME = "proxy_bytes"
 # when the bandwidth setting changes mid-pull.
 RATE_NAME = "rate.txt"
 
-# Rate files of the capped pulls running in this process; a settings change
-# rewrites them so transfers in flight re-rate. Plain strings, not Path
-# objects: staging paths are built under the caller's os.name (the uid
-# handling patches it to exercise the Linux paths), and cleanup runs in an
-# executor thread where a captured PosixPath could no longer be combined.
-# Iterated and mutated only from the owning event loop plus the settings
-# handler, both under the GIL.
-_ACTIVE_RATE_FILES: set[str] = set()
+# Rate files of the capped pulls running in this process, mapped to the
+# SHARE of the cluster budget each pull was dispatched with (1.0 for a
+# single transfer; a multi-node fan-out gets cap/width per member). A
+# settings change rewrites each file at new_cluster_cap * factor, so a
+# fan-out of N members re-rates to N * new_cluster_cap/N = new_cluster_cap
+# in aggregate instead of N times the full cluster value. Plain strings,
+# not Path objects: staging paths are built under the caller's os.name
+# (the uid handling patches it to exercise the Linux paths), and cleanup
+# runs in an executor thread where a captured PosixPath could no longer be
+# combined. Iterated and mutated only from the owning event loop plus the
+# settings handler, both under the GIL.
+_ACTIVE_RATE_FILES: dict[str, float] = {}
 
 
 def apply_bandwidth_cap(bytes_per_second: float) -> None:
-    """Re-rate the capped image pulls currently running in this process.
+    """Re-rate the capped image pulls running in this process.
 
+    The value is the NEW CLUSTER cap in bytes per second; each active pull
+    takes its allocated share of it (factor 1.0 for single transfers).
     Pulls that started unlimited used the plain daemon-side pull, which no
     user-space limiter can touch; the newly enabled cap applies to them
     nothing and to every subsequent transfer entirely.
     """
-    value = repr(float(bytes_per_second))
-    for path in list(_ACTIVE_RATE_FILES):
+    cluster = float(bytes_per_second)
+    for path, factor in list(_ACTIVE_RATE_FILES.items()):
+        value = repr(cluster * float(factor))
         try:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
@@ -91,7 +98,7 @@ def apply_bandwidth_cap(bytes_per_second: float) -> None:
 # importable. Only the download direction (registry → client) is charged,
 # and the running total is reported for progress.
 _PROXY_SCRIPT = """
-import base64, os, socket, ssl, threading, time
+import base64, ipaddress, os, socket, ssl, threading, time
 from urllib.parse import unquote, urlparse
 
 RATE = float(os.environ["SPARKDECK_DOWNLOAD_BPS"])
@@ -208,6 +215,7 @@ def no_proxy_direct(authority):
     if not NO_PROXY:
         return False
     host = split_authority(authority)[0].strip().lower().rstrip(".")
+    host_ip = None
     for raw in NO_PROXY.replace(",", " ").split():
         entry = (
             raw.strip().removeprefix("http://").removeprefix("https://")
@@ -216,6 +224,23 @@ def no_proxy_direct(authority):
         if entry == "*":
             return True
         entry = split_authority(entry)[0].strip().lower().lstrip(".").rstrip(".")
+        if "/" in entry:
+            # A CIDR entry matches by subnet containment only. Suffix logic
+            # cannot see a network ("10.0.0.0/8" matches 10.1.2.3, not any
+            # "*.10.0.0.0/8" host), and a hostname never carries a slash, so
+            # skipping the suffix branch for CIDR spelling is deliberate.
+            if host_ip is None:
+                try:
+                    host_ip = ipaddress.ip_address(host)
+                except ValueError:
+                    continue
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                continue
+            if host_ip.version == network.version and host_ip in network:
+                return True
+            continue
         if entry and (host == entry or host.endswith("." + entry)):
             return True
     return False
@@ -369,9 +394,11 @@ def matches_insecure_registry(image: str, insecure: list[str]) -> bool:
     """True when the image's registry matches a daemon insecure entry.
 
     Docker's ``InsecureRegistryCIDRs`` mixes CIDR networks with plain
-    ``host[:port]`` entries; a hit means only the daemon (which holds the
-    trust configuration and locally installed CA) can reach the registry,
-    so the capped helper must not take over the pull.
+    ``host[:port]`` entries. A hit is a TRANSPORT TRUST setting (talk to
+    this registry without TLS), not a statement about uplink locality, so
+    the capped helper keeps the pull and mirrors the setting by turning
+    TLS verification off; only loopback registries are provably off the
+    uplink and exempt from throttling.
     """
     head = registry_head(image)
     if not head:
@@ -429,9 +456,17 @@ def staging_parent() -> str | None:
 
 def skopeo_copy_args(
     source_ref: str, archive_ref: str, arch: str, *, has_authfile: bool,
+    tls_verify: bool = True,
 ) -> list[str]:
-    """Build skopeo argv (without the entrypoint) for one capped copy."""
-    args = ["copy", "--src-tls-verify=true", "--override-os", "linux"]
+    """Build skopeo argv (without the entrypoint) for one capped copy.
+
+    ``tls_verify`` follows the daemon's insecure-registries policy for this
+    registry: an insecure designation is transport trust, not an uplink
+    exemption, so the capped path mirrors the daemon instead of falling
+    back to the unthrottled ``docker pull``.
+    """
+    verify = "true" if tls_verify else "false"
+    args = ["copy", "--src-tls-verify=" + verify, "--override-os", "linux"]
     if arch:
         args += ["--override-arch", arch]
     if has_authfile:
@@ -502,6 +537,37 @@ def registry_ca_binds(
                 continue
             return [f"{certs_staging}:{CONTAINERS_CERTS_D}:ro,z"]
     return []
+
+
+_DOCKER_HUB_HOSTS = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+
+
+def registry_mirrors_config(daemon_info: dict, registry_host: str) -> str:
+    """Registries.conf.d drop-in text replaying the daemon's Hub mirrors.
+
+    An isolated skopeo helper talks to the upstream registry directly and
+    ignores dockerd's ``registry-mirrors``. On a mirror-only LAN that is a
+    hard failure, and elsewhere it silently skips the internal pull-through
+    cache the daemon would have used, so the daemon's Hub mirrors are
+    re-expressed in the containers/image syntax the helper reads. Returns
+    "" when no mirrors apply (not a Hub pull, or the daemon has none).
+    """
+    if str(registry_host or "").strip().lower() not in _DOCKER_HUB_HOSTS:
+        return ""
+    registry_config = (daemon_info or {}).get("RegistryConfig") or {}
+    lines = ['[[registry]]', 'prefix = "docker.io"', 'location = "docker.io"', ""]
+    for mirror in registry_config.get("Mirrors") or []:
+        value = str(mirror or "").strip().lower()
+        for scheme in ("https://", "http://"):
+            if value.startswith(scheme):
+                value = value[len(scheme):]
+        value = value.rstrip("/")
+        if not value:
+            continue
+        lines += ["[[registry.mirror]]", 'location = "' + value + '"', ""]
+    if len(lines) == 4:
+        return ""
+    return "\n".join(lines)
 
 
 def _registry_aliases(registry_host: str) -> list[str]:
@@ -626,14 +692,21 @@ def _preflight_binds(copy_binds: list[str]) -> list[str]:
         bind for bind in copy_binds
         # Match the certs.d target at either spelling: the current
         # parent-mount bind (``...:/etc/containers/certs.d:ro,z``) and the
-        # per-registry directory bind skopeo also honors.
-        if ":/auth/config.json" in bind or f":{CONTAINERS_CERTS_D}" in bind
+        # per-registry directory bind skopeo also honors. The
+        # registries.conf.d drop-ins (Hub mirrors) are needed too: without
+        # them the preflight inspects the Hub directly while the copy would
+        # go through the mirror, disagreeing on reachability.
+        if (
+            ":/auth/config.json" in bind
+            or f":{CONTAINERS_CERTS_D}" in bind
+            or ":/etc/containers/registries.conf.d" in bind
+        )
     ]
 
 
 async def _image_total_bytes(
     client: Any, network_id: str, proxy_url: str, source_ref: str,
-    arch: str, copy_binds: list[str],
+    arch: str, copy_binds: list[str], tls_verify: bool = True,
 ) -> int:
     """Fetch the image's compressed size via a ``skopeo inspect`` preflight.
 
@@ -646,7 +719,7 @@ async def _image_total_bytes(
     failure path returns 0 (unknown size) and lets the copy itself surface
     real errors.
     """
-    command = ["inspect", "--tls-verify=true"]
+    command = ["inspect", "--tls-verify=" + ("true" if tls_verify else "false")]
     if arch:
         command += ["--override-os", "linux", "--override-arch", arch]
     has_authfile = any(":/auth/config.json:ro" in b for b in copy_binds)
@@ -748,13 +821,30 @@ def staging_capacity_error(staging: Path, total_bytes: int) -> str | None:
 
 async def throttled_image_pull_events(
     client: Any, image: str, bytes_per_second: float,
+    cluster_bytes_per_second: float | None = None,
 ) -> AsyncIterator[dict]:
     """Yield docker-pull-shaped progress dicts for one bandwidth-capped pull.
+
+    ``bytes_per_second`` is this pull's allocated rate. A cluster fan-out
+    divides the settings cap across members, so it also passes the FULL
+    cluster cap: a live re-rate then scales each member by its share
+    (allocated/cluster) instead of writing the whole new cluster value to
+    every member, which would multiply the aggregate by the member count.
+    Without it (or 0) the pull is the only holder of the budget (factor 1).
 
     Raises nothing: a failure is emitted as ``{"error": ...}``, matching the
     event stream contract of ``manager.pull_image_stream``.
     """
     loop = asyncio.get_running_loop()
+    share_factor = 1.0
+    try:
+        cluster_bps = float(cluster_bytes_per_second or 0)
+    except (TypeError, ValueError):
+        cluster_bps = 0.0
+    if cluster_bps > 0 and float(bytes_per_second) > 0:
+        share_factor = max(
+            min(float(bytes_per_second) / cluster_bps, 1.0), 1e-9,
+        )
     try:
         source_ref, repo_tag = normalize_image_reference(image)
     except ThrottledPullError as exc:
@@ -768,6 +858,7 @@ async def throttled_image_pull_events(
     copy_container: str | None = None
     auth_dir: Path | None = None
     ca_dir: Path | None = None
+    mirror_dir: Path | None = None
     staging = Path(tempfile.mkdtemp(
         prefix="sparkdeck-pull-", dir=staging_parent(),
     ))
@@ -775,6 +866,17 @@ async def throttled_image_pull_events(
         yield {"status": f"Preparing bandwidth-limited pull of {image}"}
         version = await _run_docker(client, "version")
         arch = str((version or {}).get("Arch") or "")
+        # One info call drives the whole transport picture: rootless/userns
+        # uid handling (below), the daemon's insecure-registries trust
+        # setting, and its Hub registry-mirrors — the isolated helper
+        # containers must reproduce all three or the capped path diverges
+        # from the daemon's.
+        daemon_info: dict = {}
+        try:
+            daemon_info = (await _run_docker(client, "info")) or {}
+        except Exception:
+            daemon_info = {}
+        registry_config = daemon_info.get("RegistryConfig") or {}
         for helper in (PROXY_IMAGE, SKOPEO_IMAGE):
             try:
                 await _run_docker(client, "inspect_image", helper)
@@ -793,6 +895,13 @@ async def throttled_image_pull_events(
         )
         network_id = str(network["Id"])
         registry_host = source_ref.removeprefix("docker://").partition("/")[0]
+        # An insecure-registries designation is transport trust, not uplink
+        # locality, so this registry stays inside the limiter; the helpers
+        # simply skip TLS verification exactly like the daemon would.
+        tls_verify = not matches_insecure_registry(
+            image,
+            [str(e) for e in (registry_config.get("InsecureRegistryCIDRs") or [])],
+        )
         # Same candidate order as docker-py: $DOCKER_CONFIG first, then the
         # root and user home defaults the SDK falls back to.
         docker_config_dir = os.environ.get("DOCKER_CONFIG") or ""
@@ -841,14 +950,29 @@ async def throttled_image_pull_events(
         # copy target keeps the colon-named registry key OFF the bind spec.
         ca_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-cas-"))
         copy_binds += registry_ca_binds(registry_host, ca_dir)
+        # An isolated skopeo ignores dockerd's registry-mirrors: on a
+        # mirror-only LAN that is a hard failure, and elsewhere it skips the
+        # internal pull-through cache. Replay the daemon's Hub mirrors as a
+        # registries.conf.d drop-in; the parent-mount bind stays colon-free.
+        mirror_text = registry_mirrors_config(daemon_info, registry_host)
+        if mirror_text:
+            mirror_dir = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-mir-"))
+            (mirror_dir / "sparkdeck.conf").write_text(
+                mirror_text, encoding="utf-8",
+            )
+            copy_binds.append(
+                f"{mirror_dir}:/etc/containers/registries.conf.d:ro,z",
+            )
         # The proxy re-reads this file (at /archive/rate.txt) while it runs,
-        # so a settings change re-rates the pull already in flight. Plain
-        # string path: staging may be a PosixPath-shaped object when the
-        # flow emulates a Linux host, and string joins stay valid anywhere.
+        # so a settings change re-rates the pull already in flight — at its
+        # share of the cluster cap, recorded as the registration factor.
+        # Plain string path: staging may be a PosixPath-shaped object when
+        # the flow emulates a Linux host, and string joins stay valid
+        # anywhere.
         rate_path = os.path.join(str(staging), RATE_NAME)
         with open(rate_path, "w", encoding="utf-8") as handle:
             handle.write(repr(float(bytes_per_second)))
-        _ACTIVE_RATE_FILES.add(rate_path)
+        _ACTIVE_RATE_FILES[rate_path] = share_factor
         proxy_environment = {
             "SPARKDECK_DOWNLOAD_BPS": repr(float(bytes_per_second)),
             "SPARKDECK_BANDWIDTH_RATE_FILE": f"/archive/{RATE_NAME}",
@@ -902,7 +1026,7 @@ async def throttled_image_pull_events(
         # the staging filesystem, then capacity-check before bytes move.
         total_bytes = await _image_total_bytes(
             client, network_id, f"http://{proxy_name}:{_PROXY_PORT}",
-            source_ref, arch, copy_binds,
+            source_ref, arch, copy_binds, tls_verify=tls_verify,
         )
         capacity = staging_capacity_error(staging, total_bytes)
         if capacity:
@@ -915,12 +1039,7 @@ async def throttled_image_pull_events(
             # while an explicit host UID maps to an unprivileged subuid that
             # cannot write the 0700 staging directory or read the 0600 auth
             # file; there the override must be omitted.
-            try:
-                security = (await _run_docker(client, "info") or {}).get(
-                    "SecurityOptions",
-                ) or []
-            except Exception:
-                security = []
+            security = daemon_info.get("SecurityOptions") or []
             options = [str(item) for item in security]
             # Daemon.Info reports remapping as the literal SecurityOptions
             # entries "name=rootless" and "name=name=userns" (the doubled
@@ -948,7 +1067,7 @@ async def throttled_image_pull_events(
             command=skopeo_copy_args(
                 source_ref,
                 f"docker-archive:/archive/image.tar:{repo_tag}",
-                arch, has_authfile=has_authfile,
+                arch, has_authfile=has_authfile, tls_verify=tls_verify,
             ),
             environment={
                 "HTTPS_PROXY": f"http://{proxy_name}:{_PROXY_PORT}",
@@ -1077,11 +1196,13 @@ async def throttled_image_pull_events(
                 pass
 
         def cleanup_staging() -> None:
-            _ACTIVE_RATE_FILES.discard(os.path.join(str(staging), RATE_NAME))
+            _ACTIVE_RATE_FILES.pop(os.path.join(str(staging), RATE_NAME), None)
             shutil.rmtree(staging, ignore_errors=True)
             if auth_dir is not None:
                 shutil.rmtree(auth_dir, ignore_errors=True)
             if ca_dir is not None:
                 shutil.rmtree(ca_dir, ignore_errors=True)
+            if mirror_dir is not None:
+                shutil.rmtree(mirror_dir, ignore_errors=True)
 
         await loop.run_in_executor(None, cleanup_staging)

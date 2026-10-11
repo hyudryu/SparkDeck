@@ -96,7 +96,7 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m = bare_manager(100.0)
         held = []
 
-        async def fake_events(client, image, bps):
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
             held.append(m.internet_transfer_lock.locked())
             self.assertIs(client, m.client)
             self.assertEqual(image, "ghcr.io/org/model:1")
@@ -115,7 +115,7 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_helper_failure_still_releases_the_lock(self):
         m = bare_manager(100.0)
 
-        async def exploding_events(client, image, bps):
+        async def exploding_events(client, image, bps, cluster_bytes_per_second=None):
             raise RuntimeError("registry unreachable")
             yield  # pragma: no cover — makes this an async generator
 
@@ -141,15 +141,45 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m.client.api.pull.assert_called_once()
         self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
 
-    async def test_daemon_insecure_registry_uses_the_daemon(self):
+    async def test_daemon_insecure_registry_stays_behind_the_helper(self):
+        # An insecure-registries entry is transport trust, not uplink
+        # locality: falling back to the unthrottled daemon would exempt every
+        # pull from a private registry from the cap. The helper keeps the
+        # pull and turns its own TLS verification off (asserted in
+        # test_throttled_image_pull flow tests).
         m = bare_manager(100.0)
         m.client.api.info.return_value = {"RegistryConfig": {
             "InsecureRegistryCIDRs": ["10.0.0.0/8"],
         }}
-        m.client.api.pull.return_value = [{"status": "ok"}]
-        chunks = await self.collect(m, "10.1.2.3:5000/team/img:1")
-        m.client.api.pull.assert_called_once()
-        self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
+        used = []
+
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
+            used.append(image)
+            yield {"status": "ok"}
+
+        with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
+                   fake_events):
+            await self.collect(m, "10.1.2.3:5000/team/img:1")
+        self.assertEqual(used, ["10.1.2.3:5000/team/img:1"])
+        m.client.api.pull.assert_not_called()
+
+    async def test_fanout_member_stream_forwards_the_cluster_reference(self):
+        # A member dispatched cap/4 must re-rate to new_cap/4 on a settings
+        # change: the stream hands the helper the allocated rate AND the full
+        # cluster cap so the share factor is exact.
+        m = bare_manager(100.0)
+        seen = {}
+
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
+            seen["bps"] = bps
+            seen["cluster"] = cluster_bytes_per_second
+            yield {"status": "ok"}
+
+        with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
+                   fake_events):
+            await self.collect(m, "ghcr.io/org/model:1", bandwidth_mbps=25.0)
+        self.assertEqual(seen["bps"], 3_125_000.0)       # 25 Mbps share
+        self.assertEqual(seen["cluster"], 12_500_000.0)  # 100 Mbps cap
 
     async def test_no_proxy_registries_stay_behind_the_capped_helper(self):
         # NO_PROXY is proxy policy, not an uplink exemption: exempting its
@@ -159,7 +189,7 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m = bare_manager(100.0)
         used = []
 
-        async def fake_events(client, image, bps):
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
             used.append(image)
             yield {"status": "Downloading"}
 
@@ -176,7 +206,7 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m.client.api.info.side_effect = RuntimeError("daemon unreachable")
         used = []
 
-        async def fake_events(client, image, bps):
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
             used.append(image)
             yield {"status": "Downloading"}
 
@@ -194,7 +224,7 @@ class PullImageStreamLockTests(unittest.IsolatedAsyncioTestCase):
         m = bare_manager(100.0)
         await m.internet_transfer_lock.acquire()  # an active transfer
 
-        async def fake_events(client, image, bps):
+        async def fake_events(client, image, bps, cluster_bytes_per_second=None):
             yield {"status": "x"}
 
         with patch("sparkdeck.throttled_image_pull.throttled_image_pull_events",
@@ -907,6 +937,31 @@ class BandwidthSettingsLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             args.kwargs["json_body"], {"max_download_bandwidth_mbps": 50.0},
         )
+
+    async def test_rapid_saves_serialize_agent_broadcasts_last_wins(self):
+        # Two quick saves must not race as two independent broadcast tasks
+        # where the OLDER value could land on the agents last: the newest
+        # value is parked in a pending slot and a single delivery loop owns
+        # the wire, so broadcasts arrive in save order.
+        m = self.fixture(0.0)
+        m.apply_bandwidth_cap_live = Mock()
+        calls = []
+        gate = asyncio.Event()
+
+        async def slow_notify(value):
+            calls.append(value)
+            await gate.wait()
+
+        m._notify_agents_bandwidth_cap = slow_notify
+        await m.update_settings({"max_download_bandwidth_mbps": 50})
+        first_task = m._bandwidth_notify_task
+        await asyncio.sleep(0)  # let the loop deliver 50 and block
+        await m.update_settings({"max_download_bandwidth_mbps": 60})
+        # The second save must reuse the running loop, not race alongside.
+        self.assertIs(m._bandwidth_notify_task, first_task)
+        gate.set()
+        await first_task
+        self.assertEqual(calls, [50.0, 60.0])
 
     async def test_enabling_cap_notes_uncapped_in_flight_transfers(self):
         m = self.fixture(0.0)

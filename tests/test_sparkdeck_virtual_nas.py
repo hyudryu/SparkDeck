@@ -5279,6 +5279,51 @@ class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
             nas._release_download_rate_file("op-1")
             self.assertFalse(rate_file.exists())
 
+    def test_member_share_rerates_by_its_share_of_the_new_cap(self):
+        # A dispatched member share must re-rate as share * new_cluster_cap,
+        # never the full new cluster value per member (a 4-node fan-out would
+        # otherwise run at 4x the cap after one settings change).
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True)
+            # Worker at 50 Mbps out of a 200 Mbps cluster cap = factor 0.25.
+            rate_file = nas._register_download_rate_file(
+                "op-1", 6_250_000.0, cluster_bytes_per_second=25_000_000.0,
+            )
+            self.assertIsNotNone(rate_file)
+            nas.apply_download_bandwidth_cap(50_000_000.0)  # cap -> 400 Mbps
+            self.assertEqual(rate_file.read_text(encoding="utf-8"),
+                             "12500000.0")
+            nas._release_download_rate_file("op-1")
+
+    def test_selective_dispatch_records_share_against_node_cap(self):
+        # The selective path registers against the node's own setting (which
+        # the settings route keeps synced with the controller), so a
+        # dispatched half-cap stays a half after the re-rate.
+        with tempfile.TemporaryDirectory() as directory:
+            nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",
+                             Mock(), lambda: True,
+                             download_bandwidth_provider=lambda: 4)
+            captured = {}
+
+            def run_worker(*_args, **kwargs):
+                payload = json.loads(kwargs["input"].decode())
+                # Node cap 4 Mbps = 500000 B/s; this worker was dispatched
+                # with half of it, so a new 8 Mbps cluster cap lands at 500k.
+                nas.apply_download_bandwidth_cap(1_000_000.0)
+                captured["content"] = Path(
+                    payload["rate_file"],
+                ).read_text(encoding="utf-8")
+                return Mock(returncode=0)
+
+            with patch("sparkdeck.virtual_nas.subprocess.run",
+                       side_effect=run_worker):
+                nas._run_selective_download_process(
+                    "org/model", RESOLVED_REVISION, ["a.gguf"],
+                    "tok", 250_000.0,
+                )
+            self.assertEqual(captured["content"], "500000.0")
+
     def test_uncapped_weight_start_has_no_rate_file(self):
         with tempfile.TemporaryDirectory() as directory:
             nas = VirtualNAS(Path(directory), lambda: Path(directory) / "hub",

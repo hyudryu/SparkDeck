@@ -21,15 +21,23 @@ configured credential helper is consulted, and when neither yields a
 credential the copy proceeds anonymously (a global ``credsStore`` says where
 Docker keeps credentials, not that every registry requires them).
 
+The archive is staged on the host filesystem. ``SPARKDECK_IMAGE_STAGING_DIR``
+selects the parent directory (the system temp dir by default), and before any
+bytes move the image's compressed size is fetched with ``skopeo inspect`` so
+the staging filesystem's free space can be checked against it.
+
 When no cap is configured the normal daemon-side ``docker pull`` is used and
-nothing here runs. The first capped pull fetches the two helper images with
-an uncapped daemon pull; they are small and fetched once per node.
+nothing here runs. Loopback registries are never routed through here either
+(see :func:`is_loopback_registry_image`). The first capped pull fetches the
+two helper images with an uncapped daemon pull; they are small and fetched
+once per node.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -185,6 +193,45 @@ def normalize_image_reference(image: str) -> tuple[str, str]:
     return f"docker://{reference}", reference
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "::1", "ip6-localhost", "ip6-loopback"})
+
+
+def is_loopback_registry_image(image: str) -> bool:
+    """True when the reference's registry host is this machine's loopback.
+
+    A local registry is not an internet download, and the capped path runs
+    inside a container network where loopback reaches the container itself,
+    not the host. Callers pull such references with the daemon instead.
+    """
+    reference = str(image or "").strip().removeprefix("docker://")
+    head, slash, _rest = reference.partition("/")
+    if not slash:
+        return False
+    # Hostnames are case-insensitive; qualify against the lowered head.
+    head = head.lower()
+    if not ("." in head or ":" in head or head == "localhost"):
+        return False
+    if "@" in head:  # userinfo is never a registry name worth bypassing for
+        return False
+    if head.startswith("["):
+        host = head[1:].partition("]")[0]
+    else:
+        host = head.partition(":")[0]
+    host = host.rstrip(".").lower()
+    if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def staging_parent() -> str | None:
+    """Parent directory for pull staging; ``SPARKDECK_IMAGE_STAGING_DIR``."""
+    configured = str(os.environ.get("SPARKDECK_IMAGE_STAGING_DIR") or "").strip()
+    return configured or None
+
+
 def skopeo_copy_args(
     source_ref: str, archive_ref: str, arch: str, *, has_authfile: bool,
 ) -> list[str]:
@@ -302,47 +349,91 @@ async def _exec_ok(client: Any, container: str, command: list[str]) -> bool:
     return isinstance(result, dict) and result.get("ExitCode") == 0
 
 
-async def _exec_output(client: Any, container: str, command: list[str]) -> bytes:
-    exec_id = await _run_docker(client, "exec_create", container, cmd=command)
-    output = await _run_docker(client, "exec_start", exec_id["Id"], demux=True)
-    result = await _run_docker(client, "exec_inspect", exec_id["Id"])
-    if not isinstance(result, dict) or result.get("ExitCode") != 0:
-        raise ThrottledPullError(f"'{command[1] if len(command) > 1 else command[0]}' failed")
-    if isinstance(output, tuple):
-        output = output[0] or b""
-    return bytes(output or b"")
-
-
 async def _image_total_bytes(
-    client: Any, container: str, source_ref: str,
-    arch: str, has_authfile: bool,
+    client: Any, network_id: str, source_ref: str,
+    arch: str, copy_binds: list[str],
 ) -> int:
-    """Fetch the image's total size with ``skopeo inspect`` inside ``container``.
+    """Fetch the image's compressed size via a ``skopeo inspect`` preflight.
 
-    Progress totals are a convenience: every failure path here falls back to
-    0 (unknown total) and lets the copy itself surface real errors. The exec
-    races container start-up slightly, so a few retries are allowed.
+    Runs one short-lived skopeo container before the copy starts so the
+    caller can capacity-check the staging filesystem before any bytes move.
+    The progress total and the capacity check are both a convenience: every
+    failure path returns 0 (unknown size) and lets the copy itself surface
+    real errors.
     """
-    command = ["skopeo", "inspect", "--tls-verify=true"]
+    command = ["inspect", "--tls-verify=true"]
     if arch:
         command += ["--override-os", "linux", "--override-arch", arch]
+    has_authfile = any(b.endswith(":/auth/config.json:ro") for b in copy_binds)
     if has_authfile:
         command += ["--authfile", "/auth/config.json"]
     command.append(source_ref)
-    for attempt in range(10):
-        try:
-            output = await _exec_output(client, container, command)
-        except Exception:
-            await asyncio.sleep(0.3 if attempt < 9 else 0.0)
-            continue
-        try:
-            payload = json.loads(output.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
+    container: str | None = None
+    try:
+        created = await _run_docker(
+            client, "create_container",
+            image=SKOPEO_IMAGE,
+            command=command,
+            environment={"HOME": "/tmp"},
+            host_config={
+                "Binds": [b for b in copy_binds if ":/auth/config.json" in b],
+                "NetworkMode": network_id,
+            },
+        )
+        container = created["Id"]
+        await _run_docker(client, "start_container", container)
+        info: dict = {}
+        for _ in range(120):
+            info = await _run_docker(client, "inspect_container", container)
+            if not (info.get("State") or {}).get("Running", False):
+                break
+            await asyncio.sleep(0.5)
+        if (info.get("State") or {}).get("ExitCode") != 0:
             return 0
+        output = await _run_docker(
+            client, "container_logs", container, stdout=True, stderr=False,
+        )
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        payload = json.loads(str(output or ""))
         if isinstance(payload, dict) and isinstance(payload.get("Size"), int):
             return max(0, payload["Size"])
         return 0
+    except Exception:
+        return 0
+    finally:
+        if container is not None:
+            try:
+                await _run_docker(
+                    client, "remove_container", container, v=True, force=True,
+                )
+            except Exception:
+                pass
     return 0
+
+
+def staging_capacity_error(staging: Path, total_bytes: int) -> str | None:
+    """Error text when the staging filesystem cannot hold ``total_bytes``.
+
+    Unknown totals (0) cannot be checked and are let through: the copy then
+    fails on its own if the filesystem actually runs out.
+    """
+    if total_bytes <= 0:
+        return None
+    try:
+        free = shutil.disk_usage(staging).free
+    except OSError:
+        return None
+    required = total_bytes + total_bytes // 8 + 512 * 1024 * 1024
+    if free >= required:
+        return None
+    return (
+        f"the pull staging directory ({staging.parent}) has "
+        f"{free / 1e9:.1f} GB free but this image needs about "
+        f"{total_bytes / 1e9:.1f} GB; set SPARKDECK_IMAGE_STAGING_DIR to a "
+        "larger filesystem, or set the download limit to 0 to pull without "
+        "staging"
+    )
 
 
 async def throttled_image_pull_events(
@@ -366,7 +457,9 @@ async def throttled_image_pull_events(
     proxy_container: str | None = None
     copy_container: str | None = None
     auth_dir: Path | None = None
-    staging = Path(tempfile.mkdtemp(prefix="sparkdeck-pull-"))
+    staging = Path(tempfile.mkdtemp(
+        prefix="sparkdeck-pull-", dir=staging_parent(),
+    ))
     try:
         yield {"status": f"Preparing bandwidth-limited pull of {image}"}
         version = await _run_docker(client, "version")
@@ -440,6 +533,14 @@ async def throttled_image_pull_events(
             await asyncio.sleep(0.5)
         if not proxy_ready:
             raise ThrottledPullError("the bandwidth limiter did not start")
+        # Preflight the compressed size before the archive can start filling
+        # the staging filesystem, then capacity-check before bytes move.
+        total_bytes = await _image_total_bytes(
+            client, network_id, source_ref, arch, copy_binds,
+        )
+        capacity = staging_capacity_error(staging, total_bytes)
+        if capacity:
+            raise ThrottledPullError(capacity)
         user = None if os.name == "nt" else f"{os.getuid()}:{os.getgid()}"
         copy = await _run_docker(
             client, "create_container",
@@ -463,9 +564,6 @@ async def throttled_image_pull_events(
         )
         copy_container = copy["Id"]
         await _run_docker(client, "start_container", copy_container)
-        total_bytes = await _image_total_bytes(
-            client, copy_container, source_ref, arch, has_authfile,
-        )
         progress_path = staging / PROGRESS_NAME
         current = -1
         info: dict = {}
@@ -473,9 +571,15 @@ async def throttled_image_pull_events(
             counter = await asyncio.to_thread(_read_counter, progress_path)
             if counter != current:
                 current = counter
-                detail: dict = {"current": counter}
+                # The total is fixed from the preflight inspect; the counter
+                # is what clamps, since manifest requests make it overshoot.
                 if total_bytes > 0:
-                    detail["total"] = min(counter, total_bytes)
+                    detail = {
+                        "current": min(counter, total_bytes),
+                        "total": total_bytes,
+                    }
+                else:
+                    detail = {"current": counter}
                 yield {
                     "id": repo_tag.rsplit("/", 1)[-1],
                     "status": "Downloading",

@@ -1,7 +1,9 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,11 +16,24 @@ from sparkdeck.throttled_image_pull import (
     _auth_entry,
     _read_counter,
     helper_credentials,
+    is_loopback_registry_image,
     normalize_image_reference,
     select_docker_config,
     skopeo_copy_args,
+    staging_parent,
     throttled_image_pull_events,
 )
+
+_USAGE = namedtuple("usage", "total used free")
+
+
+def copy_kwargs(api):
+    """The real copy container kwargs, not the preflight inspect container."""
+    return next(
+        c for c in api.created
+        if c.get("image") == SKOPEO_IMAGE
+        and list(c.get("command") or [])[:1] == ["copy"]
+    )
 
 
 class NormalizeImageReferenceTests(unittest.TestCase):
@@ -228,8 +243,15 @@ class FakeDockerApi:
     def create_container(self, **kwargs):
         self.created.append(kwargs)
         image = kwargs.get("image")
-        role = "proxy" if image == PROXY_IMAGE else (
-            "copy" if image == SKOPEO_IMAGE else "other")
+        command = [str(part) for part in (kwargs.get("command") or [])]
+        if image == PROXY_IMAGE:
+            role = "proxy"
+        elif image == SKOPEO_IMAGE and command[:1] == ["inspect"]:
+            role = "inspect"
+        elif image == SKOPEO_IMAGE:
+            role = "copy"
+        else:
+            role = "other"
         self._containers[f"{role}-1"] = role
         return {"Id": f"{role}-1"}
 
@@ -255,15 +277,24 @@ class FakeDockerApi:
         return {"ExitCode": 0}
 
     def inspect_container(self, container_id):
-        if self._containers.get(container_id) == "proxy":
+        role = self._containers.get(container_id)
+        if role == "proxy":
             running = not self.proxy_dies
             return {"State": {"Running": running, "ExitCode": 0 if running else 137}}
+        if role == "inspect":
+            # The preflight inspect always finishes on its first poll.
+            return {"State": {"Running": False, "ExitCode": 0}}
         self._copy_polls += 1
         if self._copy_polls < 2:
             return {"State": {"Running": True, "ExitCode": 0}}
         return {"State": {"Running": False, "ExitCode": self.copy_exit}}
 
     def container_logs(self, container_id, stderr=True, stdout=False, tail=12):
+        if (
+            self._containers.get(container_id) == "inspect"
+            and stdout and not stderr
+        ):
+            return json.dumps({"Size": self.inspect_size}).encode()
         return self.stderr_tail
 
     def load_image(self, stream):
@@ -279,7 +310,8 @@ class FakeDockerApi:
 
 class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
     async def collect(self, api, image="nginx", bps=1_000_000.0,
-                      staging=None, authfile=None, auth_dir=None):
+                      staging=None, authfile=None, auth_dir=None,
+                      disk_free=10 ** 15):
         client = Mock()
         client.api = api
         staging = staging or Path(tempfile.mkdtemp())
@@ -290,6 +322,11 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             # machine's own ~/.docker/config.json must not leak in.
             patch.object(tip, "select_docker_config", return_value=authfile),
             patch.object(tip.tempfile, "mkdtemp", side_effect=mkdtemp_values),
+            # Capacity depends on the CI host disk; make it deterministic.
+            patch.object(
+                tip.shutil, "disk_usage",
+                return_value=_USAGE(10 ** 15, 0, disk_free),
+            ),
         ):
             async for event in throttled_image_pull_events(client, image, bps):
                 events.append(event)
@@ -312,12 +349,14 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[0]["status"],
                          "Preparing bandwidth-limited pull of nginx")
+        # The total comes from the preflight inspect (100), fixed for the
+        # whole transfer; the counter is the proxy's capped byte tally.
         self.assertIn({"id": "nginx:latest", "status": "Downloading",
-                       "progressDetail": {"current": 50, "total": 50}}, events)
+                       "progressDetail": {"current": 50, "total": 100}}, events)
         self.assertEqual(events[-1], {"status": "Successfully pulled nginx"})
         self.assertNotIn("error", json.dumps(events))
         self.assertEqual(api.loaded, b"tarbytes")
-        self.assertEqual(sorted(api.removed), ["copy-1", "proxy-1"])
+        self.assertEqual(sorted(api.removed), ["copy-1", "inspect-1", "proxy-1"])
         self.assertEqual(api.removed_networks, ["net-1"])
 
     async def test_progress_without_total_when_inspect_fails(self):
@@ -405,7 +444,7 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
                     staging=staging, authfile=str(config),
                 )
         self.assertEqual(events[-1], {"status": "Successfully pulled nginx"})
-        copy = next(c for c in api.created if c.get("image") == SKOPEO_IMAGE)
+        copy = copy_kwargs(api)
         self.assertFalse(any("auth" in bind for bind in copy["host_config"]["Binds"]))
         self.assertNotIn("--authfile", copy["command"])
 
@@ -442,7 +481,7 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
             base64.b64decode(captured["auth"]["auths"]["docker.io"]["auth"]).decode(),
             "u:s",
         )
-        copy = next(c for c in api.created if c.get("image") == SKOPEO_IMAGE)
+        copy = copy_kwargs(api)
         self.assertTrue(any(bind.endswith(":/auth/config.json:ro")
                             for bind in copy["host_config"]["Binds"]))
         self.assertIn("--authfile", copy["command"])
@@ -451,7 +490,7 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         api = FakeDockerApi()
         await self.collect(api, bps=1_000_000.0)
         proxy = next(c for c in api.created if c.get("image") == PROXY_IMAGE)
-        copy = next(c for c in api.created if c.get("image") == SKOPEO_IMAGE)
+        copy = copy_kwargs(api)
         self.assertEqual(proxy["environment"]["SPARKDECK_DOWNLOAD_BPS"], "1000000.0")
         self.assertEqual(proxy["environment"]["SPARKDECK_BANDWIDTH_PROGRESS"],
                          f"/archive/{PROGRESS_NAME}")
@@ -466,6 +505,69 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
                          copy["host_config"]["Binds"][:1])
         self.assertTrue(any("image.tar:docker.io/library/nginx:latest" in " ".join(c["command"])
                             for c in api.created if c.get("image") == SKOPEO_IMAGE))
+        # The preflight inspect runs on the proxy network too, so its
+        # manifest request never escapes the capped path.
+        inspect_kw = next(
+            c for c in api.created
+            if c.get("image") == SKOPEO_IMAGE
+            and list(c.get("command") or [])[:1] == ["inspect"]
+        )
+        self.assertEqual(inspect_kw["host_config"]["NetworkMode"], "net-1")
+        self.assertEqual(inspect_kw["host_config"]["Binds"], [])
+
+    async def test_staging_capacity_refused_before_bytes_move(self):
+        api = FakeDockerApi(inspect_size=2 * 1024 ** 3)
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        events, _ = await self.collect(
+            api, staging=staging, disk_free=600 * 1024 ** 2,
+        )
+        self.assertIsNone(api.loaded)
+        self.assertIsNone(next(
+            (c for c in api.created
+             if list(c.get("command") or [])[:1] == ["copy"]), None,
+        ))
+        self.assertIn("SPARKDECK_IMAGE_STAGING_DIR", events[-1]["error"])
+        self.assertIn("download limit to 0", events[-1]["error"])
+
+
+class StagingParentTests(unittest.TestCase):
+    def test_env_var_selects_the_parent_directory(self):
+        with patch.dict(os.environ, {"SPARKDECK_IMAGE_STAGING_DIR": "/srv/large"}):
+            self.assertEqual(staging_parent(), "/srv/large")
+
+    def test_unset_env_var_uses_the_default_temp_parent(self):
+        env = {k: v for k, v in os.environ.items()
+               if k != "SPARKDECK_IMAGE_STAGING_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(staging_parent())
+
+
+class LoopbackRegistryTests(unittest.TestCase):
+    def test_host_loopback_registries_are_detected(self):
+        for image in (
+            "localhost:5000/sparkdeck/sglang:latest",
+            "localhost/sparkdeck/sglang",
+            "127.0.0.1:5000/image:tag",
+            "[::1]:5000/image:tag",
+            "registry.localhost/sparkdeck/vllm:latest",
+            "docker.io/library/nginx:latest".replace("docker.io", "LOCALHOST"),
+        ):
+            self.assertTrue(is_loopback_registry_image(image), image)
+
+    def test_remote_and_unqualified_references_are_not_loopback(self):
+        for image in (
+            "nginx", "nginx:latest", "docker.io/library/nginx:latest",
+            "ghcr.io/org/model:1.2", "10.0.0.5:5000/image:tag",
+            "100.64.1.2:5000/image:tag",
+            "docker.io/library/nginx@sha256:" + "a" * 64,
+        ):
+            self.assertFalse(is_loopback_registry_image(image), image)
 
 
 if __name__ == "__main__":

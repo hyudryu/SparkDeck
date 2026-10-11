@@ -55,6 +55,44 @@ def bandwidth_bytes_per_second(megabits_per_second: object) -> float:
     return parse_bandwidth_mbps(megabits_per_second) * _BITS_PER_MEGABIT / 8.0
 
 
+# Ceiling for any derived transfer deadline. Beyond this a stalled peer is
+# indistinguishable from a slow capped pull, so requests stop extending.
+CAPPED_TRANSFER_CEILING_SECONDS = 90 * 24 * 3600.0
+# Allowance used when the byte count of a capped transfer is unknown: sized
+# for the largest container images SparkDeck launches, so the deadline only
+# ever expires after a transfer that could not plausibly finish.
+CAPPED_UNKNOWN_BYTES_ALLOWANCE = 32 * 1024 ** 3
+
+
+def capped_transfer_timeout_seconds(
+    megabits_per_second: object,
+    expected_bytes: object = 0,
+    default: float = 1800.0,
+    floor: float = 1800.0,
+) -> float:
+    """HTTP deadline for a request whose work is bounded by the cap.
+
+    Unlimited requests keep ``default``. Capped requests get a deadline
+    derived from the rate: four times the theoretical transfer time when
+    ``expected_bytes`` is known, otherwise the unknown-bytes allowance. The
+    result is clamped between ``floor`` and the ceiling, so a low cap gets
+    proportionally more runway instead of being killed by a fixed timeout.
+    """
+    try:
+        mbps = parse_bandwidth_mbps(megabits_per_second)
+    except ValueError:
+        return default
+    if mbps <= 0:
+        return default
+    try:
+        expected = int(expected_bytes or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    rate = bandwidth_bytes_per_second(mbps)
+    seconds = (max(expected, 0) * 4 or CAPPED_UNKNOWN_BYTES_ALLOWANCE) / rate
+    return min(CAPPED_TRANSFER_CEILING_SECONDS, max(floor, seconds))
+
+
 class TokenBucket:
     """A thread-safe fixed-rate byte schedule; ``clock`` is injectable for tests."""
 

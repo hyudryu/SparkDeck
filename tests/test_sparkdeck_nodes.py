@@ -47,19 +47,35 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["node_ids"], ["remote-1", "local"])
-        self.manager.pull_image_result.assert_awaited_once_with("ghcr.io/example/vllm:latest")
+        self.manager.pull_image_result.assert_awaited_once_with(
+            "ghcr.io/example/vllm:latest", 0.0,
+        )
         self.manager.node_registry.request.assert_awaited_once_with(
             "remote-1", "POST", "/api/agent/images/pull",
             json_body={
                 "image": "ghcr.io/example/vllm:latest",
                 # 0 is sent explicitly so a controller-side "unlimited"
                 # cannot be overridden by stale node-local settings.
-                "max_download_bandwidth_mbps": 0,
+                "max_download_bandwidth_mbps": 0.0,
             },
             timeout=1800,
         )
         self.assertNotIn("agent_url", result["selected_nodes"][0])
         self.assertNotIn("fabric_ip", result["selected_nodes"][0])
+
+    async def test_capped_pull_fanout_divides_the_cap_across_nodes(self):
+        # Two selected nodes at a 100 Mbps setting each pull at 50 Mbps, and
+        # the capped request timeout is derived from the rate, not fixed.
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        await self.manager.pull_image_on_nodes("example/image", ["remote-1", "local"])
+        self.manager.pull_image_result.assert_awaited_once_with("example/image", 50.0)
+        self.manager.node_registry.request.assert_awaited_once_with(
+            "remote-1", "POST", "/api/agent/images/pull",
+            json_body={"image": "example/image", "max_download_bandwidth_mbps": 50.0},
+            timeout=capped_transfer_timeout_seconds(50.0, default=1800),
+        )
 
     async def test_pull_reports_per_node_partial_failure(self):
         self.manager.node_registry.request.side_effect = RuntimeError("agent unavailable")

@@ -678,14 +678,23 @@ async def launch_managed_container(manager: Any, adapter: RuntimeAdapter,
     port = int(settings.get("port") or await manager._allocate_port())
     name = safe_container_name(alias, deployment_id)
 
-    def run() -> Any:
+    def _image_missing() -> bool:
         try:
             manager.client.images.get(spec.image)
+            return False
         except Exception as exc:
             # Only pull for the normal missing-image case; propagate daemon/auth errors.
             if exc.__class__.__name__ != "ImageNotFound":
                 raise
-            manager.client.images.pull(spec.image)
+            return True
+
+    # Route the first-deployment pull through the bandwidth-capped path, the
+    # same one the Images page and Manager's native launchers use, instead of
+    # an uncapped daemon pull.
+    if await asyncio.to_thread(_image_missing):
+        await manager.pull_image_result(spec.image)
+
+    def run() -> Any:
         options: dict[str, Any] = {
             "image": spec.image,
             "command": spec.command,

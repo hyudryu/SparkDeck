@@ -759,12 +759,18 @@ class StrataContainerTests(unittest.IsolatedAsyncioTestCase):
 
         manager = _manager()
         manager.client.images.get = Mock(
-            side_effect=docker.errors.ImageNotFound("missing"),
+            side_effect=[docker.errors.ImageNotFound("missing"), Mock()],
         )
+        # Missing runtime images must go through the bandwidth-capped pull
+        # path (pull_image_result), never a direct uncapped images.pull.
+        manager.pull_image_result = AsyncMock(return_value={"ok": True})
 
         await _launch(manager)
 
-        manager.client.images.pull.assert_called_once_with(DEFAULT_STRATA_IMAGE)
+        manager.pull_image_result.assert_awaited_once_with(
+            DEFAULT_STRATA_IMAGE, None,
+        )
+        manager.client.images.pull.assert_not_called()
         manager._run_managed_container.assert_called_once()
 
     async def test_launch_failure_is_reported_without_leaking_the_token(self):

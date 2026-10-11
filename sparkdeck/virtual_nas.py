@@ -28,7 +28,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -36,7 +36,11 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote, urlencode
 
 from .catalog import quantization_from_text
-from .download_throttle import bandwidth_bytes_per_second, parse_bandwidth_mbps
+from .download_throttle import (
+    bandwidth_bytes_per_second,
+    capped_transfer_timeout_seconds,
+    parse_bandwidth_mbps,
+)
 from .embeddings import CachedEmbedding, embedding_descriptor
 
 
@@ -689,6 +693,7 @@ class VirtualNAS:
         external_model_roots_provider: Callable[[], list[Path]] | None = None,
         ownership_reclaimer: Callable[[Path], bool] | None = None,
         download_bandwidth_provider: Callable[[], Any] | None = None,
+        internet_transfer_lock: asyncio.Lock | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
@@ -702,6 +707,9 @@ class VirtualNAS:
         self._download_bandwidth_provider = (
             download_bandwidth_provider or (lambda: 0)
         )
+        # Shared with the Manager so every capped internet transfer on this
+        # node (Hub weights and Docker image pulls) queues behind one budget.
+        self._internet_transfer_lock = internet_transfer_lock
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
@@ -1124,6 +1132,26 @@ class VirtualNAS:
         except ValueError:
             return 0.0
 
+    @asynccontextmanager
+    async def _capped_internet_transfer(self, bytes_per_second: float):
+        """Serialize one node's capped internet transfers behind one budget.
+
+        The dispatcher runs transfer jobs concurrently, so N capped jobs each
+        throttled to the node cap would multiply the real uplink usage. When
+        a cap is active, only one capped transfer may hold the wire at a
+        time; unlimited transfers keep running concurrently as before.
+        """
+        lock = (
+            self._internet_transfer_lock
+            if bytes_per_second > 0 and self._internet_transfer_lock is not None
+            else None
+        )
+        if lock is None:
+            yield
+            return
+        async with lock:
+            yield
+
     @_transfer_operation
     async def download_model_checked(
         self, model_id: str, revision: str = "main",
@@ -1249,10 +1277,13 @@ class VirtualNAS:
         # Retain this per-repository reservation through process teardown,
         # including failed stop attempts; another writer must never overlap.
         async with lock:
-            return await self._supervised_download_model_process(
-                model_id, revision, explicit_token, requested_revision,
-                bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
-            )
+            async with self._capped_internet_transfer(
+                self._download_bandwidth_bytes_per_second(bandwidth_mbps),
+            ):
+                return await self._supervised_download_model_process(
+                    model_id, revision, explicit_token, requested_revision,
+                    bandwidth_mbps=bandwidth_mbps, operation_id=operation_id,
+                )
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
@@ -1561,9 +1592,12 @@ class VirtualNAS:
                     "files": selected,
                 }
 
-        return await self._await_uncancelable(
-            asyncio.to_thread(download_selected),
-        )
+        async with self._capped_internet_transfer(
+            self._download_bandwidth_bytes_per_second(bandwidth_mbps),
+        ):
+            return await self._await_uncancelable(
+                asyncio.to_thread(download_selected),
+            )
 
     def has_model_files(
         self, model_id: str, revision: str, filenames: list[str],
@@ -3955,7 +3989,10 @@ class VirtualNAS:
                 job["target_node_id"], "POST",
                 self._model_agent_path(job["model_id"], "download"),
                 json_body=json_body,
-                timeout=24 * 60 * 60,
+                timeout=capped_transfer_timeout_seconds(
+                    bandwidth_mbps, job.get("bytes_total"),
+                    default=24 * 60 * 60, floor=24 * 60 * 60,
+                ),
             )
         result = await self._await_uncancelable(operation)
         if (result or {}).get("status") == "canceled":
@@ -4127,7 +4164,10 @@ class VirtualNAS:
                     job["target_node_id"], "POST",
                     self._model_agent_path(job["model_id"], "download"),
                     json_body=download_body,
-                    timeout=24 * 60 * 60,
+                    timeout=capped_transfer_timeout_seconds(
+                        bandwidth_mbps, job.get("bytes_total"),
+                        default=24 * 60 * 60, floor=24 * 60 * 60,
+                    ),
                 )
             job["download_attempt_start_bytes"] = (
                 _nonnegative_int(immutable_complete.get("size_bytes"))

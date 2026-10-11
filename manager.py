@@ -65,7 +65,11 @@ from sparkdeck.runtime_environment import (
     discovered_runtime_environment,
     normalize_runtime_environment,
 )
-from sparkdeck.download_throttle import bandwidth_bytes_per_second, parse_bandwidth_mbps
+from sparkdeck.download_throttle import (
+    bandwidth_bytes_per_second,
+    capped_transfer_timeout_seconds,
+    parse_bandwidth_mbps,
+)
 from sparkdeck.virtual_nas import (
     TRANSFER_STAGING_RESERVE_BYTES,
     VIRTUAL_NAS_DOWNLOAD_CAPABILITY,
@@ -961,6 +965,11 @@ class Manager:
         self._deployment_pricing_lock = asyncio.Lock()
         self._host_port_reservation_lock = asyncio.Lock()
         self._host_port_reservations: set[int] = set()
+        # One capped internet transfer runs at a time on this node: the
+        # configured bandwidth is a node-wide budget, so a concurrent image
+        # pull and Hub download must not each spend the full rate. Virtual
+        # NAS download workers take the same lock (passed at construction).
+        self.internet_transfer_lock = asyncio.Lock()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -986,6 +995,7 @@ class Manager:
             download_bandwidth_provider=lambda: self.settings.get(
                 "max_download_bandwidth_mbps", 0,
             ),
+            internet_transfer_lock=self.internet_transfer_lock,
         )
         # Embedding inference keeps its own virtual environment and worker
         # processes: the controller's dependency set stays untouched, and a
@@ -7146,13 +7156,19 @@ class Manager:
     async def _create_member(self, node_id: str, payload: dict) -> dict:
         if node_id == LOCAL_NODE_ID:
             return await self.create_container(**payload)
+        # The member launch may pull its runtime image at the stamped cap
+        # share; the request deadline scales with that rate instead of a
+        # fixed 30 minutes.
+        member = payload.get("cluster_member") or {}
         try:
             return await self.node_registry.request(
                 node_id,
                 "POST",
                 "/api/agent/containers",
                 json_body=payload,
-                timeout=1800,
+                timeout=capped_transfer_timeout_seconds(
+                    member.get("image_pull_bandwidth_mbps"), default=1800,
+                ),
             )
         finally:
             # Preflight may have cached this node before the member existed.
@@ -8614,6 +8630,10 @@ class Manager:
         (the group's first node) and master port, so every group is a
         complete tensor-parallel engine behind the shared served name.
         """
+        # Every member pulls its runtime image as it launches; divide the
+        # controller's cap across this fan-out so concurrent member pulls
+        # cannot multiply the configured cluster-wide download budget.
+        pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
         tasks: list = []
         member_specs: list[dict] = []
         existing_by_node = {
@@ -8652,6 +8672,7 @@ class Manager:
                         "serve_port": member_port,
                         "fabric_ip": fabric_ip,
                         "fabric_interface": fabric_interface,
+                        "image_pull_bandwidth_mbps": pull_share_mbps,
                     },
                 })
                 if engine == "vllm":
@@ -8803,6 +8824,9 @@ class Manager:
                 tensor_parallel_size=int(body.get("tensor_parallel_size") or 1),
                 instances=int(body.get("instances") or 1),
             )
+        # Non-grouped fan-out: divide the controller cap across members just
+        # like the grouped builder does above.
+        pull_share_mbps = self._cluster_image_pull_share_mbps(len(node_ids))
         for rank, node_id in enumerate([] if mode == "grouped_sharded" else node_ids):
             node = available[node_id]
             member_port = local_port if node_id == LOCAL_NODE_ID else None
@@ -8822,6 +8846,7 @@ class Manager:
                     "serve_port": member_port,
                     "fabric_ip": fabric_ip,
                     "fabric_interface": fabric_interface,
+                    "image_pull_bandwidth_mbps": pull_share_mbps,
                 },
             })
             if mode == "sharded":
@@ -17298,20 +17323,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[llama] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             # Resolve the in-container model path only after the image is
             # present: a custom image declaring HF_HOME mounts the cache
             # somewhere else, so the pull decides where --model must point.
@@ -17379,6 +17393,10 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="llama",
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17425,20 +17443,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[laya] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             command = [
                 "--model", model,
                 "--host", "0.0.0.0",
@@ -17515,6 +17522,10 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="laya",
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17569,20 +17580,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[tensorfold] pulling missing image: {image}")
-                self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            self.client.images.get(image)
             command = [
                 "serve", model,
                 "--host", "0.0.0.0",
@@ -17649,6 +17649,10 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="tensorfold",
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17712,27 +17716,14 @@ class Manager:
             model=model, cluster_member=cluster_member,
         )
 
-        def _ensure_image():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[ninfer] pulling missing image: {image}")
-                self.client.images.pull(image)
-
         try:
             # Confirm the image is usable and the artifact is cached BEFORE
             # evicting other engines: a missing image or artifact must fail
             # without stopping healthy chat backends.
-            await asyncio.to_thread(_ensure_image)
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="ninfer",
+            )
             # Resolve the in-container artifact path only after the image is
             # present: a custom image declaring HF_HOME mounts the cache
             # somewhere else, so the pull decides where the artifact must
@@ -18156,20 +18147,9 @@ class Manager:
         )
 
         def _create():
-            try:
-                self._cluster_launch_update(
-                    name, "checking_image", f"Checking Docker image {image}",
-                    model=model, cluster_member=cluster_member,
-                )
-                image_info = self.client.images.get(image)
-            except docker.errors.ImageNotFound:
-                self._cluster_launch_update(
-                    name, "pulling_image",
-                    f"Downloading Docker image {image}; this can take several minutes",
-                    model=model, cluster_member=cluster_member,
-                )
-                print(f"[strata] pulling missing image: {image}")
-                image_info = self.client.images.pull(image)
+            # The image is guaranteed present by the capped
+            # _ensure_runtime_image step below.
+            image_info = self.client.images.get(image)
             # The daemon-resolved image ID is the pack's real identity: a
             # refreshed mutable tag (notably the default :latest) must
             # invalidate a prepared volume even though its name is unchanged.
@@ -18267,6 +18247,10 @@ class Manager:
             return summary
 
         try:
+            await self._ensure_runtime_image(
+                image, name, model=model, cluster_member=cluster_member,
+                runtime="strata",
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -18434,31 +18418,9 @@ class Manager:
             )
 
             def _create():
-                # docker-py does not pull a missing image as part of
-                # containers.run().  SGLang recipes use a separate default
-                # image, so make the first launch self-contained.
-                try:
-                    self._cluster_launch_update(
-                        name, "checking_image", f"Checking Docker image {image}",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    if recipe_launch is not None:
-                        recipe_launch.update({
-                            "phase": "Checking SGLang image", "image": image,
-                        })
-                    self.client.images.get(image)
-                except docker.errors.ImageNotFound:
-                    self._cluster_launch_update(
-                        name, "pulling_image",
-                        f"Downloading Docker image {image}; this can take several minutes",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    if recipe_launch is not None:
-                        recipe_launch.update({
-                            "phase": "Downloading SGLang image", "image": image,
-                        })
-                    print(f"[sglang] pulling missing image: {image}")
-                    self.client.images.pull(image)
+                # The image is guaranteed present by the capped
+                # _ensure_runtime_image step below.
+                self.client.images.get(image)
                 self._cluster_launch_update(
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
@@ -18540,6 +18502,13 @@ class Manager:
                     )
                 return summary
             try:
+                await self._ensure_runtime_image(
+                    image, name, model=model, cluster_member=cluster_member,
+                    runtime="sglang",
+                    on_pull=(lambda: recipe_launch.update({
+                        "phase": "Downloading SGLang image", "image": image,
+                    })) if recipe_launch is not None else None,
+                )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
                 safe_error = self._redact_hf_secret(exc, hf_token)
@@ -18607,20 +18576,9 @@ class Manager:
                 cmd[8] = str(gpu_memory_utilization)  # --gpu-memory-utilization value
 
             def _create():
-                try:
-                    self._cluster_launch_update(
-                        name, "checking_image", f"Checking Docker image {image}",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    self.client.images.get(image)
-                except docker.errors.ImageNotFound:
-                    self._cluster_launch_update(
-                        name, "pulling_image",
-                        f"Downloading Docker image {image}; this can take several minutes",
-                        model=model, cluster_member=cluster_member,
-                    )
-                    print(f"[vllm] pulling missing image: {image}")
-                    self.client.images.pull(image)
+                # The image is guaranteed present by the capped
+                # _ensure_runtime_image step below.
+                self.client.images.get(image)
                 self._cluster_launch_update(
                     name, "creating_container", "Creating Docker container",
                     model=model, cluster_member=cluster_member,
@@ -18708,6 +18666,10 @@ class Manager:
                     )
                 return summary
             try:
+                await self._ensure_runtime_image(
+                    image, name, model=model, cluster_member=cluster_member,
+                    runtime="vllm",
+                )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
                 safe_error = self._redact_hf_secret(exc, hf_token)
@@ -19706,18 +19668,28 @@ class Manager:
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
-        if bytes_per_second > 0:
+        from sparkdeck.throttled_image_pull import (
+            is_loopback_registry_image, throttled_image_pull_events,
+        )
+        if bytes_per_second > 0 and not is_loopback_registry_image(image):
             # The daemon does registry I/O outside this process, so a capped
             # pull runs through the throttled helper instead (see
             # sparkdeck.throttled_image_pull) and feeds the same SSE contract.
-            from sparkdeck.throttled_image_pull import throttled_image_pull_events
+            # The node-wide transfer lock stops a concurrent Hub download
+            # from doubling this node's internet rate.
+            lock = getattr(self, "internet_transfer_lock", None)
             try:
+                if lock is not None:
+                    await lock.acquire()
                 async for event in throttled_image_pull_events(
                     self.client, image, bytes_per_second,
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                if lock is not None:
+                    lock.release()
             yield "data: {\"done\": true}\n\n"
             return
 
@@ -19738,6 +19710,75 @@ class Manager:
                 yield "data: {\"done\": true}\n\n"
                 break
             yield f"data: {json.dumps(item)}\n\n"
+
+    def _cluster_image_pull_share_mbps(self, fanout_width: int) -> float:
+        """Controller cap divided across the members of one launch fan-out.
+
+        Always explicit (0 = unlimited) so a member agent applies the
+        controller's decision instead of a stale node-local setting.
+        """
+        try:
+            cap = parse_bandwidth_mbps(
+                self.settings.get("max_download_bandwidth_mbps", 0),
+            )
+        except ValueError:
+            cap = 0.0
+        if cap <= 0:
+            return 0.0
+        return cap / max(1, int(fanout_width))
+
+    def _image_pull_share_mbps(
+        self, cluster_member: dict | None = None,
+    ) -> float | None:
+        """Bandwidth override for one launch pull, in megabits per second.
+
+        A controller-fanned-out launch divides the configured cap across the
+        members of the fan-out and stamps that share on the member payload,
+        so a launch member pulls at the controller's share while the agent
+        keeps honoring its own setting for everything else.
+        """
+        share = (cluster_member or {}).get("image_pull_bandwidth_mbps")
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            return None
+        return float(share)
+
+    async def _ensure_runtime_image(
+        self, image: str, name: str | None = None, model: str | None = None,
+        cluster_member: dict | None = None, runtime: str = "",
+        on_pull=None,
+    ) -> None:
+        """Pull a missing runtime image through the bandwidth-capped path.
+
+        Launchers used to call ``client.images.pull`` directly, which the
+        daemon runs uncapped. This keeps the deployment-triggered pull on the
+        same capped path as the Images page and updates the same launch
+        progress record the container-creation closure uses.
+        """
+        def _check_present() -> bool:
+            if name is not None:
+                self._cluster_launch_update(
+                    name, "checking_image", f"Checking Docker image {image}",
+                    model=model, cluster_member=cluster_member,
+                )
+            try:
+                self.client.images.get(image)
+                return True
+            except docker.errors.ImageNotFound:
+                return False
+        if await asyncio.to_thread(_check_present):
+            return
+        if name is not None:
+            self._cluster_launch_update(
+                name, "pulling_image",
+                f"Downloading Docker image {image}; this can take several minutes",
+                model=model, cluster_member=cluster_member,
+            )
+        if on_pull is not None:
+            on_pull()
+        print(f"[{runtime}] pulling missing image: {image}")
+        await self.pull_image_result(
+            image, self._image_pull_share_mbps(cluster_member),
+        )
 
     async def pull_image_result(
         self, image: str, bandwidth_mbps: float | None = None,
@@ -19776,17 +19817,24 @@ class Manager:
             )
         except ValueError:
             cap_mbps = 0.0
+        # Concurrent capped pulls across N nodes would each move the full
+        # configured rate, multiplying the cluster total past the setting.
+        # Divide the rate across the selected nodes so the cluster stays
+        # within one budget.
+        share_mbps = cap_mbps / len(selected) if cap_mbps > 0 and selected else cap_mbps
 
         async def pull(node: dict) -> dict:
             if node["id"] == LOCAL_NODE_ID:
-                return await self.pull_image_result(image)
+                return await self.pull_image_result(image, share_mbps)
             return await self.node_registry.request(
                 node["id"], "POST", "/api/agent/images/pull",
                 json_body={
                     "image": image,
-                    "max_download_bandwidth_mbps": cap_mbps,
+                    "max_download_bandwidth_mbps": share_mbps,
                 },
-                timeout=24 * 60 * 60 if cap_mbps > 0 else 1800,
+                timeout=capped_transfer_timeout_seconds(
+                    share_mbps, default=1800,
+                ),
             )
 
         pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)

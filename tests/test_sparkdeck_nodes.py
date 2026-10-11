@@ -79,6 +79,68 @@ class NodePullTests(unittest.IsolatedAsyncioTestCase):
             timeout=capped_transfer_timeout_seconds(50.0, default=1800),
         )
 
+    async def test_capped_fanout_serializes_behind_the_dispatch_slot(self):
+        # Each dispatched node gets the FULL node-wide cap (here the whole
+        # 100 Mbps on the single remote node), so two simultaneous capped
+        # fan-outs would double the cluster total. They must queue behind
+        # one shared dispatch slot, then both complete.
+        from manager import IMAGE_PULL_BANDWIDTH_CAPABILITY
+
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        self.nodes[1]["capabilities"] = [IMAGE_PULL_BANDWIDTH_CAPABILITY]
+        self.manager.settings["max_download_bandwidth_mbps"] = 100
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_request(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"ok": True}
+
+        self.manager.node_registry.request.side_effect = slow_request
+        first = asyncio.create_task(
+            self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+        )
+        await started.wait()
+        self.assertTrue(self.manager.dispatched_download_lock.locked())
+        second = asyncio.create_task(
+            self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+        )
+        await asyncio.sleep(0.02)
+        self.assertFalse(second.done())
+        release.set()
+        first_result, second_result = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=5,
+        )
+        self.assertTrue(first_result["ok"] and second_result["ok"])
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
+    async def test_uncapped_fanouts_run_without_the_dispatch_slot(self):
+        # Unlimited pulls do not spend the capped budget, so they must not
+        # queue behind one another: both enter concurrently.
+        self.manager.dispatched_download_lock = asyncio.Lock()
+        both_in = asyncio.Event()
+        inside = 0
+
+        async def counting_request(*args, **kwargs):
+            nonlocal inside
+            inside += 1
+            if inside >= 2:
+                both_in.set()
+            await both_in.wait()
+            return {"ok": True}
+
+        self.manager.node_registry.request.side_effect = counting_request
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+                self.manager.pull_image_on_nodes("example/image", ["remote-1"]),
+            ),
+            timeout=5,
+        )
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertFalse(self.manager.dispatched_download_lock.locked())
+
     async def test_capped_pull_rejects_agents_without_the_capability(self):
         # An older agent accepts max_download_bandwidth_mbps but pulls
         # uncapped; the fan-out must fail instead of silently violating it.

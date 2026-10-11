@@ -19,6 +19,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -976,6 +977,11 @@ class Manager:
         # pull and Hub download must not each spend the full rate. Virtual
         # NAS download workers take the same lock (passed at construction).
         self.internet_transfer_lock = asyncio.Lock()
+        # Every controller-dispatched download is sent the full node-wide
+        # cap and lands on a different agent, so per-node locks cannot
+        # coordinate them: dispatches run one at a time cluster-wide. The
+        # Virtual NAS queue takes the same lock (passed at construction).
+        self.dispatched_download_lock = asyncio.Lock()
         # A controller restart can attach to an older deployment whose vLLM
         # capacity line has already rolled beyond the normal short log tail.
         # Permit one bounded deep-history lookup per deployment, then resume
@@ -1002,6 +1008,7 @@ class Manager:
                 "max_download_bandwidth_mbps", 0,
             ),
             internet_transfer_lock=self.internet_transfer_lock,
+            dispatched_download_lock=self.dispatched_download_lock,
         )
         # Embedding inference keeps its own virtual environment and worker
         # processes: the controller's dependency set stays untouched, and a
@@ -3278,6 +3285,22 @@ class Manager:
         )
         return bool((result or {}).get("complete"))
 
+    @asynccontextmanager
+    async def _dispatched_download_slot(self, capped: bool):
+        """Hold the cluster-wide dispatch budget for one capped operation.
+
+        Every controller dispatch sends the full node-wide cap to its target
+        agent, so concurrent dispatches to different nodes would multiply the
+        configured budget. Unlimited dispatches never hold the slot. Bare
+        test fixtures may lack the lock; then there is nothing to serialize.
+        """
+        lock = getattr(self, "dispatched_download_lock", None)
+        if not capped or lock is None:
+            yield
+            return
+        async with lock:
+            yield
+
     async def node_download_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
         requested_revision: str | None = None,
@@ -3319,18 +3342,26 @@ class Manager:
                 f"node '{node_id}' cannot enforce the download bandwidth "
                 "limit; upgrade its SparkDeck agent or set the limit to 0"
             )
+        # Like the queued paths, a dispatched download carries the full
+        # node-wide cap: hold the cluster dispatch slot so a concurrent
+        # image fan-out or queued weight download cannot double the budget.
         with self.virtual_nas.transfer_operation(model_id):
-            return await self.virtual_nas._await_uncancelable(self.node_registry.request(
-                node_id, "POST",
-                f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
-                json_body=download_body,
-                # A fixed 24 h would fail ordinary GGUF artifacts at the
-                # smallest supported cap (~1 GB at 0.1 Mbps); scale the
-                # deadline with the rate like the queued paths do.
-                timeout=capped_transfer_timeout_seconds(
-                    bandwidth_mbps, default=24 * 60 * 60, floor=24 * 60 * 60,
-                ),
-            ))
+            async with self._dispatched_download_slot(bandwidth_mbps > 0):
+                return await self.virtual_nas._await_uncancelable(
+                    self.node_registry.request(
+                        node_id, "POST",
+                        f"/api/agent/virtual-nas/models/{quote(model_id, safe='')}/download",
+                        json_body=download_body,
+                        # A fixed 24 h would fail ordinary GGUF artifacts at
+                        # the smallest supported cap (~1 GB at 0.1 Mbps);
+                        # scale the deadline with the rate like the queued
+                        # paths do.
+                        timeout=capped_transfer_timeout_seconds(
+                            bandwidth_mbps, default=24 * 60 * 60,
+                            floor=24 * 60 * 60,
+                        ),
+                    )
+                )
 
     async def node_transfer_model_files(
         self, source_node_id: str, target_node_id: str,
@@ -19894,11 +19925,23 @@ class Manager:
         q: asyncio.Queue = asyncio.Queue()
         bytes_per_second = self._image_pull_bytes_per_second(bandwidth_mbps)
         from sparkdeck.throttled_image_pull import (
-            is_loopback_registry_image, throttled_image_pull_events,
+            is_loopback_registry_image, no_proxy_matches_image,
+            throttled_image_pull_events,
+        )
+        # NO_PROXY hosts are reachable directly and are not the capped
+        # internet uplink, exactly like the loopback and insecure-registry
+        # exemptions below: the daemon dials them directly, and the helper's
+        # limiter would wrongly chain them through the corporate proxy.
+        no_proxy_value = (
+            os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
         )
         if (
             bytes_per_second > 0
             and not is_loopback_registry_image(image)
+            and not (
+                no_proxy_value
+                and no_proxy_matches_image(image, no_proxy_value)
+            )
             and not await self._registry_is_insecure(image)
         ):
             # The daemon does registry I/O outside this process, so a capped
@@ -20219,7 +20262,14 @@ class Manager:
                 ),
             )
 
-        pulled = await asyncio.gather(*(pull(node) for node in selected), return_exceptions=True)
+        # The fan-out consumes the whole cluster budget while a cap is set,
+        # so it holds the same dispatch slot the queued weight downloads use:
+        # an image pull and a queued download targeting different nodes
+        # would otherwise each move the full rate.
+        async with self._dispatched_download_slot(cap_mbps > 0):
+            pulled = await asyncio.gather(
+                *(pull(node) for node in selected), return_exceptions=True,
+            )
         results = []
         for node, result in zip(selected, pulled):
             item = {

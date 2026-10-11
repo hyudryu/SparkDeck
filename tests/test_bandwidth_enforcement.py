@@ -8,6 +8,7 @@ fan-outs must divide the cap instead of multiplying it.
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,45 @@ class PullImageStreamPathTests(unittest.IsolatedAsyncioTestCase):
         m.client.api.pull.assert_called_once()
         self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
 
+    async def test_no_proxy_registry_uses_the_daemon_despite_the_cap(self):
+        # The daemon honors NO_PROXY by dialing the registry directly, while
+        # the capped helper would chain every CONNECT through the proxy the
+        # operator explicitly excluded — an internal registry behind
+        # NO_PROXY therefore pulls through the daemon, like loopback does.
+        m = bare_manager(100.0)
+        m.client.api.pull.return_value = [{"status": "ok"}]
+        with patch.dict(os.environ, {"NO_PROXY": "registry.internal.example"}):
+            chunks = await self.collect(
+                m, "registry.internal.example/team/img:1",
+            )
+        m.client.api.pull.assert_called_once_with(
+            "registry.internal.example/team/img:1", stream=True, decode=True,
+        )
+        self.assertEqual(chunks[-1], "data: {\"done\": true}\n\n")
+
+    async def test_no_proxy_matches_hub_images_by_docker_io_entry(self):
+        m = bare_manager(100.0)
+        m.client.api.pull.return_value = [{"status": "ok"}]
+        with patch.dict(os.environ, {"NO_PROXY": "corp.example,docker.io"}):
+            await self.collect(m, "alpine:latest")
+        m.client.api.pull.assert_called_once()
+
+    async def test_no_proxy_mismatch_still_uses_the_capped_helper(self):
+        m = bare_manager(100.0)
+        used = []
+
+        async def fake_events(client, image, bps):
+            used.append(image)
+            yield {"status": "Downloading"}
+
+        with patch.dict(os.environ, {"NO_PROXY": "other.example"}), patch(
+            "sparkdeck.throttled_image_pull.throttled_image_pull_events",
+            fake_events,
+        ):
+            await self.collect(m, "registry.corp/img:1")
+        self.assertEqual(used, ["registry.corp/img:1"])
+        m.client.api.pull.assert_not_called()
+
     async def test_daemon_info_failure_still_uses_the_capped_helper(self):
         m = bare_manager(100.0)
         m.client.api.info.side_effect = RuntimeError("daemon unreachable")
@@ -192,7 +232,7 @@ class PullImageStreamLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(m.internet_transfer_lock.locked())
 
 
-def bare_vnas(internet_transfer_lock):
+def bare_vnas(internet_transfer_lock, dispatched_download_lock=None):
     directory = Path(tempfile.mkdtemp())
     return VirtualNAS(
         data_dir=directory,
@@ -200,6 +240,7 @@ def bare_vnas(internet_transfer_lock):
         node_registry=Mock(),
         enabled_provider=lambda: True,
         internet_transfer_lock=internet_transfer_lock,
+        dispatched_download_lock=dispatched_download_lock,
     )
 
 
@@ -736,6 +777,35 @@ class NodeDownloadModelFilesTests(unittest.IsolatedAsyncioTestCase):
         # Unlimited keeps the historical fixed day timeout.
         self.assertEqual(kwargs["timeout"], 24 * 60 * 60)
 
+    async def test_capped_dispatch_holds_the_cluster_dispatch_slot(self):
+        m = self._manager(50.0, supports_bandwidth=True)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+
+        async def request(*args, **kwargs):
+            observed.append(lock.locked())
+            return {"ok": True}
+
+        observed = []
+        m.node_registry.request = request
+        await m.node_download_model_files("ws1", "org/model", "r" * 40, ["q.gguf"])
+        self.assertEqual(observed, [True])
+        self.assertFalse(lock.locked())
+
+    async def test_uncapped_dispatch_skips_the_slot_entirely(self):
+        # An unlimited dispatch does not move the full budget, so it must
+        # not queue behind (or block) capped dispatches.
+        m = self._manager(0.0, supports_bandwidth=True)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+
+        async def request(*args, **kwargs):
+            observed.append(lock.locked())
+            return {"ok": True}
+
+        observed = []
+        m.node_registry.request = request
+        await m.node_download_model_files("ws1", "org/model", "r" * 40, ["q.gguf"])
+        self.assertEqual(observed, [False])
+
     async def test_capped_dispatch_stamps_cap_and_scales_request_timeout(self):
         from sparkdeck.download_throttle import capped_transfer_timeout_seconds
 
@@ -752,6 +822,81 @@ class NodeDownloadModelFilesTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertGreater(kwargs["timeout"], 24 * 60 * 60 - 1)
+
+
+class DispatchedDownloadSlotTests(unittest.IsolatedAsyncioTestCase):
+    """One cluster-wide budget for every full-cap dispatch.
+
+    Each dispatch sends the FULL node-wide cap to its target agent (the
+    cap is not divided across simultaneous dispatches), so the manager's
+    fan-out paths and the Virtual NAS queue must hold one shared slot.
+    """
+
+    async def test_manager_takes_the_slot_virtual_nas_was_given(self):
+        lock = asyncio.Lock()
+        m = bare_manager(100.0)
+        # Manager.__init__ wires manager.dispatched_download_lock into the
+        # VirtualNAS instance; bare fixtures simulate that wiring.
+        m.dispatched_download_lock = lock
+        nas = bare_vnas(m.internet_transfer_lock, lock)
+        self.assertIs(nas._dispatched_download_lock, lock)
+
+        order = []
+
+        async def manager_fanout():
+            async with m._dispatched_download_slot(True):
+                order.append("fanout start")
+                await asyncio.sleep(0.05)
+                order.append("fanout end")
+
+        async def queued_download():
+            async with nas.dispatched_download_slot(True):
+                order.append("queued start")
+                await asyncio.sleep(0.05)
+                order.append("queued end")
+
+        await asyncio.gather(manager_fanout(), queued_download())
+        self.assertEqual(
+            order,
+            ["fanout start", "fanout end", "queued start", "queued end"],
+        )
+        self.assertFalse(lock.locked())
+
+    async def test_unlimited_dispatches_keep_full_parallelism(self):
+        lock = asyncio.Lock()
+        m = bare_manager(0.0)
+        m.dispatched_download_lock = lock
+        nas = bare_vnas(m.internet_transfer_lock, lock)
+        order = []
+
+        async def manager_fanout():
+            async with m._dispatched_download_slot(False):
+                self.assertFalse(lock.locked())
+                order.append("start")
+                await asyncio.sleep(0.05)
+                order.append("end")
+
+        async def queued_download():
+            async with nas.dispatched_download_slot(False):
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(manager_fanout(), queued_download(), manager_fanout())
+        self.assertEqual(order[:2], ["start", "start"])
+
+    async def test_slot_releases_after_an_error(self):
+        m = bare_manager(100.0)
+        m.dispatched_download_lock = lock = asyncio.Lock()
+        with self.assertRaises(RuntimeError):
+            async with m._dispatched_download_slot(True):
+                raise RuntimeError("boom")
+        self.assertFalse(lock.locked())
+
+    async def test_missing_lock_fixture_still_runs_the_dispatch(self):
+        # Bare test Managers built with Manager.__new__ lack the lock; the
+        # slot must no-op instead of failing the call.
+        m = bare_manager(100.0)
+        async with m._dispatched_download_slot(True):
+            pass
 
 
 class RequireBandwidthCapableNodesTests(unittest.TestCase):

@@ -23,6 +23,7 @@ from sparkdeck.throttled_image_pull import (
     helper_credentials,
     is_loopback_registry_image,
     matches_insecure_registry,
+    no_proxy_matches_image,
     normalize_image_reference,
     select_docker_config,
     split_authority,
@@ -155,6 +156,71 @@ class AuthEntryTests(unittest.TestCase):
         self.assertEqual(_auth_entry(entry, "registry:5000"), {"auth": "eQ=="})
         self.assertIsNone(_auth_entry({"auths": {"other:5000": {"auth": "eQ=="}}}, "registry:5000"))
         self.assertIsNone(_auth_entry({"auths": {"docker.io": {}}}, "docker.io"))
+
+
+class NoProxyMatchTests(unittest.TestCase):
+    """Docker's NO_PROXY semantics applied to an image's registry host."""
+
+    def test_bare_host_matches_host_and_subdomains(self):
+        self.assertTrue(no_proxy_matches_image(
+            "registry.internal.example/team/img:1", "registry.internal.example",
+        ))
+        self.assertTrue(no_proxy_matches_image(
+            "cache.registry.internal.example/img:1", "registry.internal.example",
+        ))
+        self.assertFalse(no_proxy_matches_image(
+            "registry.internal.example.evil.net/img:1", "registry.internal.example",
+        ))
+        self.assertTrue(no_proxy_matches_image(
+            "any.internal.example/img:1", ".internal.example",
+        ))
+
+    def test_wildcard_matches_everything(self):
+        self.assertTrue(no_proxy_matches_image("ghcr.io/org/img:1", "*"))
+
+    def test_hub_images_match_the_docker_io_alias(self):
+        # An unqualified reference pulls from docker.io, so a NO_PROXY entry
+        # for docker.io must exempt it (and index.docker.io likewise).
+        self.assertTrue(no_proxy_matches_image("alpine:latest", "docker.io"))
+        self.assertTrue(no_proxy_matches_image(
+            "index.docker.io/library/alpine:latest", "docker.io",
+        ))
+        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", "docker.io"))
+
+    def test_explicit_port_must_match(self):
+        self.assertTrue(no_proxy_matches_image(
+            "registry.corp:5000/team/img:1", "registry.corp:5000",
+        ))
+        self.assertFalse(no_proxy_matches_image(
+            "registry.corp:5000/team/img:1", "registry.corp:8080",
+        ))
+        # An entry without a port covers every port on that host.
+        self.assertTrue(no_proxy_matches_image(
+            "registry.corp:5000/team/img:1", "registry.corp",
+        ))
+
+    def test_cidr_entries_match_ip_hosts_only(self):
+        self.assertTrue(no_proxy_matches_image("10.1.2.3:5000/img:1", "10.0.0.0/8"))
+        self.assertFalse(no_proxy_matches_image("192.168.1.5/img:1", "10.0.0.0/8"))
+        # A network entry never matches a hostname, even one resolving into it.
+        self.assertFalse(no_proxy_matches_image("host.internal/img:1", "10.0.0.0/8"))
+
+    def test_scheme_prefix_and_trailing_punctuation_are_tolerated(self):
+        self.assertTrue(no_proxy_matches_image(
+            "registry.corp/img:1", "http://registry.corp/",
+        ))
+        self.assertTrue(no_proxy_matches_image(
+            "registry.corp/img:1", "REGISTRY.CORP.",
+        ))
+
+    def test_comma_and_space_separated_lists(self):
+        value = " other.example , registry.corp "
+        self.assertTrue(no_proxy_matches_image("registry.corp/img:1", value))
+        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", value))
+
+    def test_empty_value_and_unqualified_daemon_registries(self):
+        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", ""))
+        self.assertFalse(no_proxy_matches_image("ghcr.io/org/img:1", "  "))
 
 
 class HelperCredentialsTests(unittest.TestCase):

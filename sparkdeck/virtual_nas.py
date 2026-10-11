@@ -694,6 +694,7 @@ class VirtualNAS:
         ownership_reclaimer: Callable[[Path], bool] | None = None,
         download_bandwidth_provider: Callable[[], Any] | None = None,
         internet_transfer_lock: asyncio.Lock | None = None,
+        dispatched_download_lock: asyncio.Lock | None = None,
     ):
         self.data_dir = Path(data_dir)
         self._hub_path_provider = hub_path_provider
@@ -713,8 +714,12 @@ class VirtualNAS:
         # Every controller-dispatched download is sent the full node-wide
         # cap, and a per-node lock cannot coordinate separate agents, so
         # downloads run one at a time cluster-wide while this lock is held
-        # across each dispatched operation.
-        self._dispatched_download_lock = asyncio.Lock()
+        # across each dispatched operation. The Manager passes its own
+        # instance so controller dispatches outside the queue (image
+        # fan-outs, GGUF seed dispatches) share the same budget.
+        self._dispatched_download_lock = (
+            dispatched_download_lock or asyncio.Lock()
+        )
         self._external_model_roots_provider = (
             external_model_roots_provider or _default_comfyui_model_roots
         )
@@ -1155,6 +1160,22 @@ class VirtualNAS:
             yield
             return
         async with lock:
+            yield
+
+    @asynccontextmanager
+    async def dispatched_download_slot(self, capped: bool):
+        """Hold the cluster-wide dispatch budget for one capped operation.
+
+        Every controller dispatch (queued weight download, GGUF seed, image
+        fan-out) carries the full node-wide cap, so only one may run at a
+        time while a cap is active; unlimited dispatches keep the pre-cap
+        parallel behavior. async with owns the release: a caller cancelled
+        while queued never frees a holder's lock.
+        """
+        if not capped:
+            yield
+            return
+        async with self._dispatched_download_lock:
             yield
 
     @_transfer_operation
@@ -3968,6 +3989,7 @@ class VirtualNAS:
             ):
                 raise LookupError("partial model cache no longer exists")
         requested_revision = job.get("requested_revision") or revision
+        bandwidth_mbps = self._download_bandwidth_mbps()
         if job["target_node_id"] == LOCAL_NODE_ID:
             operation = self.download_model_files_checked(
                 job["model_id"], revision, selected,
@@ -3983,7 +4005,6 @@ class VirtualNAS:
                 "hf_token": token,
                 "files": selected,
             }
-            bandwidth_mbps = self._download_bandwidth_mbps()
             if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
                 download_status.get("capabilities") or []
             ):
@@ -4009,7 +4030,9 @@ class VirtualNAS:
             )
         # Every dispatched download carries the full node-wide cap, so only
         # one may run cluster-wide at a time (see the constructor lock note).
-        async with self._dispatched_download_lock:
+        # Unlimited dispatches take no slot: serializing them would regress
+        # the per-node parallelism the dispatcher is built for.
+        async with self.dispatched_download_slot(bandwidth_mbps > 0):
             result = await self._await_uncancelable(operation)
         if (result or {}).get("status") == "canceled":
             raise TransferCanceled()
@@ -4131,6 +4154,7 @@ class VirtualNAS:
                 return
             if event.is_set():
                 raise TransferCanceled()
+            bandwidth_mbps = self._download_bandwidth_mbps()
             if job["target_node_id"] == LOCAL_NODE_ID:
                 operation = self._download_model_process(
                     job["model_id"],
@@ -4149,7 +4173,6 @@ class VirtualNAS:
                     ),
                     "hf_token": token,
                 }
-                bandwidth_mbps = self._download_bandwidth_mbps()
                 if VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY in (
                     download_status.get("capabilities") or []
                 ):
@@ -4211,8 +4234,8 @@ class VirtualNAS:
                 raise TransferCanceled()
             # Every dispatched download carries the full node-wide cap, so
             # only one may run cluster-wide at a time (see the constructor
-            # lock note).
-            async with self._dispatched_download_lock:
+            # lock note). Unlimited dispatches take no slot.
+            async with self.dispatched_download_slot(bandwidth_mbps > 0):
                 result = await (
                     self._await_download_with_cancel(
                         operation, event, cancel_writer, job,

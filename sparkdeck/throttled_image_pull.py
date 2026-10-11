@@ -319,6 +319,78 @@ def is_loopback_registry_image(image: str) -> bool:
         return False
 
 
+def no_proxy_matches_image(image: str, no_proxy_value: str) -> bool:
+    """True when the image's registry matches one NO_PROXY list entry.
+
+    The daemon honors NO_PROXY by dialing matching registries directly, and
+    the capped helper's limiter would still chain every CONNECT through the
+    corporate proxy (which can reject bypassed hosts), so callers pull these
+    references with the daemon instead — the same exemption the loopback and
+    insecure-registry checks already grant. Matching follows Docker's own
+    proxy semantics: ``*`` matches everything; a bare name matches that host
+    and any subdomain; entries may carry a scheme prefix, a leading dot, or
+    an explicit ``:port`` (port must match when given); IP hosts also match
+    CIDR entries.
+    """
+    head = registry_head(image)
+    if head is None:
+        reference = str(image or "").strip().removeprefix("docker://")
+        head_part, slash, _rest = reference.partition("/")
+        # Unqualified (``alpine``, even with a tag colon) and namespaced-only
+        # (``library/alpine``) references resolve to Docker Hub; the daemon's
+        # proxy bypass applies to that registry, not to the bare token.
+        if not slash or (
+            "@" not in head_part
+            and not ("." in head_part or ":" in head_part or head_part == "localhost")
+        ):
+            head = "docker.io"
+    value = str(no_proxy_value or "").strip()
+    if not head or not value:
+        return False
+    host, port = split_authority(head)
+    host = host.rstrip(".").lower()
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address | None = (
+            ipaddress.ip_address(host)
+        )
+    except ValueError:
+        address = None
+    # ``index.docker.io`` and ``docker.io`` name the same registry; match a
+    # NO_PROXY entry against either spelling of the reference's registry.
+    canonical = "docker.io" if host == "index.docker.io" else host
+    candidates = []
+    for alias in _registry_aliases(canonical):
+        candidates.append(alias.rstrip("."))
+    for raw in re.split(r"[,\s]+", value):
+        entry = (
+            str(raw).strip().removeprefix("http://").removeprefix("https://")
+        ).rstrip("/")
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            network = None
+        if network is not None:
+            if address is not None and address in network:
+                return True
+            continue  # a network entry never matches a hostname
+        entry_host, entry_port = split_authority(entry)
+        entry_host = entry_host.rstrip(".").lower().lstrip(".")
+        if not entry_host:
+            continue
+        if entry_port and entry_port != port:
+            continue
+        if any(
+            candidate == entry_host or candidate.endswith("." + entry_host)
+            for candidate in candidates
+        ):
+            return True
+    return False
+
+
 def staging_parent() -> str | None:
     """Parent directory for pull staging; ``SPARKDECK_IMAGE_STAGING_DIR``."""
     configured = str(os.environ.get("SPARKDECK_IMAGE_STAGING_DIR") or "").strip()

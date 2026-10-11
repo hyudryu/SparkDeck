@@ -145,6 +145,34 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         self.manager.client.images.get.assert_not_called()
         self.manager.pull_image_result.assert_not_awaited()
 
+    async def test_local_build_strips_forwarded_cap_from_the_build_payload(self):
+        from sparkdeck.image_patches import normalize_patch_request
+
+        # The builder re-validates the payload and rejects any key outside
+        # the build schema, so the forwarded coordination field must never
+        # reach it — every controller-dispatched build had been failing here.
+        core = {k: v for k, v in request().items() if k != "node_ids"}
+        self.assertTrue(isinstance(normalize_patch_request(core), dict))
+        with self.assertRaises(ValueError):
+            normalize_patch_request(
+                {**core, "max_download_bandwidth_mbps": 25.0},
+            )
+
+        seen = {}
+
+        def build(client, payload, log):
+            seen.update(payload)
+            return result()
+
+        with patch("sparkdeck.image_patch_jobs.build_patched_image", side_effect=build):
+            outcome = await self.jobs._local(
+                {"logs": []},
+                {**request(), "max_download_bandwidth_mbps": 25.0},
+            )
+        self.assertEqual(outcome, result())
+        self.assertNotIn("max_download_bandwidth_mbps", seen)
+        self.assertEqual(seen["base_image"], "runtime/base:stable")
+
     async def test_controller_forwards_settings_cap_to_capable_agents(self):
         self.manager.settings = {"max_download_bandwidth_mbps": 40}
         self.manager.selected_cluster_nodes = AsyncMock(return_value=[
@@ -527,6 +555,73 @@ class ImagePatchJobTests(unittest.IsolatedAsyncioTestCase):
         logs = job["nodes"][0]["logs"]
         self.assertLessEqual(len(logs), 21)
         self.assertTrue(all(len(line) <= 2000 for line in logs))
+
+    async def test_remote_deadline_rearms_on_new_worker_progress(self):
+        # A bandwidth-capped base pull legitimately runs far past the
+        # historical fixed two hours while it keeps emitting log lines: new
+        # remote logs re-arm the polling window instead of failing the job.
+        elapsed = [0]
+
+        async def sleep(seconds):
+            elapsed[0] += 240
+
+        polls = {"n": 0}
+
+        async def remote(node_id, method, path, **kwargs):
+            if method == "POST":
+                return {"id": "accepted", "status": "building",
+                        "nodes": [{"logs": ["Pulling base layer 1/50"]}]}
+            polls["n"] += 1
+            if polls["n"] >= 35:  # elapsed 35*240 = 8400 s > 7200 s window
+                return {"id": "accepted", "status": "succeeded",
+                        "nodes": [{"logs": ["done"], "image_id": "sha256:patched",
+                                   "base_id": BASE_ID}],
+                        "files": HASHES}
+            return {"id": "accepted", "status": "building",
+                    "nodes": [{"logs": [f"Pulling base layer {polls['n'] + 1}/50"]}]}
+
+        self.manager.node_registry.request.side_effect = remote
+        node = {"node_id": "node-3", "node_name": "node-3", "logs": []}
+        with patch("sparkdeck.image_patch_jobs.time",
+                   new=SimpleNamespace(monotonic=lambda: elapsed[0])), \
+                patch("sparkdeck.image_patch_jobs.asyncio.sleep", side_effect=sleep):
+            outcome = await self.jobs._remote(node, request())
+        self.assertEqual(outcome, result())
+        self.assertGreater(elapsed[0], 7200)
+
+    async def test_capped_remote_window_extends_past_the_two_hour_floor(self):
+        # With a forwarded cap, the unknown-size allowance divided by the
+        # rate can far exceed two hours; a persistently unreachable status
+        # endpoint must then fail only at the scaled deadline, and poll
+        # warnings alone must not re-arm it.
+        from sparkdeck.download_throttle import capped_transfer_timeout_seconds
+
+        expected = capped_transfer_timeout_seconds(
+            4.0, default=7200.0, floor=7200.0,
+        )
+        self.assertGreater(expected, 7200)
+        elapsed = [0]
+
+        async def sleep(seconds):
+            elapsed[0] += 240
+
+        async def remote(node_id, method, path, **kwargs):
+            if method == "POST":
+                return {"id": "accepted", "status": "building",
+                        "nodes": [{"logs": ["Building"]}]}
+            raise RuntimeError("lost connection")
+
+        self.manager.node_registry.request.side_effect = remote
+        node = {"node_id": "node-3", "node_name": "node-3", "logs": []}
+        with patch("sparkdeck.image_patch_jobs.time",
+                   new=SimpleNamespace(monotonic=lambda: elapsed[0])), \
+                patch("sparkdeck.image_patch_jobs.asyncio.sleep", side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, "may still be running"):
+                await self.jobs._remote(
+                    node, {**request(), "max_download_bandwidth_mbps": 4.0},
+                )
+        self.assertGreater(elapsed[0], 7200)
+        self.assertLess(elapsed[0], expected + 240)
 
     async def test_terminal_worker_failure_after_connection_recovers_is_not_retried(self):
         self.manager.node_registry.request.side_effect = [

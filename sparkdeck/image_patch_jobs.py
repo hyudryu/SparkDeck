@@ -13,6 +13,7 @@ from pathlib import Path
 from cluster import NodeAgentResponseError
 from sparkdeck.download_throttle import (
     IMAGE_PULL_BANDWIDTH_CAPABILITY,
+    capped_transfer_timeout_seconds,
     parse_bandwidth_mbps,
 )
 from sparkdeck.image_patches import build_patched_image, normalize_patch_request, valid_base_image_identity
@@ -243,7 +244,15 @@ class ImagePatchJobs:
             except Exception as exc:
                 self._log(node, f"Base image pull failed: {exc}")
                 raise
-        result = await asyncio.to_thread(build_patched_image, self.manager.client, request, log)
+        # max_download_bandwidth_mbps is a coordination field the controller
+        # (or a forwarded agent dispatch) adds to the request; the patch
+        # builder re-validates its payload against the strict field set, so
+        # strip it before handing the request over.
+        build_request = {
+            key: value for key, value in request.items()
+            if key != "max_download_bandwidth_mbps"
+        }
+        result = await asyncio.to_thread(build_patched_image, self.manager.client, build_request, log)
         self.manager._images_cache = []
         self.manager._images_ts = 0
         return result
@@ -252,7 +261,17 @@ class ImagePatchJobs:
         registry = self.manager.node_registry
         remote_id = uuid.uuid4().hex
         remote_request = {**request, "job_id": remote_id}
-        deadline = time.monotonic() + 7200
+        # The agent-side base pull honors the forwarded cap, so a large base
+        # image at a low cap legitimately runs past the historical fixed two
+        # hours. Scale the polling window with the cap (unknown archive size
+        # uses the capped-transfer allowance), and re-arm it whenever the
+        # remote reports new progress: slow work is not a stalled job.
+        window = capped_transfer_timeout_seconds(
+            request.get("max_download_bandwidth_mbps"), default=7200.0,
+            floor=7200.0,
+        )
+        deadline = time.monotonic() + window
+        seen_remote_logs: list | None = None
         poll_warnings = []
         remote = None
         method = "POST"
@@ -287,7 +306,13 @@ class ImagePatchJobs:
                     method = "GET"
                     poll_warnings = [*poll_warnings, ("Status temporarily unavailable; retrying the existing build: " + str(exc))[:2000]][-20:]
             detail = remote["nodes"][0] if remote else {}
-            logs = [str(line)[:2000] for line in [*detail.get("logs", [])[-200:], *poll_warnings]][-200:]
+            # Remote progress (not transient poll warnings) is what proves the
+            # build is still working, so the polling window re-arms only on it.
+            detail_logs = [str(line)[:2000] for line in detail.get("logs", [])[-200:]]
+            if detail.get("logs") is not None and detail_logs != seen_remote_logs:
+                seen_remote_logs = detail_logs
+                deadline = time.monotonic() + window
+            logs = [*detail_logs, *poll_warnings][-200:]
             if logs != node["logs"]:
                 node["logs"] = logs
                 self._save_progress()

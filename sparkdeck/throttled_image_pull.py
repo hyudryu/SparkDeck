@@ -435,6 +435,18 @@ async def _ensure_image(client: Any, image: str) -> None:
         await _run_docker(client, "pull", image)
 
 
+async def ensure_helper_images(client: Any) -> None:
+    """Pre-install the two helper images the capped pull flow needs.
+
+    The throttle itself runs inside these containers, so their bootstrap
+    daemon pull can never be rate limited. Enabling a download cap
+    pre-installs them immediately, turning that uncapped step into a
+    one-time action at settings-save time instead of the first user pull.
+    """
+    for image in (PROXY_IMAGE, SKOPEO_IMAGE):
+        await _ensure_image(client, image)
+
+
 async def _exec_ok(client: Any, container: str, command: list[str]) -> bool:
     exec_id = await _run_docker(client, "exec_create", container, cmd=command)
     await _run_docker(client, "exec_start", exec_id["Id"], demux=False)
@@ -572,8 +584,19 @@ async def throttled_image_pull_events(
         yield {"status": f"Preparing bandwidth-limited pull of {image}"}
         version = await _run_docker(client, "version")
         arch = str((version or {}).get("Arch") or "")
-        await _ensure_image(client, PROXY_IMAGE)
-        await _ensure_image(client, SKOPEO_IMAGE)
+        for helper in (PROXY_IMAGE, SKOPEO_IMAGE):
+            try:
+                await _run_docker(client, "inspect_image", helper)
+            except Exception:
+                # Chicken-and-egg: the limiter lives inside these helpers, so
+                # their own daemon pull cannot be capped. Settings-save
+                # pre-installs them; surfacing the event keeps the exception
+                # visible instead of silently overrunning the cap.
+                yield {"status": (
+                    f"Bootstrapping pull helper {helper}; this one-time "
+                    "daemon pull is not covered by the bandwidth limit"
+                )}
+                await _run_docker(client, "pull", helper)
         network = await _run_docker(
             client, "create_network", name=network_name, driver="bridge",
         )

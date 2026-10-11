@@ -203,7 +203,8 @@ class FakeDockerApi:
     """Minimal docker-py APIClient stand-in for the helper orchestration."""
 
     def __init__(self, *, copy_exit=0, proxy_dies=False, stderr_tail=b"fatal: copy failed",
-                 load_events=None, verify_fails=False, inspect_size=100):
+                 load_events=None, verify_fails=False, inspect_size=100,
+                 helpers_missing=False):
         self.copy_exit = copy_exit
         self.proxy_dies = proxy_dies
         self.stderr_tail = stderr_tail
@@ -212,6 +213,7 @@ class FakeDockerApi:
         ]
         self.verify_fails = verify_fails
         self.inspect_size = inspect_size
+        self.helpers_missing = helpers_missing
         self.loaded = None
         self.created: list[dict] = []
         self.removed: list[str] = []
@@ -232,6 +234,8 @@ class FakeDockerApi:
         # Helper images always exist (no pull); the requested image resolves
         # only after a successful load unless verify_fails is set.
         if ref in (PROXY_IMAGE, SKOPEO_IMAGE):
+            if self.helpers_missing:
+                raise RuntimeError(f"helper image {ref} not found")
             return {"Id": f"sha256:{ref}"}
         if self.verify_fails or self.loaded is None:
             raise RuntimeError(f"image {ref} not found")
@@ -542,6 +546,39 @@ class ThrottledPullFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIn("SPARKDECK_IMAGE_STAGING_DIR", events[-1]["error"])
         self.assertIn("download limit to 0", events[-1]["error"])
+
+    async def test_helper_bootstrap_is_surfaced_as_uncapped_one_time_pull(self):
+        api = FakeDockerApi(helpers_missing=True)
+        staging = Path(tempfile.mkdtemp())
+
+        def on_start(container_id):
+            if container_id == "copy-1":
+                staging.joinpath("image.tar").write_bytes(b"tar")
+
+        api.on_start = on_start
+        events, _ = await self.collect(api, staging=staging)
+        notices = [
+            str(event.get("status")) for event in events
+            if "not covered by the bandwidth limit" in str(event.get("status", ""))
+        ]
+        self.assertEqual(len(notices), 2)
+        self.assertIn(PROXY_IMAGE, notices[0])
+        self.assertIn(SKOPEO_IMAGE, notices[1])
+        self.assertEqual(api.pulls, [PROXY_IMAGE, SKOPEO_IMAGE])
+        self.assertIsNotNone(api.loaded)
+
+
+class HelperBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preinstall_pulls_only_missing_helpers(self):
+        client = Mock()
+        client.api = FakeDockerApi()
+        await tip.ensure_helper_images(client)
+        self.assertEqual(client.api.pulls, [])
+        api = FakeDockerApi(helpers_missing=True)
+        client = Mock()
+        client.api = api
+        await tip.ensure_helper_images(client)
+        self.assertEqual(api.pulls, [PROXY_IMAGE, SKOPEO_IMAGE])
 
 
 class LimiterProxyTests(unittest.TestCase):

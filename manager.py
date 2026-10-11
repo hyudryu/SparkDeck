@@ -12157,7 +12157,30 @@ class Manager:
             self.virtual_nas.start()
         elif not self.settings.get("virtual_nas_enabled"):
             await self.virtual_nas.stop()
+        if (
+            "max_download_bandwidth_mbps" in data
+            and self._image_pull_bytes_per_second(None) > 0
+        ):
+            self._prefetch_pull_helper_images()
         return self.public_settings()
+
+    def _prefetch_pull_helper_images(self) -> None:
+        """Best-effort pre-install of the capped pull flow's helper images.
+
+        The bootstrap pulls for SparkDeck's own pull helpers cannot be
+        rate limited (the throttle runs inside those containers), so the
+        uncapped one-time step happens at settings-save time, explicitly,
+        instead of mid-pull at the first capped request.
+        """
+        async def _run() -> None:
+            try:
+                from sparkdeck.throttled_image_pull import ensure_helper_images
+                await ensure_helper_images(self.client)
+            except Exception:
+                # A failed prefetch only defers the bootstrap to the first
+                # capped pull, which surfaces it as a progress event.
+                pass
+        self._helper_prefetch_task = asyncio.create_task(_run())
 
     # ---------- lifetime token stats ----------
     # Counters are keyed by model id plus a variant tag (quant/dtype) so the
@@ -17532,6 +17555,14 @@ class Manager:
                 image, name, model=model, cluster_member=cluster_member,
                 runtime="laya",
             )
+            # Laya resolves or downloads the checkpoint inside the container
+            # through the mounted shared HF cache, so prefetch it through the
+            # capped worker while a download limit is active.
+            await self._prefetch_runtime_weights(
+                model, name=name, cluster_member=cluster_member,
+                runtime="laya", hf_token=hf_token,
+                revision=self._cli_option(list(extra_args or []), {"--revision"}),
+            )
             return await asyncio.to_thread(_create)
         except Exception as exc:
             safe_error = self._redact_hf_secret(exc)
@@ -17658,6 +17689,13 @@ class Manager:
             await self._ensure_runtime_image(
                 image, name, model=model, cluster_member=cluster_member,
                 runtime="tensorfold",
+            )
+            # TensorFold resolves or downloads the checkpoint inside the
+            # container through the mounted shared HF cache (it has no
+            # --revision flag, so the default branch is what it will fetch).
+            await self._prefetch_runtime_weights(
+                model, name=name, cluster_member=cluster_member,
+                runtime="tensorfold", hf_token=hf_token,
             )
             return await asyncio.to_thread(_create)
         except Exception as exc:
@@ -17987,6 +18025,34 @@ class Manager:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
+    def _require_strata_weights_prepared(
+        self, deployment_key: str, environment, image_identity: str,
+    ) -> None:
+        """Refuse a capped first launch; Strata's download is uncappable.
+
+        A first launch (or any config change, which lands in a fresh
+        fingerprinted volume) downloads the pinned checkpoint inside the
+        container from a repository only the upstream entrypoint knows, so
+        SparkDeck can prefetch it under the cap the way it does for the
+        cache-resolving runtimes, and cannot shape the container's egress.
+        Refuse instead of silently overrunning the limit; a volume that
+        already exists means the setup ran and a restart skips it.
+        """
+        if self._image_pull_bytes_per_second(None) <= 0:
+            return
+        probe = (
+            f"{self._strata_volume_prefix(deployment_key)}-"
+            f"{self._strata_setup_fingerprint(environment, image_identity)}"
+        )
+        try:
+            self.client.volumes.get(probe)
+        except docker.errors.NotFound:
+            raise RuntimeError(
+                "Strata downloads its model pack inside the container on "
+                "first launch, which the bandwidth limit cannot cover; set "
+                "the download limit to 0 for this launch, then restore it"
+            )
+
     def _strata_data_volume(
         self, deployment_key: str, environment, image: str | None = None,
     ) -> str:
@@ -18196,6 +18262,9 @@ class Manager:
             # saved config exists, so a config-affecting edit lands in a
             # fresh volume whose setup runs with the new settings, while an
             # unchanged relaunch reuses the prepared pack.
+            self._require_strata_weights_prepared(
+                deployment_key, environment, image_identity,
+            )
             data_volume = self._strata_data_volume(
                 deployment_key, environment, image_identity,
             )
@@ -18518,6 +18587,7 @@ class Manager:
                 await self._prefetch_runtime_weights(
                     model, name=name, cluster_member=cluster_member,
                     runtime="sglang", hf_token=hf_token,
+                    revision=self._cli_option(list(extra_args or []), {"--revision"}),
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -18683,6 +18753,7 @@ class Manager:
                 await self._prefetch_runtime_weights(
                     model, name=name, cluster_member=cluster_member,
                     runtime="vllm", hf_token=hf_token,
+                    revision=self._cli_option(list(extra_args or []), {"--revision"}),
                 )
                 return await asyncio.to_thread(_create)
             except Exception as exc:
@@ -19826,16 +19897,19 @@ class Manager:
     async def _prefetch_runtime_weights(
         self, model: str, name: str | None = None,
         cluster_member: dict | None = None, runtime: str = "",
-        hf_token: str | None = None,
+        hf_token: str | None = None, revision: str | None = None,
     ) -> None:
         """Prepare missing HF weights through the capped worker pre-launch.
 
-        vLLM and SGLang resolve the model inside the runtime container, so
-        an uncached deployment would fetch the weights over the uplink
-        outside every SparkDeck throttle. When a download cap is active, the
-        snapshot is downloaded first through the same capped worker (and the
-        node-wide transfer lock) that the Transfer queue uses, into the hub
-        directory the container mounts, so the container starts offline.
+        vLLM, SGLang, Laya, and TensorFold resolve the model inside the
+        runtime container, so an uncached deployment would fetch the weights
+        over the uplink outside every SparkDeck throttle. When a download cap
+        is active, the snapshot is downloaded first through the same capped
+        worker (and the node-wide transfer lock) that the Transfer queue
+        uses, into the hub directory the container mounts, so the container
+        starts offline. Strata is not covered here: its entrypoint picks the
+        checkpoint repository itself and stages it into a private volume, so
+        its launcher refuses first launches while capped.
         """
         share = self._image_pull_share_mbps(cluster_member)
         if share is None:
@@ -19857,11 +19931,14 @@ class Manager:
             # A local directory path; the container reads files directly.
             return
         token = self._resolved_hf_token(hf_token)
+        requested = str(revision or "").strip() or "main"
 
         def _resolve_revision() -> str:
+            if _is_commit_sha(requested):
+                return requested
             from huggingface_hub import HfApi
             info = HfApi(token=token or None).model_info(
-                model_id, revision="main",
+                model_id, revision=requested,
             )
             return str(getattr(info, "sha", "") or "").strip()
 
@@ -19882,7 +19959,7 @@ class Manager:
         def _cached() -> bool:
             return any(
                 item.get("model_id") == model_id
-                and nas._has_revision(item, revision, "main")
+                and nas._has_revision(item, revision, requested)
                 for item in nas.inventory()
             )
 
@@ -19896,7 +19973,7 @@ class Manager:
             )
         print(f"[{runtime}] prefetching weights: {model_id}@{revision[:12]}")
         await nas._download_model_process(
-            model_id, revision, token, "main", bandwidth_mbps=share,
+            model_id, revision, token, requested, bandwidth_mbps=share,
         )
 
     async def pull_image_result(

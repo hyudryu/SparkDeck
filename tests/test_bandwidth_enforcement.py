@@ -276,6 +276,156 @@ class PrefetchRuntimeWeightsTests(unittest.IsolatedAsyncioTestCase):
                 await m._prefetch_runtime_weights("org/model", runtime="vllm")
         m.virtual_nas._download_model_process.assert_not_awaited()
 
+    async def test_requested_revision_is_resolved_and_downloaded(self):
+        m = self.harness(100.0)
+        api = Mock()
+        api.model_info.return_value.sha = self.SHA
+        with patch("huggingface_hub.HfApi", Mock(return_value=api)):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm", revision="feature-branch",
+            )
+        api.model_info.assert_called_once_with(
+            "org/model", revision="feature-branch",
+        )
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", self.SHA, "tok", "feature-branch", bandwidth_mbps=100.0,
+        )
+
+    async def test_pinned_commit_sha_skips_resolution(self):
+        m = self.harness(100.0)
+        factory = Mock()
+        with patch("huggingface_hub.HfApi", factory):
+            await m._prefetch_runtime_weights(
+                "org/model", runtime="vllm", revision="b" * 40,
+            )
+        factory.assert_not_called()
+        m.virtual_nas._download_model_process.assert_awaited_once_with(
+            "org/model", "b" * 40, "tok", "b" * 40, bandwidth_mbps=100.0,
+        )
+
+
+class CacheExternalRuntimeWiringTests(unittest.IsolatedAsyncioTestCase):
+    """Laya and TensorFold must prefetch weights before the container starts.
+
+    Both resolve the model inside the container through the mounted shared
+    HF cache, so the capped pre-launch prefetch has to run between the image
+    gate and container creation, and must forward the launch's --revision.
+    """
+
+    def launcher_manager(self, cap_mbps=100.0):
+        m = bare_manager(cap_mbps)
+        m.settings["hf_cache"] = "/cache"
+        m.settings["shm_size"] = "8g"
+        m._ensure_runtime_image = AsyncMock()
+        m._prefetch_runtime_weights = AsyncMock()
+        m._allocate_port = AsyncMock(return_value=3123)
+        m._cluster_launch_update = Mock()
+        m._build_volumes = Mock(return_value={})
+        m._container_hf_environment = Mock(return_value={})
+        m._container_summary = Mock(return_value=None)
+        m._created_container_model_source = Mock(return_value="")
+        m._run_managed_container = Mock(return_value=Mock())
+        m.evict_other_backends = AsyncMock()
+        return m
+
+    async def test_laya_prefetches_with_the_flag_revision(self):
+        m = self.launcher_manager()
+        with (
+            patch("manager._node_has_nvidia_driver", return_value=False),
+            patch("manager._laya_gpu_preference", return_value=False),
+        ):
+            await m._create_laya_container(
+                "org/model", 3000, "laya:1", None,
+                ["--revision", "v1.2"], "laya-1", None, "tok", None,
+            )
+        m._prefetch_runtime_weights.assert_awaited_once()
+        kwargs = m._prefetch_runtime_weights.await_args.kwargs
+        self.assertEqual(kwargs["runtime"], "laya")
+        self.assertEqual(kwargs["revision"], "v1.2")
+        self.assertEqual(kwargs["hf_token"], "tok")
+
+    async def test_tensorfold_prefetches_without_a_revision_flag(self):
+        m = self.launcher_manager()
+        with patch("manager._node_has_nvidia_driver", return_value=True):
+            await m._create_tensorfold_container(
+                "org/model", 3000, "tf:1", None, [], "tf-1", None, "tok", None,
+            )
+        kwargs = m._prefetch_runtime_weights.await_args.kwargs
+        self.assertEqual(kwargs["runtime"], "tensorfold")
+        self.assertNotIn("revision", kwargs)
+
+    async def test_prefetch_runs_between_the_image_gate_and_container_start(self):
+        m = self.launcher_manager()
+        order = []
+        m._ensure_runtime_image = AsyncMock(
+            side_effect=lambda *a, **k: order.append("image"),
+        )
+        m._prefetch_runtime_weights = AsyncMock(
+            side_effect=lambda *a, **k: order.append("prefetch"),
+        )
+        m._run_managed_container = Mock(
+            side_effect=lambda opts: order.append("container") or Mock(),
+        )
+        with (
+            patch("manager._node_has_nvidia_driver", return_value=False),
+            patch("manager._laya_gpu_preference", return_value=False),
+        ):
+            await m._create_laya_container(
+                "org/model", 3000, "laya:1", None, [], "laya-1", None, None, None,
+            )
+        self.assertEqual(order, ["image", "prefetch", "container"])
+
+
+class StrataCappedLaunchGuardTests(unittest.TestCase):
+    def test_capped_first_launch_is_refused(self):
+        m = bare_manager(100.0)
+        m.client.volumes.get.side_effect = docker.errors.NotFound("gone")
+        with self.assertRaisesRegex(RuntimeError, "cannot cover"):
+            m._require_strata_weights_prepared("dep-1", {"MODEL": "IQ2_XS"}, "imgid")
+
+    def test_prepared_volume_allows_a_capped_relaunch(self):
+        m = bare_manager(100.0)
+        m.client.volumes.get.return_value = Mock()
+        m._require_strata_weights_prepared("dep-1", {"MODEL": "IQ2_XS"}, "imgid")
+        m.client.volumes.get.assert_called_once()
+
+    def test_uncapped_never_probes(self):
+        m = bare_manager(0.0)
+        m._require_strata_weights_prepared("dep-1", {}, "imgid")
+        m.client.volumes.get.assert_not_called()
+
+
+class HelperPrefetchOnSettingsTests(unittest.IsolatedAsyncioTestCase):
+    def settings_manager(self, cap_mbps):
+        m = bare_manager(cap_mbps)
+        m.lock = asyncio.Lock()
+        m._save_settings = Mock()
+        m.is_joined_worker = Mock(return_value=True)
+        m.virtual_nas = Mock(start=Mock(), stop=AsyncMock())
+        m.public_settings = Mock(return_value={})
+        m._prefetch_pull_helper_images = Mock()
+        return m
+
+    async def test_enabling_the_cap_preinstalls_helpers(self):
+        m = self.settings_manager(0.0)
+        await m.update_settings({"max_download_bandwidth_mbps": 50})
+        self.assertEqual(m.settings["max_download_bandwidth_mbps"], 50.0)
+        m._prefetch_pull_helper_images.assert_called_once_with()
+
+    async def test_disabling_the_cap_does_not_prefetch(self):
+        m = self.settings_manager(50.0)
+        await m.update_settings({"max_download_bandwidth_mbps": 0})
+        m._prefetch_pull_helper_images.assert_not_called()
+
+    async def test_prefetch_task_invokes_ensure_helper_images(self):
+        m = bare_manager(0.0)
+        with patch(
+            "sparkdeck.throttled_image_pull.ensure_helper_images", AsyncMock(),
+        ) as ensure:
+            m._prefetch_pull_helper_images()
+            await m._helper_prefetch_task
+        ensure.assert_awaited_once_with(m.client)
+
 
 class CappedInternetTransferGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_capped_sections_serialize_behind_one_lock(self):

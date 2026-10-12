@@ -695,6 +695,8 @@ export interface AppSettings {
   /** Cluster-wide internet download cap in megabits per second; 0 = unlimited. */
   max_download_bandwidth_mbps?: number
   telemetry_interval_seconds?: number
+  /** Friendly names for client addresses, keyed by canonical IP string. */
+  ip_aliases?: Record<string, string>
   [key: string]: unknown
 }
 

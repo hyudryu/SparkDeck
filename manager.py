@@ -153,6 +153,11 @@ DEFAULT_SETTINGS = {
     "cluster_node_hidden_from_dashboard": False,
     "cluster_fabric_ip": "",
     "cluster_fabric_interface": "",
+    # Friendly names for client addresses, keyed by canonical IP string.
+    # Used to label the caller IPs shown in live inference sessions and IP
+    # routing rules. Stored locally: the node that records a caller is the
+    # node whose dashboard shows it.
+    "ip_aliases": {},
     # llama-server launcher (GGUF models from the local HF cache). One server
     # at a time, bound to localhost and proxied via /v1.
     "llama_server_bin": "~/.local/share/llama.cpp/llama-server",
@@ -12270,10 +12275,44 @@ class Manager:
             self._save_settings()
         return self.public_settings()
 
+    MAX_IP_ALIASES = 100
+    MAX_IP_ALIAS_LENGTH = 60
+
+    @classmethod
+    def _normalize_ip_aliases(cls, value: Any) -> dict[str, str]:
+        """Canonicalize the ip_aliases mapping: IP keys are validated and
+        rewritten to their canonical form so caller IPs recorded from sockets
+        match, and blank aliases drop their entry. Raises ValueError."""
+        if not isinstance(value, dict):
+            raise ValueError("ip_aliases must be an object")
+        if len(value) > cls.MAX_IP_ALIASES:
+            raise ValueError(
+                f"ip_aliases supports at most {cls.MAX_IP_ALIASES} entries",
+            )
+        aliases: dict[str, str] = {}
+        for raw_ip, raw_alias in value.items():
+            try:
+                address = ipaddress.ip_address(str(raw_ip).strip())
+            except ValueError:
+                raise ValueError(
+                    f"ip_aliases key {raw_ip!r} is not a valid IP address",
+                ) from None
+            if not isinstance(raw_alias, str):
+                raise ValueError(f"alias for {address} must be a string")
+            alias = raw_alias.strip()
+            if len(alias) > cls.MAX_IP_ALIAS_LENGTH:
+                raise ValueError(
+                    "ip_aliases values must be "
+                    f"{cls.MAX_IP_ALIAS_LENGTH} characters or fewer",
+                )
+            if alias:
+                aliases[str(address)] = alias
+        return aliases
+
     async def update_settings(self, data: dict) -> dict:
-        # Validate the bandwidth cap before mutating anything: a payload can
-        # carry several keys, and a rejected cap must not leave earlier keys
-        # already applied to the live settings object.
+        # Validate the bandwidth cap and IP aliases before mutating anything: a
+        # payload can carry several keys, and a rejected value must not leave
+        # earlier keys already applied to the live settings object.
         try:
             old_bandwidth_mbps = float(
                 self.settings.get("max_download_bandwidth_mbps", 0) or 0,
@@ -12285,6 +12324,9 @@ class Manager:
             data["max_download_bandwidth_mbps"] = parse_bandwidth_mbps(
                 data["max_download_bandwidth_mbps"],
             )
+        if "ip_aliases" in data:
+            data = dict(data)
+            data["ip_aliases"] = self._normalize_ip_aliases(data["ip_aliases"])
         async with self.lock:
             for k, v in data.items():
                 # Dashboard visibility is presentation-only node state. Keep

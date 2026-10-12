@@ -3175,6 +3175,7 @@ async def v1_settings():
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
+    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     # cluster_node_name is deliberately absent: this response is forwarded to
     # the controller on joined workers, so it would name the controller rather
@@ -3256,6 +3257,16 @@ async def v1_update_settings(req: Request):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    if "ip_aliases" in body:
+        # The map is authoritative in manager settings, shared with the
+        # legacy /api/settings surface, so the v1 route validates and
+        # forwards it like the bandwidth cap.
+        try:
+            forwarded_settings["ip_aliases"] = manager._normalize_ip_aliases(
+                body["ip_aliases"],
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
     sparkdeck.prompt_gate.refresh()
@@ -3267,6 +3278,7 @@ async def v1_update_settings(req: Request):
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
+    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
@@ -3282,6 +3294,7 @@ async def v1_clear_hf_token():
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
+    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 

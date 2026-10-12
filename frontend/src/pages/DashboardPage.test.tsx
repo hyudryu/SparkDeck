@@ -37,10 +37,11 @@ class MockWebSocket {
   }
 }
 
-function stubDashboardFetch(stats: Record<string, unknown>) {
+function stubDashboardFetch(stats: Record<string, unknown>, settings: Record<string, unknown> = { items: [] }) {
   return vi.fn<typeof fetch>().mockImplementation(async (input) => {
     const path = String(input)
     if (path.includes('/api/stats')) return json(stats)
+    if (path.includes('/api/v1/settings')) return json(settings)
     if (path.includes('/api/inference-queue')) return json({})
     if (path.includes('/api/v1/deployments')) return json({ items: [] })
     if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
@@ -559,6 +560,7 @@ describe('DashboardPage', () => {
       if (path.includes('/api/v1/deployments')) return json({ items: [] })
       if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
       if (path.includes('/api/v1/model-routing-policies')) return json({ items: [] })
+      if (path.includes('/api/v1/settings')) return json({ theme: 'system' })
       if (path.includes('/api/v1/onboarding')) return json({
         role: 'controller',
         node: { id: 'local', name: 'This node', port: 7878, access_urls: [] },
@@ -871,6 +873,27 @@ describe('DashboardPage', () => {
 
     expect(await screen.findByText('live-model')).toBeInTheDocument()
     expect(screen.getByText('2 from 192.0.2.10 · 1 from 192.0.2.20')).toBeInTheDocument()
+  })
+
+  it('labels caller IPs with configured machine aliases, keeping the address visible', async () => {
+    vi.stubGlobal('fetch', stubDashboardFetch(
+      {
+        cpu_pct: 25, mem: {}, gpus: [],
+        active_requests: {
+          'live-model': {
+            connections: 3,
+            output_tok_s: 12,
+            caller_ips: { '192.0.2.20': 1, '192.0.2.10': 2 },
+          },
+        },
+      },
+      { theme: 'system', ip_aliases: { '192.0.2.10': 'Studio laptop' } },
+    ))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    expect(await screen.findByText('live-model')).toBeInTheDocument()
+    expect(screen.getByText('2 from Studio laptop (192.0.2.10) · 1 from 192.0.2.20')).toBeInTheDocument()
   })
 
   it('shows live prompt processing, output, and thinking token rates per stage', async () => {

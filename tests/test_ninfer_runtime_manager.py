@@ -1005,11 +1005,13 @@ class NinferClusterLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[2], "a" * 40)
             self.assertEqual(args[3], ["model.ninfer"])
             service._resolved_model_revision.assert_not_awaited()
-            # The validated snapshot feeds the relaunch (Manager suppresses
-            # the flag itself for NInfer; the artifact path pins it).
+            # The verified snapshot must not reach the relaunch as a pin:
+            # Manager renders a pin as a --revision flag, and NInfer hands
+            # extra_args to ninfer-serve verbatim. The persisted artifact
+            # reference already names this snapshot, so the relaunch needs
+            # no pin at all.
             manager.deployment_action.assert_awaited_once_with(
                 "cluster-old", "start", ["spark-2"],
-                model_revision="a" * 40,
             )
         finally:
             await manager.http.aclose()

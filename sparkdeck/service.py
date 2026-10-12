@@ -4641,7 +4641,12 @@ class SparkDeckService:
                     "model weights are not available on selected node(s): "
                     + ", ".join(missing)
                 )
-            return resolved
+            # NInfer renders no revision flag: ``ninfer-serve <artifact>``
+            # receives the saved extra_args verbatim, and the artifact
+            # reference is what fixes the snapshot the relaunch loads.
+            # Returning the resolved revision would ask Manager to pin a
+            # --revision flag this runtime cannot honour.
+            return None
         if deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value:
             # A selective GGUF download leaves the repository snapshot
             # deliberately partial, so whole-repository completeness is the

@@ -116,3 +116,18 @@ class CachedRevisionRelaunchTests(unittest.IsolatedAsyncioTestCase):
         for action, nodes in (("stop", ["node-4"]), ("start", None)):
             with self.assertRaisesRegex(ValueError, "explicit full-deployment"):
                 await manager.deployment_action("old", action, nodes, model_revision=A)
+
+    async def test_pin_is_refused_for_engines_that_render_no_revision_flag(self):
+        """A pin becomes a --revision flag on the replacement launch, so an
+        engine that cannot render one must be refused here. NInfer hands its
+        extra_args to ninfer-serve verbatim and pins the snapshot inside the
+        cache-relative artifact reference, so its start selection has to
+        verify and drop the resolved revision instead of forwarding it."""
+        manager = self.manager()
+        manager.deployments[0]["engine"] = "ninfer"
+        manager.deployments[0]["launch_settings"]["engine"] = "ninfer"
+        with self.assertRaisesRegex(ValueError, "explicit full-deployment"):
+            await manager.deployment_action("old", "start", ["node-4"], model_revision=A)
+        manager._preflight_deployment_launch.assert_not_called()
+        manager.create_deployment.assert_not_called()
+        manager._member_action.assert_not_called()

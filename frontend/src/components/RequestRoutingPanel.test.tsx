@@ -18,7 +18,6 @@ const groupedDeployment: Deployment = {
 beforeEach(() => {
   vi.spyOn(api.deployments, 'list').mockResolvedValue([groupedDeployment])
   vi.spyOn(api.inferenceRouting, 'list').mockResolvedValue([])
-  vi.spyOn(api.settings, 'get').mockResolvedValue({})
 })
 
 afterEach(() => {
@@ -109,13 +108,12 @@ describe('RequestRoutingPanel', () => {
   })
 
   it('shows the machine alias next to a rule source address', async () => {
-    vi.spyOn(api.settings, 'get').mockResolvedValue({ ip_aliases: { '10.0.0.10': 'Studio laptop' } })
     vi.spyOn(api.inferenceRouting, 'list').mockResolvedValue([{
       source_ip: '10.0.0.10', requested_model: 'shared-model', enabled: true,
       deployment_id: 'deployment-a', instance_id: 0, node_ids: ['node-1', 'node-2'],
     }])
 
-    render(<RequestRoutingPanel />)
+    render(<RequestRoutingPanel ipAliases={{ '10.0.0.10': 'Studio laptop' }} />)
 
     const alias = await screen.findByText('Studio laptop')
     expect(alias.closest('div')?.textContent).toContain('10.0.0.10')

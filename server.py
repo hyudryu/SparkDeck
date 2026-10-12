@@ -3162,7 +3162,42 @@ _APP_SETTING_DEFAULTS = {
     "default_context_length": 8192,
     "history_enabled": DEFAULT_HISTORY_ENABLED,
     "history_sample_seconds": DEFAULT_HISTORY_SAMPLE_SECONDS,
+    "ip_aliases": {},
 }
+
+MAX_IP_ALIASES = 100
+MAX_IP_ALIAS_LENGTH = 60
+
+
+def _normalize_ip_aliases(value: object) -> dict[str, str]:
+    """Canonicalize the cluster-wide ip_aliases map: IP keys are validated and
+    rewritten to canonical form so caller IPs recorded from sockets match, and
+    blank aliases drop their entry. Raises ValueError."""
+    if not isinstance(value, dict):
+        raise ValueError("ip_aliases must be an object")
+    if len(value) > MAX_IP_ALIASES:
+        raise ValueError(
+            f"ip_aliases supports at most {MAX_IP_ALIASES} entries",
+        )
+    aliases: dict[str, str] = {}
+    for raw_ip, raw_alias in value.items():
+        try:
+            address = ipaddress.ip_address(str(raw_ip).strip())
+        except ValueError:
+            raise ValueError(
+                f"ip_aliases key {raw_ip!r} is not a valid IP address",
+            ) from None
+        if not isinstance(raw_alias, str):
+            raise ValueError(f"alias for {address} must be a string")
+        alias = raw_alias.strip()
+        if len(alias) > MAX_IP_ALIAS_LENGTH:
+            raise ValueError(
+                "ip_aliases values must be "
+                f"{MAX_IP_ALIAS_LENGTH} characters or fewer",
+            )
+        if alias:
+            aliases[str(address)] = alias
+    return aliases
 
 
 @app.get("/api/v1/settings")
@@ -3175,7 +3210,6 @@ async def v1_settings():
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
-    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     # cluster_node_name is deliberately absent: this response is forwarded to
     # the controller on joined workers, so it would name the controller rather
@@ -3231,6 +3265,16 @@ async def v1_update_settings(req: Request):
             "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
         ),
     ))
+    # Aliases are a cluster-wide controller setting, not node-local: a joined
+    # worker forwards this route to the controller, so storing per-node would
+    # either silently edit the controller's copy or be unreachable.
+    if "ip_aliases" in body:
+        try:
+            ip_aliases = _normalize_ip_aliases(body["ip_aliases"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    else:
+        ip_aliases = sparkdeck.store.get_setting("ip_aliases", {})
     values = {
         "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
@@ -3238,6 +3282,7 @@ async def v1_update_settings(req: Request):
         "default_context_length": default_context_length,
         "history_enabled": raw_history_enabled,
         "history_sample_seconds": history_sample_seconds,
+        "ip_aliases": ip_aliases,
     }
     credential = body.get("hf_token")
     if credential is not None:
@@ -3257,16 +3302,6 @@ async def v1_update_settings(req: Request):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-    if "ip_aliases" in body:
-        # The map is authoritative in manager settings, shared with the
-        # legacy /api/settings surface, so the v1 route validates and
-        # forwards it like the bandwidth cap.
-        try:
-            forwarded_settings["ip_aliases"] = manager._normalize_ip_aliases(
-                body["ip_aliases"],
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
     for key, value in values.items():
         sparkdeck.store.set_setting(key, value)
     sparkdeck.prompt_gate.refresh()
@@ -3278,7 +3313,6 @@ async def v1_update_settings(req: Request):
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
-    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 
@@ -3294,7 +3328,6 @@ async def v1_clear_hf_token():
     values["max_download_bandwidth_mbps"] = manager.settings.get(
         "max_download_bandwidth_mbps", 0,
     )
-    values["ip_aliases"] = manager.settings.get("ip_aliases") or {}
     values["hf_token_configured"] = bool(manager._resolved_hf_token())
     return values
 

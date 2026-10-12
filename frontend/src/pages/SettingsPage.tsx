@@ -600,7 +600,7 @@ export function SettingsPage() {
           <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster Management</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
         </Panel>
         <Panel className="settings-section" aria-labelledby="ip-aliases-title">
-          <div className="settings-heading"><span><Tag size={18} /></span><div><h2 id="ip-aliases-title">Machine aliases</h2><p>Name client addresses so live inference sessions and IP routing rules show the machine instead of only an address. Label each machine's Tailscale IP here; aliases are stored on this node.</p></div></div>
+          <div className="settings-heading"><span><Tag size={18} /></span><div><h2 id="ip-aliases-title">Machine aliases</h2><p>Name client addresses so live inference sessions and IP routing rules show the machine instead of only an address. Label each machine's Tailscale IP here; one alias map is shared across the cluster.</p></div></div>
           <div className="settings-fields wide-field ip-alias-fields">
             {aliasRows.length === 0 && <p className="muted">No address aliases yet.</p>}
             {aliasRows.map((row, index) => (
@@ -690,7 +690,7 @@ export function SettingsPage() {
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
-      <RequestRoutingPanel />
+      <RequestRoutingPanel ipAliases={form.ip_aliases} />
       <SoftwareUpdatePanel />
       <Panel className="settings-section support-legal-section">
         <div className="settings-heading"><span><ShieldCheck size={18} /></span><div><h2>Support & legal</h2><p>Review how Community Features handle data, read the service terms, or report a problem.</p></div></div>

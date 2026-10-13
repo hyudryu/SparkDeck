@@ -694,10 +694,29 @@ export interface AppSettings {
   hf_token_configured?: boolean
   /** Cluster-wide internet download cap in megabits per second; 0 = unlimited. */
   max_download_bandwidth_mbps?: number
+  /** Request id served when an API call asks for the reserved "default" model. */
+  default_model?: string
   telemetry_interval_seconds?: number
   /** Friendly names for client addresses, keyed by canonical IP string. */
   ip_aliases?: Record<string, string>
   [key: string]: unknown
+}
+
+/** One entry in the gateway's OpenAI-compatible /v1/models listing. */
+export interface GatewayModelEntry {
+  id: string
+  object?: string
+  owned_by?: string
+  runtime?: string
+  deployment_id?: string
+  /** Set on the reserved "default" alias entry: the id it routes to. */
+  alias_of?: string
+  type?: string
+}
+
+export interface GatewayModelList {
+  object: string
+  data: GatewayModelEntry[]
 }
 
 export interface SystemUpdateRelease {

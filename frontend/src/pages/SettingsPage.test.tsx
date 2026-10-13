@@ -114,6 +114,83 @@ describe('settings page', () => {
     await waitFor(() => expect(screen.getByRole('spinbutton', bandwidth)).toHaveValue(25))
   })
 
+  it('saves the default model choice from the gateway model listing', async () => {
+    let defaultModel = 'beta-model'
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/v1/models') {
+        body = { object: 'list', data: [
+          { id: 'beta-model' }, { id: 'alpha-model' }, { id: 'embed-one', type: 'embedding' },
+        ] }
+      } else if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') {
+          const saved = JSON.parse(String(init.body))
+          if ('default_model' in saved) defaultModel = saved.default_model
+        }
+        body = { theme: 'system', max_concurrent_prompt_processing: 1, default_model: defaultModel }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    const visit = render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    await waitFor(() => expect(select).toHaveValue('beta-model'))
+    // Embedding models are served on a separate surface the alias never
+    // routes to, so they are not offered as a default.
+    expect(within(select).queryByRole('option', { name: 'embed-one' })).not.toBeInTheDocument()
+    expect(within(select).getByRole('option', { name: 'alpha-model' })).toBeInTheDocument()
+    await user.selectOptions(select, 'alpha-model')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(defaultModel).toBe('alpha-model'))
+    visit.unmount()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Default model' })).toHaveValue('alpha-model'))
+  })
+
+  it('keeps an unserved default model selected and can clear it to no default', async () => {
+    let defaultModel = 'gone-model'
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/v1/models') body = { object: 'list', data: [{ id: 'alpha-model' }] }
+      if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') {
+          const saved = JSON.parse(String(init.body))
+          if ('default_model' in saved) defaultModel = saved.default_model
+        }
+        body = { theme: 'system', default_model: defaultModel }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    // The stopped target stays selectable instead of silently resetting.
+    await waitFor(() => expect(select).toHaveValue('gone-model'))
+    expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled()
+    await user.selectOptions(select, '')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(defaultModel).toBe(''))
+  })
+
+  it('never offers a case variant of the reserved default name', async () => {
+    // Routing and the save-time validation claim "default" casefolded, so a
+    // deployment that publishes "Default" can never be a target: offering it
+    // would produce a selector choice that always saves with a 400.
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/v1/models') body = { object: 'list', data: [{ id: 'alpha-model' }, { id: 'Default' }] }
+      if (path === '/api/v1/settings') body = { theme: 'system', default_model: '' }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    await waitFor(() => expect(within(select).getByRole('option', { name: 'alpha-model' })).toBeInTheDocument())
+    expect(within(select).queryByRole('option', { name: 'Default' })).not.toBeInTheDocument()
+  })
+
   it('treats a cleared bandwidth field as unlimited when saving', async () => {
     const update = vi.spyOn(api.settings, 'update').mockResolvedValue({
       theme: 'system', max_download_bandwidth_mbps: 0,

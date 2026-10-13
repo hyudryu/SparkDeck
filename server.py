@@ -3162,6 +3162,7 @@ _APP_SETTING_DEFAULTS = {
     "default_context_length": 8192,
     "history_enabled": DEFAULT_HISTORY_ENABLED,
     "history_sample_seconds": DEFAULT_HISTORY_SAMPLE_SECONDS,
+    "default_model": "",
     "ip_aliases": {},
 }
 
@@ -3265,6 +3266,20 @@ async def v1_update_settings(req: Request):
             "history_sample_seconds", DEFAULT_HISTORY_SAMPLE_SECONDS,
         ),
     ))
+    raw_default_model = body.get(
+        "default_model", sparkdeck.store.get_setting("default_model", ""),
+    )
+    if raw_default_model is None:
+        raw_default_model = ""
+    if not isinstance(raw_default_model, str):
+        raise HTTPException(400, "default_model must be a string")
+    default_model = raw_default_model.strip()
+    if len(default_model) > 512:
+        raise HTTPException(400, "default_model must be 512 characters or fewer")
+    # "default" is the reserved request alias this setting redirects from, so
+    # it can never name its own target.
+    if default_model.casefold() == "default":
+        raise HTTPException(400, "default_model cannot be the reserved name default")
     # Aliases are a cluster-wide controller setting, not node-local: a joined
     # worker forwards this route to the controller, so storing per-node would
     # either silently edit the controller's copy or be unreachable.
@@ -3282,6 +3297,7 @@ async def v1_update_settings(req: Request):
         "default_context_length": default_context_length,
         "history_enabled": raw_history_enabled,
         "history_sample_seconds": history_sample_seconds,
+        "default_model": default_model,
         "ip_aliases": ip_aliases,
     }
     credential = body.get("hf_token")
@@ -4880,6 +4896,12 @@ async def v1_chat_completions(req: Request):
 @app.post("/v1/responses")
 async def v1_responses(req: Request):
     body = await _inference_json(req)
+    # Resolve the reserved default alias before conversion: the Responses
+    # adapters build response metadata from the original request, so the
+    # resolved target must replace it here for the response to report the
+    # model that actually served the request, as the chat surface does.
+    if isinstance(body, dict) and isinstance(body.get("model"), str):
+        body = {**body, "model": sparkdeck.resolve_default_model(body["model"])}
     try:
         chat_body = to_chat_request(body)
     except (ValueError, TypeError) as exc:

@@ -7614,6 +7614,61 @@ class SparkDeckService:
             if model.get("dimension") is not None:
                 entry["dimension"] = model["dimension"]
             data.append(entry)
+        default_target = self._default_model_target()
+        if default_target:
+            # Routing reserves the name case-insensitively: every case variant
+            # of "default" redirects to the configured target, so a deployment
+            # that publishes the reserved name keeps its other request ids
+            # while the reserved entry is replaced by the alias entry.
+            winner = self._default_model_winner_id(
+                default_target, deployments, request_owners, shared_owners,
+            )
+            # Snapshot the winning deployment's own entry before the reserved
+            # entries are removed: a deployment whose only published id is a
+            # case variant of "default" still supplies the alias entry's
+            # metadata.
+            winner_entry = None
+            if winner is not None:
+                winner_entry = next(
+                    (
+                        item for item in data
+                        if item.get("deployment_id") == winner
+                    ),
+                    None,
+                )
+            reserved_ids = {
+                item["id"] for item in data
+                if item["id"].casefold() == self.DEFAULT_MODEL_REQUEST_ID
+            }
+            if reserved_ids:
+                data = [
+                    item for item in data
+                    if item["id"] not in reserved_ids
+                ]
+                seen.difference_update(reserved_ids)
+            # The target may be listed under its own id; an embedding row that
+            # happens to share the id serves a different surface, so it falls
+            # through to the winning chat deployment instead.
+            target_entry = next(
+                (
+                    item for item in data
+                    if item["id"] == default_target
+                    and item.get("type") != "embedding"
+                ),
+                None,
+            )
+            if target_entry is None:
+                target_entry = winner_entry
+            # Advertise the alias only while its target is actually served as
+            # a chat model, so the listing never promises a name the gateway
+            # cannot route.
+            if target_entry is not None and target_entry.get("type") != "embedding":
+                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
+                data.append({
+                    **target_entry,
+                    "id": self.DEFAULT_MODEL_REQUEST_ID,
+                    "alias_of": default_target,
+                })
         return {
             "object": "list", "data": data,
             "models": [
@@ -8505,10 +8560,68 @@ class SparkDeckService:
             )
         return min(matches, key=lambda rule: rule["requested_model"])
 
+    DEFAULT_MODEL_REQUEST_ID = "default"
+
+    def _default_model_target(self) -> str:
+        """Return the configured default model request id, or '' when unset.
+
+        The Settings page stores the target request id verbatim; an empty or
+        self-referential value disables the reserved "default" alias.
+        """
+        value = self.store.get_setting("default_model", "")
+        target = str(value if isinstance(value, str) else "").strip()
+        if not target or target.casefold() == self.DEFAULT_MODEL_REQUEST_ID:
+            return ""
+        return target
+
+    def resolve_default_model(self, requested_model: str) -> str:
+        """Resolve the reserved "default" request id to the configured target.
+
+        The name passes through unchanged whenever the alias is unset or does
+        not apply, so callers (including the /v1/responses adapter, which
+        builds response metadata from the original request) may treat this as
+        a total normalization of a requested model name.
+        """
+        if requested_model.casefold() != self.DEFAULT_MODEL_REQUEST_ID:
+            return requested_model
+        return self._default_model_target() or requested_model
+
+    def _default_model_winner_id(
+        self, target: str,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+        shared_owners: dict[str, str],
+    ) -> str | None:
+        """Return the live deployment id proxy() would select for target.
+
+        Mirrors the inference resolution order: an exact stored id/alias wins
+        only while it is live — proxy() keeps resolving through the candidate
+        set when the stored record is stopped — then the shared-name winner,
+        then a single owner.
+        """
+        exact = self.store.deployment(target, include_private=True)
+        if exact is not None and str(exact["id"]) in {
+            deployment["id"] for deployment in deployments
+        }:
+            return str(exact["id"])
+        winner = shared_owners.get(target)
+        if winner is not None:
+            return str(winner)
+        owners = request_owners.get(target, set())
+        return str(next(iter(owners))) if len(owners) == 1 else None
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
+        resolved_model = self.resolve_default_model(requested_model)
+        if resolved_model != requested_model:
+            # The reserved alias behaves exactly like a request that named
+            # the configured model: source-IP rules, policies, and the
+            # legacy container path all see the resolved identity, and the
+            # registered paths already rewrite the upstream body.
+            requested_model = resolved_model
+            body = {**body, "model": resolved_model}
         route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
         source_route = (
             route_lookup(caller_ip, requested_model)

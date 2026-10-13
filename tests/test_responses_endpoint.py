@@ -41,6 +41,28 @@ class ResponsesEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxy.await_args.kwargs["caller_ip"], "127.0.0.1")
         self.assertIsInstance(cancel, asyncio.Event)
 
+    async def test_default_alias_resolves_before_response_metadata_is_built(self):
+        proxy = AsyncMock(return_value={"model": "ignored", "choices": [{
+            "message": {"role": "assistant", "content": "Hello"}, "finish_reason": "stop",
+        }], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+        with (
+            patch.object(
+                server.sparkdeck.store, "get_setting",
+                side_effect=lambda key, default="": "org/target" if key == "default_model" else default,
+            ),
+            patch.object(server.sparkdeck, "proxy", proxy),
+        ):
+            response = await self.client.post("/v1/responses", json={
+                "model": "default", "input": "Hi", "store": False,
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        # The Responses adapters build metadata from the original request, so
+        # the endpoint must resolve the reserved alias itself: both the body
+        # reaching the gateway and the response must name the target that
+        # actually served the request, as the chat surface reports.
+        self.assertEqual(response.json()["model"], "org/target")
+        self.assertEqual(proxy.await_args.args[0]["model"], "org/target")
+
     async def test_stream_emits_responses_events_and_closes_upstream(self):
         closed = []
         async def upstream():

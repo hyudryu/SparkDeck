@@ -413,12 +413,13 @@ export function SettingsPage() {
   const closeLegalDialog = useCallback(() => setLegalDialog(undefined), [])
 
   // Embedding models are served on a separate surface the "default" alias
-  // never routes to, and the alias itself can never be its own target. A
-  // configured target that is not currently served stays listed so a stopped
-  // model never silently resets the selection.
+  // never routes to, and the reserved name is claimed case-insensitively by
+  // both routing and the save-time validation, so no case variant of it can
+  // ever be a target. A configured target that is not currently served stays
+  // listed so a stopped model never silently resets the selection.
   const defaultModelOptions = useMemo(() => {
     const ids = (gatewayModels.data?.data ?? [])
-      .filter((entry) => entry.type !== 'embedding' && entry.id !== 'default')
+      .filter((entry) => entry.type !== 'embedding' && entry.id.toLowerCase() !== 'default')
       .map((entry) => entry.id)
     const saved = (form.default_model ?? '').trim()
     if (saved) ids.push(saved)

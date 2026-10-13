@@ -174,6 +174,23 @@ describe('settings page', () => {
     await waitFor(() => expect(defaultModel).toBe(''))
   })
 
+  it('never offers a case variant of the reserved default name', async () => {
+    // Routing and the save-time validation claim "default" casefolded, so a
+    // deployment that publishes "Default" can never be a target: offering it
+    // would produce a selector choice that always saves with a 400.
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/v1/models') body = { object: 'list', data: [{ id: 'alpha-model' }, { id: 'Default' }] }
+      if (path === '/api/v1/settings') body = { theme: 'system', default_model: '' }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    await waitFor(() => expect(within(select).getByRole('option', { name: 'alpha-model' })).toBeInTheDocument())
+    expect(within(select).queryByRole('option', { name: 'Default' })).not.toBeInTheDocument()
+  })
+
   it('treats a cleared bandwidth field as unlimited when saving', async () => {
     const update = vi.spyOn(api.settings, 'update').mockResolvedValue({
       theme: 'system', max_download_bandwidth_mbps: 0,

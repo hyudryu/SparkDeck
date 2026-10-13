@@ -66,6 +66,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "default_context_length": 24576,
             "history_enabled": True,
             "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
+            "default_model": "",
             "vllm_image": server.manager.settings["vllm_image"],
             "max_download_bandwidth_mbps": server.manager.settings.get(
                 "max_download_bandwidth_mbps", 0,
@@ -105,6 +106,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "default_context_length": 32768,
             "history_enabled": True,
             "history_sample_seconds": server.DEFAULT_HISTORY_SAMPLE_SECONDS,
+            "default_model": "",
             "vllm_image": server.manager.settings["vllm_image"],
             "max_download_bandwidth_mbps": server.manager.settings.get(
                 "max_download_bandwidth_mbps", 0,
@@ -120,6 +122,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             call("default_context_length", 32768),
             call("history_enabled", True),
             call("history_sample_seconds", server.DEFAULT_HISTORY_SAMPLE_SECONDS),
+            call("default_model", ""),
         ])
 
     async def test_prompt_limit_requires_positive_integer_without_partial_writes(self):
@@ -150,6 +153,35 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
             response = await self.client.get("/api/v1/settings")
             self.assertEqual(response.json()["max_concurrent_prompt_processing"], 3)
+
+    async def test_default_model_persists_stripped_and_preserved_when_omitted(self):
+        stored = {}
+        with (
+            patch.object(server.sparkdeck.store, "get_setting",
+                         side_effect=lambda key, default: stored.get(key, default)),
+            patch.object(server.sparkdeck.store, "set_setting",
+                         side_effect=lambda key, value: stored.update({key: value})),
+            patch.object(server.sparkdeck.prompt_gate, "refresh"),
+        ):
+            response = await self.client.put("/api/v1/settings", json={
+                "default_model": "  org/model-two  ",
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["default_model"], "org/model-two")
+            # A save that does not carry the field keeps the stored target.
+            response = await self.client.put("/api/v1/settings", json={"theme": "light"})
+            self.assertEqual(response.json()["default_model"], "org/model-two")
+            response = await self.client.put("/api/v1/settings", json={"default_model": ""})
+            self.assertEqual(response.json()["default_model"], "")
+
+    async def test_default_model_rejects_invalid_values_without_saving(self):
+        for value in ["default", " DEFAULT ", "x" * 513, 5, ["org/model"]]:
+            with patch.object(server.sparkdeck.store, "set_setting") as save:
+                response = await self.client.put("/api/v1/settings", json={
+                    "default_model": value,
+                })
+                self.assertEqual(response.status_code, 400, value)
+            save.assert_not_called()
 
     async def test_bandwidth_cap_validated_before_writes_and_forwarded(self):
         update_settings = AsyncMock()

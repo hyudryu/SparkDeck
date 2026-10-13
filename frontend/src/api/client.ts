@@ -71,6 +71,7 @@ import type {
   FanMaxSpeedResult,
   FanPidSettings,
   FanSettingsUpdateResult,
+  GatewayModelList,
   BenchmarkRunnerStatus,
   BenchmarkRunnerModel,
   BenchmarkRunnerRunConfig,
@@ -1090,6 +1091,11 @@ export const api = {
       }
     },
     clearHfToken: () => request<AppSettings>('/api/v1/settings/hf-token', { method: 'DELETE' }),
+  },
+  gateway: {
+    // The OpenAI-compatible surface lists exactly the request ids the
+    // gateway routes, so it is the source for default-model choices.
+    models: (signal?: AbortSignal) => request<GatewayModelList>('/v1/models', { signal }),
   },
   updates: {
     overview: (signal?: AbortSignal, refresh = false) => request<SystemUpdateOverview>(

@@ -7614,6 +7614,25 @@ class SparkDeckService:
             if model.get("dimension") is not None:
                 entry["dimension"] = model["dimension"]
             data.append(entry)
+        default_target = self._default_model_target()
+        # Advertise the reserved "default" alias only while its configured
+        # target is actually served as a chat model, so the listing never
+        # promises a name the gateway cannot route. A deployment that itself
+        # serves "default" already appears above, so no duplicate is added.
+        if (
+            default_target
+            and self.DEFAULT_MODEL_REQUEST_ID not in seen
+        ):
+            target_entry = next(
+                (item for item in data if item["id"] == default_target), None,
+            )
+            if target_entry is not None and target_entry.get("type") != "embedding":
+                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
+                data.append({
+                    **target_entry,
+                    "id": self.DEFAULT_MODEL_REQUEST_ID,
+                    "alias_of": default_target,
+                })
         return {
             "object": "list", "data": data,
             "models": [
@@ -8505,10 +8524,33 @@ class SparkDeckService:
             )
         return min(matches, key=lambda rule: rule["requested_model"])
 
+    DEFAULT_MODEL_REQUEST_ID = "default"
+
+    def _default_model_target(self) -> str:
+        """Return the configured default model request id, or '' when unset.
+
+        The Settings page stores the target request id verbatim; an empty or
+        self-referential value disables the reserved "default" alias.
+        """
+        value = self.store.get_setting("default_model", "")
+        target = str(value if isinstance(value, str) else "").strip()
+        if not target or target.casefold() == self.DEFAULT_MODEL_REQUEST_ID:
+            return ""
+        return target
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
+        if requested_model.casefold() == self.DEFAULT_MODEL_REQUEST_ID:
+            target = self._default_model_target()
+            if target:
+                # The reserved alias behaves exactly like a request that named
+                # the configured model: source-IP rules, policies, and the
+                # legacy container path all see the resolved identity, and the
+                # registered paths already rewrite the upstream body.
+                requested_model = target
+                body = {**body, "model": target}
         route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
         source_route = (
             route_lookup(caller_ip, requested_model)

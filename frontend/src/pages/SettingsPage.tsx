@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
-import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
+import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, Waypoints, X } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, SystemUpdateNode } from '../api/types'
@@ -132,6 +132,7 @@ function editableSettingsFingerprint(settings: AppSettings) {
     history_enabled: settings.history_enabled !== false,
     history_sample_seconds: settings.history_sample_seconds ?? DEFAULT_HISTORY_SAMPLE_SECONDS,
     max_download_bandwidth_mbps: bandwidthMbpsSetting(settings.max_download_bandwidth_mbps),
+    default_model: (settings.default_model ?? '').trim(),
   })
 }
 
@@ -387,6 +388,9 @@ export function SettingsPage() {
   const { confirm, confirmationDialog } = useConfirmDialog()
   const resource = useResource((signal) => api.settings.get(signal))
   const communitySync = useResource((signal) => api.benchmarks.syncStatus(signal))
+  // The gateway listing is exactly the request ids routing can reach, so it
+  // is the source for default-model choices.
+  const gatewayModels = useResource((signal) => api.gateway.models(signal))
   const auth = useAuth()
   const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), max_concurrent_prompt_processing: 1 })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
@@ -407,6 +411,19 @@ export function SettingsPage() {
   const privacyButtonRef = useRef<HTMLButtonElement>(null)
   const termsButtonRef = useRef<HTMLButtonElement>(null)
   const closeLegalDialog = useCallback(() => setLegalDialog(undefined), [])
+
+  // Embedding models are served on a separate surface the "default" alias
+  // never routes to, and the alias itself can never be its own target. A
+  // configured target that is not currently served stays listed so a stopped
+  // model never silently resets the selection.
+  const defaultModelOptions = useMemo(() => {
+    const ids = (gatewayModels.data?.data ?? [])
+      .filter((entry) => entry.type !== 'embedding' && entry.id !== 'default')
+      .map((entry) => entry.id)
+    const saved = (form.default_model ?? '').trim()
+    if (saved) ids.push(saved)
+    return [...new Set(ids)].sort((left, right) => left.localeCompare(right))
+  }, [gatewayModels.data, form.default_model])
 
   useEffect(() => {
     if (resource.data) {
@@ -552,6 +569,12 @@ export function SettingsPage() {
           <div className="settings-heading"><span><Network size={18} /></span><div><h2 id="load-balancer-title">Load Balancer</h2><p>Limit simultaneous prompt processing (PP / prefill) independently for each serving group.</p></div></div>
           <div className="settings-fields">
             <label className="field wide-field"><span>Concurrent prompt processing streams per group</span><input aria-label="Concurrent prompt processing streams per group" type="number" min="1" step="1" required inputMode="numeric" value={Number.isNaN(form.max_concurrent_prompt_processing) ? '' : form.max_concurrent_prompt_processing ?? 1} onChange={(event) => setForm({ ...form, max_concurrent_prompt_processing: event.target.valueAsNumber })} aria-describedby="prompt-processing-help" /><small id="prompt-processing-help">Each group has its own limit. With a limit of 1 and two groups, each group can process one prompt at the same time. Additional requests wait until a slot is available in their group. A streaming request releases its slot on its first generated token; streams already generating tokens do not count toward this limit. Non-streaming requests keep their slot until the response finishes.</small></label>
+          </div>
+        </Panel>
+        <Panel className="settings-section" aria-labelledby="default-model-title">
+          <div className="settings-heading"><span><Waypoints size={18} /></span><div><h2 id="default-model-title">Default model</h2><p>Route API calls that request the reserved model name “default” to one of the served models.</p></div></div>
+          <div className="settings-fields">
+            <label className="field wide-field"><span>Default model</span><select aria-label="Default model" value={form.default_model ?? ''} onChange={(event) => setForm({ ...form, default_model: event.target.value })} aria-describedby="default-model-help"><option value="">No default</option>{defaultModelOptions.map((id) => <option key={id} value={id}>{id}</option>)}</select><small id="default-model-help">Requests to /v1/chat/completions, /v1/completions, and /v1/responses with model “default” are routed to this model as if it had been named, and “default” appears in /v1/models while it is serving. Choose “No default” to disable the alias.</small></label>
           </div>
         </Panel>
         <Panel className="settings-section">

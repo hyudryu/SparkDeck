@@ -1,0 +1,202 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import httpx
+
+from sparkdeck.models import Deployment, DeploymentKind, ModelIdentity, RuntimeKind
+from sparkdeck.service import SparkDeckService
+
+
+class FakeManager:
+    def __init__(self):
+        self.http = httpx.AsyncClient()
+        self.list_containers = AsyncMock(return_value=[])
+        self.proxy_chat_completions = AsyncMock()
+        self.proxy_completions = AsyncMock()
+        self.proxy_cluster_inference = AsyncMock(return_value={
+            "id": "chatcmpl-1", "model": "ignored", "choices": [], "usage": {},
+        })
+
+
+def live_rows():
+    # One request id per deployment so the default alias resolves to exactly
+    # one owner, plus distinct aliases to prove names still route directly.
+    return [
+        {
+            "id": "record-one", "alias": "model-one", "runtime": "vllm",
+            "kind": "managed", "status": "running",
+            "served_models": ["alpha-model"],
+            "model": {"repository": "org/model-one"},
+            "settings": {"manager_deployment_id": "cluster-one"},
+            "last_deployed_at": "2026-10-01T00:00:00Z",
+        },
+        {
+            "id": "record-two", "alias": "model-two", "runtime": "vllm",
+            "kind": "managed", "status": "running",
+            "served_models": ["beta-model"],
+            "model": {"repository": "org/model-two"},
+            "settings": {"manager_deployment_id": "cluster-two"},
+            "last_deployed_at": "2026-10-01T00:00:00Z",
+        },
+    ]
+
+
+def build_service(directory, default_model=None):
+    manager = FakeManager()
+    service = SparkDeckService(manager, Path(directory))
+    for row in live_rows():
+        service.store.add_deployment(Deployment(
+            id=row["id"], alias=row["alias"], runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity(row["model"]["repository"]),
+            settings={"manager_deployment_id": row["settings"]["manager_deployment_id"]},
+        ))
+    service.deployments = AsyncMock(return_value=live_rows())
+    if default_model is not None:
+        service.store.set_setting("default_model", default_model)
+    return manager, service
+
+
+class DefaultModelProxyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_routes_to_the_configured_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="beta-model")
+            try:
+                result = await service.proxy(
+                    {"model": "default", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        call = manager.proxy_cluster_inference.await_args
+        # The alias is indistinguishable from a request that named the target:
+        # the target's Manager id and repository reach the upstream body.
+        self.assertEqual(call.args[0], "cluster-two")
+        self.assertEqual(call.args[1], "org/model-two")
+        self.assertEqual(call.args[2]["model"], "org/model-two")
+        self.assertEqual(result["model"], "beta-model")
+
+    async def test_default_alias_matches_any_casing(self):
+        for requested in ("default", "Default", "DEFAULT"):
+            with tempfile.TemporaryDirectory() as directory:
+                manager, service = build_service(directory, default_model="beta-model")
+                try:
+                    await service.proxy(
+                        {"model": requested, "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+                finally:
+                    await manager.http.aclose()
+                    await service.close()
+            self.assertEqual(
+                manager.proxy_cluster_inference.await_args.args[0], "cluster-two",
+                requested,
+            )
+
+    async def test_without_setting_the_alias_takes_the_legacy_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            manager.proxy_chat_completions.side_effect = LookupError(
+                "model not found",
+            )
+            try:
+                with self.assertRaises(LookupError):
+                    await service.proxy(
+                        {"model": "default", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+            manager.proxy_cluster_inference.assert_not_awaited()
+
+    async def test_unserved_target_falls_through_like_a_named_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="ghost-model")
+            manager.proxy_chat_completions.side_effect = LookupError(
+                "model not found",
+            )
+            try:
+                with self.assertRaises(LookupError):
+                    await service.proxy(
+                        {"model": "default", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+            # The redirect rewrote the request to the configured target, so
+            # the legacy forward carries that name rather than the alias.
+            self.assertEqual(
+                manager.proxy_chat_completions.await_args.args[0]["model"],
+                "ghost-model",
+            )
+
+    async def test_named_models_route_exactly_as_before(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="beta-model")
+            try:
+                await service.proxy(
+                    {"model": "alpha-model", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertEqual(
+            manager.proxy_cluster_inference.await_args.args[0], "cluster-one",
+        )
+
+
+class DefaultModelListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_models_advertise_the_default_alias_of_the_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="beta-model")
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        entries = {entry["id"]: entry for entry in listing["data"]}
+        self.assertIn("default", entries)
+        self.assertEqual(entries["default"]["alias_of"], "beta-model")
+        self.assertEqual(entries["default"]["deployment_id"], "record-two")
+        self.assertIn(
+            "default",
+            [model["slug"] for model in listing["models"]],
+        )
+
+    async def test_models_omit_the_alias_when_unset_or_unserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertNotIn(
+            "default", [entry["id"] for entry in listing["data"]],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="beta-model")
+            # The target stops serving its request id: the gateway would
+            # reject "default", so the listing must not promise it either.
+            stopped = [dict(row) for row in live_rows()]
+            stopped[1]["served_models"] = ["renamed-model"]
+            service.deployments = AsyncMock(return_value=stopped)
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertNotIn(
+            "default", [entry["id"] for entry in listing["data"]],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

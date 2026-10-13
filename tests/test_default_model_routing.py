@@ -18,6 +18,7 @@ class FakeManager:
         self.proxy_cluster_inference = AsyncMock(return_value={
             "id": "chatcmpl-1", "model": "ignored", "choices": [], "usage": {},
         })
+        self.embedding_models = AsyncMock(return_value={"models": []})
 
 
 def live_rows():
@@ -153,6 +154,39 @@ class DefaultModelProxyTests(unittest.IsolatedAsyncioTestCase):
             manager.proxy_cluster_inference.await_args.args[0], "cluster-two",
         )
 
+    async def test_stopped_exact_record_falls_through_to_the_live_owner(self):
+        # The target names a stopped persisted record's compat alias while a
+        # live discovered container uses that alias: proxy() keeps resolving
+        # through the candidate set, so the listing must advertise the same
+        # owner instead of dropping the alias.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="model-two")
+            live = [live_rows()[0], {
+                "id": "discovered-1", "alias": "model-two", "runtime": "vllm",
+                "kind": "managed", "status": "running",
+                "served_models": ["gamma-model"],
+                "model": {"repository": "org/model-gamma"},
+                "settings": {"manager_deployment_id": "cluster-gamma"},
+                "last_deployed_at": "2026-10-02T00:00:00Z",
+            }]
+            service.deployments = AsyncMock(return_value=live)
+            try:
+                await service.proxy(
+                    {"model": "default", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertEqual(
+            manager.proxy_cluster_inference.await_args.args[0], "cluster-gamma",
+        )
+        entries = {entry["id"]: entry for entry in listing["data"]}
+        self.assertIn("default", entries)
+        self.assertEqual(entries["default"]["deployment_id"], "discovered-1")
+        self.assertEqual(entries["default"]["alias_of"], "model-two")
+
     async def test_named_models_route_exactly_as_before(self):
         with tempfile.TemporaryDirectory() as directory:
             manager, service = build_service(directory, default_model="beta-model")
@@ -227,6 +261,58 @@ class DefaultModelListingTests(unittest.IsolatedAsyncioTestCase):
         entry_ids = [entry["id"] for entry in listing["data"]]
         self.assertNotIn("Default", entry_ids)
         self.assertIn("alpha-model", entry_ids)
+
+    async def test_winner_entry_survives_reserved_removal_for_metadata(self):
+        # The winning deployment publishes only a case variant of the reserved
+        # name: its row is removed from the listing, but it must still supply
+        # the metadata for the alias entry because inference routes the
+        # configured alias to it.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="model-two")
+            live = [live_rows()[0], {**live_rows()[1], "served_models": ["Default"]}]
+            service.deployments = AsyncMock(return_value=live)
+            try:
+                await service.proxy(
+                    {"model": "default", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertEqual(
+            manager.proxy_cluster_inference.await_args.args[0], "cluster-two",
+        )
+        reserved = [
+            entry for entry in listing["data"]
+            if entry["id"].casefold() == "default"
+        ]
+        self.assertEqual(len(reserved), 1)
+        self.assertEqual(reserved[0]["deployment_id"], "record-two")
+        self.assertEqual(reserved[0]["alias_of"], "model-two")
+        self.assertNotIn("Default", [entry["id"] for entry in listing["data"]])
+
+    async def test_embedding_id_collision_does_not_hide_the_chat_owner(self):
+        # An embedding cache entry may share the target's compat-alias id on
+        # the separate embedding surface; the alias must still advertise the
+        # chat deployment inference routes to.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="model-two")
+            manager.embedding_models = AsyncMock(return_value={"models": [{
+                "model_id": "model-two", "node_ids": ["node-1"], "revision": "abc",
+            }]})
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        reserved = [
+            entry for entry in listing["data"]
+            if entry["id"].casefold() == "default"
+        ]
+        self.assertEqual(len(reserved), 1)
+        self.assertEqual(reserved[0]["deployment_id"], "record-two")
+        self.assertEqual(reserved[0]["alias_of"], "model-two")
 
     async def test_models_omit_the_alias_when_unset_or_unserved(self):
         with tempfile.TemporaryDirectory() as directory:

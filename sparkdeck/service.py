@@ -7620,6 +7620,22 @@ class SparkDeckService:
             # of "default" redirects to the configured target, so a deployment
             # that publishes the reserved name keeps its other request ids
             # while the reserved entry is replaced by the alias entry.
+            winner = self._default_model_winner_id(
+                default_target, deployments, request_owners, shared_owners,
+            )
+            # Snapshot the winning deployment's own entry before the reserved
+            # entries are removed: a deployment whose only published id is a
+            # case variant of "default" still supplies the alias entry's
+            # metadata.
+            winner_entry = None
+            if winner is not None:
+                winner_entry = next(
+                    (
+                        item for item in data
+                        if item.get("deployment_id") == winner
+                    ),
+                    None,
+                )
             reserved_ids = {
                 item["id"] for item in data
                 if item["id"].casefold() == self.DEFAULT_MODEL_REQUEST_ID
@@ -7630,25 +7646,19 @@ class SparkDeckService:
                     if item["id"] not in reserved_ids
                 ]
                 seen.difference_update(reserved_ids)
+            # The target may be listed under its own id; an embedding row that
+            # happens to share the id serves a different surface, so it falls
+            # through to the winning chat deployment instead.
             target_entry = next(
-                (item for item in data if item["id"] == default_target), None,
+                (
+                    item for item in data
+                    if item["id"] == default_target
+                    and item.get("type") != "embedding"
+                ),
+                None,
             )
             if target_entry is None:
-                # The target may name a deployment through its id or a
-                # compatibility alias, which proxy() resolves directly rather
-                # than through a listed request id; advertise the alias of the
-                # deployment that would actually serve it.
-                winner = self._default_model_winner_id(
-                    default_target, deployments, request_owners, shared_owners,
-                )
-                if winner is not None:
-                    target_entry = next(
-                        (
-                            item for item in data
-                            if item.get("deployment_id") == winner
-                        ),
-                        None,
-                    )
+                target_entry = winner_entry
             # Advertise the alias only while its target is actually served as
             # a chat model, so the listing never promises a name the gateway
             # cannot route.
@@ -8585,12 +8595,15 @@ class SparkDeckService:
         """Return the live deployment id proxy() would select for target.
 
         Mirrors the inference resolution order: an exact stored id/alias wins
-        while live, then the shared-name winner, then a single owner.
+        only while it is live — proxy() keeps resolving through the candidate
+        set when the stored record is stopped — then the shared-name winner,
+        then a single owner.
         """
         exact = self.store.deployment(target, include_private=True)
-        if exact is not None:
-            live_ids = {deployment["id"] for deployment in deployments}
-            return str(exact["id"]) if exact["id"] in live_ids else None
+        if exact is not None and str(exact["id"]) in {
+            deployment["id"] for deployment in deployments
+        }:
+            return str(exact["id"])
         winner = shared_owners.get(target)
         if winner is not None:
             return str(winner)

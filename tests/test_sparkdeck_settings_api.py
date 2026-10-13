@@ -70,6 +70,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "max_download_bandwidth_mbps": server.manager.settings.get(
                 "max_download_bandwidth_mbps", 0,
             ),
+            "ip_aliases": {},
             "hf_token_configured": True,
         })
         # The node name must never ride the settings response: on joined
@@ -109,6 +110,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             "max_download_bandwidth_mbps": server.manager.settings.get(
                 "max_download_bandwidth_mbps", 0,
             ),
+            "ip_aliases": {},
             "hf_token_configured": True,
         })
         self.assertNotIn(sentinel, response.text)
@@ -120,6 +122,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             call("default_context_length", 32768),
             call("history_enabled", True),
             call("history_sample_seconds", server.DEFAULT_HISTORY_SAMPLE_SECONDS),
+            call("ip_aliases", {}),
         ])
 
     async def test_prompt_limit_requires_positive_integer_without_partial_writes(self):
@@ -181,6 +184,73 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
                 "/api/settings", json={"max_download_bandwidth_mbps": "fast"},
             )
         self.assertEqual(response.status_code, 400)
+
+    async def test_get_surfaces_saved_ip_aliases(self):
+        with (
+            patch.object(
+                server.sparkdeck.store, "get_setting",
+                side_effect=lambda key, default: (
+                    {"10.0.0.5": "Front desk"}
+                    if key == "ip_aliases" else default
+                ),
+            ),
+            patch.object(server.manager, "_resolved_hf_token", return_value=""),
+        ):
+            response = await self.client.get("/api/v1/settings")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["ip_aliases"], {"10.0.0.5": "Front desk"})
+
+    async def test_ip_aliases_canonicalized_before_saving(self):
+        update_settings = AsyncMock()
+        with (
+            patch.object(server.sparkdeck.store, "set_setting") as set_setting,
+            patch.object(server.manager, "update_settings", update_settings),
+        ):
+            for bad in ("nope", {"front-desk": "Reception"}, {"10.0.0.5": 7},
+                        {"10.0.0.5": "x" * 61}):
+                response = await self.client.put("/api/v1/settings", json={
+                    "theme": "dark", "ip_aliases": bad,
+                })
+                self.assertEqual(response.status_code, 400, bad)
+            # A rejected alias map must not save the theme from the same body.
+            set_setting.assert_not_called()
+            update_settings.assert_not_awaited()
+
+            response = await self.client.put("/api/v1/settings", json={
+                "ip_aliases": {
+                    " 10.0.0.5 ": " Front desk ",
+                    "FE80::1": "Router",
+                    "10.0.0.6": "   ",
+                },
+            })
+
+        self.assertEqual(response.status_code, 200)
+        # Keys are stored canonical (lowercased, compressed IPv6) so caller
+        # IPs recorded from sockets match, and a blank alias drops its entry.
+        set_setting.assert_any_call("ip_aliases", {
+            "10.0.0.5": "Front desk", "fe80::1": "Router",
+        })
+        self.assertEqual(response.json()["ip_aliases"], {
+            "10.0.0.5": "Front desk", "fe80::1": "Router",
+        })
+        update_settings.assert_not_awaited()
+
+    def test_alias_map_shape_is_enforced(self):
+        self.assertEqual(server._normalize_ip_aliases({
+            " 10.0.0.5 ": " Front desk ", "FE80::1": "Router", "10.0.0.6": "   ",
+        }), {"10.0.0.5": "Front desk", "fe80::1": "Router"})
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            server._normalize_ip_aliases(["10.0.0.5"])
+        with self.assertRaisesRegex(ValueError, "at most"):
+            server._normalize_ip_aliases({
+                f"10.0.{index // 256}.{index % 256}": f"host {index}"
+                for index in range(101)
+            })
+        with self.assertRaisesRegex(ValueError, "60 characters"):
+            server._normalize_ip_aliases({"10.0.0.5": "x" * 61})
+        with self.assertRaisesRegex(ValueError, "must be a string"):
+            server._normalize_ip_aliases({"10.0.0.5": None})
 
 
     async def test_invalid_deployment_defaults_are_rejected_without_saving(self):

@@ -3,6 +3,7 @@ import { ArrowRight, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { Deployment, InferenceRoutingRule } from '../api/types'
 import { useResource } from '../hooks/useResource'
+import { ipAliasFor, type IpAliases } from '../utils/ipAliases'
 import { Button, LoadingState, Panel } from './ui'
 
 interface InferenceRouteTarget {
@@ -95,7 +96,10 @@ const sameNodes = (left: string[], right: string[]) => {
   return left.length === right.length && left.every((node, index) => node === right[index])
 }
 
-export function RequestRoutingPanel({ refreshGeneration = 0 }: { refreshGeneration?: number }) {
+export function RequestRoutingPanel({ refreshGeneration = 0, ipAliases }: {
+  refreshGeneration?: number
+  ipAliases?: IpAliases
+}) {
   const [refresh, setRefresh] = useState(0)
   const deployments = useResource(
     (signal) => api.deployments.list(signal), [refreshGeneration, refresh],
@@ -163,7 +167,8 @@ export function RequestRoutingPanel({ refreshGeneration = 0 }: { refreshGenerati
       const fallback = `${rule.deployment_id}${rule.instance_id === null ? '' : ` - Group ${rule.instance_id + 1}`}`
       const unavailable = !target || !target.available
       const key = ruleKey(rule)
-      return <li key={key}><label className="request-rule-toggle"><input type="checkbox" role="switch" aria-label={`Enable request routing for ${rule.source_ip} and ${rule.requested_model}`} checked={rule.enabled} disabled={busy === key} onChange={(event) => void toggle(rule, event.target.checked)} /><span className="request-toggle-track" aria-hidden="true"><span /></span><span>{rule.enabled ? 'Enabled' : 'Disabled'}</span></label><div><strong>{rule.source_ip}</strong><code>{rule.requested_model}</code></div><ArrowRight size={14} aria-hidden="true" /><div><strong>{target?.label ?? fallback}</strong>{unavailable && <small>Unavailable</small>}</div><Button type="button" variant="tertiary" aria-label={`Remove request routing for ${rule.source_ip} and ${rule.requested_model}`} disabled={busy === key} onClick={() => void remove(rule)}><Trash2 size={14} /> Remove</Button></li>
+      const alias = ipAliasFor(ipAliases, rule.source_ip)
+      return <li key={key}><label className="request-rule-toggle"><input type="checkbox" role="switch" aria-label={`Enable request routing for ${rule.source_ip} and ${rule.requested_model}`} checked={rule.enabled} disabled={busy === key} onChange={(event) => void toggle(rule, event.target.checked)} /><span className="request-toggle-track" aria-hidden="true"><span /></span><span>{rule.enabled ? 'Enabled' : 'Disabled'}</span></label><div>{alias ? <strong>{alias}</strong> : <strong>{rule.source_ip}</strong>}{alias && <small className="request-rule-source-ip">{rule.source_ip}</small>}<code>{rule.requested_model}</code></div><ArrowRight size={14} aria-hidden="true" /><div><strong>{target?.label ?? fallback}</strong>{unavailable && <small>Unavailable</small>}</div><Button type="button" variant="tertiary" aria-label={`Remove request routing for ${rule.source_ip} and ${rule.requested_model}`} disabled={busy === key} onClick={() => void remove(rule)}><Trash2 size={14} /> Remove</Button></li>
     })}</ul> : <p className="usage-routing-empty">No request routing rules yet.</p>}
   </Panel>
 }

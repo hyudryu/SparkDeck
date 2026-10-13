@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type RefObject } from 'react'
-import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, Waypoints, X } from 'lucide-react'
+import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, Tag, Waypoints, X } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import type { AppSettings, SystemUpdateNode } from '../api/types'
@@ -11,6 +11,7 @@ import { LegalDialog } from '../components/LegalDialog'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 import { DEFAULT_HISTORY_SAMPLE_SECONDS } from '../utils/historySettings'
+import { isIpLiteral, type IpAliases } from '../utils/ipAliases'
 import { applyTheme, persistTheme, storedTheme } from '../theme'
 import { SPARKDECK_VERSION } from '../buildInfo'
 
@@ -125,6 +126,33 @@ function bandwidthMbpsSetting(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
 }
 
+// A blank or removed alias drops its entry; the editor rows are the
+// authoritative map while editing, and the saved response rows the canonical
+// form back. Sorting keeps the fingerprint order-insensitive.
+interface IpAliasRow { ip: string; alias: string }
+
+function aliasRowsFromSettings(aliases: IpAliases | undefined): IpAliasRow[] {
+  return Object.entries(aliases ?? {}).map(([ip, alias]) => ({ ip, alias }))
+}
+
+function ipAliasesFromRows(rows: IpAliasRow[]): IpAliases {
+  const aliases: IpAliases = {}
+  for (const row of rows) {
+    const ip = row.ip.trim()
+    const alias = row.alias.trim()
+    if (!ip || !alias) continue
+    aliases[ip] = alias
+  }
+  return aliases
+}
+
+function ipAliasesFingerprint(aliases: IpAliases | undefined) {
+  return Object.entries(aliases ?? {})
+    .map(([ip, alias]) => [ip.trim(), alias.trim()])
+    .filter(([ip, alias]) => ip && alias)
+    .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
+}
+
 function editableSettingsFingerprint(settings: AppSettings) {
   return JSON.stringify({
     theme: settings.theme ?? 'system',
@@ -133,6 +161,7 @@ function editableSettingsFingerprint(settings: AppSettings) {
     history_sample_seconds: settings.history_sample_seconds ?? DEFAULT_HISTORY_SAMPLE_SECONDS,
     max_download_bandwidth_mbps: bandwidthMbpsSetting(settings.max_download_bandwidth_mbps),
     default_model: (settings.default_model ?? '').trim(),
+    ip_aliases: ipAliasesFingerprint(settings.ip_aliases),
   })
 }
 
@@ -394,6 +423,7 @@ export function SettingsPage() {
   const auth = useAuth()
   const [form, setForm] = useState<AppSettings>({ theme: storedTheme(), max_concurrent_prompt_processing: 1 })
   const [huggingFaceApiKey, setHuggingFaceApiKey] = useState('')
+  const [aliasRows, setAliasRows] = useState<IpAliasRow[]>([])
   const [savedFingerprint, setSavedFingerprint] = useState<string>()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -433,6 +463,7 @@ export function SettingsPage() {
         setSavedFingerprint(editableSettingsFingerprint(loaded))
         return loaded
       })
+      setAliasRows(aliasRowsFromSettings(resource.data.ip_aliases))
       persistTheme(resource.data.theme ?? storedTheme())
     }
   }, [resource.data])
@@ -485,8 +516,14 @@ export function SettingsPage() {
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
+    const editedAliases = ipAliasesFromRows(aliasRows)
+    const invalidRow = aliasRows.find((row) => (row.ip.trim() || row.alias.trim()) && !isIpLiteral(row.ip))
+    if (invalidRow) {
+      setError(`Enter a valid IPv4 or IPv6 address for the alias “${invalidRow.alias.trim() || 'new alias'}”.`)
+      return
+    }
     if (savedFingerprint === undefined
-      || (editableSettingsFingerprint(form) === savedFingerprint && !huggingFaceApiKey.trim())) return
+      || (editableSettingsFingerprint({ ...form, ip_aliases: editedAliases }) === savedFingerprint && !huggingFaceApiKey.trim())) return
     setSaving(true)
     setSaved(false)
     setError(undefined)
@@ -496,6 +533,7 @@ export function SettingsPage() {
         ...savedSettings
       } = await api.settings.update({
         ...form,
+        ip_aliases: editedAliases,
         max_download_bandwidth_mbps: bandwidthMbpsSetting(form.max_download_bandwidth_mbps),
         hf_token: huggingFaceApiKey.trim() || undefined,
       })
@@ -504,6 +542,9 @@ export function SettingsPage() {
       setBandwidthNote(typeof runningNote === 'string' && runningNote ? runningNote : undefined)
       const savedForm = { ...form, ...savedSettings, hf_token: '' }
       setForm(savedForm)
+      // The server canonicalizes IP keys, so re-seed the rows from the
+      // response rather than keeping whatever was typed.
+      setAliasRows(aliasRowsFromSettings(savedForm.ip_aliases))
       setHuggingFaceApiKey('')
       setSavedFingerprint(editableSettingsFingerprint(savedForm))
       persistTheme(savedSettings.theme ?? form.theme ?? 'system')
@@ -544,7 +585,7 @@ export function SettingsPage() {
   }
 
   const hasUnsavedChanges = savedFingerprint !== undefined
-    && (editableSettingsFingerprint(form) !== savedFingerprint || Boolean(huggingFaceApiKey.trim()))
+    && (editableSettingsFingerprint({ ...form, ip_aliases: ipAliasesFromRows(aliasRows) }) !== savedFingerprint || Boolean(huggingFaceApiKey.trim()))
 
   return (
     <div className="page settings-page">
@@ -581,6 +622,20 @@ export function SettingsPage() {
         <Panel className="settings-section">
           <div className="settings-heading"><span><Network size={18} /></span><div><h2>DGX Spark cluster</h2><p>Connect nodes privately over Tailscale for targeted pulls and deployments.</p></div></div>
           <div className="settings-fields"><div className="credential-state wide-field"><Network size={17} /><div><strong>Cluster Management</strong><span className="muted">Review this node’s role, private access URL, and join instructions.</span></div><Link className="button button-secondary" to="/cluster">Open cluster setup</Link></div></div>
+        </Panel>
+        <Panel className="settings-section" aria-labelledby="ip-aliases-title">
+          <div className="settings-heading"><span><Tag size={18} /></span><div><h2 id="ip-aliases-title">Machine aliases</h2><p>Name client addresses so live inference sessions and IP routing rules show the machine instead of only an address. Label each machine's Tailscale IP here; one alias map is shared across the cluster.</p></div></div>
+          <div className="settings-fields wide-field ip-alias-fields">
+            {aliasRows.length === 0 && <p className="muted">No address aliases yet.</p>}
+            {aliasRows.map((row, index) => (
+              <div className="ip-alias-row" key={index}>
+                <label className="field"><span>Address</span><input aria-label={`Alias address ${index + 1}`} autoComplete="off" maxLength={45} value={row.ip} onChange={(event) => setAliasRows((current) => current.map((item, position) => position === index ? { ...item, ip: event.target.value } : item))} placeholder="100.64.0.24" /></label>
+                <label className="field"><span>Name</span><input aria-label={`Alias name ${index + 1}`} autoComplete="off" maxLength={60} value={row.alias} onChange={(event) => setAliasRows((current) => current.map((item, position) => position === index ? { ...item, alias: event.target.value } : item))} placeholder="Studio workstation" /></label>
+                <Button type="button" variant="tertiary" aria-label={`Remove alias for ${row.ip.trim() || `address slot ${index + 1}`}`} onClick={() => setAliasRows((current) => current.filter((_, position) => position !== index))}>Remove</Button>
+              </div>
+            ))}
+            <Button type="button" variant="tertiary" className="ip-alias-add" onClick={() => setAliasRows((current) => [...current, { ip: '', alias: '' }])}>Add address alias</Button>
+          </div>
         </Panel>
         <Panel className="settings-section">
           <div className="settings-heading"><span><KeyRound size={18} /></span><div><h2>Hugging Face access</h2><p>Use one credential for gated and private models across the cluster.</p></div></div>
@@ -659,7 +714,7 @@ export function SettingsPage() {
         </Panel>
         <div className="settings-save"><span aria-live="polite">{saved && <><Check size={15} /> Saved</>}</span><Button type="submit" variant="primary" disabled={saving || !hasUnsavedChanges}><Save size={16} /> {saving ? 'Saving…' : 'Save settings'}</Button></div>
       </form>}
-      <RequestRoutingPanel />
+      <RequestRoutingPanel ipAliases={form.ip_aliases} />
       <SoftwareUpdatePanel />
       <Panel className="settings-section support-legal-section">
         <div className="settings-heading"><span><ShieldCheck size={18} /></span><div><h2>Support & legal</h2><p>Review how Community Features handle data, read the service terms, or report a problem.</p></div></div>

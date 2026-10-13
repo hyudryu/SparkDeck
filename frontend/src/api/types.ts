@@ -697,6 +697,8 @@ export interface AppSettings {
   /** Request id served when an API call asks for the reserved "default" model. */
   default_model?: string
   telemetry_interval_seconds?: number
+  /** Friendly names for client addresses, keyed by canonical IP string. */
+  ip_aliases?: Record<string, string>
   [key: string]: unknown
 }
 

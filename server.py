@@ -3163,7 +3163,42 @@ _APP_SETTING_DEFAULTS = {
     "history_enabled": DEFAULT_HISTORY_ENABLED,
     "history_sample_seconds": DEFAULT_HISTORY_SAMPLE_SECONDS,
     "default_model": "",
+    "ip_aliases": {},
 }
+
+MAX_IP_ALIASES = 100
+MAX_IP_ALIAS_LENGTH = 60
+
+
+def _normalize_ip_aliases(value: object) -> dict[str, str]:
+    """Canonicalize the cluster-wide ip_aliases map: IP keys are validated and
+    rewritten to canonical form so caller IPs recorded from sockets match, and
+    blank aliases drop their entry. Raises ValueError."""
+    if not isinstance(value, dict):
+        raise ValueError("ip_aliases must be an object")
+    if len(value) > MAX_IP_ALIASES:
+        raise ValueError(
+            f"ip_aliases supports at most {MAX_IP_ALIASES} entries",
+        )
+    aliases: dict[str, str] = {}
+    for raw_ip, raw_alias in value.items():
+        try:
+            address = ipaddress.ip_address(str(raw_ip).strip())
+        except ValueError:
+            raise ValueError(
+                f"ip_aliases key {raw_ip!r} is not a valid IP address",
+            ) from None
+        if not isinstance(raw_alias, str):
+            raise ValueError(f"alias for {address} must be a string")
+        alias = raw_alias.strip()
+        if len(alias) > MAX_IP_ALIAS_LENGTH:
+            raise ValueError(
+                "ip_aliases values must be "
+                f"{MAX_IP_ALIAS_LENGTH} characters or fewer",
+            )
+        if alias:
+            aliases[str(address)] = alias
+    return aliases
 
 
 @app.get("/api/v1/settings")
@@ -3245,6 +3280,16 @@ async def v1_update_settings(req: Request):
     # it can never name its own target.
     if default_model.casefold() == "default":
         raise HTTPException(400, "default_model cannot be the reserved name default")
+    # Aliases are a cluster-wide controller setting, not node-local: a joined
+    # worker forwards this route to the controller, so storing per-node would
+    # either silently edit the controller's copy or be unreachable.
+    if "ip_aliases" in body:
+        try:
+            ip_aliases = _normalize_ip_aliases(body["ip_aliases"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    else:
+        ip_aliases = sparkdeck.store.get_setting("ip_aliases", {})
     values = {
         "max_concurrent_prompt_processing": prompt_limit,
         "theme": theme,
@@ -3253,6 +3298,7 @@ async def v1_update_settings(req: Request):
         "history_enabled": raw_history_enabled,
         "history_sample_seconds": history_sample_seconds,
         "default_model": default_model,
+        "ip_aliases": ip_aliases,
     }
     credential = body.get("hf_token")
     if credential is not None:

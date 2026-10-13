@@ -17,6 +17,7 @@ import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { useDashboardStream } from '../hooks/useDashboardStream'
 import type { DashboardStreamResources, DashboardStreamSource } from '../hooks/useDashboardStream'
+import { callerLabel, type IpAliases } from '../utils/ipAliases'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
   return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(digits)}${suffix}`
@@ -336,6 +337,9 @@ export function DashboardPage() {
   const syncResource = useDashboardResource((signal) => api.dashboard.sync(signal), polling('sync'))
   const nodesResource = useDashboardResource((signal) => api.dashboard.nodes(signal), polling('nodes'))
   const routingResource = useDashboardResource((signal) => api.modelRouting.list(signal))
+  // Caller aliases are edited on the Settings page and read here once per
+  // mount; the dashboard remounts on navigation, so no polling is needed.
+  const settingsResource = useResource((signal) => api.settings.get(signal))
   useEffect(() => {
     resourcesRef.current = {
       stats: statsResource,
@@ -349,6 +353,7 @@ export function DashboardPage() {
   const accessHint = communityAccessHint(communityAccess.signedIn)
 
   const stats = statsResource.data
+  const ipAliases = settingsResource.data?.ip_aliases
   const admission = admissionResource.data
   const previousAdmission = useRef(admission)
   const [admissionFailedSinceSuccess, setAdmissionFailedSinceSuccess] = useState(false)
@@ -486,7 +491,7 @@ export function DashboardPage() {
               {admissionResource.error && <p className="dashboard-stale" role="status">{admission ? 'Queue refresh paused' : 'Queue status unavailable'}: {admissionResource.error}</p>}
               {activeRequests.length > 0 ? (
                 <div className="dashboard-list">
-                  {activeRequests.map(({ key, model, request, groupLabel }) => <SessionRow key={key} model={model} request={request} groupLabel={groupLabel} />)}
+                  {activeRequests.map(({ key, model, request, groupLabel }) => <SessionRow key={key} model={model} request={request} groupLabel={groupLabel} aliases={ipAliases} />)}
                 </div>
               ) : !inferenceAvailable && (statsResource.error || admissionResource.error) ? (
                 <EmptyState title="Active session status unavailable" description="Refresh to retry loading current inference sessions." />
@@ -531,7 +536,7 @@ function stageRate(value: number | null | undefined, waiting: boolean) {
   return `${value.toFixed(1)} tok/s`
 }
 
-function SessionRow({ model, request, groupLabel }: { model: string; request: ActiveRequestStats; groupLabel: string }) {
+function SessionRow({ model, request, groupLabel, aliases }: { model: string; request: ActiveRequestStats; groupLabel: string; aliases?: IpAliases }) {
   const waiting = request.connections <= 0 && (request.queued ?? 0) > 0
   const outputSessions = request.output_sessions ?? 0
   const thinkingSessions = request.thinking_sessions ?? 0
@@ -556,7 +561,7 @@ function SessionRow({ model, request, groupLabel }: { model: string; request: Ac
   ].filter(Boolean)
   const callers = Object.entries(request.caller_ips ?? {})
     .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
-    .map(([ip, connections]) => `${connections} from ${ip}`)
+    .map(([ip, connections]) => `${connections} from ${callerLabel(aliases, ip)}`)
   return (
     <div className="dashboard-list-row session-row">
       <span className={`status-dot status-${waiting ? 'waiting' : 'running'}`} aria-hidden="true" />

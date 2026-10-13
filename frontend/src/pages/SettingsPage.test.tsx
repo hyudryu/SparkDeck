@@ -209,6 +209,44 @@ describe('settings page', () => {
     expect(update.mock.calls[0][0]).toMatchObject({ max_download_bandwidth_mbps: 0 })
   })
 
+  it('round-trips machine aliases and refuses to save an invalid address', async () => {
+    let stored: Record<string, string> = {}
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      let body: unknown = { items: [] }
+      if (path === '/api/v1/settings') {
+        if (init?.method === 'PUT') {
+          const saved = JSON.parse(String(init.body))
+          if ('ip_aliases' in saved) stored = saved.ip_aliases
+        }
+        body = { theme: 'system', ip_aliases: stored }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('No address aliases yet.')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Add address alias' }))
+    await user.type(screen.getByLabelText('Alias address 1'), '100.114.180.111')
+    await user.type(screen.getByLabelText('Alias name 1'), 'Studio laptop')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    await waitFor(() => expect(stored).toEqual({ '100.114.180.111': 'Studio laptop' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled())
+    expect(screen.getByLabelText('Alias address 1')).toHaveValue('100.114.180.111')
+    expect(screen.getByLabelText('Alias name 1')).toHaveValue('Studio laptop')
+
+    // A row whose address is not an IP literal blocks the save outright: no
+    // request goes out and the entered values stay put for correction.
+    await user.click(screen.getByRole('button', { name: 'Add address alias' }))
+    await user.type(screen.getByLabelText('Alias address 2'), 'front-desk')
+    await user.type(screen.getByLabelText('Alias name 2'), 'Office')
+    await user.click(screen.getByRole('button', { name: 'Save settings' }))
+    expect(await screen.findByText('Enter a valid IPv4 or IPv6 address for the alias “Office”.')).toBeInTheDocument()
+    expect(stored).toEqual({ '100.114.180.111': 'Studio laptop' })
+    expect(screen.getByLabelText('Alias address 2')).toHaveValue('front-desk')
+  })
+
   it('surfaces the running-transfer note returned by a bandwidth save', async () => {
     // Transfers already in flight started uncapped: the settings response
     // carries a transient note that must reach the user instead of being

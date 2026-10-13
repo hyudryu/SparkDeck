@@ -107,6 +107,18 @@ describe('RequestRoutingPanel', () => {
     expect(screen.queryByText('Unavailable')).not.toBeInTheDocument()
   })
 
+  it('shows the machine alias next to a rule source address', async () => {
+    vi.spyOn(api.inferenceRouting, 'list').mockResolvedValue([{
+      source_ip: '10.0.0.10', requested_model: 'shared-model', enabled: true,
+      deployment_id: 'deployment-a', instance_id: 0, node_ids: ['node-1', 'node-2'],
+    }])
+
+    render(<RequestRoutingPanel ipAliases={{ '10.0.0.10': 'Studio laptop' }} />)
+
+    const alias = await screen.findByText('Studio laptop')
+    expect(alias.closest('div')?.textContent).toContain('10.0.0.10')
+  })
+
   it('keeps a stale rule visible and allows disabling and removing it', async () => {
     const user = userEvent.setup()
     let rules: InferenceRoutingRule[] = [{

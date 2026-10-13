@@ -4850,6 +4850,12 @@ async def v1_chat_completions(req: Request):
 @app.post("/v1/responses")
 async def v1_responses(req: Request):
     body = await _inference_json(req)
+    # Resolve the reserved default alias before conversion: the Responses
+    # adapters build response metadata from the original request, so the
+    # resolved target must replace it here for the response to report the
+    # model that actually served the request, as the chat surface does.
+    if isinstance(body, dict) and isinstance(body.get("model"), str):
+        body = {**body, "model": sparkdeck.resolve_default_model(body["model"])}
     try:
         chat_body = to_chat_request(body)
     except (ValueError, TypeError) as exc:

@@ -7615,17 +7615,43 @@ class SparkDeckService:
                 entry["dimension"] = model["dimension"]
             data.append(entry)
         default_target = self._default_model_target()
-        # Advertise the reserved "default" alias only while its configured
-        # target is actually served as a chat model, so the listing never
-        # promises a name the gateway cannot route. A deployment that itself
-        # serves "default" already appears above, so no duplicate is added.
-        if (
-            default_target
-            and self.DEFAULT_MODEL_REQUEST_ID not in seen
-        ):
+        if default_target:
+            # Routing reserves the name case-insensitively: every case variant
+            # of "default" redirects to the configured target, so a deployment
+            # that publishes the reserved name keeps its other request ids
+            # while the reserved entry is replaced by the alias entry.
+            reserved_ids = {
+                item["id"] for item in data
+                if item["id"].casefold() == self.DEFAULT_MODEL_REQUEST_ID
+            }
+            if reserved_ids:
+                data = [
+                    item for item in data
+                    if item["id"] not in reserved_ids
+                ]
+                seen.difference_update(reserved_ids)
             target_entry = next(
                 (item for item in data if item["id"] == default_target), None,
             )
+            if target_entry is None:
+                # The target may name a deployment through its id or a
+                # compatibility alias, which proxy() resolves directly rather
+                # than through a listed request id; advertise the alias of the
+                # deployment that would actually serve it.
+                winner = self._default_model_winner_id(
+                    default_target, deployments, request_owners, shared_owners,
+                )
+                if winner is not None:
+                    target_entry = next(
+                        (
+                            item for item in data
+                            if item.get("deployment_id") == winner
+                        ),
+                        None,
+                    )
+            # Advertise the alias only while its target is actually served as
+            # a chat model, so the listing never promises a name the gateway
+            # cannot route.
             if target_entry is not None and target_entry.get("type") != "embedding":
                 seen.add(self.DEFAULT_MODEL_REQUEST_ID)
                 data.append({
@@ -8538,19 +8564,51 @@ class SparkDeckService:
             return ""
         return target
 
+    def resolve_default_model(self, requested_model: str) -> str:
+        """Resolve the reserved "default" request id to the configured target.
+
+        The name passes through unchanged whenever the alias is unset or does
+        not apply, so callers (including the /v1/responses adapter, which
+        builds response metadata from the original request) may treat this as
+        a total normalization of a requested model name.
+        """
+        if requested_model.casefold() != self.DEFAULT_MODEL_REQUEST_ID:
+            return requested_model
+        return self._default_model_target() or requested_model
+
+    def _default_model_winner_id(
+        self, target: str,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+        shared_owners: dict[str, str],
+    ) -> str | None:
+        """Return the live deployment id proxy() would select for target.
+
+        Mirrors the inference resolution order: an exact stored id/alias wins
+        while live, then the shared-name winner, then a single owner.
+        """
+        exact = self.store.deployment(target, include_private=True)
+        if exact is not None:
+            live_ids = {deployment["id"] for deployment in deployments}
+            return str(exact["id"]) if exact["id"] in live_ids else None
+        winner = shared_owners.get(target)
+        if winner is not None:
+            return str(winner)
+        owners = request_owners.get(target, set())
+        return str(next(iter(owners))) if len(owners) == 1 else None
+
     async def proxy(self, body: dict[str, Any], endpoint: str,
                     cancel: Any = None, *, caller_ip: str | None = None,
                     ) -> dict[str, Any] | AsyncIterator[str]:
         requested_model = str(body.get("model") or "")
-        if requested_model.casefold() == self.DEFAULT_MODEL_REQUEST_ID:
-            target = self._default_model_target()
-            if target:
-                # The reserved alias behaves exactly like a request that named
-                # the configured model: source-IP rules, policies, and the
-                # legacy container path all see the resolved identity, and the
-                # registered paths already rewrite the upstream body.
-                requested_model = target
-                body = {**body, "model": target}
+        resolved_model = self.resolve_default_model(requested_model)
+        if resolved_model != requested_model:
+            # The reserved alias behaves exactly like a request that named
+            # the configured model: source-IP rules, policies, and the
+            # legacy container path all see the resolved identity, and the
+            # registered paths already rewrite the upstream body.
+            requested_model = resolved_model
+            body = {**body, "model": resolved_model}
         route_lookup = getattr(self.manager, "source_ip_routing_rule", None)
         source_route = (
             route_lookup(caller_ip, requested_model)

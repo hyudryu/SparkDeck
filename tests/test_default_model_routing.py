@@ -135,6 +135,24 @@ class DefaultModelProxyTests(unittest.IsolatedAsyncioTestCase):
                 "ghost-model",
             )
 
+    async def test_target_naming_a_deployment_alias_routes_to_its_owner(self):
+        # The setting stores a deployment id/compat alias rather than a served
+        # request id: store resolution handles it, exactly as a direct request
+        # naming that alias would.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="model-two")
+            try:
+                await service.proxy(
+                    {"model": "default", "messages": [], "stream": False},
+                    "chat/completions",
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        self.assertEqual(
+            manager.proxy_cluster_inference.await_args.args[0], "cluster-two",
+        )
+
     async def test_named_models_route_exactly_as_before(self):
         with tempfile.TemporaryDirectory() as directory:
             manager, service = build_service(directory, default_model="beta-model")
@@ -168,6 +186,47 @@ class DefaultModelListingTests(unittest.IsolatedAsyncioTestCase):
             "default",
             [model["slug"] for model in listing["models"]],
         )
+
+    async def test_alias_id_target_is_advertised_off_its_owner(self):
+        # A target naming a deployment through its compat alias is not a
+        # listed request id, so the entry is built from the deployment that
+        # would actually serve it, mirroring proxy resolution.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="model-two")
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        entries = {entry["id"]: entry for entry in listing["data"]}
+        self.assertIn("default", entries)
+        self.assertEqual(entries["default"]["deployment_id"], "record-two")
+        self.assertEqual(entries["default"]["alias_of"], "model-two")
+
+    async def test_deployment_serving_the_reserved_name_is_replaced(self):
+        # Routing claims the reserved name case-insensitively, so a
+        # deployment that publishes "Default" itself keeps its other request
+        # ids while its reserved entry is replaced by the alias entry.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="beta-model")
+            rows = [dict(row) for row in live_rows()]
+            rows[0]["served_models"] = ["alpha-model", "Default"]
+            service.deployments = AsyncMock(return_value=rows)
+            try:
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        reserved = [
+            entry for entry in listing["data"]
+            if entry["id"].casefold() == "default"
+        ]
+        self.assertEqual(len(reserved), 1)
+        self.assertEqual(reserved[0]["deployment_id"], "record-two")
+        self.assertEqual(reserved[0]["alias_of"], "beta-model")
+        entry_ids = [entry["id"] for entry in listing["data"]]
+        self.assertNotIn("Default", entry_ids)
+        self.assertIn("alpha-model", entry_ids)
 
     async def test_models_omit_the_alias_when_unset_or_unserved(self):
         with tempfile.TemporaryDirectory() as directory:

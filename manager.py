@@ -21888,11 +21888,12 @@ class Manager:
         registers both), and USB4/Thunderbolt PCI class (a card can exist
         before any netdev is bound). PCI functions of one adapter merge by
         bus:device key; Socket Direct peers — the same physical card on two
-        PCIe connections with different bus addresses — merge through the
-        RDMA device's shared HCA ``uid``.
+        PCIe connections with different bus addresses — merge through a
+        shared HCA identity: the stable-ABI ``sys_image_guid`` (equal across
+        ports of one physical card) or the OFED ``uid`` where present.
         """
         groups: dict[str, list[Path]] = {}
-        uid_by_function: dict[str, str] = {}
+        identity_by_function: dict[str, str] = {}
 
         def resolved_dir(candidate: Path) -> Path | None:
             try:
@@ -21904,23 +21905,38 @@ class Manager:
         def add_grouped(resolved: Path, key: str) -> None:
             groups.setdefault(key, []).append(resolved)
 
-        # RDMA verbs devices first: their HCA uid identifies the physical
-        # card across every PCIe connection, so later function-keyed views
-        # (e.g. the bound net interface) fold into the same group.
+        def rdma_identity(rdma: Path) -> str | None:
+            # Stable ABI: ports/<n>/sys_image_guid is identical across every
+            # port of one physical HCA, including Socket Direct peers.
+            try:
+                for port in (rdma / "ports").iterdir():
+                    try:
+                        guid = (port / "sys_image_guid").read_text().strip()
+                    except OSError:
+                        continue
+                    if guid:
+                        return f"image:{guid}"
+            except OSError:
+                pass
+            # OFED/DOCA mlx5 also exposes a card-level uid at the device root.
+            try:
+                uid = (rdma / "uid").read_text().strip()
+                return f"uid:{uid}" if uid else None
+            except OSError:
+                return None
+
+        # RDMA verbs devices first: their card identity folds later
+        # function-keyed views (e.g. the bound net interface) into the group.
         try:
             for rdma in (sysfs_root / "class" / "infiniband").iterdir():
-                uid: str | None = None
-                try:
-                    uid = (rdma / "uid").read_text().strip() or None
-                except OSError:
-                    pass
+                identity = rdma_identity(rdma)
                 resolved = resolved_dir(rdma / "device")
                 if resolved is None:
                     continue
                 function_key = self._nic_card_key(resolved)
-                if uid:
-                    uid_by_function[function_key] = uid
-                    add_grouped(resolved, f"uid:{uid}")
+                if identity:
+                    identity_by_function[function_key] = identity
+                    add_grouped(resolved, identity)
                 else:
                     add_grouped(resolved, function_key)
         except OSError:
@@ -21938,7 +21954,10 @@ class Manager:
                 if resolved is None:
                     continue
                 function_key = self._nic_card_key(resolved)
-                add_grouped(resolved, uid_by_function.get(function_key, function_key))
+                add_grouped(
+                    resolved,
+                    identity_by_function.get(function_key, function_key),
+                )
         except OSError:
             pass
         try:
@@ -21952,7 +21971,10 @@ class Manager:
                 if resolved is None:
                     continue
                 function_key = self._nic_card_key(resolved)
-                add_grouped(resolved, uid_by_function.get(function_key, function_key))
+                add_grouped(
+                    resolved,
+                    identity_by_function.get(function_key, function_key),
+                )
         except OSError:
             pass
 

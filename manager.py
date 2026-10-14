@@ -21834,12 +21834,24 @@ class Manager:
     _NIC_PCI_LABELS = {
         ("0x15b3", "0x1017"): "NVIDIA ConnectX-5",
         ("0x15b3", "0x1019"): "NVIDIA ConnectX-5 Ex",
-        ("0x15b3", "0x101b"): "NVIDIA ConnectX-6 Lx",
-        ("0x15b3", "0x101d"): "NVIDIA ConnectX-6",
-        ("0x15b3", "0x101f"): "NVIDIA ConnectX-6 Dx",
+        ("0x15b3", "0x101b"): "NVIDIA ConnectX-6",
+        ("0x15b3", "0x101d"): "NVIDIA ConnectX-6 Dx",
+        ("0x15b3", "0x101f"): "NVIDIA ConnectX-6 Lx",
         ("0x15b3", "0x1021"): "NVIDIA ConnectX-7",
         ("0x15b3", "0x1023"): "NVIDIA ConnectX-8",
     }
+
+    # PCI sysfs device names look like 0000:3b:00.1. Socket Direct adapters
+    # expose one physical card as several functions, all reporting the same
+    # ASIC sensors, so card identity drops the trailing function suffix.
+    _PCI_FUNCTION_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
+
+    @classmethod
+    def _nic_card_key(cls, device: Path) -> str:
+        name = device.name
+        if cls._PCI_FUNCTION_RE.match(name):
+            return name[:-2]
+        return str(device)
 
     def _nic_label(self, device: Path) -> str:
         """Human name for a network card from its PCI identity files."""
@@ -21876,7 +21888,7 @@ class Manager:
         registers both), and USB4/Thunderbolt PCI class (a card can exist
         before any netdev is bound).
         """
-        devices: dict[str, Path] = {}
+        devices: dict[str, list[Path]] = {}
 
         def add_device(candidate: Path) -> None:
             try:
@@ -21884,7 +21896,7 @@ class Manager:
             except OSError:
                 return
             if resolved.is_dir():
-                devices.setdefault(str(resolved), resolved)
+                devices.setdefault(self._nic_card_key(resolved), []).append(resolved)
 
         try:
             for iface in (sysfs_root / "class" / "net").iterdir():
@@ -21913,22 +21925,23 @@ class Manager:
             pass
 
         nics: list[dict] = []
-        for device in devices.values():
-            hwmon_root = device / "hwmon"
-            if not hwmon_root.is_dir():
-                continue
+        for functions in devices.values():
             temps: list[float] = []
-            for input_path in sorted(hwmon_root.glob("*/temp*_input")):
-                try:
-                    value = float(input_path.read_text().strip()) / 1000.0
-                except (OSError, ValueError):
+            for device in functions:
+                hwmon_root = device / "hwmon"
+                if not hwmon_root.is_dir():
                     continue
-                if -40.0 <= value <= 150.0:
-                    temps.append(round(value, 1))
+                for input_path in sorted(hwmon_root.glob("*/temp*_input")):
+                    try:
+                        value = float(input_path.read_text().strip()) / 1000.0
+                    except (OSError, ValueError):
+                        continue
+                    if -40.0 <= value <= 150.0:
+                        temps.append(round(value, 1))
             if not temps:
                 # Card has no readable temperature sensor: omit it entirely.
                 continue
-            nics.append({"name": self._nic_label(device), "temp": max(temps)})
+            nics.append({"name": self._nic_label(functions[0]), "temp": max(temps)})
         nics.sort(key=lambda nic: nic["name"])
         return nics
 

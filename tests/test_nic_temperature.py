@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from manager import Manager
 
@@ -48,6 +48,18 @@ class NicTemperatureTests(unittest.TestCase):
                 [{"name": "NVIDIA ConnectX", "temp": 61.0}],
             )
 
+    def test_connectx_6_dx_uses_pci_ids_database_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.pci_device(
+                root, "class/infiniband/mlx5_0/device",
+                pci_id="15b3:101d", temps=["57000"],
+            )
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "NVIDIA ConnectX-6 Dx", "temp": 57.0}],
+            )
+
     def test_thunderbolt_class_device_detected_without_netdev(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -83,6 +95,16 @@ class NicTemperatureTests(unittest.TestCase):
                 self.manager()._read_nics(root),
                 [{"name": "Network adapter", "temp": 70.0}],
             )
+
+    def test_pci_functions_of_one_card_share_a_card_key(self) -> None:
+        key = Manager._nic_card_key
+        first = PurePosixPath("/sys/devices/pci0000:2a/0000:2a:00.0")
+        peer = PurePosixPath("/sys/devices/pci0000:2a/0000:2a:00.1")
+        other_card = PurePosixPath("/sys/devices/pci0000:2a/0000:2b:00.0")
+        self.assertEqual(key(first), key(peer))
+        self.assertNotEqual(key(first), key(other_card))
+        # Non-PCI-function paths key verbatim.
+        self.assertEqual(key(PurePosixPath("/a/eth0/device")), "/a/eth0/device")
 
     def test_unreadable_sysfs_returns_no_cards(self) -> None:
         self.assertEqual(self.manager()._read_nics(Path("/definitely/not/sys")), [])

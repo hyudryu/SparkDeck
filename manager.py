@@ -7434,7 +7434,7 @@ class Manager:
         return [chosen, *rest]
 
     @staticmethod
-    def _cluster_member_available(member: dict) -> bool:
+    def _member_record_available(member: dict) -> bool:
         return (
             member.get("desired_state") != "stopped"
             and str(member.get("status") or "").casefold() in {"running", "ready"}
@@ -7442,6 +7442,27 @@ class Manager:
             not in {"offline", "unreachable", "unknown", "disconnected"}
             and member.get("node_docker_ready") is not False
         )
+
+    def _cluster_member_available(self, member: dict) -> bool:
+        if not self._member_record_available(member):
+            return False
+        # Durable records carry no live node fields: get_state decorates
+        # copies without writing back, so a node that became unreachable
+        # after launch still reads "running" here. The registry's latest
+        # connectivity observation is the live signal when one exists; with
+        # no observation yet, the readiness probe stays the final gate.
+        if member.get("node_status") is None:
+            registry = getattr(self, "node_registry", None)
+            observed = (
+                registry.cached_status(str(member.get("node_id") or ""))
+                if registry is not None else None
+            )
+            if observed is not None and (
+                observed.get("online") is False
+                or observed.get("docker_ready") is False
+            ):
+                return False
+        return True
 
     def _source_route_candidates(
         self, deployment: dict, source_route: dict,

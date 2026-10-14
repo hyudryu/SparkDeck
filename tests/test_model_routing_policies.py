@@ -475,6 +475,32 @@ class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
 
+    async def test_catalog_advertises_balanced_shared_ids_on_every_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                rows = live_rows()
+                rows[1]["last_deployed_at"] = "2026-10-10T00:00:00Z"
+                # No policy: both owners join the balancing pool, so the
+                # shared name is advertised once per owner instead of only
+                # on the newest one.
+                owners = {"shared-name": {"record-one", "record-two"}}
+                balanced = service._balanced_shared_ids(rows, owners)
+                self.assertEqual(balanced, {"shared-name"})
+                catalog = await service.models()
+                shared = [
+                    entry for entry in catalog["data"]
+                    if entry["id"] == "shared-name"
+                ]
+                self.assertEqual(
+                    sorted(entry["deployment_id"] for entry in shared),
+                    ["record-one", "record-two"],
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
 class ModelRoutingDirectTrafficTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_alias_traffic_consumes_the_member_cap(self):
         """An alias request to a policy member occupies that member's

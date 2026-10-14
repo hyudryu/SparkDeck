@@ -7550,21 +7550,33 @@ class SparkDeckService:
             deployments, public_ids,
         )
         shared_owners = self._shared_selector_owners(deployments, request_owners)
+        balanced = self._balanced_shared_ids(deployments, request_owners)
         for deployment in deployments:
             model_ids = [
                 model_id for model_id in public_ids[deployment["id"]]
                 if self._model_id_routes_to_deployment(
-                    model_id, deployment, request_owners, shared_owners,
+                    model_id, deployment, request_owners, shared_owners, balanced,
                 )
             ]
-            if not model_ids:
-                alias = str(deployment.get("alias") or "").strip()
-                if alias and self._model_id_routes_to_deployment(
-                    alias, deployment, request_owners, shared_owners,
-                ):
-                    model_ids = [alias]
+            alias = str(deployment.get("alias") or "").strip()
+            if (
+                alias
+                and alias not in model_ids
+                and (not model_ids
+                     or all(model_id in balanced for model_id in model_ids))
+                and self._model_id_routes_to_deployment(
+                    alias, deployment, request_owners, shared_owners, balanced,
+                )
+            ):
+                # An alias is listed whenever it is the deployment's only
+                # selector, and balanced pool ids do not count as one:
+                # otherwise advertising the pool would hide every owner's
+                # unique name.
+                model_ids = [*model_ids, alias]
             for model_id in model_ids:
-                if model_id in seen:
+                # A balanced shared id is advertised once per owner, so its
+                # discovery entries describe the whole pool.
+                if model_id not in balanced and model_id in seen:
                     continue
                 seen.add(model_id)
                 data.append({
@@ -7664,12 +7676,16 @@ class SparkDeckService:
                     "id": self.DEFAULT_MODEL_REQUEST_ID,
                     "alias_of": default_target,
                 })
+        codex_listed: list[str] = []
+        for item in data:
+            # A balanced shared id has one entry per owner; the coding
+            # catalog lists each request id once.
+            if item.get("type") == "embedding" or item["id"] in codex_listed:
+                continue
+            codex_listed.append(item["id"])
         return {
             "object": "list", "data": data,
-            "models": [
-                codex_model(item["id"]) for item in data
-                if item.get("type") != "embedding"
-            ],
+            "models": [codex_model(item_id) for item_id in codex_listed],
         }
 
     async def _cached_embedding_models(self) -> list[dict[str, Any]]:
@@ -7776,8 +7792,13 @@ class SparkDeckService:
         deployment: dict[str, Any],
         request_owners: dict[str, set[str]],
         shared_owners: dict[str, str] | None = None,
+        balanced_ids: frozenset[str] | set[str] = frozenset(),
     ) -> bool:
         """Return whether gateway lookup selects exactly this deployment."""
+        if model_id in balanced_ids:
+            # A balanced shared id has no single owner: every live owner
+            # advertises it, matching how the proxy spreads its requests.
+            return deployment["id"] in request_owners.get(model_id, set())
         winner = (shared_owners or {}).get(model_id)
         if winner is not None:
             return winner == deployment["id"]
@@ -7786,6 +7807,31 @@ class SparkDeckService:
         if exact is not None and exact["id"] in owners:
             return exact["id"] == deployment["id"]
         return owners == {deployment["id"]}
+
+    def _balanced_shared_ids(
+        self,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+    ) -> set[str]:
+        """Shared request ids that balance across owners instead of a winner.
+
+        Without a live policy there is no priority: every live owner joins
+        the routing pool, so discovery must advertise the name on each of
+        them rather than pinning the newest one.
+        """
+        live_ids = {deployment["id"] for deployment in deployments}
+        balanced: set[str] = set()
+        for model_id, owners in request_owners.items():
+            if len(owners & live_ids) < 2:
+                continue
+            policy = self._model_routing_policies.get(model_id)
+            if policy is not None and any(
+                member["deployment_id"] in live_ids
+                for member in policy["members"]
+            ):
+                continue
+            balanced.add(model_id)
+        return balanced
 
     @staticmethod
     def _deployment_can_serve_inference(deployment: dict[str, Any]) -> bool:

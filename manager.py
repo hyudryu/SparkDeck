@@ -7630,12 +7630,20 @@ class Manager:
             return candidates
         # A cache hint only breaks ties at minimum load: honoring it elsewhere
         # would leave the cached member more than one request above the
-        # least-loaded one, and throughput comes from even spread. Members that
-        # do not look available (a crashed engine or a group still starting)
-        # sit idle at load 0 but cannot take traffic without a failed probe, so
-        # they neither lower the minimum nor take preference over the cached
-        # member. When nothing looks available, every member probes alike.
-        available = [m for m in candidates if self._cluster_member_available(m)]
+        # least-loaded one, and throughput comes from even spread. Members
+        # that do not look available (a crashed engine or a group whose
+        # worker rank is gone) sit idle at load 0 but cannot take traffic
+        # without a failed probe, so they neither lower the minimum nor take
+        # preference over the cached member. When nothing looks available,
+        # every member probes alike.
+        available = [
+            m for m in candidates
+            if (
+                self._cluster_group_available(deployment, m)
+                if m.get("instance_id") is not None
+                else self._cluster_member_available(m)
+            )
+        ]
         if available and preferred not in available:
             return candidates
         comparison = available or candidates

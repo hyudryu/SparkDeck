@@ -851,6 +851,12 @@ export interface GpuStats {
   error?: string
 }
 
+export interface NicStats {
+  /** Card label from its PCI identity, e.g. 'NVIDIA ConnectX-7'. */
+  name?: string
+  temp?: number | null
+}
+
 export interface ActiveRequestStats {
   connections: number
   caller_ips?: Record<string, number>
@@ -889,6 +895,8 @@ export interface SystemStats {
   cpu_model?: string | null
   mem?: { total?: number; used?: number; available?: number; pct?: number }
   gpus?: GpuStats[]
+  /** Network cards with a detected temperature sensor; empty when none found. */
+  nics?: NicStats[]
   active_requests?: Record<string, ActiveRequestStats>
   active_request_groups?: Record<string, ActiveRequestGroupStats>
   ts?: number

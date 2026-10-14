@@ -447,6 +447,52 @@ describe('DashboardPage', () => {
     expect(screen.getByRole('link', { name: 'Open community settings' })).toHaveAttribute('href', '/settings')
   })
 
+  it('shows each detected network card temperature and omits nodes without one', async () => {
+    const localStats = {
+      cpu_pct: 20, cpu_temp_c: 47, mem: { used: 16 * 1024 ** 3, total: 64 * 1024 ** 3, pct: 25 },
+      gpus: [{ index: 0, name: 'NVIDIA RTX 6000', util: 30, temp: 60, mem_used_mib: 4096, mem_total_mib: 24576 }],
+      nics: [
+        { name: 'NVIDIA ConnectX-7', temp: 54 },
+        { name: 'Thunderbolt controller', temp: 48 },
+        { name: 'Network adapter', temp: null },
+      ],
+      active_requests: {}, ts: 1_777_000_000,
+    }
+    const workstationStats = {
+      cpu_pct: 15, cpu_temp_c: 49, mem: { used: 8 * 1024 ** 3, total: 64 * 1024 ** 3, pct: 12 },
+      gpus: [
+        { index: 0, name: 'NVIDIA RTX', util: 20, temp: 52, mem_used_mib: 1024, mem_total_mib: 24576 },
+        { index: 1, name: 'NVIDIA RTX', util: 25, temp: 55, mem_used_mib: 2048, mem_total_mib: 24576 },
+      ],
+      active_requests: {}, ts: 1_777_000_000,
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/stats')) return json(localStats)
+      if (path.includes('/api/inference-queue')) return json({})
+      if (path.includes('/api/v1/deployments')) return json({ items: [] })
+      if (path.includes('/api/v1/community/sync')) return json({ consent: false, outbox: {} })
+      return json({ items: [
+        { id: 'local', name: 'Threadripper', local: true, online: true, stats: localStats },
+        { id: 'node-2', name: 'Bare workstation', online: true, stats: workstationStats },
+      ] })
+    }))
+
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    const localCard = await screen.findByLabelText('Resource usage for Threadripper')
+    expect(within(localCard).getByLabelText('Threadripper NVIDIA ConnectX-7')).toBeInTheDocument()
+    expect(within(localCard).getByText('NVIDIA ConnectX-7')).toBeInTheDocument()
+    expect(within(localCard).getByText('54.0°C')).toBeInTheDocument()
+    expect(within(localCard).getByText('48.0°C')).toBeInTheDocument()
+    // A card with no readable temperature is omitted entirely.
+    expect(within(localCard).queryByText('Network adapter')).not.toBeInTheDocument()
+
+    const remoteCard = screen.getByLabelText('Resource usage for Bare workstation')
+    expect(within(remoteCard).getAllByRole('progressbar').length).toBeGreaterThan(1)
+    expect(within(remoteCard).queryByText(/NIC temp/)).not.toBeInTheDocument()
+  })
+
   it('keeps local telemetry visible when cluster inventory fails', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
       const path = String(input)

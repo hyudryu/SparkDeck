@@ -22758,6 +22758,257 @@ class Manager:
         except Exception as e:
             return [{"error": str(e)}]
 
+    # Known network-card PCI ids (vendor:device from uevent). Cards outside
+    # this map still surface under a generic label when a temp sensor exists.
+    _NIC_PCI_LABELS = {
+        ("0x15b3", "0x1017"): "NVIDIA ConnectX-5",
+        ("0x15b3", "0x1019"): "NVIDIA ConnectX-5 Ex",
+        ("0x15b3", "0x101b"): "NVIDIA ConnectX-6",
+        ("0x15b3", "0x101d"): "NVIDIA ConnectX-6 Dx",
+        ("0x15b3", "0x101f"): "NVIDIA ConnectX-6 Lx",
+        ("0x15b3", "0x1021"): "NVIDIA ConnectX-7",
+        ("0x15b3", "0x1023"): "NVIDIA ConnectX-8",
+    }
+
+    # PCI sysfs device names look like 0000:3b:00.1. Socket Direct adapters
+    # expose one physical card as several functions, all reporting the same
+    # ASIC sensors, so card identity drops the trailing function suffix.
+    _PCI_FUNCTION_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d$")
+
+    @classmethod
+    def _nic_card_key(cls, device: Path) -> str:
+        name = device.name
+        if cls._PCI_FUNCTION_RE.match(name):
+            return name[:-2]
+        return str(device)
+
+    @staticmethod
+    def _vpd_readonly_serial(payload: bytes) -> str | None:
+        # Read-only VPD resources hold 2-char keyword TLVs: keyword, 1-byte
+        # length, value. The product serial is the value of the SN keyword.
+        j = 0
+        n = len(payload)
+        while j + 3 <= n:
+            klen = payload[j + 2]
+            if payload[j:j + 2] == b"SN" and klen:
+                value = payload[j + 3:j + 3 + klen]
+                try:
+                    serial = value.decode("ascii", "replace").strip()
+                except UnicodeError:
+                    return None
+                return serial or None
+            j += 3 + klen
+        return None
+
+    @classmethod
+    def _vpd_serial(cls, device: Path) -> str | None:
+        """Product serial from PCI VPD; None unless it parses cleanly.
+
+        Standard layout: large resources use a tag plus little-endian
+        2-byte length and the serial is the ``SN`` keyword inside the
+        read-only (0x90) resource; ``78 78`` terminates the VPD. The kernel
+        exports ``vpd`` mode 0600, so this is best-effort identity only
+        (typically readable when the agent runs as root); for multi-function
+        cards (Socket Direct peers) without the RDMA driver and without VPD
+        access there is no reliable unprivileged shared identity, so peers
+        may appear as separate cards in that configuration.
+        """
+        try:
+            data = (device / "vpd").read_bytes()
+        except OSError:
+            return None
+        i = 0
+        n = len(data)
+        while i < n:
+            tag = data[i]
+            if tag == 0x78 and (i + 1 >= n or data[i + 1] == 0x78):
+                break
+            if tag >= 0x80:
+                if i + 2 >= n:
+                    break
+                length = data[i + 1] | (data[i + 2] << 8)
+                if length > n - i - 3:
+                    break  # Corrupt VPD: stop rather than scan past the end.
+                if tag == 0x90:  # Read-only area holds the SN keyword.
+                    serial = cls._vpd_readonly_serial(data[i + 3:i + 3 + length])
+                    if serial:
+                        return serial
+                i += 3 + length
+            else:
+                i += 1 + (tag & 0x07)  # Small resource: length in the tag.
+        return None
+
+    def _nic_label(self, device: Path) -> str:
+        """Human name for a network card from its PCI identity files."""
+        vendor = device_id = None
+        try:
+            for line in (device / "uevent").read_text().splitlines():
+                key, _, value = line.partition("=")
+                if key == "PCI_ID" and ":" in value:
+                    vendor, device_id = (part.lower() for part in value.split(":", 1))
+        except OSError:
+            pass
+        pci_class = ""
+        try:
+            pci_class = (device / "class").read_text().strip()
+        except OSError:
+            pass
+        if vendor and device_id:
+            label = self._NIC_PCI_LABELS.get((f"0x{vendor}", f"0x{device_id}"))
+            if label:
+                return label
+            if vendor == "15b3":
+                return "NVIDIA ConnectX"
+        if pci_class == "0x0c0340":
+            return "Thunderbolt controller"
+        return "Network adapter"
+
+    def _read_nics(self, sysfs_root: Path = Path("/sys")) -> list[dict]:
+        """Temperature of network cards that expose a hwmon sensor.
+
+        Cards like ConnectX (mlx5 hwmon) or a Thunderbolt card appear only
+        when a readable temperature sensor is detected; everything else is
+        omitted so the UI never renders a placeholder card. Scans three
+        sysfs views: physical net interfaces, RDMA verbs devices (ConnectX
+        registers both), and USB4/Thunderbolt PCI class (a card can exist
+        before any netdev is bound). PCI functions of one adapter merge by
+        bus:device key; Socket Direct peers — the same physical card on two
+        PCIe connections with different bus addresses — merge through a
+        shared card identity: the stable-ABI ``sys_image_guid`` (equal across
+        ports of one physical card), the OFED ``uid`` where present, or the
+        PCI VPD product serial (covers hosts without the RDMA driver where
+        the VPD file is readable).
+        """
+        groups: dict[str, list[Path]] = {}
+        identity_by_function: dict[str, str] = {}
+
+        def resolved_dir(candidate: Path) -> Path | None:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                return None
+            return resolved if resolved.is_dir() else None
+
+        def function_identity(resolved: Path) -> str:
+            function_key = self._nic_card_key(resolved)
+            identity = identity_by_function.get(function_key)
+            if identity:
+                return identity
+            serial = self._vpd_serial(resolved)
+            if serial:
+                identity = f"vpd:{serial}"
+                identity_by_function[function_key] = identity
+                return identity
+            return function_key
+
+        def add_grouped(resolved: Path, key: str) -> None:
+            groups.setdefault(key, []).append(resolved)
+
+        def rdma_identity(rdma: Path) -> str | None:
+            # Stable ABI: sys_image_guid is identical across every port of
+            # one physical HCA, including Socket Direct peers. Some drivers
+            # expose it only per port, so check both layouts.
+            try:
+                guid = (rdma / "sys_image_guid").read_text().strip()
+                if guid:
+                    return f"image:{guid}"
+            except OSError:
+                pass
+            try:
+                for port in (rdma / "ports").iterdir():
+                    try:
+                        guid = (port / "sys_image_guid").read_text().strip()
+                    except OSError:
+                        continue
+                    if guid:
+                        return f"image:{guid}"
+            except OSError:
+                pass
+            # OFED/DOCA mlx5 also exposes a card-level uid at the device root.
+            try:
+                uid = (rdma / "uid").read_text().strip()
+                return f"uid:{uid}" if uid else None
+            except OSError:
+                return None
+
+        # RDMA verbs devices first: their card identity folds later
+        # function-keyed views (e.g. the bound net interface) into the group.
+        try:
+            for rdma in (sysfs_root / "class" / "infiniband").iterdir():
+                identity = rdma_identity(rdma)
+                resolved = resolved_dir(rdma / "device")
+                if resolved is None:
+                    continue
+                if identity:
+                    identity_by_function[self._nic_card_key(resolved)] = identity
+                    add_grouped(resolved, identity)
+                else:
+                    add_grouped(resolved, function_identity(resolved))
+        except OSError:
+            pass
+
+        try:
+            for iface in (sysfs_root / "class" / "net").iterdir():
+                name = iface.name
+                if name == "lo" or name.startswith(("veth", "virbr", "docker", "br-")):
+                    continue
+                # Linux creates /sys/class/net/<iface>/bridge for bridges.
+                if (iface / "bridge").exists():
+                    continue
+                resolved = resolved_dir(iface / "device")
+                if resolved is None:
+                    continue
+                add_grouped(resolved, function_identity(resolved))
+        except OSError:
+            pass
+        try:
+            for pci in (sysfs_root / "bus" / "pci" / "devices").iterdir():
+                try:
+                    if (pci / "class").read_text().strip() != "0x0c0340":
+                        continue
+                except OSError:
+                    continue
+                resolved = resolved_dir(pci)
+                if resolved is None:
+                    continue
+                add_grouped(resolved, function_identity(resolved))
+        except OSError:
+            pass
+
+        nics: list[dict] = []
+        for functions in groups.values():
+            temps: list[float] = []
+            for device in functions:
+                hwmon_root = device / "hwmon"
+                try:
+                    if not hwmon_root.is_dir():
+                        continue
+                    # A hot-unplugged adapter can disappear between the dir
+                    # check and the lazy glob, so materialize inside try.
+                    input_paths = sorted(hwmon_root.glob("*/temp*_input"))
+                except OSError:
+                    continue
+                for input_path in input_paths:
+                    # hwmon: a channel with tempN_fault set must not be trusted.
+                    stem = input_path.name[: -len("_input")]
+                    try:
+                        if (input_path.parent / f"{stem}_fault").read_text().strip() == "1":
+                            continue
+                    except OSError:
+                        pass
+                    try:
+                        value = float(input_path.read_text().strip()) / 1000.0
+                    except (OSError, ValueError):
+                        continue
+                    if -40.0 <= value <= 150.0:
+                        temps.append(round(value, 1))
+            if not temps:
+                # Card has no readable temperature sensor: omit it entirely.
+                continue
+            nics.append({"name": self._nic_label(functions[0]), "temp": max(temps)})
+        nics.sort(key=lambda nic: nic["name"])
+        return nics
+
     async def _gpu_total_gb(self) -> float | None:
         """Total GPU memory of the first GPU in GB, or None if unavailable."""
         try:
@@ -23065,6 +23316,7 @@ class Manager:
                 "cpu_clock_base_mhz": cpu_clock.get("base"),
                 "mem": self._read_mem(),
                 "gpus": self._read_gpu(),
+                "nics": self._read_nics(),
                 "net": self._read_net(),
                 "mem_bw": self._read_mem_bw(),
                 "online_users": self._read_online_users(),

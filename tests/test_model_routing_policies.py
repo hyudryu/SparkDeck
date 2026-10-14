@@ -104,7 +104,6 @@ class ModelRoutingPolicyValidationTests(unittest.IsolatedAsyncioTestCase):
                     {"model": "shared-name", "members": [], "updated_at": None},
                 )
                 self.assertEqual(await service.model_routing_policies(), [])
-                self.assertEqual(service._model_routing_member_ids, set())
             finally:
                 await manager.http.aclose()
                 await service.close()

@@ -1457,6 +1457,45 @@ describe('Running models shared-instance routing', () => {
     expect(save).toBeDisabled()
   })
 
+  it('resets the editor after clearing a policy shaped like the defaults', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    let deleted = 0
+    // The saved policy matches what routingDefaults would pre-fill: same
+    // ordered members, unlimited caps.
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'dgx', max_concurrency: null, alias: 'dgx-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'ws1', max_concurrency: null, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'DELETE') {
+          deleted += 1
+          return json({ ok: true })
+        }
+        return deleted > 0 ? json({ items: [] }) : json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove dgx-model from routing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove ws1-model from routing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save routing' }))
+    await waitFor(() => expect(deleted).toBe(1))
+    // The reload restores the no-policy defaults instead of leaving the
+    // emptied draft behind.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save routing' })).toBeEnabled())
+    expect(screen.getByText('dgx-model')).toBeInTheDocument()
+  })
+
   it('renders a plain row for a deployment with no shared request id', async () => {
     const base = stubDashboardFetch({ active_requests: {} })
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

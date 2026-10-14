@@ -385,9 +385,9 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_shared_selector_logs_ownership_changes_once(self):
-        """Shared names are routine, so the request path logs one line per
-        ownership change instead of one per inference."""
+    async def test_shared_selector_requests_stay_quiet_while_balancing(self):
+        """Shared names are routine and no-policy traffic balances across
+        owners, so the request path logs no ownership warnings at all."""
         from unittest.mock import patch as patch_module
 
         with tempfile.TemporaryDirectory() as directory:
@@ -435,7 +435,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 call for call in warning.call_args_list
                 if "is shared by several live deployments" in str(call)
             ]
-            self.assertEqual(len(shared_logs), 1)
+            self.assertEqual(shared_logs, [])
 
             await manager.http.aclose()
             await service.close()

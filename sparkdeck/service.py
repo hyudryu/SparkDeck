@@ -506,11 +506,6 @@ class SparkDeckService:
         self._model_routing_policies: dict[str, dict[str, Any]] = (
             self._load_model_routing_policies()
         )
-        self._model_routing_member_ids: set[str] = {
-            member["deployment_id"]
-            for policy in self._model_routing_policies.values()
-            for member in policy["members"]
-        }
         self._model_routing_inflight: dict[str, int] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
@@ -8045,7 +8040,6 @@ class SparkDeckService:
         staged[policy["model"]] = policy
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
-        self._rebuild_routing_member_index()
         items = await self.model_routing_policies()
         return next(item for item in items if item["model"] == policy["model"])
 
@@ -8057,24 +8051,19 @@ class SparkDeckService:
         staged.pop(key, None)
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
-        self._rebuild_routing_member_index()
         return True
 
-    def _rebuild_routing_member_index(self) -> None:
-        self._model_routing_member_ids = {
-            member["deployment_id"]
-            for policy in self._model_routing_policies.values()
-            for member in policy["members"]
-        }
-
     def _reserve_policy_slot(self, deployment_id: str) -> bool:
-        """Count a directly-routed request against a policy member's cap.
+        """Count a directly-routed request in the shared load counters.
 
-        Alias and source-IP traffic consumes the same concurrency budget as
-        policy-selected requests, so a member busy on its unique selector
-        cannot also be picked as idle for the shared id.
+        Alias and source-IP traffic must be visible to whichever selector
+        runs next: the policy selector enforces caps from these counters and
+        the no-policy balancer spreads by them, so a deployment busy on its
+        unique selector cannot also be picked as idle for the shared id.
+        Only configured policy members have a cap to enforce, but every
+        deployment is counted.
         """
-        if not deployment_id or deployment_id not in self._model_routing_member_ids:
+        if not deployment_id:
             return False
         self._model_routing_inflight[deployment_id] = (
             self._model_routing_inflight.get(deployment_id, 0) + 1
@@ -8125,7 +8114,7 @@ class SparkDeckService:
         return live_by_id[chosen]
 
     def _select_balanced_shared_owner(
-        self, model_id: str, candidates: list[dict[str, Any]],
+        self, candidates: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], str]:
         """Spread shared-name traffic across live owners, least in-flight first.
 
@@ -8149,7 +8138,9 @@ class SparkDeckService:
         deployment = max(tied, key=self._selector_owner_sort_key)
         deployment_id = str(deployment.get("id") or "")
         inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
-        self._note_shared_selector_owner(model_id, deployment)
+        # Deliberately not _note_shared_selector_owner: balanced selections
+        # alternate between owners by design, and that helper warns on every
+        # ownership change, which would flood the log at one line per request.
         return deployment, deployment_id
 
     def _release_routing_slot(self, deployment_id: str) -> None:
@@ -8694,7 +8685,7 @@ class SparkDeckService:
                     deployment = candidates[0]
                 elif candidates:
                     deployment, routing_slot = self._select_balanced_shared_owner(
-                        requested_model, candidates,
+                        candidates,
                     )
             if deployment is None:
                 deployment = stored_deployment

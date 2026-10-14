@@ -743,7 +743,10 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
   onChanged: () => void
 }) {
   const defaults = routingDefaults(deployments, policy)
-  const serverFingerprint = JSON.stringify(defaults)
+  const defaultMembers = JSON.stringify(defaults)
+  // The fingerprint includes policy presence: clearing a policy whose saved
+  // members match the no-policy defaults must still reset the editor.
+  const serverFingerprint = JSON.stringify([policy ? policy.model : null, defaults])
   const [draft, setDraft] = useState(() => ({ members: defaults, fingerprint: serverFingerprint }))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
@@ -752,7 +755,7 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
     if (draft.fingerprint === serverFingerprint) return
     setDraft({ members: routingDefaults(deployments, policy), fingerprint: serverFingerprint })
   }, [serverFingerprint]) // eslint-disable-line react-hooks/exhaustive-deps
-  const dirty = JSON.stringify(draft.members) !== serverFingerprint
+  const dirty = JSON.stringify(draft.members) !== defaultMembers
   // Policy mutations wait for a successful policy load: editing from
   // inventory defaults while the saved policy is unknown could silently
   // replace configured membership.

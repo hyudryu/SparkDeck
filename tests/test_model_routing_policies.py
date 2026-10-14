@@ -534,6 +534,45 @@ class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
                 await manager.http.aclose()
                 await service.close()
 
+    async def test_balanced_pool_skips_live_exact_deployment_ids(self):
+        # A live deployment's ID is a valid exact selector even when it does
+        # not serve the name: the proxy always routes to it, so the other
+        # publishers must not be advertised as a pool.
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                service.store.add_deployment(Deployment(
+                    id="shared-name", alias="other-model",
+                    runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity("org/other"),
+                    settings={"manager_deployment_id": "cluster-other"},
+                ))
+                rows = [
+                    {"id": "shared-name", "alias": "other-model",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["other-name"],
+                     "model": {"repository": "org/other"}, "settings": {}},
+                    {"id": "record-two", "alias": "model-two",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": "org/two"}, "settings": {}},
+                    {"id": "record-three", "alias": "model-three",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": "org/three"}, "settings": {}},
+                ]
+                owners = {
+                    "shared-name": {"record-two", "record-three"},
+                    "other-name": {"shared-name"},
+                }
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners), set(),
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
     async def test_balanced_pool_ignores_policy_members_not_serving_the_id(self):
         # A live policy member relaunched under other served names does not
         # route this id, so it must not suppress balanced discovery.

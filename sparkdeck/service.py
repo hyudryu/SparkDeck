@@ -7825,10 +7825,11 @@ class SparkDeckService:
         for model_id, owners in request_owners.items():
             if len(owners & live_ids) < 2:
                 continue
-            # An exact live id/alias always wins in the proxy, so it is not
-            # a pool even when its owners share additional served names.
+            # An exact live id/alias always wins in the proxy — a deployment
+            # whose ID is the requested name routes even when it does not
+            # serve the name — so the id is not a pool.
             exact = self.store.deployment(model_id, include_private=True)
-            if exact is not None and exact["id"] in owners:
+            if exact is not None and exact["id"] in live_ids:
                 continue
             # Only members that actually serve this id route it; a live
             # member relaunched under other served names falls back to the

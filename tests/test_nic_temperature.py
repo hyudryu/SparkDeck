@@ -96,6 +96,47 @@ class NicTemperatureTests(unittest.TestCase):
                 [{"name": "Network adapter", "temp": 70.0}],
             )
 
+    def test_socket_direct_peers_merge_via_shared_hca_uid(self) -> None:
+        # One physical ConnectX-7 presented on two PCIe connections: the
+        # verbs devices resolve to different paths but share the HCA uid.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.pci_device(
+                root, "class/infiniband/mlx5_0/device",
+                pci_id="15b3:1021", temps=["54000"],
+            )
+            (root / "class/infiniband/mlx5_0/uid").write_text("0x0002c9990000abcd\n")
+            self.pci_device(
+                root, "class/infiniband/mlx5_1/device",
+                pci_id="15b3:1021", temps=["56000"],
+            )
+            (root / "class/infiniband/mlx5_1/uid").write_text("0x0002c9990000abcd\n")
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "NVIDIA ConnectX-7", "temp": 56.0}],
+            )
+
+    def test_distinct_cards_with_different_uids_stay_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.pci_device(
+                root, "class/infiniband/mlx5_0/device",
+                pci_id="15b3:1021", temps=["54000"],
+            )
+            (root / "class/infiniband/mlx5_0/uid").write_text("0x0002c9000000aaaa\n")
+            self.pci_device(
+                root, "class/infiniband/mlx5_1/device",
+                pci_id="15b3:1021", temps=["61000"],
+            )
+            (root / "class/infiniband/mlx5_1/uid").write_text("0x0002c9000000bbbb\n")
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [
+                    {"name": "NVIDIA ConnectX-7", "temp": 54.0},
+                    {"name": "NVIDIA ConnectX-7", "temp": 61.0},
+                ],
+            )
+
     def test_pci_functions_of_one_card_share_a_card_key(self) -> None:
         key = Manager._nic_card_key
         first = PurePosixPath("/sys/devices/pci0000:2a/0000:2a:00.0")

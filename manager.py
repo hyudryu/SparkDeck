@@ -21886,17 +21886,45 @@ class Manager:
         omitted so the UI never renders a placeholder card. Scans three
         sysfs views: physical net interfaces, RDMA verbs devices (ConnectX
         registers both), and USB4/Thunderbolt PCI class (a card can exist
-        before any netdev is bound).
+        before any netdev is bound). PCI functions of one adapter merge by
+        bus:device key; Socket Direct peers — the same physical card on two
+        PCIe connections with different bus addresses — merge through the
+        RDMA device's shared HCA ``uid``.
         """
-        devices: dict[str, list[Path]] = {}
+        groups: dict[str, list[Path]] = {}
+        uid_by_function: dict[str, str] = {}
 
-        def add_device(candidate: Path) -> None:
+        def resolved_dir(candidate: Path) -> Path | None:
             try:
                 resolved = candidate.resolve()
             except OSError:
-                return
-            if resolved.is_dir():
-                devices.setdefault(self._nic_card_key(resolved), []).append(resolved)
+                return None
+            return resolved if resolved.is_dir() else None
+
+        def add_grouped(resolved: Path, key: str) -> None:
+            groups.setdefault(key, []).append(resolved)
+
+        # RDMA verbs devices first: their HCA uid identifies the physical
+        # card across every PCIe connection, so later function-keyed views
+        # (e.g. the bound net interface) fold into the same group.
+        try:
+            for rdma in (sysfs_root / "class" / "infiniband").iterdir():
+                uid: str | None = None
+                try:
+                    uid = (rdma / "uid").read_text().strip() or None
+                except OSError:
+                    pass
+                resolved = resolved_dir(rdma / "device")
+                if resolved is None:
+                    continue
+                function_key = self._nic_card_key(resolved)
+                if uid:
+                    uid_by_function[function_key] = uid
+                    add_grouped(resolved, f"uid:{uid}")
+                else:
+                    add_grouped(resolved, function_key)
+        except OSError:
+            pass
 
         try:
             for iface in (sysfs_root / "class" / "net").iterdir():
@@ -21906,26 +21934,30 @@ class Manager:
                 # Linux creates /sys/class/net/<iface>/bridge for bridges.
                 if (iface / "bridge").exists():
                     continue
-                add_device(iface / "device")
-        except OSError:
-            pass
-        try:
-            for rdma in (sysfs_root / "class" / "infiniband").iterdir():
-                add_device(rdma / "device")
+                resolved = resolved_dir(iface / "device")
+                if resolved is None:
+                    continue
+                function_key = self._nic_card_key(resolved)
+                add_grouped(resolved, uid_by_function.get(function_key, function_key))
         except OSError:
             pass
         try:
             for pci in (sysfs_root / "bus" / "pci" / "devices").iterdir():
                 try:
-                    if (pci / "class").read_text().strip() == "0x0c0340":
-                        add_device(pci)
+                    if (pci / "class").read_text().strip() != "0x0c0340":
+                        continue
                 except OSError:
                     continue
+                resolved = resolved_dir(pci)
+                if resolved is None:
+                    continue
+                function_key = self._nic_card_key(resolved)
+                add_grouped(resolved, uid_by_function.get(function_key, function_key))
         except OSError:
             pass
 
         nics: list[dict] = []
-        for functions in devices.values():
+        for functions in groups.values():
             temps: list[float] = []
             for device in functions:
                 hwmon_root = device / "hwmon"

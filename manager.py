@@ -21854,45 +21854,57 @@ class Manager:
         return str(device)
 
     @staticmethod
-    def _vpd_tlv(data: bytes, start: int, end: int):
-        i = start
-        while i < end:
-            tag = data[i]
-            if tag == 0x78 and i + 1 < end and data[i + 1] == 0x78:
-                return
-            if tag == 0x00:  # padding
-                i += 1
-                continue
-            if i + 1 >= end:
-                return
-            length = data[i + 1]
-            yield tag, data[i + 2:i + 2 + length]
-            i += 2 + length
+    def _vpd_readonly_serial(payload: bytes) -> str | None:
+        # Read-only VPD resources hold 2-char keyword TLVs: keyword, 1-byte
+        # length, value. The product serial is the value of the SN keyword.
+        j = 0
+        n = len(payload)
+        while j + 3 <= n:
+            klen = payload[j + 2]
+            if payload[j:j + 2] == b"SN" and klen:
+                value = payload[j + 3:j + 3 + klen]
+                try:
+                    serial = value.decode("ascii", "replace").strip()
+                except UnicodeError:
+                    return None
+                return serial or None
+            j += 3 + klen
+        return None
 
     @classmethod
     def _vpd_serial(cls, device: Path) -> str | None:
         """Product serial from PCI VPD; None unless it parses cleanly.
 
-        ``vpd`` is root-readable on many distros, so this is best-effort
-        identity for multi-function cards (Socket Direct peers) on hosts
-        without the RDMA driver, where no guid/uid attribute exists.
+        Standard layout: large resources use a tag plus 2-byte length and
+        the serial is the ``SN`` keyword inside the read-only (0x90)
+        resource; ``78 78`` terminates the VPD. The file is root-readable
+        on many distros, so this is best-effort identity for multi-function
+        cards (Socket Direct peers) on hosts without the RDMA driver,
+        where no guid/uid attribute exists.
         """
         try:
             data = (device / "vpd").read_bytes()
         except OSError:
             return None
-        if not data:
-            return None
-        try:
-            for tag, value in cls._vpd_tlv(data, 0, len(data)):
-                if tag == 0x82:  # INVENTORY
-                    for inner, field in cls._vpd_tlv(value, 0, len(value)):
-                        if inner == 0x76 and field:  # Product Serial Number
-                            serial = field.decode("ascii", "replace").strip()
-                            if serial:
-                                return serial
-        except (IndexError, ValueError):
-            return None
+        i = 0
+        n = len(data)
+        while i < n:
+            tag = data[i]
+            if tag == 0x78 and (i + 1 >= n or data[i + 1] == 0x78):
+                break
+            if tag >= 0x80:
+                if i + 2 >= n:
+                    break
+                length = (data[i + 1] << 8) | data[i + 2]
+                if length > n - i - 3:
+                    break  # Corrupt VPD: stop rather than scan past the end.
+                if tag == 0x90:  # Read-only area holds the SN keyword.
+                    serial = cls._vpd_readonly_serial(data[i + 3:i + 3 + length])
+                    if serial:
+                        return serial
+                i += 3 + length
+            else:
+                i += 1 + (tag & 0x07)  # Small resource: length in the tag.
         return None
 
     def _nic_label(self, device: Path) -> str:

@@ -179,12 +179,16 @@ class NicTemperatureTests(unittest.TestCase):
 
     @staticmethod
     def vpd_bytes(serial: str) -> bytes:
+        # Standard layout: value-length header (0x80), identifier string
+        # (0x82), read-only resource (0x90) carrying the SN keyword, then
+        # the 78 78 end marker. Large resources use a 2-byte length.
         field = serial.encode("ascii")
-        inventory = bytes([0x76, len(field)]) + field
+        readonly = b"SN" + bytes([len(field)]) + field + b"\x78\x78"
+        ident = b"Mellanox ConnectX"
         return (
-            bytes([0x80, 0x02, 0x00, 0x00])
-            + bytes([0x82, len(inventory)])
-            + inventory
+            b"\x80\x00\x04\x00\x00\x00\x00"
+            + bytes([0x82, 0x00, len(ident)]) + ident
+            + bytes([0x90, 0x00, len(readonly)]) + readonly
             + b"\x78\x78"
         )
 

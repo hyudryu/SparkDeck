@@ -10028,7 +10028,7 @@ def _replica_summary(cluster: dict[str, Any]) -> list[dict[str, Any]]:
             in {"online", "degraded"},
             "available": cluster.get("desired_state") != "stopped"
             and str(member.get("node_status") or "").casefold() in {"online", "degraded"}
-            and Manager._source_routing_member_available(member),
+            and Manager._cluster_member_available(member),
         }
         for member in cluster.get("members") or []
         if isinstance(member, dict) and member.get("node_id")

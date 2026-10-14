@@ -794,7 +794,11 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
       setBusy(false)
     }
   }
-  const save = () => submit(() => api.modelRouting.save({ model, members: draft.members }))
+  // An emptied membership clears the policy: saving zero members is how the
+  // editor gets back to default balancing for this model.
+  const save = () => submit(() => draft.members.length === 0
+    ? api.modelRouting.remove(model)
+    : api.modelRouting.save({ model, members: draft.members }))
   const clear = () => submit(() => api.modelRouting.remove(model))
   const candidates = deployments.filter(
     (deployment) => !draft.members.some((member) => member.deployment_id === deployment.id),
@@ -805,7 +809,7 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
     <div className="model-routing-editor">
       <div className="model-routing-heading">
         <strong>Load balancing</strong>
-        <small>Requests fill the priority instance up to its cap, then overflow to the next one.</small>
+        <small>Requests fill the priority instance up to its cap, then overflow to the next one. Without a saved policy, concurrent requests balance across instances instead.</small>
         {!routingReady && <small role="status">Loading routing policies…</small>}
       </div>
       {draft.members.map((member, index) => {
@@ -860,7 +864,7 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
         </small>
       )}
       <div className="model-routing-actions">
-        <Button onClick={save} disabled={locked || draft.members.length === 0 || (Boolean(policy) && !dirty)}>Save routing</Button>
+        <Button onClick={save} disabled={locked || (draft.members.length === 0 && !policy) || (Boolean(policy) && !dirty)}>Save routing</Button>
         {policy && <Button onClick={clear} disabled={locked}>Clear</Button>}
         {saved && !dirty && !error && <span role="status">Routing saved</span>}
         {error && <p className="inline-error" role="alert">{error}</p>}

@@ -64,7 +64,7 @@ class ModelRoutingPolicyValidationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 with self.assertRaisesRegex(ValueError, "between 1 and"):
                     await service.upsert_model_routing_policy(
-                        {"model": "shared-name", "members": []},
+                        {"model": "shared-name", "members": "everything"},
                     )
                 with self.assertRaisesRegex(ValueError, "duplicate"):
                     await service.upsert_model_routing_policy({
@@ -84,6 +84,27 @@ class ModelRoutingPolicyValidationTests(unittest.IsolatedAsyncioTestCase):
                         "members": [{"deployment_id": "missing"}],
                     })
                 self.assertEqual(await service.model_routing_policies(), [])
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_saving_an_emptied_membership_clears_the_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                await service.upsert_model_routing_policy({
+                    "model": "shared-name",
+                    "members": [{"deployment_id": "record-one"}],
+                })
+                saved = await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [],
+                })
+                self.assertEqual(
+                    saved,
+                    {"model": "shared-name", "members": [], "updated_at": None},
+                )
+                self.assertEqual(await service.model_routing_policies(), [])
+                self.assertEqual(service._model_routing_member_ids, set())
             finally:
                 await manager.http.aclose()
                 await service.close()

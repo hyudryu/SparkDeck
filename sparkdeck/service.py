@@ -8006,6 +8006,15 @@ class SparkDeckService:
     async def upsert_model_routing_policy(
         self, body: Any,
     ) -> dict[str, Any]:
+        if isinstance(body, dict) and body.get("members") == []:
+            # Saving an emptied membership clears the policy: removing every
+            # pair is how an operator expresses "route this model without a
+            # priority policy", and that state must be savable.
+            model = str(body.get("model") or "").strip()
+            if not model:
+                raise ValueError("model must be a non-empty string of at most 512 characters")
+            self.delete_model_routing_policy(model)
+            return {"model": model, "members": [], "updated_at": None}
         policy = self._normalize_model_routing_policy(body)
         live_deployments = await self.deployments()
         live_ids = {deployment["id"] for deployment in live_deployments}

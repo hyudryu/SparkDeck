@@ -1401,6 +1401,62 @@ describe('Running models shared-instance routing', () => {
     })
   })
 
+  it('saving an emptied membership clears the policy', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    let deleted = 0
+    const policy = {
+      model: 'shared-name',
+      members: [
+        { deployment_id: 'ws1', max_concurrency: 3, alias: 'ws1-model', status: 'running', node_names: [], live: true, inflight: 0 },
+        { deployment_id: 'dgx', max_concurrency: null, alias: 'dgx-model', status: 'running', node_names: [], live: true, inflight: 0 },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) {
+        if (init?.method === 'DELETE') {
+          deleted += 1
+          return json({ ok: true })
+        }
+        return deleted > 0 ? json({ items: [] }) : json({ items: [policy] })
+      }
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    const save = screen.getByRole('button', { name: 'Save routing' })
+    expect(save).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove ws1-model from routing' }))
+    expect(save).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove dgx-model from routing' }))
+    expect(save).toBeEnabled()
+    fireEvent.click(save)
+    await waitFor(() => expect(deleted).toBe(1))
+  })
+
+  it('disables saving when the draft is empty and no policy exists', async () => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('/api/v1/deployments')) {
+        return json({ items: [wire('dgx', 'dgx-model', 'DGX Spark'), wire('ws1', 'ws1-model', 'RTX Pro 6000')] })
+      }
+      if (path.includes('/api/v1/model-routing-policies')) return json({ items: [] })
+      return base(input as RequestInfo, init)
+    }))
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('2 instances share this request id')
+    const save = screen.getByRole('button', { name: 'Save routing' })
+    fireEvent.click(screen.getByRole('button', { name: 'Remove ws1-model from routing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove dgx-model from routing' }))
+    expect(save).toBeDisabled()
+  })
+
   it('renders a plain row for a deployment with no shared request id', async () => {
     const base = stubDashboardFetch({ active_requests: {} })
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

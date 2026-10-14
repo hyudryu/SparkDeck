@@ -21906,8 +21906,15 @@ class Manager:
             groups.setdefault(key, []).append(resolved)
 
         def rdma_identity(rdma: Path) -> str | None:
-            # Stable ABI: ports/<n>/sys_image_guid is identical across every
-            # port of one physical HCA, including Socket Direct peers.
+            # Stable ABI: sys_image_guid is identical across every port of
+            # one physical HCA, including Socket Direct peers. Some drivers
+            # expose it only per port, so check both layouts.
+            try:
+                guid = (rdma / "sys_image_guid").read_text().strip()
+                if guid:
+                    return f"image:{guid}"
+            except OSError:
+                pass
             try:
                 for port in (rdma / "ports").iterdir():
                     try:
@@ -21986,6 +21993,13 @@ class Manager:
                 if not hwmon_root.is_dir():
                     continue
                 for input_path in sorted(hwmon_root.glob("*/temp*_input")):
+                    # hwmon: a channel with tempN_fault set must not be trusted.
+                    stem = input_path.name[: -len("_input")]
+                    try:
+                        if (input_path.parent / f"{stem}_fault").read_text().strip() == "1":
+                            continue
+                    except OSError:
+                        pass
                     try:
                         value = float(input_path.read_text().strip()) / 1000.0
                     except (OSError, ValueError):

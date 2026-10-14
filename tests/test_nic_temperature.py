@@ -138,28 +138,75 @@ class NicTemperatureTests(unittest.TestCase):
             )
 
     def test_socket_direct_peers_merge_via_shared_sys_image_guid(self) -> None:
-        # Mainline mlx5 exposes no uid file; ports/*/sys_image_guid is the
-        # stable-ABI identity shared by every port of one physical card.
+        # Stable-ABI device-root sys_image_guid is shared by every port of
+        # one physical card, including Socket Direct peers on separate buses.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.pci_device(
                 root, "class/infiniband/mlx5_0/device",
                 pci_id="15b3:1021", temps=["54000"],
             )
-            guid0 = root / "class/infiniband/mlx5_0/ports/1"
-            guid0.mkdir(parents=True)
-            (guid0 / "sys_image_guid").write_text("0x0002c90300abcdef\n")
+            (root / "class/infiniband/mlx5_0/sys_image_guid").write_text("0x0002c90300abcdef\n")
             self.pci_device(
                 root, "class/infiniband/mlx5_1/device",
                 pci_id="15b3:1021", temps=["56000"],
             )
-            guid1 = root / "class/infiniband/mlx5_1/ports/1"
-            guid1.mkdir(parents=True)
-            (guid1 / "sys_image_guid").write_text("0x0002c90300abcdef\n")
+            (root / "class/infiniband/mlx5_1/sys_image_guid").write_text("0x0002c90300abcdef\n")
             self.assertEqual(
                 self.manager()._read_nics(root),
                 [{"name": "NVIDIA ConnectX-7", "temp": 56.0}],
             )
+
+    def test_per_port_sys_image_guid_is_a_fallback_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.pci_device(
+                root, "class/infiniband/mlx5_0/device",
+                pci_id="15b3:1021", temps=["54000"],
+            )
+            (root / "class/infiniband/mlx5_0/ports/1").mkdir(parents=True)
+            (root / "class/infiniband/mlx5_0/ports/1/sys_image_guid").write_text("0x0002c90300abcdef\n")
+            self.pci_device(
+                root, "class/infiniband/mlx5_1/device",
+                pci_id="15b3:1021", temps=["56000"],
+            )
+            (root / "class/infiniband/mlx5_1/ports/1").mkdir(parents=True)
+            (root / "class/infiniband/mlx5_1/ports/1/sys_image_guid").write_text("0x0002c90300abcdef\n")
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "NVIDIA ConnectX-7", "temp": 56.0}],
+            )
+
+    def test_faulted_sensor_channels_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = self.pci_device(
+                root, "class/net/eth0/device", pci_id="8086:15f8",
+            )
+            hwmon = device / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            # The first channel is a stale 45°C sentinel behind a fault flag;
+            # only the healthy 70°C channel may be reported.
+            (hwmon / "temp1_input").write_text("45000\n")
+            (hwmon / "temp1_fault").write_text("1\n")
+            (hwmon / "temp2_input").write_text("70000\n")
+            (hwmon / "temp2_fault").write_text("0\n")
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "Network adapter", "temp": 70.0}],
+            )
+
+    def test_card_with_only_faulted_sensors_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = self.pci_device(
+                root, "class/net/eth0/device", pci_id="8086:15f8",
+            )
+            hwmon = device / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "temp1_input").write_text("60000\n")
+            (hwmon / "temp1_fault").write_text("1\n")
+            self.assertEqual(self.manager()._read_nics(root), [])
 
     def test_distinct_cards_with_different_guids_stay_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,16 +215,12 @@ class NicTemperatureTests(unittest.TestCase):
                 root, "class/infiniband/mlx5_0/device",
                 pci_id="15b3:1021", temps=["54000"],
             )
-            g0 = root / "class/infiniband/mlx5_0/ports/1"
-            g0.mkdir(parents=True)
-            (g0 / "sys_image_guid").write_text("0x0002c9030000aaaa\n")
+            (root / "class/infiniband/mlx5_0/sys_image_guid").write_text("0x0002c9030000aaaa\n")
             self.pci_device(
                 root, "class/infiniband/mlx5_1/device",
                 pci_id="15b3:1021", temps=["61000"],
             )
-            g1 = root / "class/infiniband/mlx5_1/ports/1"
-            g1.mkdir(parents=True)
-            (g1 / "sys_image_guid").write_text("0x0002c9030000bbbb\n")
+            (root / "class/infiniband/mlx5_1/sys_image_guid").write_text("0x0002c9030000bbbb\n")
             self.assertEqual(
                 self.manager()._read_nics(root),
                 [

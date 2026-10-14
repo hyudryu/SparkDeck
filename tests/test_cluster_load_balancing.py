@@ -149,6 +149,22 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(nodes, ["remote-1", "remote-2", "remote-1", "remote-2"])
 
+    async def test_unreachable_node_observation_yields_to_healthy_replica(self):
+        # Durable members carry no live node fields, so a node that went
+        # unreachable after launch still reads "running": the registry's
+        # latest connectivity observation must keep it out of the lead.
+        deployment = replicated_deployment()
+        deployment["members"].append(member(2, "remote-3", "repl-1-r2"))
+        manager = build_manager(deployment)
+        manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
+            {"online": False, "status": "unreachable"} if node_id == "remote-3" else None
+        ))
+        manager._acquire_cluster_member("repl-1", deployment["members"][0])
+
+        await self.proxy(manager)
+
+        self.assertEqual(proxied_containers(manager)[0], "repl-1-r1")
+
     async def test_remote_request_tracks_and_forwards_original_caller_ip(self):
         manager = build_manager(replicated_deployment())
         manager._req_seq = 0

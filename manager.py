@@ -7347,19 +7347,27 @@ class Manager:
         A replica's load is counted from selection until its response (or
         stream) finishes, so concurrent arrivals spread across every member.
         Round-robin tie-breaking keeps an idle cluster alternating instead of
-        funneling every request to rank 0.
+        funneling every request to rank 0. Members that do not look available
+        (a crashed engine or one still starting) would burn a failed readiness
+        probe before any traffic, so they are only chosen when no candidate
+        looks available; their zero load must not lead healthy replicas.
         """
         members = (
             candidates if candidates is not None
             else self._cluster_members_sorted(deployment)
         )
         deployment_id = str(deployment.get("id") or "")
+        serving = [
+            member for member in members
+            if self._cluster_member_available(member)
+        ]
+        pool = serving or members
         loads = [
             self._cluster_member_active(deployment_id, member)
-            for member in members
+            for member in pool
         ]
         tied = [
-            member for member, load in zip(members, loads)
+            member for member, load in zip(pool, loads)
             if load == min(loads)
         ]
         rotation = getattr(self, "_cluster_member_rotation", None)
@@ -7389,9 +7397,10 @@ class Manager:
     def _cluster_route_order(self, deployment: dict) -> list[dict]:
         """Members to try for one request, best candidate first.
 
-        Replicated deployments balance across every member, and the failover
-        candidates follow in least-loaded order so an outage shifts work to
-        the least busy replicas first. Sharded ranks form a single engine,
+        Replicated deployments balance across every member, preferring ones
+        that look available, and the failover candidates follow available-first
+        in least-loaded order so an outage shifts work to the least busy
+        serving replicas first. Sharded ranks form a single engine,
         so only the rank-0 coordinator may serve a request. Grouped-sharded
         deployments balance across the running engine groups: each group's
         rank-0 coordinator carries the group's requests, and stopped, failed,
@@ -7408,8 +7417,9 @@ class Manager:
                 return []
             chosen = self._balanced_cluster_member(deployment, coordinators)
             rest = [m for m in coordinators if m is not chosen]
-            rest.sort(key=lambda m: self._cluster_member_active(
-                str(deployment.get("id") or ""), m,
+            rest.sort(key=lambda m: (
+                not self._cluster_member_available(m),
+                self._cluster_member_active(str(deployment.get("id") or ""), m),
             ))
             return [chosen, *rest]
         if deployment.get("mode") != "replicated" or len(members) < 2:
@@ -7417,11 +7427,14 @@ class Manager:
         deployment_id = str(deployment.get("id") or "")
         chosen = self._balanced_cluster_member(deployment)
         rest = [m for m in members if m is not chosen]
-        rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
+        rest.sort(key=lambda m: (
+            not self._cluster_member_available(m),
+            self._cluster_member_active(deployment_id, m),
+        ))
         return [chosen, *rest]
 
     @staticmethod
-    def _source_routing_member_available(member: dict) -> bool:
+    def _member_record_available(member: dict) -> bool:
         return (
             member.get("desired_state") != "stopped"
             and str(member.get("status") or "").casefold() in {"running", "ready"}
@@ -7429,6 +7442,27 @@ class Manager:
             not in {"offline", "unreachable", "unknown", "disconnected"}
             and member.get("node_docker_ready") is not False
         )
+
+    def _cluster_member_available(self, member: dict) -> bool:
+        if not self._member_record_available(member):
+            return False
+        # Durable records carry no live node fields: get_state decorates
+        # copies without writing back, so a node that became unreachable
+        # after launch still reads "running" here. The registry's latest
+        # connectivity observation is the live signal when one exists; with
+        # no observation yet, the readiness probe stays the final gate.
+        if member.get("node_status") is None:
+            registry = getattr(self, "node_registry", None)
+            observed = (
+                registry.cached_status(str(member.get("node_id") or ""))
+                if registry is not None else None
+            )
+            if observed is not None and (
+                observed.get("online") is False
+                or observed.get("docker_ready") is False
+            ):
+                return False
+        return True
 
     def _source_route_candidates(
         self, deployment: dict, source_route: dict,
@@ -7501,7 +7535,7 @@ class Manager:
                     for m in observed_members if isinstance(m, dict)] != identities
                 or len(observed_members) != len(unit)
                 or not all(
-                    self._source_routing_member_available(m)
+                    self._cluster_member_available(m)
                     and m.get("node_status") in {"online", "degraded"}
                     and m.get("node_docker_ready") is True
                     for m in observed_members
@@ -7570,8 +7604,21 @@ class Manager:
         preferred = targets.get(affinity.lookup(scope, keys, list(targets)))
         if preferred is None:
             return candidates
-        minimum = min(self._cluster_member_active(deployment_id, m) for m in candidates)
-        if self._cluster_member_active(deployment_id, preferred) > minimum + 2:
+        # A cache hint only breaks ties at minimum load: honoring it elsewhere
+        # would leave the cached member more than one request above the
+        # least-loaded one, and throughput comes from even spread. Members that
+        # do not look available (a crashed engine or a group still starting)
+        # sit idle at load 0 but cannot take traffic without a failed probe, so
+        # they neither lower the minimum nor take preference over the cached
+        # member. When nothing looks available, every member probes alike.
+        available = [m for m in candidates if self._cluster_member_available(m)]
+        if available and preferred not in available:
+            return candidates
+        comparison = available or candidates
+        minimum = min(
+            self._cluster_member_active(deployment_id, m) for m in comparison
+        )
+        if self._cluster_member_active(deployment_id, preferred) > minimum:
             return candidates
         return [preferred, *(m for m in candidates if m is not preferred)]
 
@@ -7935,8 +7982,10 @@ class Manager:
             key = ("cluster", deployment_id, "replica", member.get("node_id"))
         else:
             key = ("cluster", deployment_id)
-        # Include queued PP requests in normal balancing. Transfer this
-        # reservation to the transport's existing accounting when dispatched.
+        # Include queued PP requests in normal balancing. This reservation
+        # carries through the readiness probe into the transport's existing
+        # accounting once dispatched, so the member never appears idle between
+        # selection and serving.
         self._acquire_cluster_member(deployment_id, member)
         waiting = True
         pending = getattr(self, "_prompt_waiting_requests", None)
@@ -7950,7 +7999,6 @@ class Manager:
 
         async def dispatch():
             nonlocal waiting
-            self._release_cluster_member(deployment_id, member)
             waiting = False
             pending.pop(ticket, None)
             current = self._deployment(deployment_id)
@@ -7961,13 +8009,18 @@ class Manager:
                 selected.get(field) != member.get(field)
                 for field in ("container_id", "launch_settings_fingerprint")
             ):
+                self._release_cluster_member(deployment_id, member)
                 raise ClusterReplicaUnavailable("engine group changed while waiting for prompt processing")
             observation_dispatch = getattr(self, "_prompt_observation_dispatch", None)
             if callable(observation_dispatch):
                 observation_dispatch(current, selected)
+            # The gate's reservation stays live through the readiness probe so
+            # concurrent routing cannot see this member idle and double-book
+            # it; the unlimited pass inherits it.
             return await self._proxy_cluster_member_unlimited(
                 current, selected, model, body, endpoint, cancel,
                 caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+                member_reserved=True,
             )
 
         try:
@@ -8030,42 +8083,49 @@ class Manager:
         *,
         caller_ip: str | None = None,
         startup_benchmark: bool = False,
+        member_reserved: bool = False,
     ):
         """Send one request to a specific member without failover.
 
         The replica's load is held from selection until its response (or
-        stream) finishes. Streaming upstream connections and HTTP statuses are
-        validated here without waiting for a generated event. Once a stream
-        is returned, its generator owns the load slot and the outer relay can
-        still fail over until the first real SSE event is forwarded.
+        stream) finishes, including across the readiness probe: when the
+        caller (the prompt-gated pass) already reserved the member it passes
+        ``member_reserved`` and this pass inherits that reservation. A member
+        still probing readiness therefore never looks idle to a concurrently
+        routing cached request. Streaming upstream connections and HTTP
+        statuses are validated here without waiting for a generated event.
+        Once a stream is returned, its generator owns the load slot and the
+        outer relay can still fail over until the first real SSE event is
+        forwarded.
         """
         deployment_id = str(deployment.get("id") or "")
-        current = self._deployment(deployment_id)
-        if current and current.get("desired_state") == "stopped":
-            raise RuntimeError("deployment is stopped; start it before sending inference requests")
-        if str(member.get("desired_state") or "") == "stopped":
-            # A per-instance grouped-sharded stop races the route snapshot:
-            # the member is unavailable rather than broken, so fail over.
-            raise ClusterReplicaUnavailable(
-                "engine group is stopped; start it or route to a running group"
-            )
-        if not startup_benchmark and not await self._cluster_member_serving(
-            deployment, member, model,
-        ):
-            # A container can be up for minutes while its weights are still
-            # loading, so Docker status alone proves nothing. Only a member
-            # whose engine answers its health endpoint may take traffic;
-            # everyone else stays out of rotation and the request fails over
-            # (or is rejected when no member is serving yet).
-            raise ClusterReplicaUnavailable(
-                "engine is not ready yet; its health endpoint is not "
-                "answering, so it cannot take traffic"
-            )
-        node_id = member.get("node_id")
-        self._acquire_cluster_member(deployment_id, member)
+        if not member_reserved:
+            self._acquire_cluster_member(deployment_id, member)
         stream_owns_member = False
         release_member_once = None
         try:
+            current = self._deployment(deployment_id)
+            if current and current.get("desired_state") == "stopped":
+                raise RuntimeError("deployment is stopped; start it before sending inference requests")
+            if str(member.get("desired_state") or "") == "stopped":
+                # A per-instance grouped-sharded stop races the route snapshot:
+                # the member is unavailable rather than broken, so fail over.
+                raise ClusterReplicaUnavailable(
+                    "engine group is stopped; start it or route to a running group"
+                )
+            if not startup_benchmark and not await self._cluster_member_serving(
+                deployment, member, model,
+            ):
+                # A container can be up for minutes while its weights are still
+                # loading, so Docker status alone proves nothing. Only a member
+                # whose engine answers its health endpoint may take traffic;
+                # everyone else stays out of rotation and the request fails over
+                # (or is rejected when no member is serving yet).
+                raise ClusterReplicaUnavailable(
+                    "engine is not ready yet; its health endpoint is not "
+                    "answering, so it cannot take traffic"
+                )
+            node_id = member.get("node_id")
             if node_id == LOCAL_NODE_ID:
                 proxy = (
                     self._vllm_chat

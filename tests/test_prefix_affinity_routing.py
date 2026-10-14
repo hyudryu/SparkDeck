@@ -48,6 +48,102 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.send(manager, prompt(2))
         self.assertEqual([c.args[1]['node_id'] for c in manager._proxy_cluster_member.await_args_list], ['node-0', 'node-0'])
 
+    async def test_concurrent_cached_requests_spread_within_one(self):
+        manager, _ = setup()
+        # Hold each dispatch in flight (acquire without release) so the second
+        # and third concurrent arrivals see the cached replica already busy.
+        async def hold(deployment, member, *args, **kwargs):
+            manager._acquire_cluster_member('d', member)
+            return {'choices': []}
+        manager._proxy_cluster_member.side_effect = hold
+        for _ in range(3):
+            await self.send(manager, prompt(2))
+        nodes = {c.args[1]['node_id'] for c in manager._proxy_cluster_member.await_args_list}
+        self.assertEqual(nodes, {'node-0', 'node-1'})
+        self.assertEqual(sorted(manager._cluster_member_loads().values()), [1, 2])
+
+    async def test_reservation_holds_across_readiness_probe(self):
+        # Real unlimited path (no gate): a request still awaiting its readiness
+        # probe must keep its load reservation, so a concurrent cached request
+        # sees it busy and routes to the other replica instead of queueing on
+        # the same member.
+        from manager import LOCAL_NODE_ID
+        manager, deployment = setup()
+        del manager._proxy_cluster_member  # exercise the real gated/unlimited path
+        for member in deployment['members']:
+            member['node_id'] = LOCAL_NODE_ID
+        ready = asyncio.Event()
+        probes = []
+        served = []
+
+        async def health(model, **kwargs):
+            probes.append(kwargs.get('container_name'))
+            if kwargs.get('container_name') == 'engine-0' and len(probes) > 1:
+                await ready.wait()
+            return True
+        manager.inference_target_health = health
+
+        async def chat(model, body, stream, cancel, *, container_name, **kwargs):
+            served.append(container_name)
+            return {'choices': []}
+        manager._vllm_chat = chat
+
+        await self.send(manager, prompt())  # caches the conversation on engine-0
+        first = asyncio.create_task(self.send(manager, prompt(2)))
+        for _ in range(200):
+            if len(probes) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(probes[-1], 'engine-0')  # first is awaiting readiness
+        await self.send(manager, prompt(2))
+        self.assertFalse(first.done())
+        self.assertEqual(served, ['engine-0', 'engine-1'])
+        ready.set()
+        await first
+        self.assertEqual(served, ['engine-0', 'engine-1', 'engine-0'])
+        self.assertEqual(set(manager._cluster_member_loads().values()), {0})
+
+    async def test_cached_hint_survives_idle_unavailable_replica(self):
+        manager, deployment = setup()
+        for member in deployment['members']:
+            member['status'] = 'running'
+        await self.send(manager, prompt())  # caches on node-0
+        deployment['members'][1]['status'] = 'exited'  # idle but cannot serve
+        manager._acquire_cluster_member('d', deployment['members'][0])
+        await self.send(manager, prompt(2))
+        self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-0')
+
+    async def test_cached_unavailable_member_does_not_take_preference(self):
+        manager, deployment = setup()
+        for member in deployment['members']:
+            member['status'] = 'running'
+        await self.send(manager, prompt())  # caches on node-0
+        deployment['members'][0]['status'] = 'exited'
+        await self.send(manager, prompt(2))
+        self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-1')
+
+    async def test_failed_replica_yields_to_less_loaded_healthy_one(self):
+        manager = Manager.__new__(Manager)
+        statuses = ['running', 'running', 'exited']
+        members = [
+            {'node_id': f'node-{i}', 'container_name': f'engine-{i}',
+             'container_id': f'container-{i}', 'rank': i, 'status': statuses[i]}
+            for i in range(3)
+        ]
+        manager.deployments = [{'id': 'd', 'mode': 'replicated', 'members': members}]
+        manager._proxy_cluster_member = AsyncMock(return_value={'choices': []})
+        await self.send(manager, prompt())  # caches on engine-0 (idle at the time)
+        # Codex scenario: cached member at 2, healthy member at 1, failed
+        # member idle at 0. The request must reach the load-1 healthy replica
+        # first instead of burning a failed probe on the exited one.
+        for _ in range(2):
+            manager._acquire_cluster_member('d', members[0])
+        manager._acquire_cluster_member('d', members[1])
+        await self.send(manager, prompt(2))
+        self.assertEqual(
+            manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-1',
+        )
+
     async def test_common_boilerplate_does_not_pin_new_conversations(self):
         manager, _ = setup()
         await self.send(manager, prompt())
@@ -58,10 +154,8 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
         manager, deployment = setup('grouped_sharded')
         await self.send(manager, prompt())
         preferred = deployment['members'][0]
-        for _ in range(2):
-            manager._acquire_cluster_member('d', preferred)
-        await self.send(manager, prompt(2))
-        self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['instance_id'], 0)
+        # A single in-flight request already leaves the cached group one above
+        # the idle group, so a cached follow-up must spread instead of stacking.
         manager._acquire_cluster_member('d', preferred)
         await self.send(manager, prompt(2))
         self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['instance_id'], 1)

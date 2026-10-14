@@ -41,6 +41,9 @@ class GroupPromptGateTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     self.closed.append(name)
                     self.manager._active_reqs.pop(name, None)
+                    # Mirror the real unlimited pass: it owns the inherited
+                    # gate reservation until the response completes.
+                    self.manager._release_cluster_member(deployment['id'], member)
             return stream()
 
         self.manager._proxy_cluster_member_unlimited = AsyncMock(side_effect=upstream)
@@ -110,13 +113,17 @@ class GroupPromptGateTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(queued.cancel)
         await self.wait_queued()
         member = self.deployment['members'][0]
-        self.assertEqual(self.manager._cluster_member_active('two-groups', member), 1)
+        # 'first' still generates (its inherited reservation is live until the
+        # stream closes) and the cancelled request waits with its own.
+        self.assertEqual(self.manager._cluster_member_active('two-groups', member), 2)
         cancel.set()
         with self.assertRaises(ClientAbort):
             await asyncio.wait_for(queued, 2)
-        self.assertEqual(self.manager._cluster_member_active('two-groups', member), 0)
+        self.assertEqual(self.manager._cluster_member_active('two-groups', member), 1)
         self.assertEqual(self.manager._prompt_waiting_requests, {})
         await self.emit_token('first', first)
+        await first.aclose()
+        self.assertEqual(self.manager._cluster_member_active('two-groups', member), 0)
         await asyncio.wait_for(self.request('next'), 2)
         self.assertNotIn('cancelled', [item[0] for item in self.entered])
 
@@ -130,9 +137,13 @@ class GroupPromptGateTests(unittest.IsolatedAsyncioTestCase):
         await self.emit_token('first', first)
         with self.assertRaises(ClusterReplicaUnavailable):
             await asyncio.wait_for(queued, 2)
-        self.assertEqual(self.manager._cluster_member_active('two-groups', previous), 0)
         self.assertEqual(self.manager._prompt_waiting_requests, {})
         self.assertEqual([item[0] for item in self.entered], ['first'])
+        # 'first' still holds its inherited reservation; closing it must leave
+        # nothing behind, proving the rejected queued request released its own.
+        self.assertEqual(self.manager._cluster_member_active('two-groups', previous), 1)
+        await first.aclose()
+        self.assertEqual(self.manager._cluster_member_active('two-groups', previous), 0)
 
     async def test_failover_waits_for_destination_group_prompt_slot(self):
         occupied = await self.request('occupied', group=1)
@@ -140,6 +151,9 @@ class GroupPromptGateTests(unittest.IsolatedAsyncioTestCase):
 
         async def upstream(deployment, member, model, body, endpoint, cancel, **kwargs):
             attempts.append(member['instance_id'])
+            # Mirror the real unlimited pass, which owns and releases the
+            # inherited reservation on both the raise and the success return.
+            self.manager._release_cluster_member('two-groups', member)
             if member['instance_id'] == 0:
                 raise ClusterReplicaUnavailable('first group unavailable')
             return {'choices': []}

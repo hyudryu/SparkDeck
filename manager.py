@@ -7350,7 +7350,9 @@ class Manager:
         funneling every request to rank 0. Members that do not look available
         (a crashed engine or one still starting) would burn a failed readiness
         probe before any traffic, so they are only chosen when no candidate
-        looks available; their zero load must not lead healthy replicas.
+        looks available; their zero load must not lead healthy replicas. A
+        grouped-sharded candidate is only available while its whole engine
+        group looks available, not just its rank-0 coordinator.
         """
         members = (
             candidates if candidates is not None
@@ -7359,7 +7361,11 @@ class Manager:
         deployment_id = str(deployment.get("id") or "")
         serving = [
             member for member in members
-            if self._cluster_member_available(member)
+            if (
+                self._cluster_group_available(deployment, member)
+                if member.get("instance_id") is not None
+                else self._cluster_member_available(member)
+            )
         ]
         pool = serving or members
         loads = [
@@ -7418,7 +7424,7 @@ class Manager:
             chosen = self._balanced_cluster_member(deployment, coordinators)
             rest = [m for m in coordinators if m is not chosen]
             rest.sort(key=lambda m: (
-                not self._cluster_member_available(m),
+                not self._cluster_group_available(deployment, m),
                 self._cluster_member_active(str(deployment.get("id") or ""), m),
             ))
             return [chosen, *rest]
@@ -7443,26 +7449,44 @@ class Manager:
             and member.get("node_docker_ready") is not False
         )
 
-    def _cluster_member_available(self, member: dict) -> bool:
-        if not self._member_record_available(member):
+    def _cluster_group_available(self, deployment: dict, coordinator: dict) -> bool:
+        """A group is routable only while every rank's node can serve.
+
+        Route candidates carry only the rank-0 coordinator, so a headless
+        worker's node going unreachable must still retire the whole group.
+        """
+        if not self._cluster_member_available(coordinator):
             return False
+        instance = coordinator.get("instance_id")
+        if instance is None:
+            return True
+        target = int(instance)
+        return all(
+            self._cluster_member_available(member)
+            for member in self._cluster_members_sorted(deployment)
+            if int(member.get("instance_id") or 0) == target
+        )
+
+    def _cluster_member_available(self, member: dict) -> bool:
         # Durable records carry no live node fields: get_state decorates
-        # copies without writing back, so a node that became unreachable
-        # after launch still reads "running" here. The registry's latest
-        # connectivity observation is the live signal when one exists; with
-        # no observation yet, the readiness probe stays the final gate.
+        # copies without writing back, so the record and reality drift in
+        # both directions — a node that went unreachable after launch still
+        # reads "running", and an externally restarted replica still reads
+        # "exited". A recent connectivity observation is the newer signal in
+        # both directions; with none, the record decides and the readiness
+        # probe stays the final gate.
         if member.get("node_status") is None:
             registry = getattr(self, "node_registry", None)
             observed = (
                 registry.cached_status(str(member.get("node_id") or ""))
                 if registry is not None else None
             )
-            if observed is not None and (
-                observed.get("online") is False
-                or observed.get("docker_ready") is False
-            ):
-                return False
-        return True
+            if observed is not None:
+                return (
+                    observed.get("online") is True
+                    and observed.get("docker_ready") is not False
+                )
+        return self._member_record_available(member)
 
     def _source_route_candidates(
         self, deployment: dict, source_route: dict,

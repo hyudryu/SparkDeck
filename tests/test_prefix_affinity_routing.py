@@ -122,6 +122,28 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.send(manager, prompt(2))
         self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-1')
 
+    async def test_failed_replica_yields_to_less_loaded_healthy_one(self):
+        manager = Manager.__new__(Manager)
+        statuses = ['running', 'running', 'exited']
+        members = [
+            {'node_id': f'node-{i}', 'container_name': f'engine-{i}',
+             'container_id': f'container-{i}', 'rank': i, 'status': statuses[i]}
+            for i in range(3)
+        ]
+        manager.deployments = [{'id': 'd', 'mode': 'replicated', 'members': members}]
+        manager._proxy_cluster_member = AsyncMock(return_value={'choices': []})
+        await self.send(manager, prompt())  # caches on engine-0 (idle at the time)
+        # Codex scenario: cached member at 2, healthy member at 1, failed
+        # member idle at 0. The request must reach the load-1 healthy replica
+        # first instead of burning a failed probe on the exited one.
+        for _ in range(2):
+            manager._acquire_cluster_member('d', members[0])
+        manager._acquire_cluster_member('d', members[1])
+        await self.send(manager, prompt(2))
+        self.assertEqual(
+            manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-1',
+        )
+
     async def test_common_boilerplate_does_not_pin_new_conversations(self):
         manager, _ = setup()
         await self.send(manager, prompt())

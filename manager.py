@@ -7347,19 +7347,27 @@ class Manager:
         A replica's load is counted from selection until its response (or
         stream) finishes, so concurrent arrivals spread across every member.
         Round-robin tie-breaking keeps an idle cluster alternating instead of
-        funneling every request to rank 0.
+        funneling every request to rank 0. Members that do not look available
+        (a crashed engine or one still starting) would burn a failed readiness
+        probe before any traffic, so they are only chosen when no candidate
+        looks available; their zero load must not lead healthy replicas.
         """
         members = (
             candidates if candidates is not None
             else self._cluster_members_sorted(deployment)
         )
         deployment_id = str(deployment.get("id") or "")
+        serving = [
+            member for member in members
+            if self._cluster_member_available(member)
+        ]
+        pool = serving or members
         loads = [
             self._cluster_member_active(deployment_id, member)
-            for member in members
+            for member in pool
         ]
         tied = [
-            member for member, load in zip(members, loads)
+            member for member, load in zip(pool, loads)
             if load == min(loads)
         ]
         rotation = getattr(self, "_cluster_member_rotation", None)
@@ -7389,9 +7397,10 @@ class Manager:
     def _cluster_route_order(self, deployment: dict) -> list[dict]:
         """Members to try for one request, best candidate first.
 
-        Replicated deployments balance across every member, and the failover
-        candidates follow in least-loaded order so an outage shifts work to
-        the least busy replicas first. Sharded ranks form a single engine,
+        Replicated deployments balance across every member, preferring ones
+        that look available, and the failover candidates follow available-first
+        in least-loaded order so an outage shifts work to the least busy
+        serving replicas first. Sharded ranks form a single engine,
         so only the rank-0 coordinator may serve a request. Grouped-sharded
         deployments balance across the running engine groups: each group's
         rank-0 coordinator carries the group's requests, and stopped, failed,
@@ -7408,8 +7417,9 @@ class Manager:
                 return []
             chosen = self._balanced_cluster_member(deployment, coordinators)
             rest = [m for m in coordinators if m is not chosen]
-            rest.sort(key=lambda m: self._cluster_member_active(
-                str(deployment.get("id") or ""), m,
+            rest.sort(key=lambda m: (
+                not self._cluster_member_available(m),
+                self._cluster_member_active(str(deployment.get("id") or ""), m),
             ))
             return [chosen, *rest]
         if deployment.get("mode") != "replicated" or len(members) < 2:
@@ -7417,7 +7427,10 @@ class Manager:
         deployment_id = str(deployment.get("id") or "")
         chosen = self._balanced_cluster_member(deployment)
         rest = [m for m in members if m is not chosen]
-        rest.sort(key=lambda m: self._cluster_member_active(deployment_id, m))
+        rest.sort(key=lambda m: (
+            not self._cluster_member_available(m),
+            self._cluster_member_active(deployment_id, m),
+        ))
         return [chosen, *rest]
 
     @staticmethod

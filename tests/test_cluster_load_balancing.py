@@ -94,6 +94,9 @@ def build_manager(deployment: dict) -> Manager:
     manager = Manager.__new__(Manager)
     manager.deployments = [deployment]
     manager.node_registry = Mock()
+    # No connectivity observation by default: balancing decides from the
+    # durable member records unless a test supplies a live observation.
+    manager.node_registry.cached_status = Mock(return_value=None)
     # The readiness gate probes every candidate through the observational
     # agent health endpoint before forwarding; serve that by default so
     # tests exercise balancing and failover against healthy replicas.
@@ -154,7 +157,10 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         # unreachable after launch still reads "running": the registry's
         # latest connectivity observation must keep it out of the lead.
         deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
         deployment["members"].append(member(2, "remote-3", "repl-1-r2"))
+        deployment["members"][2]["status"] = "running"
         manager = build_manager(deployment)
         manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
             {"online": False, "status": "unreachable"} if node_id == "remote-3" else None
@@ -164,6 +170,79 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         await self.proxy(manager)
 
         self.assertEqual(proxied_containers(manager)[0], "repl-1-r1")
+
+    async def test_live_observation_revives_externally_restarted_replica(self):
+        # The inverse staleness: a durable member still reading "exited"
+        # after an external restart is serving again; the observation must
+        # confirm its own container is running to put it back in the pool.
+        deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
+        deployment["members"][0]["status"] = "exited"
+        manager = build_manager(deployment)
+        manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
+            {"online": True, "containers": [
+                {"name": "repl-1-r0", "status": "running"},
+            ]}
+            if node_id == "remote-1" else None
+        ))
+        manager._acquire_cluster_member("repl-1", deployment["members"][1])
+
+        await self.proxy(manager)
+
+        self.assertEqual(proxied_containers(manager)[0], "repl-1-r0")
+
+    async def test_host_online_alone_does_not_revive_a_stopped_container(self):
+        # Host connectivity does not prove this member's container runs:
+        # an exited replica stays out of the pool while a healthy sibling
+        # is serving.
+        deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
+        deployment["members"][0]["status"] = "exited"
+        manager = build_manager(deployment)
+        manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
+            {"online": True, "containers": [
+                {"name": "repl-1-r0", "status": "exited"},
+            ]}
+            if node_id == "remote-1" else None
+        ))
+        manager._acquire_cluster_member("repl-1", deployment["members"][1])
+
+        await self.proxy(manager)
+
+        self.assertEqual(proxied_containers(manager)[0], "repl-1-r1")
+
+    async def test_broken_worker_rank_keeps_group_out_of_the_lead(self):
+        # Route candidates are rank-0 coordinators only: an unreachable
+        # headless worker's node must retire the whole engine group.
+        def grouped_member(group: int, rank: int, node_id: str) -> dict:
+            return {
+                "rank": rank, "node_id": node_id, "node_name": node_id,
+                "container_name": f"grp-1-r{group}{rank}",
+                "instance_id": group, "status": "running",
+            }
+        deployment = {
+            "id": "grp-1", "model": "org/model", "mode": "grouped_sharded",
+            "launch_settings": {},
+            "members": [
+                grouped_member(0, 0, "remote-1"), grouped_member(0, 1, "remote-2"),
+                grouped_member(1, 0, "remote-3"), grouped_member(1, 1, "remote-4"),
+            ],
+        }
+        manager = build_manager(deployment)
+        manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
+            {"online": False} if node_id == "remote-4" else None
+        ))
+        manager._acquire_cluster_member("grp-1", deployment["members"][0])
+
+        await manager.proxy_cluster_inference(
+            "grp-1", "org/model",
+            {"model": "org/model", "messages": [], "stream": False},
+            "chat/completions",
+        )
+
+        self.assertEqual(proxied_containers(manager)[0], "grp-1-r00")
 
     async def test_remote_request_tracks_and_forwards_original_caller_ip(self):
         manager = build_manager(replicated_deployment())

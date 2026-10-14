@@ -144,6 +144,16 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
             manager._proxy_cluster_member.await_args.args[1]['node_id'], 'node-1',
         )
 
+    async def test_affinity_respects_whole_group_availability(self):
+        manager, deployment = setup('grouped_sharded')
+        await self.send(manager, prompt())  # caches on group 0
+        manager._acquire_cluster_member('d', deployment['members'][0])
+        # Group 1's headless worker is gone while its coordinator still
+        # reads running: the cached hint must stay with the healthy group.
+        deployment['members'][3]['status'] = 'exited'
+        await self.send(manager, prompt(2))
+        self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['instance_id'], 0)
+
     async def test_common_boilerplate_does_not_pin_new_conversations(self):
         manager, _ = setup()
         await self.send(manager, prompt())

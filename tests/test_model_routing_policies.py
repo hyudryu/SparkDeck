@@ -64,7 +64,7 @@ class ModelRoutingPolicyValidationTests(unittest.IsolatedAsyncioTestCase):
                     )
                 with self.assertRaisesRegex(ValueError, "between 1 and"):
                     await service.upsert_model_routing_policy(
-                        {"model": "shared-name", "members": []},
+                        {"model": "shared-name", "members": "everything"},
                     )
                 with self.assertRaisesRegex(ValueError, "duplicate"):
                     await service.upsert_model_routing_policy({
@@ -83,6 +83,26 @@ class ModelRoutingPolicyValidationTests(unittest.IsolatedAsyncioTestCase):
                         "model": "shared-name",
                         "members": [{"deployment_id": "missing"}],
                     })
+                self.assertEqual(await service.model_routing_policies(), [])
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_saving_an_emptied_membership_clears_the_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                await service.upsert_model_routing_policy({
+                    "model": "shared-name",
+                    "members": [{"deployment_id": "record-one"}],
+                })
+                saved = await service.upsert_model_routing_policy({
+                    "model": "shared-name", "members": [],
+                })
+                self.assertEqual(
+                    saved,
+                    {"model": "shared-name", "members": [], "updated_at": None},
+                )
                 self.assertEqual(await service.model_routing_policies(), [])
             finally:
                 await manager.http.aclose()
@@ -302,26 +322,45 @@ class ModelRoutingProxyTests(unittest.IsolatedAsyncioTestCase):
                 await manager.http.aclose()
                 await service.close()
 
-    async def test_without_policy_the_newest_owner_still_answers(self):
+    async def test_without_policy_concurrent_requests_balance_within_one(self):
+        """No policy means no automatic priority: concurrent requests spread
+        across the live owners, off by at most one, tie-breaking to the
+        newest owner instead of stacking on it."""
         with tempfile.TemporaryDirectory() as directory:
             manager, service = build_service(directory)
-            manager.proxy_cluster_inference = AsyncMock(return_value={
-                "model": "shared-name", "choices": [], "usage": {},
-            })
+            started = []
+            release = asyncio.Event()
+
+            async def cluster_inference(manager_id, *args, **kwargs):
+                started.append(manager_id)
+                if len(started) >= 3:
+                    release.set()
+                else:
+                    await release.wait()
+                return {"model": "shared-name", "choices": [], "usage": {}}
+
+            manager.proxy_cluster_inference = cluster_inference
             try:
                 rows = live_rows()
                 rows[0]["last_deployed_at"] = "2026-10-10T00:00:00Z"
                 service.deployments = AsyncMock(return_value=rows)
-                await service.proxy(
-                    {"model": "shared-name", "messages": [], "stream": False},
-                    "chat/completions",
-                )
+                await asyncio.gather(*(
+                    service.proxy(
+                        {"model": "shared-name", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+                    for _ in range(3)
+                ))
                 self.assertEqual(
-                    manager.proxy_cluster_inference.await_args.args[0],
-                    "cluster-one",
+                    started, ["cluster-one", "cluster-two", "cluster-one"],
                 )
+                for _ in range(200):
+                    if not service._model_routing_inflight:
+                        break
+                    await asyncio.sleep(0.01)
                 self.assertEqual(service._model_routing_inflight, {})
             finally:
+                release.set()
                 await manager.http.aclose()
                 await service.close()
 
@@ -431,6 +470,135 @@ class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
                 # record-two is the newest deployment, but the policy's first
                 # live member publishes the shared name in the catalog.
                 self.assertEqual(owners, {"shared-name": "record-one"})
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
+    async def test_catalog_advertises_balanced_shared_ids_on_every_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                rows = live_rows()
+                rows[1]["last_deployed_at"] = "2026-10-10T00:00:00Z"
+                # No policy: both owners join the balancing pool, so the
+                # shared name is advertised once per owner instead of only
+                # on the newest one.
+                owners = {"shared-name": {"record-one", "record-two"}}
+                balanced = service._balanced_shared_ids(rows, owners)
+                self.assertEqual(balanced, {"shared-name"})
+                catalog = await service.models()
+                shared = [
+                    entry for entry in catalog["data"]
+                    if entry["id"] == "shared-name"
+                ]
+                self.assertEqual(
+                    sorted(entry["deployment_id"] for entry in shared),
+                    ["record-one", "record-two"],
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
+    async def test_balanced_pool_skips_exact_live_selectors(self):
+        # A live deployment whose own alias IS the shared name always wins
+        # in the proxy, so the id is not a pool and is not advertised as one.
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                for record_id, alias in (
+                    ("record-one", "shared-name"), ("record-two", "model-two"),
+                ):
+                    service.store.add_deployment(Deployment(
+                        id=record_id, alias=alias, runtime=RuntimeKind.VLLM,
+                        kind=DeploymentKind.MANAGED,
+                        model=ModelIdentity(f"org/{alias}"),
+                        settings={"manager_deployment_id": f"cluster-{record_id}"},
+                    ))
+                rows = [
+                    {"id": record_id, "alias": alias, "runtime": "vllm",
+                     "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": f"org/{alias}"}, "settings": {}}
+                    for record_id, alias in (
+                        ("record-one", "shared-name"), ("record-two", "model-two"),
+                    )
+                ]
+                owners = {"shared-name": {"record-one", "record-two"}}
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners), set(),
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_balanced_pool_skips_live_exact_deployment_ids(self):
+        # A live deployment's ID is a valid exact selector even when it does
+        # not serve the name: the proxy always routes to it, so the other
+        # publishers must not be advertised as a pool.
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                service.store.add_deployment(Deployment(
+                    id="shared-name", alias="other-model",
+                    runtime=RuntimeKind.VLLM, kind=DeploymentKind.MANAGED,
+                    model=ModelIdentity("org/other"),
+                    settings={"manager_deployment_id": "cluster-other"},
+                ))
+                rows = [
+                    {"id": "shared-name", "alias": "other-model",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["other-name"],
+                     "model": {"repository": "org/other"}, "settings": {}},
+                    {"id": "record-two", "alias": "model-two",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": "org/two"}, "settings": {}},
+                    {"id": "record-three", "alias": "model-three",
+                     "runtime": "vllm", "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": "org/three"}, "settings": {}},
+                ]
+                owners = {
+                    "shared-name": {"record-two", "record-three"},
+                    "other-name": {"shared-name"},
+                }
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners), set(),
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_balanced_pool_ignores_policy_members_not_serving_the_id(self):
+        # A live policy member relaunched under other served names does not
+        # route this id, so it must not suppress balanced discovery.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                service._model_routing_policies = {
+                    "shared-name": {
+                        "model": "shared-name",
+                        "members": [
+                            {"deployment_id": "record-one", "max_concurrency": None},
+                        ],
+                        "updated_at": None,
+                    },
+                }
+                rows = live_rows()
+                rows[0]["served_models"] = ["other-name"]
+                owners = {
+                    "shared-name": {"record-two", "record-three"},
+                    "other-name": {"record-one"},
+                }
+                rows.append({**rows[1], "id": "record-three"})
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners),
+                    {"shared-name"},
+                )
             finally:
                 await manager.http.aclose()
                 await service.close()

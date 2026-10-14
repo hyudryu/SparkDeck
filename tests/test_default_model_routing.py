@@ -204,6 +204,31 @@ class DefaultModelProxyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DefaultModelListingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_alias_represents_every_balanced_owner(self):
+        # A no-policy shared target balances across owners, so the reserved
+        # alias carries one entry per owner instead of one owner's metadata.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory, default_model="shared-name")
+            try:
+                rows = live_rows()
+                for row in rows:
+                    row["served_models"] = ["shared-name"]
+                service.deployments = AsyncMock(return_value=rows)
+                listing = await service.models()
+            finally:
+                await manager.http.aclose()
+                await service.close()
+        default_rows = [
+            entry for entry in listing["data"] if entry["id"] == "default"
+        ]
+        self.assertEqual(
+            sorted(row["deployment_id"] for row in default_rows),
+            ["record-one", "record-two"],
+        )
+        self.assertTrue(
+            all(row["alias_of"] == "shared-name" for row in default_rows),
+        )
+
     async def test_models_advertise_the_default_alias_of_the_target(self):
         with tempfile.TemporaryDirectory() as directory:
             manager, service = build_service(directory, default_model="beta-model")

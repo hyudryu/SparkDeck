@@ -506,11 +506,6 @@ class SparkDeckService:
         self._model_routing_policies: dict[str, dict[str, Any]] = (
             self._load_model_routing_policies()
         )
-        self._model_routing_member_ids: set[str] = {
-            member["deployment_id"]
-            for policy in self._model_routing_policies.values()
-            for member in policy["members"]
-        }
         self._model_routing_inflight: dict[str, int] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
@@ -7555,21 +7550,33 @@ class SparkDeckService:
             deployments, public_ids,
         )
         shared_owners = self._shared_selector_owners(deployments, request_owners)
+        balanced = self._balanced_shared_ids(deployments, request_owners)
         for deployment in deployments:
             model_ids = [
                 model_id for model_id in public_ids[deployment["id"]]
                 if self._model_id_routes_to_deployment(
-                    model_id, deployment, request_owners, shared_owners,
+                    model_id, deployment, request_owners, shared_owners, balanced,
                 )
             ]
-            if not model_ids:
-                alias = str(deployment.get("alias") or "").strip()
-                if alias and self._model_id_routes_to_deployment(
-                    alias, deployment, request_owners, shared_owners,
-                ):
-                    model_ids = [alias]
+            alias = str(deployment.get("alias") or "").strip()
+            if (
+                alias
+                and alias not in model_ids
+                and (not model_ids
+                     or all(model_id in balanced for model_id in model_ids))
+                and self._model_id_routes_to_deployment(
+                    alias, deployment, request_owners, shared_owners, balanced,
+                )
+            ):
+                # An alias is listed whenever it is the deployment's only
+                # selector, and balanced pool ids do not count as one:
+                # otherwise advertising the pool would hide every owner's
+                # unique name.
+                model_ids = [*model_ids, alias]
             for model_id in model_ids:
-                if model_id in seen:
+                # A balanced shared id is advertised once per owner, so its
+                # discovery entries describe the whole pool.
+                if model_id not in balanced and model_id in seen:
                     continue
                 seen.add(model_id)
                 data.append({
@@ -7648,33 +7655,38 @@ class SparkDeckService:
                 seen.difference_update(reserved_ids)
             # The target may be listed under its own id; an embedding row that
             # happens to share the id serves a different surface, so it falls
-            # through to the winning chat deployment instead.
-            target_entry = next(
-                (
-                    item for item in data
-                    if item["id"] == default_target
-                    and item.get("type") != "embedding"
-                ),
-                None,
-            )
-            if target_entry is None:
-                target_entry = winner_entry
+            # through to the winning chat deployment instead. A balanced
+            # target has one entry per owner, and the reserved alias must
+            # represent every owner it can reach.
+            target_entries = [
+                item for item in data
+                if item["id"] == default_target
+                and item.get("type") != "embedding"
+            ]
+            if not target_entries and winner_entry is not None \
+                    and winner_entry.get("type") != "embedding":
+                target_entries = [winner_entry]
             # Advertise the alias only while its target is actually served as
             # a chat model, so the listing never promises a name the gateway
             # cannot route.
-            if target_entry is not None and target_entry.get("type") != "embedding":
-                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
+            for target_entry in target_entries:
                 data.append({
                     **target_entry,
                     "id": self.DEFAULT_MODEL_REQUEST_ID,
                     "alias_of": default_target,
                 })
+            if target_entries:
+                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
+        codex_listed: list[str] = []
+        for item in data:
+            # A balanced shared id has one entry per owner; the coding
+            # catalog lists each request id once.
+            if item.get("type") == "embedding" or item["id"] in codex_listed:
+                continue
+            codex_listed.append(item["id"])
         return {
             "object": "list", "data": data,
-            "models": [
-                codex_model(item["id"]) for item in data
-                if item.get("type") != "embedding"
-            ],
+            "models": [codex_model(item_id) for item_id in codex_listed],
         }
 
     async def _cached_embedding_models(self) -> list[dict[str, Any]]:
@@ -7781,8 +7793,13 @@ class SparkDeckService:
         deployment: dict[str, Any],
         request_owners: dict[str, set[str]],
         shared_owners: dict[str, str] | None = None,
+        balanced_ids: frozenset[str] | set[str] = frozenset(),
     ) -> bool:
         """Return whether gateway lookup selects exactly this deployment."""
+        if model_id in balanced_ids:
+            # A balanced shared id has no single owner: every live owner
+            # advertises it, matching how the proxy spreads its requests.
+            return deployment["id"] in request_owners.get(model_id, set())
         winner = (shared_owners or {}).get(model_id)
         if winner is not None:
             return winner == deployment["id"]
@@ -7791,6 +7808,40 @@ class SparkDeckService:
         if exact is not None and exact["id"] in owners:
             return exact["id"] == deployment["id"]
         return owners == {deployment["id"]}
+
+    def _balanced_shared_ids(
+        self,
+        deployments: list[dict[str, Any]],
+        request_owners: dict[str, set[str]],
+    ) -> set[str]:
+        """Shared request ids that balance across owners instead of a winner.
+
+        Without a live policy there is no priority: every live owner joins
+        the routing pool, so discovery must advertise the name on each of
+        them rather than pinning the newest one.
+        """
+        live_ids = {deployment["id"] for deployment in deployments}
+        balanced: set[str] = set()
+        for model_id, owners in request_owners.items():
+            if len(owners & live_ids) < 2:
+                continue
+            # An exact live id/alias always wins in the proxy — a deployment
+            # whose ID is the requested name routes even when it does not
+            # serve the name — so the id is not a pool.
+            exact = self.store.deployment(model_id, include_private=True)
+            if exact is not None and exact["id"] in live_ids:
+                continue
+            # Only members that actually serve this id route it; a live
+            # member relaunched under other served names falls back to the
+            # balancing pool exactly like the proxy does.
+            policy = self._model_routing_policies.get(model_id)
+            if policy is not None and any(
+                member["deployment_id"] in owners
+                for member in policy["members"]
+            ):
+                continue
+            balanced.add(model_id)
+        return balanced
 
     @staticmethod
     def _deployment_can_serve_inference(deployment: dict[str, Any]) -> bool:
@@ -8006,6 +8057,15 @@ class SparkDeckService:
     async def upsert_model_routing_policy(
         self, body: Any,
     ) -> dict[str, Any]:
+        if isinstance(body, dict) and body.get("members") == []:
+            # Saving an emptied membership clears the policy: removing every
+            # pair is how an operator expresses "route this model without a
+            # priority policy", and that state must be savable.
+            model = str(body.get("model") or "").strip()
+            if not model:
+                raise ValueError("model must be a non-empty string of at most 512 characters")
+            self.delete_model_routing_policy(model)
+            return {"model": model, "members": [], "updated_at": None}
         policy = self._normalize_model_routing_policy(body)
         live_deployments = await self.deployments()
         live_ids = {deployment["id"] for deployment in live_deployments}
@@ -8036,7 +8096,6 @@ class SparkDeckService:
         staged[policy["model"]] = policy
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
-        self._rebuild_routing_member_index()
         items = await self.model_routing_policies()
         return next(item for item in items if item["model"] == policy["model"])
 
@@ -8048,24 +8107,19 @@ class SparkDeckService:
         staged.pop(key, None)
         self._save_model_routing_policies(staged)
         self._model_routing_policies = staged
-        self._rebuild_routing_member_index()
         return True
 
-    def _rebuild_routing_member_index(self) -> None:
-        self._model_routing_member_ids = {
-            member["deployment_id"]
-            for policy in self._model_routing_policies.values()
-            for member in policy["members"]
-        }
-
     def _reserve_policy_slot(self, deployment_id: str) -> bool:
-        """Count a directly-routed request against a policy member's cap.
+        """Count a directly-routed request in the shared load counters.
 
-        Alias and source-IP traffic consumes the same concurrency budget as
-        policy-selected requests, so a member busy on its unique selector
-        cannot also be picked as idle for the shared id.
+        Alias and source-IP traffic must be visible to whichever selector
+        runs next: the policy selector enforces caps from these counters and
+        the no-policy balancer spreads by them, so a deployment busy on its
+        unique selector cannot also be picked as idle for the shared id.
+        Only configured policy members have a cap to enforce, but every
+        deployment is counted.
         """
-        if not deployment_id or deployment_id not in self._model_routing_member_ids:
+        if not deployment_id:
             return False
         self._model_routing_inflight[deployment_id] = (
             self._model_routing_inflight.get(deployment_id, 0) + 1
@@ -8114,6 +8168,36 @@ class SparkDeckService:
             self._model_routing_inflight.get(chosen, 0) + 1
         )
         return live_by_id[chosen]
+
+    def _select_balanced_shared_owner(
+        self, candidates: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str]:
+        """Spread shared-name traffic across live owners, least in-flight first.
+
+        Without a manually configured policy there is no priority to honor,
+        and answering every request from the newest owner wastes the rest of
+        the fleet. The least-loaded owner wins; the deterministic
+        newest-owner rule only breaks ties, so concurrent requests stay
+        within one of each other. The reservation here also makes direct
+        alias and source-IP traffic visible to later selections; callers
+        release the slot when the response completes.
+        """
+        inflight = self._model_routing_inflight
+        least = min(
+            inflight.get(str(candidate.get("id") or ""), 0)
+            for candidate in candidates
+        )
+        tied = [
+            candidate for candidate in candidates
+            if inflight.get(str(candidate.get("id") or ""), 0) == least
+        ]
+        deployment = max(tied, key=self._selector_owner_sort_key)
+        deployment_id = str(deployment.get("id") or "")
+        inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
+        # Deliberately not _note_shared_selector_owner: balanced selections
+        # alternate between owners by design, and that helper warns on every
+        # ownership change, which would flood the log at one line per request.
+        return deployment, deployment_id
 
     def _release_routing_slot(self, deployment_id: str) -> None:
         current = self._model_routing_inflight.get(deployment_id, 0)
@@ -8644,9 +8728,10 @@ class SparkDeckService:
             if exact is not None:
                 deployment = exact
             else:
-                # A policy for this request id routes by priority with a
-                # concurrency overflow; without one (or with no live member)
-                # the newest owner answers as before.
+                # A manually configured policy routes by priority with a
+                # concurrency overflow. Without one, no automatic priority
+                # exists: concurrent requests balance across the live owners,
+                # off by at most one, instead of stacking on the newest one.
                 deployment = self._select_routed_member(
                     requested_model, candidates,
                 )
@@ -8655,10 +8740,9 @@ class SparkDeckService:
                 elif len(candidates) == 1:
                     deployment = candidates[0]
                 elif candidates:
-                    deployment = max(
-                        candidates, key=self._selector_owner_sort_key,
+                    deployment, routing_slot = self._select_balanced_shared_owner(
+                        candidates,
                     )
-                    self._note_shared_selector_owner(requested_model, deployment)
             if deployment is None:
                 deployment = stored_deployment
         if routing_slot is None and deployment is not None:

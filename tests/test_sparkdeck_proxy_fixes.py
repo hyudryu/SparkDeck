@@ -320,9 +320,9 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_models_catalog_publishes_the_shared_name_on_its_winner(self):
-        """Discovery must agree with inference: the shared id is advertised
-        on the deployment that routing selects."""
+    async def test_models_catalog_publishes_the_shared_name_on_every_owner(self):
+        """Discovery must agree with balanced routing: without a policy the
+        shared id is advertised on every live owner, not a single winner."""
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager.deployments = [
@@ -379,15 +379,20 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                     (item["id"], item["deployment_id"])
                     for item in models["data"]
                 ),
-                [("model-one", "record-one"), ("shared-name", "record-two")],
+                [
+                    ("model-one", "record-one"),
+                    ("model-two", "record-two"),
+                    ("shared-name", "record-one"),
+                    ("shared-name", "record-two"),
+                ],
             )
 
             await manager.http.aclose()
             await service.close()
 
-    async def test_shared_selector_logs_ownership_changes_once(self):
-        """Shared names are routine, so the request path logs one line per
-        ownership change instead of one per inference."""
+    async def test_shared_selector_requests_stay_quiet_while_balancing(self):
+        """Shared names are routine and no-policy traffic balances across
+        owners, so the request path logs no ownership warnings at all."""
         from unittest.mock import patch as patch_module
 
         with tempfile.TemporaryDirectory() as directory:
@@ -435,7 +440,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 call for call in warning.call_args_list
                 if "is shared by several live deployments" in str(call)
             ]
-            self.assertEqual(len(shared_logs), 1)
+            self.assertEqual(shared_logs, [])
 
             await manager.http.aclose()
             await service.close()
@@ -625,11 +630,11 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 "chat/completions",
             )
 
-            # The shared name advertises on the newest (here: id-tiebroken)
-            # owner; the other container stays reachable through its alias.
+            # Without a policy the shared name advertises on both owners and
+            # each container stays visible through its own name.
             self.assertEqual(
                 [item["id"] for item in models["data"]],
-                ["container-one", "shared-name"],
+                ["shared-name", "container-one", "shared-name", "container-two"],
             )
             self.assertEqual(response["model"], "container-two")
             self.assertEqual(manager._vllm_chat.await_args.kwargs, {

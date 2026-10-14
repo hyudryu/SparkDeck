@@ -209,7 +209,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
             item["deployment_id"] == "dep-1" for item in result["data"]
         ))
 
-    async def test_models_contract_advertises_shared_name_on_its_winner(self):
+    async def test_models_contract_advertises_shared_name_on_every_owner(self):
         self.service.deployments = AsyncMock(return_value=[
             {
                 "id": "dep-1", "alias": "model-one", "runtime": "vllm",
@@ -225,11 +225,19 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.models()
 
+        # Without a policy both owners join the pool: the shared id is
+        # advertised on each of them alongside its own name.
         self.assertEqual(
             [item["id"] for item in result["data"]],
-            ["model-one", "shared-name"],
+            ["shared-name", "model-one", "shared-name", "model-two"],
         )
-        self.assertEqual(result["data"][1]["deployment_id"], "dep-2")
+        self.assertEqual(
+            sorted(
+                item["deployment_id"] for item in result["data"]
+                if item["id"] == "shared-name"
+            ),
+            ["dep-1", "dep-2"],
+        )
 
     async def test_inactive_deployment_does_not_reserve_its_served_name(self):
         self.service.deployments = AsyncMock(return_value=[
@@ -250,7 +258,7 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in result["data"]], ["shared-name"])
 
-    async def test_discovered_alias_is_not_restored_after_served_name_collision(self):
+    async def test_discovered_alias_collision_follows_pool_advertisement(self):
         self.service._native_llama_model = AsyncMock(return_value="shared-name")
         self.service.deployments = AsyncMock(return_value=[
             {
@@ -269,11 +277,16 @@ class BenchmarkCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.service.models()
 
-        # The shared id belongs to its winner; the discovered container's
-        # alias is not re-advertised as a second route to the same name.
+        # Both owners serve the shared id, so the pool advertises it on
+        # each of them; the discovered container's alias adds no separate
+        # entry of its own.
         self.assertEqual(
             [(item["id"], item["deployment_id"]) for item in result["data"]],
-            [("shared-name", "registered")],
+            [
+                ("shared-name", "registered"),
+                ("registered-alias", "registered"),
+                ("shared-name", "container:external"),
+            ],
         )
 
     def test_discovered_deployment_preserves_all_served_names(self):

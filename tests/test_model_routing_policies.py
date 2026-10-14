@@ -501,6 +501,70 @@ class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
 
 
+    async def test_balanced_pool_skips_exact_live_selectors(self):
+        # A live deployment whose own alias IS the shared name always wins
+        # in the proxy, so the id is not a pool and is not advertised as one.
+        with tempfile.TemporaryDirectory() as directory:
+            manager = FakeManager()
+            service = SparkDeckService(manager, Path(directory))
+            try:
+                for record_id, alias in (
+                    ("record-one", "shared-name"), ("record-two", "model-two"),
+                ):
+                    service.store.add_deployment(Deployment(
+                        id=record_id, alias=alias, runtime=RuntimeKind.VLLM,
+                        kind=DeploymentKind.MANAGED,
+                        model=ModelIdentity(f"org/{alias}"),
+                        settings={"manager_deployment_id": f"cluster-{record_id}"},
+                    ))
+                rows = [
+                    {"id": record_id, "alias": alias, "runtime": "vllm",
+                     "kind": "managed", "status": "running",
+                     "served_models": ["shared-name"],
+                     "model": {"repository": f"org/{alias}"}, "settings": {}}
+                    for record_id, alias in (
+                        ("record-one", "shared-name"), ("record-two", "model-two"),
+                    )
+                ]
+                owners = {"shared-name": {"record-one", "record-two"}}
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners), set(),
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+    async def test_balanced_pool_ignores_policy_members_not_serving_the_id(self):
+        # A live policy member relaunched under other served names does not
+        # route this id, so it must not suppress balanced discovery.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            try:
+                service._model_routing_policies = {
+                    "shared-name": {
+                        "model": "shared-name",
+                        "members": [
+                            {"deployment_id": "record-one", "max_concurrency": None},
+                        ],
+                        "updated_at": None,
+                    },
+                }
+                rows = live_rows()
+                rows[0]["served_models"] = ["other-name"]
+                owners = {
+                    "shared-name": {"record-two", "record-three"},
+                    "other-name": {"record-one"},
+                }
+                rows.append({**rows[1], "id": "record-three"})
+                self.assertEqual(
+                    service._balanced_shared_ids(rows, owners),
+                    {"shared-name"},
+                )
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
+
 class ModelRoutingDirectTrafficTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_alias_traffic_consumes_the_member_cap(self):
         """An alias request to a policy member occupies that member's

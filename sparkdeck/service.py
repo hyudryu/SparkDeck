@@ -7655,27 +7655,28 @@ class SparkDeckService:
                 seen.difference_update(reserved_ids)
             # The target may be listed under its own id; an embedding row that
             # happens to share the id serves a different surface, so it falls
-            # through to the winning chat deployment instead.
-            target_entry = next(
-                (
-                    item for item in data
-                    if item["id"] == default_target
-                    and item.get("type") != "embedding"
-                ),
-                None,
-            )
-            if target_entry is None:
-                target_entry = winner_entry
+            # through to the winning chat deployment instead. A balanced
+            # target has one entry per owner, and the reserved alias must
+            # represent every owner it can reach.
+            target_entries = [
+                item for item in data
+                if item["id"] == default_target
+                and item.get("type") != "embedding"
+            ]
+            if not target_entries and winner_entry is not None \
+                    and winner_entry.get("type") != "embedding":
+                target_entries = [winner_entry]
             # Advertise the alias only while its target is actually served as
             # a chat model, so the listing never promises a name the gateway
             # cannot route.
-            if target_entry is not None and target_entry.get("type") != "embedding":
-                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
+            for target_entry in target_entries:
                 data.append({
                     **target_entry,
                     "id": self.DEFAULT_MODEL_REQUEST_ID,
                     "alias_of": default_target,
                 })
+            if target_entries:
+                seen.add(self.DEFAULT_MODEL_REQUEST_ID)
         codex_listed: list[str] = []
         for item in data:
             # A balanced shared id has one entry per owner; the coding
@@ -7824,9 +7825,17 @@ class SparkDeckService:
         for model_id, owners in request_owners.items():
             if len(owners & live_ids) < 2:
                 continue
+            # An exact live id/alias always wins in the proxy, so it is not
+            # a pool even when its owners share additional served names.
+            exact = self.store.deployment(model_id, include_private=True)
+            if exact is not None and exact["id"] in owners:
+                continue
+            # Only members that actually serve this id route it; a live
+            # member relaunched under other served names falls back to the
+            # balancing pool exactly like the proxy does.
             policy = self._model_routing_policies.get(model_id)
             if policy is not None and any(
-                member["deployment_id"] in live_ids
+                member["deployment_id"] in owners
                 for member in policy["members"]
             ):
                 continue

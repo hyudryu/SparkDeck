@@ -48,6 +48,20 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.send(manager, prompt(2))
         self.assertEqual([c.args[1]['node_id'] for c in manager._proxy_cluster_member.await_args_list], ['node-0', 'node-0'])
 
+    async def test_concurrent_cached_requests_spread_within_one(self):
+        manager, _ = setup()
+        # Hold each dispatch in flight (acquire without release) so the second
+        # and third concurrent arrivals see the cached replica already busy.
+        async def hold(deployment, member, *args, **kwargs):
+            manager._acquire_cluster_member('d', member)
+            return {'choices': []}
+        manager._proxy_cluster_member.side_effect = hold
+        for _ in range(3):
+            await self.send(manager, prompt(2))
+        nodes = {c.args[1]['node_id'] for c in manager._proxy_cluster_member.await_args_list}
+        self.assertEqual(nodes, {'node-0', 'node-1'})
+        self.assertEqual(sorted(manager._cluster_member_loads().values()), [1, 2])
+
     async def test_common_boilerplate_does_not_pin_new_conversations(self):
         manager, _ = setup()
         await self.send(manager, prompt())
@@ -58,10 +72,8 @@ class PrefixRoutingTests(unittest.IsolatedAsyncioTestCase):
         manager, deployment = setup('grouped_sharded')
         await self.send(manager, prompt())
         preferred = deployment['members'][0]
-        for _ in range(2):
-            manager._acquire_cluster_member('d', preferred)
-        await self.send(manager, prompt(2))
-        self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['instance_id'], 0)
+        # A single in-flight request already leaves the cached group one above
+        # the idle group, so a cached follow-up must spread instead of stacking.
         manager._acquire_cluster_member('d', preferred)
         await self.send(manager, prompt(2))
         self.assertEqual(manager._proxy_cluster_member.await_args.args[1]['instance_id'], 1)

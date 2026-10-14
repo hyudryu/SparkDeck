@@ -7571,7 +7571,10 @@ class Manager:
         if preferred is None:
             return candidates
         minimum = min(self._cluster_member_active(deployment_id, m) for m in candidates)
-        if self._cluster_member_active(deployment_id, preferred) > minimum + 2:
+        # A cache hint only breaks ties at minimum load: honoring it elsewhere
+        # would leave the cached member more than one request above the
+        # least-loaded one, and throughput comes from even spread.
+        if self._cluster_member_active(deployment_id, preferred) > minimum:
             return candidates
         return [preferred, *(m for m in candidates if m is not preferred)]
 

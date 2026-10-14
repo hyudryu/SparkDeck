@@ -183,6 +183,7 @@ function NodeResourceCard({ node, stats, fallback, refreshPaused, now }: { node:
   const sessions = sessionValues?.reduce((sum, request) => sum + (request.connections ?? 0), 0)
   const ramUsed = finiteNumber(stats?.mem?.used)
   const ramTotal = finiteNumber(stats?.mem?.total)
+  const nics = (stats?.nics ?? []).filter((nic) => finiteNumber(nic.temp) !== undefined)
   return <Panel className="cluster-health-card" aria-label={`Resource usage for ${node.name}`}>
     <div className="cluster-health-heading"><div><Server size={16} /><div><h3>{node.name}</h3><p>{fallback ? 'Local telemetry only' : node.local ? 'Current entry node' : node.id}</p></div></div><Status status={node.online ? 'running' : 'offline'}>{node.online ? 'Online' : 'Offline'}</Status></div>
     {node.online ? <>
@@ -211,6 +212,15 @@ function NodeResourceCard({ node, stats, fallback, refreshPaused, now }: { node:
         </section>})}
         {!stats?.gpus?.length && <p className="node-telemetry-notice">GPU telemetry unavailable.</p>}
       </div>
+      {nics.length > 0 && <div className="node-nic-list">
+        {nics.map((nic, position) => {
+          const nicName = nic.name ?? 'Network adapter'
+          return <section className="node-gpu-card node-nic-card" key={`${nicName}-${position}`} aria-label={`${node.name} ${nicName}`}>
+            <div className="node-gpu-heading"><strong>{nicName}</strong><span>Network card</span></div>
+            <dl><div><dt>NIC temp</dt><dd className={temperatureTone(finiteNumber(nic.temp))}>{displayValue(finiteNumber(nic.temp), '°C', 1)}</dd></div></dl>
+          </section>
+        })}
+      </div>}
     </> : <p className="cluster-health-offline">Telemetry unavailable while this node is offline.</p>}
   </Panel>
 }

@@ -21829,6 +21829,109 @@ class Manager:
         except Exception as e:
             return [{"error": str(e)}]
 
+    # Known network-card PCI ids (vendor:device from uevent). Cards outside
+    # this map still surface under a generic label when a temp sensor exists.
+    _NIC_PCI_LABELS = {
+        ("0x15b3", "0x1017"): "NVIDIA ConnectX-5",
+        ("0x15b3", "0x1019"): "NVIDIA ConnectX-5 Ex",
+        ("0x15b3", "0x101b"): "NVIDIA ConnectX-6 Lx",
+        ("0x15b3", "0x101d"): "NVIDIA ConnectX-6",
+        ("0x15b3", "0x101f"): "NVIDIA ConnectX-6 Dx",
+        ("0x15b3", "0x1021"): "NVIDIA ConnectX-7",
+        ("0x15b3", "0x1023"): "NVIDIA ConnectX-8",
+    }
+
+    def _nic_label(self, device: Path) -> str:
+        """Human name for a network card from its PCI identity files."""
+        vendor = device_id = None
+        try:
+            for line in (device / "uevent").read_text().splitlines():
+                key, _, value = line.partition("=")
+                if key == "PCI_ID" and ":" in value:
+                    vendor, device_id = (part.lower() for part in value.split(":", 1))
+        except OSError:
+            pass
+        pci_class = ""
+        try:
+            pci_class = (device / "class").read_text().strip()
+        except OSError:
+            pass
+        if vendor and device_id:
+            label = self._NIC_PCI_LABELS.get((f"0x{vendor}", f"0x{device_id}"))
+            if label:
+                return label
+            if vendor == "15b3":
+                return "NVIDIA ConnectX"
+        if pci_class == "0x0c0340":
+            return "Thunderbolt controller"
+        return "Network adapter"
+
+    def _read_nics(self, sysfs_root: Path = Path("/sys")) -> list[dict]:
+        """Temperature of network cards that expose a hwmon sensor.
+
+        Cards like ConnectX (mlx5 hwmon) or a Thunderbolt card appear only
+        when a readable temperature sensor is detected; everything else is
+        omitted so the UI never renders a placeholder card. Scans three
+        sysfs views: physical net interfaces, RDMA verbs devices (ConnectX
+        registers both), and USB4/Thunderbolt PCI class (a card can exist
+        before any netdev is bound).
+        """
+        devices: dict[str, Path] = {}
+
+        def add_device(candidate: Path) -> None:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                return
+            if resolved.is_dir():
+                devices.setdefault(str(resolved), resolved)
+
+        try:
+            for iface in (sysfs_root / "class" / "net").iterdir():
+                name = iface.name
+                if name == "lo" or name.startswith(("veth", "virbr", "docker", "br-")):
+                    continue
+                # Linux creates /sys/class/net/<iface>/bridge for bridges.
+                if (iface / "bridge").exists():
+                    continue
+                add_device(iface / "device")
+        except OSError:
+            pass
+        try:
+            for rdma in (sysfs_root / "class" / "infiniband").iterdir():
+                add_device(rdma / "device")
+        except OSError:
+            pass
+        try:
+            for pci in (sysfs_root / "bus" / "pci" / "devices").iterdir():
+                try:
+                    if (pci / "class").read_text().strip() == "0x0c0340":
+                        add_device(pci)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
+        nics: list[dict] = []
+        for device in devices.values():
+            hwmon_root = device / "hwmon"
+            if not hwmon_root.is_dir():
+                continue
+            temps: list[float] = []
+            for input_path in sorted(hwmon_root.glob("*/temp*_input")):
+                try:
+                    value = float(input_path.read_text().strip()) / 1000.0
+                except (OSError, ValueError):
+                    continue
+                if -40.0 <= value <= 150.0:
+                    temps.append(round(value, 1))
+            if not temps:
+                # Card has no readable temperature sensor: omit it entirely.
+                continue
+            nics.append({"name": self._nic_label(device), "temp": max(temps)})
+        nics.sort(key=lambda nic: nic["name"])
+        return nics
+
     async def _gpu_total_gb(self) -> float | None:
         """Total GPU memory of the first GPU in GB, or None if unavailable."""
         try:
@@ -22136,6 +22239,7 @@ class Manager:
                 "cpu_clock_base_mhz": cpu_clock.get("base"),
                 "mem": self._read_mem(),
                 "gpus": self._read_gpu(),
+                "nics": self._read_nics(),
                 "net": self._read_net(),
                 "mem_bw": self._read_mem_bw(),
                 "online_users": self._read_online_users(),

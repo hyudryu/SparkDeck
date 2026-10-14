@@ -441,6 +441,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .node-resource-metric .metric-bar, .node-gpu-card > .metric-bar { margin-top: 7px; }
 .node-telemetry-notice { color: var(--text-secondary); font-size: 11px; margin-top: 10px; overflow-wrap: anywhere; }
 .node-gpu-list { display: grid; gap: 10px; margin-top: 12px; }
+.node-nic-list { display: grid; gap: 10px; margin-top: 12px; }
 .node-gpu-card { min-width: 0; padding: 10px; border: 1px solid var(--border-subtle); border-radius: 8px; }
 .node-gpu-heading { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; font-size: 11px; }
 .node-gpu-heading > strong { flex-shrink: 0; }

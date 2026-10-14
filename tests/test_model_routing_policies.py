@@ -302,26 +302,45 @@ class ModelRoutingProxyTests(unittest.IsolatedAsyncioTestCase):
                 await manager.http.aclose()
                 await service.close()
 
-    async def test_without_policy_the_newest_owner_still_answers(self):
+    async def test_without_policy_concurrent_requests_balance_within_one(self):
+        """No policy means no automatic priority: concurrent requests spread
+        across the live owners, off by at most one, tie-breaking to the
+        newest owner instead of stacking on it."""
         with tempfile.TemporaryDirectory() as directory:
             manager, service = build_service(directory)
-            manager.proxy_cluster_inference = AsyncMock(return_value={
-                "model": "shared-name", "choices": [], "usage": {},
-            })
+            started = []
+            release = asyncio.Event()
+
+            async def cluster_inference(manager_id, *args, **kwargs):
+                started.append(manager_id)
+                if len(started) >= 3:
+                    release.set()
+                else:
+                    await release.wait()
+                return {"model": "shared-name", "choices": [], "usage": {}}
+
+            manager.proxy_cluster_inference = cluster_inference
             try:
                 rows = live_rows()
                 rows[0]["last_deployed_at"] = "2026-10-10T00:00:00Z"
                 service.deployments = AsyncMock(return_value=rows)
-                await service.proxy(
-                    {"model": "shared-name", "messages": [], "stream": False},
-                    "chat/completions",
-                )
+                await asyncio.gather(*(
+                    service.proxy(
+                        {"model": "shared-name", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+                    for _ in range(3)
+                ))
                 self.assertEqual(
-                    manager.proxy_cluster_inference.await_args.args[0],
-                    "cluster-one",
+                    started, ["cluster-one", "cluster-two", "cluster-one"],
                 )
+                for _ in range(200):
+                    if not service._model_routing_inflight:
+                        break
+                    await asyncio.sleep(0.01)
                 self.assertEqual(service._model_routing_inflight, {})
             finally:
+                release.set()
                 await manager.http.aclose()
                 await service.close()
 

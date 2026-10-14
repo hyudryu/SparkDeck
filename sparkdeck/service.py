@@ -8115,6 +8115,34 @@ class SparkDeckService:
         )
         return live_by_id[chosen]
 
+    def _select_balanced_shared_owner(
+        self, model_id: str, candidates: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str]:
+        """Spread shared-name traffic across live owners, least in-flight first.
+
+        Without a manually configured policy there is no priority to honor,
+        and answering every request from the newest owner wastes the rest of
+        the fleet. The least-loaded owner wins; the deterministic
+        newest-owner rule only breaks ties, so concurrent requests stay
+        within one of each other. The reservation here also makes direct
+        alias and source-IP traffic visible to later selections; callers
+        release the slot when the response completes.
+        """
+        inflight = self._model_routing_inflight
+        least = min(
+            inflight.get(str(candidate.get("id") or ""), 0)
+            for candidate in candidates
+        )
+        tied = [
+            candidate for candidate in candidates
+            if inflight.get(str(candidate.get("id") or ""), 0) == least
+        ]
+        deployment = max(tied, key=self._selector_owner_sort_key)
+        deployment_id = str(deployment.get("id") or "")
+        inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
+        self._note_shared_selector_owner(model_id, deployment)
+        return deployment, deployment_id
+
     def _release_routing_slot(self, deployment_id: str) -> None:
         current = self._model_routing_inflight.get(deployment_id, 0)
         if current > 1:
@@ -8644,9 +8672,10 @@ class SparkDeckService:
             if exact is not None:
                 deployment = exact
             else:
-                # A policy for this request id routes by priority with a
-                # concurrency overflow; without one (or with no live member)
-                # the newest owner answers as before.
+                # A manually configured policy routes by priority with a
+                # concurrency overflow. Without one, no automatic priority
+                # exists: concurrent requests balance across the live owners,
+                # off by at most one, instead of stacking on the newest one.
                 deployment = self._select_routed_member(
                     requested_model, candidates,
                 )
@@ -8655,10 +8684,9 @@ class SparkDeckService:
                 elif len(candidates) == 1:
                     deployment = candidates[0]
                 elif candidates:
-                    deployment = max(
-                        candidates, key=self._selector_owner_sort_key,
+                    deployment, routing_slot = self._select_balanced_shared_owner(
+                        requested_model, candidates,
                     )
-                    self._note_shared_selector_owner(requested_model, deployment)
             if deployment is None:
                 deployment = stored_deployment
         if routing_slot is None and deployment is not None:

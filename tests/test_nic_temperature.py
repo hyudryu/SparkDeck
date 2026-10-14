@@ -181,16 +181,43 @@ class NicTemperatureTests(unittest.TestCase):
     def vpd_bytes(serial: str) -> bytes:
         # Standard layout: value-length header (0x80), identifier string
         # (0x82), read-only resource (0x90) carrying the SN keyword, then
-        # the 78 78 end marker. Large resources use a 2-byte length.
+        # the 78 78 end marker. Large resources use a little-endian length.
         field = serial.encode("ascii")
         readonly = b"SN" + bytes([len(field)]) + field + b"\x78\x78"
         ident = b"Mellanox ConnectX"
         return (
-            b"\x80\x00\x04\x00\x00\x00\x00"
-            + bytes([0x82, 0x00, len(ident)]) + ident
-            + bytes([0x90, 0x00, len(readonly)]) + readonly
+            b"\x80\x04\x00\x00\x00\x00\x00"
+            + bytes([0x82, len(ident) & 0xFF, len(ident) >> 8]) + ident
+            + bytes([0x90, len(readonly) & 0xFF, len(readonly) >> 8]) + readonly
             + b"\x78\x78"
         )
+
+    def test_vpd_sn_after_oversized_readonly_entries_decodes(self) -> None:
+        # Read-only resource longer than 255 bytes proves the little-endian
+        # two-byte length decode that real ConnectX VPD layouts need.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            readonly = (
+                b"EC" + bytes([250]) + b"x" * 250
+                + b"PN" + bytes([40]) + b"y" * 40
+                + b"SN" + bytes([8]) + b"MTA9999Z"
+                + b"\x78\x78"
+            )
+            vpd = (
+                b"\x80\x04\x00\x00\x00\x00\x00"
+                + bytes([0x90, len(readonly) & 0xFF, len(readonly) >> 8])
+                + readonly
+                + b"\x78\x78"
+            )
+            device = self.pci_device(
+                root, "class/net/eth0/device",
+                pci_id="15b3:1021", temps=["54000"],
+            )
+            (device / "vpd").write_bytes(vpd)
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "NVIDIA ConnectX-7", "temp": 54.0}],
+            )
 
     def test_socket_direct_merges_via_vpd_serial_without_rdma(self) -> None:
         # No mlx5_ib loaded: /sys/class/infiniband is absent, so the two

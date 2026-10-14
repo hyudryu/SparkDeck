@@ -21875,12 +21875,14 @@ class Manager:
     def _vpd_serial(cls, device: Path) -> str | None:
         """Product serial from PCI VPD; None unless it parses cleanly.
 
-        Standard layout: large resources use a tag plus 2-byte length and
-        the serial is the ``SN`` keyword inside the read-only (0x90)
-        resource; ``78 78`` terminates the VPD. The file is root-readable
-        on many distros, so this is best-effort identity for multi-function
-        cards (Socket Direct peers) on hosts without the RDMA driver,
-        where no guid/uid attribute exists.
+        Standard layout: large resources use a tag plus little-endian
+        2-byte length and the serial is the ``SN`` keyword inside the
+        read-only (0x90) resource; ``78 78`` terminates the VPD. The kernel
+        exports ``vpd`` mode 0600, so this is best-effort identity only
+        (typically readable when the agent runs as root); for multi-function
+        cards (Socket Direct peers) without the RDMA driver and without VPD
+        access there is no reliable unprivileged shared identity, so peers
+        may appear as separate cards in that configuration.
         """
         try:
             data = (device / "vpd").read_bytes()
@@ -21895,7 +21897,7 @@ class Manager:
             if tag >= 0x80:
                 if i + 2 >= n:
                     break
-                length = (data[i + 1] << 8) | data[i + 2]
+                length = data[i + 1] | (data[i + 2] << 8)
                 if length > n - i - 3:
                     break  # Corrupt VPD: stop rather than scan past the end.
                 if tag == 0x90:  # Read-only area holds the SN keyword.

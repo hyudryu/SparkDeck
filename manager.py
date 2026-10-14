@@ -21853,6 +21853,48 @@ class Manager:
             return name[:-2]
         return str(device)
 
+    @staticmethod
+    def _vpd_tlv(data: bytes, start: int, end: int):
+        i = start
+        while i < end:
+            tag = data[i]
+            if tag == 0x78 and i + 1 < end and data[i + 1] == 0x78:
+                return
+            if tag == 0x00:  # padding
+                i += 1
+                continue
+            if i + 1 >= end:
+                return
+            length = data[i + 1]
+            yield tag, data[i + 2:i + 2 + length]
+            i += 2 + length
+
+    @classmethod
+    def _vpd_serial(cls, device: Path) -> str | None:
+        """Product serial from PCI VPD; None unless it parses cleanly.
+
+        ``vpd`` is root-readable on many distros, so this is best-effort
+        identity for multi-function cards (Socket Direct peers) on hosts
+        without the RDMA driver, where no guid/uid attribute exists.
+        """
+        try:
+            data = (device / "vpd").read_bytes()
+        except OSError:
+            return None
+        if not data:
+            return None
+        try:
+            for tag, value in cls._vpd_tlv(data, 0, len(data)):
+                if tag == 0x82:  # INVENTORY
+                    for inner, field in cls._vpd_tlv(value, 0, len(value)):
+                        if inner == 0x76 and field:  # Product Serial Number
+                            serial = field.decode("ascii", "replace").strip()
+                            if serial:
+                                return serial
+        except (IndexError, ValueError):
+            return None
+        return None
+
     def _nic_label(self, device: Path) -> str:
         """Human name for a network card from its PCI identity files."""
         vendor = device_id = None
@@ -21889,8 +21931,10 @@ class Manager:
         before any netdev is bound). PCI functions of one adapter merge by
         bus:device key; Socket Direct peers — the same physical card on two
         PCIe connections with different bus addresses — merge through a
-        shared HCA identity: the stable-ABI ``sys_image_guid`` (equal across
-        ports of one physical card) or the OFED ``uid`` where present.
+        shared card identity: the stable-ABI ``sys_image_guid`` (equal across
+        ports of one physical card), the OFED ``uid`` where present, or the
+        PCI VPD product serial (covers hosts without the RDMA driver where
+        the VPD file is readable).
         """
         groups: dict[str, list[Path]] = {}
         identity_by_function: dict[str, str] = {}
@@ -21901,6 +21945,18 @@ class Manager:
             except OSError:
                 return None
             return resolved if resolved.is_dir() else None
+
+        def function_identity(resolved: Path) -> str:
+            function_key = self._nic_card_key(resolved)
+            identity = identity_by_function.get(function_key)
+            if identity:
+                return identity
+            serial = self._vpd_serial(resolved)
+            if serial:
+                identity = f"vpd:{serial}"
+                identity_by_function[function_key] = identity
+                return identity
+            return function_key
 
         def add_grouped(resolved: Path, key: str) -> None:
             groups.setdefault(key, []).append(resolved)
@@ -21940,12 +21996,11 @@ class Manager:
                 resolved = resolved_dir(rdma / "device")
                 if resolved is None:
                     continue
-                function_key = self._nic_card_key(resolved)
                 if identity:
-                    identity_by_function[function_key] = identity
+                    identity_by_function[self._nic_card_key(resolved)] = identity
                     add_grouped(resolved, identity)
                 else:
-                    add_grouped(resolved, function_key)
+                    add_grouped(resolved, function_identity(resolved))
         except OSError:
             pass
 
@@ -21960,11 +22015,7 @@ class Manager:
                 resolved = resolved_dir(iface / "device")
                 if resolved is None:
                     continue
-                function_key = self._nic_card_key(resolved)
-                add_grouped(
-                    resolved,
-                    identity_by_function.get(function_key, function_key),
-                )
+                add_grouped(resolved, function_identity(resolved))
         except OSError:
             pass
         try:
@@ -21977,11 +22028,7 @@ class Manager:
                 resolved = resolved_dir(pci)
                 if resolved is None:
                     continue
-                function_key = self._nic_card_key(resolved)
-                add_grouped(
-                    resolved,
-                    identity_by_function.get(function_key, function_key),
-                )
+                add_grouped(resolved, function_identity(resolved))
         except OSError:
             pass
 
@@ -21990,9 +22037,15 @@ class Manager:
             temps: list[float] = []
             for device in functions:
                 hwmon_root = device / "hwmon"
-                if not hwmon_root.is_dir():
+                try:
+                    if not hwmon_root.is_dir():
+                        continue
+                    # A hot-unplugged adapter can disappear between the dir
+                    # check and the lazy glob, so materialize inside try.
+                    input_paths = sorted(hwmon_root.glob("*/temp*_input"))
+                except OSError:
                     continue
-                for input_path in sorted(hwmon_root.glob("*/temp*_input")):
+                for input_path in input_paths:
                     # hwmon: a channel with tempN_fault set must not be trusted.
                     stem = input_path.name[: -len("_input")]
                     try:

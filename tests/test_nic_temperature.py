@@ -177,6 +177,54 @@ class NicTemperatureTests(unittest.TestCase):
                 [{"name": "NVIDIA ConnectX-7", "temp": 56.0}],
             )
 
+    @staticmethod
+    def vpd_bytes(serial: str) -> bytes:
+        field = serial.encode("ascii")
+        inventory = bytes([0x76, len(field)]) + field
+        return (
+            bytes([0x80, 0x02, 0x00, 0x00])
+            + bytes([0x82, len(inventory)])
+            + inventory
+            + b"\x78\x78"
+        )
+
+    def test_socket_direct_merges_via_vpd_serial_without_rdma(self) -> None:
+        # No mlx5_ib loaded: /sys/class/infiniband is absent, so the two
+        # PCIe connections identify the card through their shared VPD serial.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for iface, temp in (("eth0", "54000"), ("eth1", "56000")):
+                device = self.pci_device(
+                    root, f"class/net/{iface}/device",
+                    pci_id="15b3:1021", temps=[temp],
+                )
+                (device / "vpd").write_bytes(self.vpd_bytes("MTA1234X"))
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [{"name": "NVIDIA ConnectX-7", "temp": 56.0}],
+            )
+
+    def test_distinct_cards_with_different_vpd_serials_stay_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device0 = self.pci_device(
+                root, "class/net/eth0/device",
+                pci_id="15b3:1021", temps=["54000"],
+            )
+            (device0 / "vpd").write_bytes(self.vpd_bytes("MTA1111A"))
+            device1 = self.pci_device(
+                root, "class/net/eth1/device",
+                pci_id="15b3:1021", temps=["61000"],
+            )
+            (device1 / "vpd").write_bytes(self.vpd_bytes("MTA2222B"))
+            self.assertEqual(
+                self.manager()._read_nics(root),
+                [
+                    {"name": "NVIDIA ConnectX-7", "temp": 54.0},
+                    {"name": "NVIDIA ConnectX-7", "temp": 61.0},
+                ],
+            )
+
     def test_faulted_sensor_channels_are_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

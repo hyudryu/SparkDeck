@@ -7472,21 +7472,39 @@ class Manager:
         # copies without writing back, so the record and reality drift in
         # both directions — a node that went unreachable after launch still
         # reads "running", and an externally restarted replica still reads
-        # "exited". A recent connectivity observation is the newer signal in
-        # both directions; with none, the record decides and the readiness
-        # probe stays the final gate.
-        if member.get("node_status") is None:
-            registry = getattr(self, "node_registry", None)
-            observed = (
-                registry.cached_status(str(member.get("node_id") or ""))
-                if registry is not None else None
-            )
-            if observed is not None:
-                return (
-                    observed.get("online") is True
-                    and observed.get("docker_ready") is not False
-                )
-        return self._member_record_available(member)
+        # "exited". A recent connectivity observation is the newer signal:
+        # a failed host retires the member outright, and a durable failure
+        # is only overridden when the same observation confirms this
+        # member's own container is running — host connectivity alone says
+        # nothing about one container. With no observation the record
+        # decides and the readiness probe stays the final gate.
+        record = self._member_record_available(member)
+        if member.get("node_status") is not None:
+            return record
+        registry = getattr(self, "node_registry", None)
+        observed = (
+            registry.cached_status(str(member.get("node_id") or ""))
+            if registry is not None else None
+        )
+        if observed is None:
+            return record
+        if (
+            observed.get("online") is not True
+            or observed.get("docker_ready") is False
+        ):
+            return False
+        if record:
+            return True
+        containers = observed.get("containers")
+        if not isinstance(containers, list):
+            return False
+        name = str(member.get("container_name") or "")
+        return any(
+            isinstance(container, dict)
+            and container.get("name") == name
+            and str(container.get("status") or "").casefold() in {"running", "ready"}
+            for container in containers
+        )
 
     def _source_route_candidates(
         self, deployment: dict, source_route: dict,

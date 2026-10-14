@@ -157,7 +157,10 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
         # unreachable after launch still reads "running": the registry's
         # latest connectivity observation must keep it out of the lead.
         deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
         deployment["members"].append(member(2, "remote-3", "repl-1-r2"))
+        deployment["members"][2]["status"] = "running"
         manager = build_manager(deployment)
         manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
             {"online": False, "status": "unreachable"} if node_id == "remote-3" else None
@@ -170,19 +173,45 @@ class ReplicaBalancingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_observation_revives_externally_restarted_replica(self):
         # The inverse staleness: a durable member still reading "exited"
-        # after an external restart is serving again, and its fresh
-        # connectivity observation must put it back in the pool.
+        # after an external restart is serving again; the observation must
+        # confirm its own container is running to put it back in the pool.
         deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
         deployment["members"][0]["status"] = "exited"
         manager = build_manager(deployment)
         manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
-            {"online": True} if node_id == "remote-1" else None
+            {"online": True, "containers": [
+                {"name": "repl-1-r0", "status": "running"},
+            ]}
+            if node_id == "remote-1" else None
         ))
         manager._acquire_cluster_member("repl-1", deployment["members"][1])
 
         await self.proxy(manager)
 
         self.assertEqual(proxied_containers(manager)[0], "repl-1-r0")
+
+    async def test_host_online_alone_does_not_revive_a_stopped_container(self):
+        # Host connectivity does not prove this member's container runs:
+        # an exited replica stays out of the pool while a healthy sibling
+        # is serving.
+        deployment = replicated_deployment()
+        for existing in deployment["members"]:
+            existing["status"] = "running"
+        deployment["members"][0]["status"] = "exited"
+        manager = build_manager(deployment)
+        manager.node_registry.cached_status = Mock(side_effect=lambda node_id: (
+            {"online": True, "containers": [
+                {"name": "repl-1-r0", "status": "exited"},
+            ]}
+            if node_id == "remote-1" else None
+        ))
+        manager._acquire_cluster_member("repl-1", deployment["members"][1])
+
+        await self.proxy(manager)
+
+        self.assertEqual(proxied_containers(manager)[0], "repl-1-r1")
 
     async def test_broken_worker_rank_keeps_group_out_of_the_lead(self):
         # Route candidates are rank-0 coordinators only: an unreachable

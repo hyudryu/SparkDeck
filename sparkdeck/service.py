@@ -507,6 +507,11 @@ class SparkDeckService:
             self._load_model_routing_policies()
         )
         self._model_routing_inflight: dict[str, int] = {}
+        # Rotation cursors for the no-policy balancer, keyed by request id:
+        # equal in-flight counts are broken by taking turns, so a sequential
+        # client spreads across the live owners instead of always landing on
+        # the newest one.
+        self._model_routing_rotation: dict[str, int] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -8170,28 +8175,35 @@ class SparkDeckService:
         return live_by_id[chosen]
 
     def _select_balanced_shared_owner(
-        self, candidates: list[dict[str, Any]],
+        self, model_id: str, candidates: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], str]:
         """Spread shared-name traffic across live owners, least in-flight first.
 
         Without a manually configured policy there is no priority to honor,
         and answering every request from the newest owner wastes the rest of
-        the fleet. The least-loaded owner wins; the deterministic
-        newest-owner rule only breaks ties, so concurrent requests stay
-        within one of each other. The reservation here also makes direct
-        alias and source-IP traffic visible to later selections; callers
-        release the slot when the response completes.
+        the fleet. The least-loaded owner wins, so concurrent requests stay
+        within one of each other; equal in-flight counts rotate through a
+        per-request-id cursor, so sequential requests alternate across the
+        owners instead of always returning to the newest one. The reservation
+        here also makes direct alias and source-IP traffic visible to later
+        selections; callers release the slot when the response completes.
         """
         inflight = self._model_routing_inflight
         least = min(
             inflight.get(str(candidate.get("id") or ""), 0)
             for candidate in candidates
         )
-        tied = [
-            candidate for candidate in candidates
-            if inflight.get(str(candidate.get("id") or ""), 0) == least
-        ]
-        deployment = max(tied, key=self._selector_owner_sort_key)
+        tied = sorted(
+            (
+                candidate for candidate in candidates
+                if inflight.get(str(candidate.get("id") or ""), 0) == least
+            ),
+            key=self._selector_owner_sort_key,
+            reverse=True,
+        )
+        cursor = self._model_routing_rotation.get(model_id, 0)
+        self._model_routing_rotation[model_id] = cursor + 1
+        deployment = tied[cursor % len(tied)]
         deployment_id = str(deployment.get("id") or "")
         inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
         # Deliberately not _note_shared_selector_owner: balanced selections
@@ -8730,8 +8742,9 @@ class SparkDeckService:
             else:
                 # A manually configured policy routes by priority with a
                 # concurrency overflow. Without one, no automatic priority
-                # exists: concurrent requests balance across the live owners,
-                # off by at most one, instead of stacking on the newest one.
+                # exists: requests take turns across the live owners (least
+                # in-flight first, off by at most one) instead of stacking on
+                # the newest one.
                 deployment = self._select_routed_member(
                     requested_model, candidates,
                 )
@@ -8741,7 +8754,7 @@ class SparkDeckService:
                     deployment = candidates[0]
                 elif candidates:
                     deployment, routing_slot = self._select_balanced_shared_owner(
-                        candidates,
+                        requested_model, candidates,
                     )
             if deployment is None:
                 deployment = stored_deployment

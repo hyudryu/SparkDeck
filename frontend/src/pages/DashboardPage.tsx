@@ -812,7 +812,9 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
     <div className="model-routing-editor">
       <div className="model-routing-heading">
         <strong>Load balancing</strong>
-        <small>Requests fill the priority instance up to its cap, then overflow to the next one. Without a saved policy, concurrent requests balance across instances instead.</small>
+        <small>{policy
+          ? 'Priority order is active: requests fill each instance up to its cap, then overflow to the next one.'
+          : 'No priority saved: requests take turns across the live instances. Saving an order below routes by priority instead.'}</small>
         {!routingReady && <small role="status">Loading routing policies…</small>}
       </div>
       {draft.members.map((member, index) => {
@@ -866,10 +868,15 @@ function ModelRoutingEditor({ model, deployments, policy, routingReady, onChange
           Routing supports at most {MODEL_ROUTING_MEMBER_LIMIT} instances; remove one to add another.
         </small>
       )}
+      {draft.members.length === 0 && (
+        <small>Saving this empty list clears the priority order and returns {model} to default balancing.</small>
+      )}
       <div className="model-routing-actions">
-        <Button onClick={save} disabled={locked || (draft.members.length === 0 && !policy) || (Boolean(policy) && !dirty)}>Save routing</Button>
+        <Button onClick={save} disabled={locked || (Boolean(policy) && !dirty)}>Save routing</Button>
         {policy && <Button onClick={clear} disabled={locked}>Clear</Button>}
-        {saved && !dirty && !error && <span role="status">Routing saved</span>}
+        {/* The confirmation tracks the last mutation, not the draft shape: an
+            emptied draft differs from the defaults but is still a saved state. */}
+        {saved && !error && <span role="status">Routing saved</span>}
         {error && <p className="inline-error" role="alert">{error}</p>}
       </div>
     </div>

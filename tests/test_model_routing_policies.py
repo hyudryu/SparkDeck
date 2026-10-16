@@ -364,6 +364,40 @@ class ModelRoutingProxyTests(unittest.IsolatedAsyncioTestCase):
                 await manager.http.aclose()
                 await service.close()
 
+    async def test_without_policy_sequential_requests_take_turns(self):
+        """Sequential requests rotate across the live owners.
+
+        Every counter is idle again once a response completes, so a
+        newest-owner tie-break alone would pin a one-request-at-a-time client
+        to a single deployment while its siblings sit idle.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            manager, service = build_service(directory)
+            started = []
+
+            async def cluster_inference(manager_id, *args, **kwargs):
+                started.append(manager_id)
+                return {"model": "shared-name", "choices": [], "usage": {}}
+
+            manager.proxy_cluster_inference = cluster_inference
+            try:
+                rows = live_rows()
+                rows[0]["last_deployed_at"] = "2026-10-10T00:00:00Z"
+                service.deployments = AsyncMock(return_value=rows)
+                for _ in range(4):
+                    await service.proxy(
+                        {"model": "shared-name", "messages": [], "stream": False},
+                        "chat/completions",
+                    )
+                self.assertEqual(
+                    started,
+                    ["cluster-one", "cluster-two", "cluster-one", "cluster-two"],
+                )
+                self.assertEqual(service._model_routing_inflight, {})
+            finally:
+                await manager.http.aclose()
+                await service.close()
+
 
 class ModelRoutingReviewFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_members_may_be_live_discovered_deployments(self):

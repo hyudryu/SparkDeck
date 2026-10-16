@@ -2847,9 +2847,11 @@ async def v1_upsert_model_routing_policy(req: Request):
 
 @app.delete("/api/v1/model-routing-policies")
 async def v1_delete_model_routing_policy(model: str = Query(...)):
-    if not sparkdeck.delete_model_routing_policy(model):
-        raise HTTPException(404, "model routing policy was not found")
-    return {"ok": True}
+    # Idempotent on purpose: the dashboard editor's remove-all must land on
+    # default balancing whether or not a policy was ever saved, so an absent
+    # policy is success, not a 404 the caller has to special-case.
+    removed = sparkdeck.delete_model_routing_policy(model)
+    return {"ok": True, "removed": removed}
 
 
 @app.post("/api/v1/runtime-flags/preview")

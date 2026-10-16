@@ -507,6 +507,12 @@ class SparkDeckService:
             self._load_model_routing_policies()
         )
         self._model_routing_inflight: dict[str, int] = {}
+        # Turn state for the no-policy balancer, keyed by request id:
+        # {"order": tuple[str, ...], "cursor": int}. The order is the stable
+        # launch ranking the cursor indexes, so a re-ranked pool (new owner,
+        # departure, re-deployment) restarts the turn with its newest owner
+        # instead of resuming an offset that indexed a different list.
+        self._model_routing_rotation: dict[str, dict[str, Any]] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -8170,28 +8176,41 @@ class SparkDeckService:
         return live_by_id[chosen]
 
     def _select_balanced_shared_owner(
-        self, candidates: list[dict[str, Any]],
+        self, model_id: str, candidates: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], str]:
         """Spread shared-name traffic across live owners, least in-flight first.
 
         Without a manually configured policy there is no priority to honor,
         and answering every request from the newest owner wastes the rest of
-        the fleet. The least-loaded owner wins; the deterministic
-        newest-owner rule only breaks ties, so concurrent requests stay
-        within one of each other. The reservation here also makes direct
-        alias and source-IP traffic visible to later selections; callers
-        release the slot when the response completes.
+        the fleet. The least-loaded owner wins, so concurrent requests stay
+        within one of each other; equal in-flight counts rotate through a
+        per-request-id cursor, so sequential requests alternate across the
+        owners instead of always returning to the newest one. The cursor is
+        tied to the ranking it indexes and restarts when that ranking changes,
+        so a newly deployed owner leads the next turn. The reservation here
+        also makes direct alias and source-IP traffic visible to later
+        selections; callers release the slot when the response completes.
         """
         inflight = self._model_routing_inflight
+        ordered = sorted(
+            candidates, key=self._balanced_owner_sort_key, reverse=True,
+        )
+        order = tuple(str(candidate.get("id") or "") for candidate in ordered)
+        turn = self._model_routing_rotation.get(model_id)
+        if turn is None or turn["order"] != order:
+            turn = {"order": order, "cursor": 0}
+            self._model_routing_rotation[model_id] = turn
+        cursor = turn["cursor"]
+        turn["cursor"] = cursor + 1
         least = min(
             inflight.get(str(candidate.get("id") or ""), 0)
-            for candidate in candidates
+            for candidate in ordered
         )
         tied = [
-            candidate for candidate in candidates
+            candidate for candidate in ordered
             if inflight.get(str(candidate.get("id") or ""), 0) == least
         ]
-        deployment = max(tied, key=self._selector_owner_sort_key)
+        deployment = tied[cursor % len(tied)]
         deployment_id = str(deployment.get("id") or "")
         inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
         # Deliberately not _note_shared_selector_owner: balanced selections
@@ -8270,6 +8289,24 @@ class SparkDeckService:
         the deterministic tiebreaker and the fallback.
         """
         for field in ("last_deployed_at", "last_used_at", "created_at"):
+            stamp = cls._selector_owner_timestamp(deployment.get(field))
+            if stamp is not None:
+                return (stamp, str(deployment.get("id") or ""))
+        return (0.0, str(deployment.get("id") or ""))
+
+    @classmethod
+    def _balanced_owner_sort_key(
+        cls, deployment: dict[str, Any],
+    ) -> tuple[float, str]:
+        """Order the balancing pool by launch identity only.
+
+        ``_selector_owner_sort_key`` falls back to ``last_used_at`` when a
+        deployment carries no launch timestamp, and traffic moves that field:
+        ordering the turn by it would reshuffle the pool as a side effect of
+        the very requests the turn is meant to spread. The id stays the
+        deterministic fallback.
+        """
+        for field in ("last_deployed_at", "created_at"):
             stamp = cls._selector_owner_timestamp(deployment.get(field))
             if stamp is not None:
                 return (stamp, str(deployment.get("id") or ""))
@@ -8730,8 +8767,9 @@ class SparkDeckService:
             else:
                 # A manually configured policy routes by priority with a
                 # concurrency overflow. Without one, no automatic priority
-                # exists: concurrent requests balance across the live owners,
-                # off by at most one, instead of stacking on the newest one.
+                # exists: requests take turns across the live owners (least
+                # in-flight first, off by at most one) instead of stacking on
+                # the newest one.
                 deployment = self._select_routed_member(
                     requested_model, candidates,
                 )
@@ -8741,7 +8779,7 @@ class SparkDeckService:
                     deployment = candidates[0]
                 elif candidates:
                     deployment, routing_slot = self._select_balanced_shared_owner(
-                        candidates,
+                        requested_model, candidates,
                     )
             if deployment is None:
                 deployment = stored_deployment

@@ -177,8 +177,8 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_served_name_routes_to_the_newest_live_owner(self):
         """Sharing one request id across live deployments is allowed, so
         resolution must stay deterministic instead of failing: the most
-        recently deployed owner answers and the older one stays reachable by
-        its alias."""
+        recently deployed owner answers first, the owners then take turns,
+        and older ones stay reachable by their aliases."""
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager.proxy_cluster_inference = AsyncMock(return_value={
@@ -225,8 +225,19 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 manager.proxy_cluster_inference.await_args.args[0],
                 "cluster-two",
             )
+            # The sibling answers the next sequential request instead of
+            # sitting idle while one owner takes every turn.
+            await service.proxy(
+                {"model": "shared-name", "messages": [], "stream": False},
+                "chat/completions",
+            )
+            self.assertEqual(
+                manager.proxy_cluster_inference.await_args.args[0],
+                "cluster-one",
+            )
 
-            # Re-deploying the first profile makes it the newest owner.
+            # Re-deploying the first profile makes it the newest owner, and
+            # the re-ranked pool restarts its turn order with it.
             service.deployments = AsyncMock(return_value=live({
                 "record-one": "2026-10-10T00:00:00Z",
                 "record-two": "2026-10-09T00:00:00Z",
@@ -245,7 +256,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_selector_ranks_discovered_owners_with_stored_ones(self):
         """A discovered container that shares a stored deployment's request
-        id competes in the same candidate set; the newest launch wins."""
+        id competes in the same candidate set; the newest launch leads."""
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager.proxy_cluster_inference = AsyncMock(return_value={
@@ -281,7 +292,7 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ]
 
-            # The stored profile is the newest launch: it answers.
+            # The stored profile is the newest launch: it leads the turn order.
             service.deployments = AsyncMock(return_value=live(
                 "2026-10-09T00:00:00Z", "2026-10-01T00:00:00Z",
             ))
@@ -294,8 +305,9 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 "cluster-stored",
             )
 
-            # Re-deploying the discovered container makes it the winner; it
-            # competes in the same set instead of losing to the stored class.
+            # Re-deploying the discovered container makes it the newest
+            # launch; it competes in the same set instead of losing to the
+            # stored class.
             manager._vllm_chat.return_value = {"choices": [], "usage": {}}
             manager.list_containers.return_value = [{
                 "name": "discovered-container", "id": "discovered-id",

@@ -507,11 +507,12 @@ class SparkDeckService:
             self._load_model_routing_policies()
         )
         self._model_routing_inflight: dict[str, int] = {}
-        # Rotation cursors for the no-policy balancer, keyed by request id:
-        # equal in-flight counts are broken by taking turns, so a sequential
-        # client spreads across the live owners instead of always landing on
-        # the newest one.
-        self._model_routing_rotation: dict[str, int] = {}
+        # Turn state for the no-policy balancer, keyed by request id:
+        # {"order": tuple[str, ...], "cursor": int}. The order is the stable
+        # launch ranking the cursor indexes, so a re-ranked pool (new owner,
+        # departure, re-deployment) restarts the turn with its newest owner
+        # instead of resuming an offset that indexed a different list.
+        self._model_routing_rotation: dict[str, dict[str, Any]] = {}
         self._deployment_log_states: dict[tuple[str, Any], tuple[str, str]] = {}
         self._deployment_log_errors: dict[tuple[str, Any], str] = {}
         # In-flight label-defined lifecycle scripts, keyed by container name:
@@ -8184,25 +8185,31 @@ class SparkDeckService:
         the fleet. The least-loaded owner wins, so concurrent requests stay
         within one of each other; equal in-flight counts rotate through a
         per-request-id cursor, so sequential requests alternate across the
-        owners instead of always returning to the newest one. The reservation
-        here also makes direct alias and source-IP traffic visible to later
+        owners instead of always returning to the newest one. The cursor is
+        tied to the ranking it indexes and restarts when that ranking changes,
+        so a newly deployed owner leads the next turn. The reservation here
+        also makes direct alias and source-IP traffic visible to later
         selections; callers release the slot when the response completes.
         """
         inflight = self._model_routing_inflight
+        ordered = sorted(
+            candidates, key=self._balanced_owner_sort_key, reverse=True,
+        )
+        order = tuple(str(candidate.get("id") or "") for candidate in ordered)
+        turn = self._model_routing_rotation.get(model_id)
+        if turn is None or turn["order"] != order:
+            turn = {"order": order, "cursor": 0}
+            self._model_routing_rotation[model_id] = turn
+        cursor = turn["cursor"]
+        turn["cursor"] = cursor + 1
         least = min(
             inflight.get(str(candidate.get("id") or ""), 0)
-            for candidate in candidates
+            for candidate in ordered
         )
-        tied = sorted(
-            (
-                candidate for candidate in candidates
-                if inflight.get(str(candidate.get("id") or ""), 0) == least
-            ),
-            key=self._selector_owner_sort_key,
-            reverse=True,
-        )
-        cursor = self._model_routing_rotation.get(model_id, 0)
-        self._model_routing_rotation[model_id] = cursor + 1
+        tied = [
+            candidate for candidate in ordered
+            if inflight.get(str(candidate.get("id") or ""), 0) == least
+        ]
         deployment = tied[cursor % len(tied)]
         deployment_id = str(deployment.get("id") or "")
         inflight[deployment_id] = inflight.get(deployment_id, 0) + 1
@@ -8282,6 +8289,24 @@ class SparkDeckService:
         the deterministic tiebreaker and the fallback.
         """
         for field in ("last_deployed_at", "last_used_at", "created_at"):
+            stamp = cls._selector_owner_timestamp(deployment.get(field))
+            if stamp is not None:
+                return (stamp, str(deployment.get("id") or ""))
+        return (0.0, str(deployment.get("id") or ""))
+
+    @classmethod
+    def _balanced_owner_sort_key(
+        cls, deployment: dict[str, Any],
+    ) -> tuple[float, str]:
+        """Order the balancing pool by launch identity only.
+
+        ``_selector_owner_sort_key`` falls back to ``last_used_at`` when a
+        deployment carries no launch timestamp, and traffic moves that field:
+        ordering the turn by it would reshuffle the pool as a side effect of
+        the very requests the turn is meant to spread. The id stays the
+        deterministic fallback.
+        """
+        for field in ("last_deployed_at", "created_at"):
             stamp = cls._selector_owner_timestamp(deployment.get(field))
             if stamp is not None:
                 return (stamp, str(deployment.get("id") or ""))

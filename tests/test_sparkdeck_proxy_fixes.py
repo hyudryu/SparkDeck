@@ -236,9 +236,8 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 "cluster-one",
             )
 
-            # Re-deploying the first profile makes it the newest owner, so a
-            # fresh turn order leads with it.
-            service._model_routing_rotation.clear()
+            # Re-deploying the first profile makes it the newest owner, and
+            # the re-ranked pool restarts its turn order with it.
             service.deployments = AsyncMock(return_value=live({
                 "record-one": "2026-10-10T00:00:00Z",
                 "record-two": "2026-10-09T00:00:00Z",
@@ -315,7 +314,6 @@ class ManagedIdentityTests(unittest.IsolatedAsyncioTestCase):
                 "runtime": "vllm", "status": "running",
                 "model": "org/discovered", "port": 8000,
             }]
-            service._model_routing_rotation.clear()
             service.deployments = AsyncMock(return_value=live(
                 "2026-10-01T00:00:00Z", "2026-10-09T00:00:00Z",
             ))

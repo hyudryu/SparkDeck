@@ -2997,6 +2997,32 @@ class Manager:
         if not node_id:
             raise ValueError("node_id must not be empty")
         requested_revision = validate_revision(revision) if revision is not None else None
+        # Resuming work that is already queued or running must return that job.
+        # The Storage page renders active work from the response, so answering
+        # with a conflict would leave the user staring at a disabled control
+        # while the download keeps running.
+        if requested_revision is not None:
+            active_jobs = [
+                job for job in self.virtual_nas.list_transfers()["items"]
+                if job.get("kind") == "download"
+                and job.get("model_id") == model_id
+                and job.get("target_node_id") == node_id
+                and job.get("status") in {"queued", "running"}
+                and requested_revision in {
+                    str(job.get("requested_revision") or ""),
+                    str(job.get("revision") or ""),
+                }
+            ]
+            active = next((
+                job for job in active_jobs
+                if job.get("status") == "running"
+            ), active_jobs[0] if active_jobs else None)
+            if active is not None:
+                return {
+                    "job_ids": [active["id"]],
+                    "jobs": [self._public_virtual_nas_job(active)],
+                    "resume_in_progress": True,
+                }
         recovered_resolution = None
         if requested_revision is None:
             previous_downloads = sorted(
@@ -3138,6 +3164,22 @@ class Manager:
         if not target.get("has_partial_model_cache"):
             raise LookupError("partial model cache not found on the selected node")
         if not target.get("download_eligible"):
+            # The preflight can reject a resume only because the same
+            # preparation is already active. Hand that job back so the caller
+            # shows its live progress instead of an error.
+            active_job_id = str(target.get("active_job_id") or "")
+            active = next((
+                job for job in self.virtual_nas.list_transfers()["items"]
+                if active_job_id
+                and str(job.get("id")) == active_job_id
+                and job.get("status") in {"queued", "running"}
+            ), None)
+            if active is not None:
+                return {
+                    "job_ids": [active["id"]],
+                    "jobs": [self._public_virtual_nas_job(active)],
+                    "resume_in_progress": True,
+                }
             raise RuntimeError(
                 str(target.get("download_reason") or "node is not eligible for download")
             )

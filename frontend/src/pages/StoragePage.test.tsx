@@ -438,6 +438,47 @@ describe('StoragePage', () => {
     expect(screen.getByRole('option', { name: 'org/partial-model' })).toBeInTheDocument()
   })
 
+  it('shows the running download when a resume is already in progress', async () => {
+    const partialNode = {
+      ...enabledStorage.nodes[0],
+      models: [{
+        model_id: 'org/partial-model', size_bytes: 400_000_000,
+        expected_size_bytes: 1_000_000_000, partial: true, revision: '746f3a1d',
+        file_count: 2,
+      }],
+    }
+    const storage: StorageState = { ...enabledStorage, nodes: [partialNode], jobs: [] }
+    const activeJob = {
+      id: 'download-active', kind: 'download' as const, model_id: 'org/partial-model',
+      source_node_id: 'huggingface', source_node_name: 'Hugging Face',
+      target_node_id: 'node-a', target_node_name: 'Studio Spark',
+      status: 'running', bytes_total: 1_000_000_000, bytes_transferred: 400_000_000,
+      progress: 0.4, bytes_per_second: 3_500_000, download_cancelable: true,
+      created_at: '2026-08-26T12:00:00Z',
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/v1/storage/nodes/node-a/models/org%2Fpartial-model/download') && init?.method === 'POST') {
+        return json({ job_ids: ['download-active'], jobs: [activeJob], resume_in_progress: true }, 202)
+      }
+      return json(storage)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<StoragePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Finish downloading org/partial-model?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Finish download' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'org/partial-model is already downloading on Studio Spark; showing its live progress.',
+    )
+    const card = await screen.findByRole('region', { name: 'Storage on Studio Spark' })
+    expect(within(card).getByText(/Downloading from Hugging Face/)).toBeInTheDocument()
+    expect(within(card).getByText(/40% · 400 MB of 1.0 GB/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Finish download of org/partial-model on Studio Spark' })).not.toBeInTheDocument()
+  })
+
   it('reports selective resumes as tracked queue downloads', async () => {
     const user = userEvent.setup()
     const storage: StorageState = {

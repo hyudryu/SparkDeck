@@ -1,8 +1,8 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { UpdateBanner } from './UpdateBanner'
+import { UpdateBanner, requestUpdateCheck } from './UpdateBanner'
 import { api } from '../api/client'
 import type { SystemUpdateOverview } from '../api/types'
 
@@ -34,6 +34,16 @@ function availableOverview(revision = 'abc1234567890'): SystemUpdateOverview {
     blockers: [],
     nodes: [],
   } as SystemUpdateOverview
+}
+
+function rolloutOverview(revision = 'abc1234567890'): SystemUpdateOverview {
+  return {
+    ...availableOverview(revision),
+    job: {
+      id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+      target_revision: revision, nodes: [],
+    },
+  }
 }
 
 function renderBanner(initialPath = '/dashboard') {
@@ -81,6 +91,78 @@ describe('UpdateBanner', () => {
 
     resolve({ ...availableOverview(), can_update: false, blockers: ['node offline'] })
     await waitFor(() => expect(overviewMock).toHaveResolved())
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('stays hidden while a rollout is already running', async () => {
+    overviewMock.mockResolvedValue({
+      ...availableOverview(),
+      job: {
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+        target_revision: 'abc1234567890', nodes: [],
+      },
+    })
+    renderBanner()
+    await waitFor(() => expect(overviewMock).toHaveBeenCalled())
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('re-checks when a page announces update progress', async () => {
+    overviewMock.mockResolvedValue(availableOverview('abc1234567890'))
+    renderBanner()
+    expect(await screen.findByRole('status')).toHaveTextContent(/Update available/)
+
+    overviewMock.mockResolvedValue({
+      ...availableOverview('abc1234567890'),
+      up_to_date: true,
+      can_update: false,
+      current_revision: 'abc1234567890',
+    })
+    act(() => requestUpdateCheck())
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+  })
+
+  it('keeps the rollout cadence after a transient overview failure', async () => {
+    vi.useFakeTimers()
+    try {
+      overviewMock.mockResolvedValue(rolloutOverview())
+      renderBanner()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(overviewMock).toHaveBeenCalledTimes(1)
+
+      // The updater restarts the controller last; that outage must not
+      // downgrade the watch cadence to the normal ten-minute poll.
+      overviewMock.mockRejectedValueOnce(new Error('controller restarting'))
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(overviewMock).toHaveBeenCalledTimes(2)
+
+      overviewMock.mockResolvedValue(rolloutOverview())
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(overviewMock).toHaveBeenCalledTimes(3)
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('hides at once when a rollout starts, before the overview responds', async () => {
+    overviewMock.mockResolvedValue(availableOverview('abc1234567890'))
+    renderBanner()
+    expect(await screen.findByRole('status')).toHaveTextContent(/Update available/)
+
+    let resolve!: (value: SystemUpdateOverview) => void
+    overviewMock.mockReturnValue(new Promise<SystemUpdateOverview>((r) => { resolve = r }))
+    act(() => requestUpdateCheck({ hide: true }))
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+
+    resolve({
+      ...availableOverview('abc1234567890'),
+      job: {
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+        target_revision: 'abc1234567890', nodes: [],
+      },
+    })
+    await waitFor(() => expect(overviewMock).toHaveBeenCalledTimes(2))
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 

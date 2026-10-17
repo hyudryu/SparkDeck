@@ -660,6 +660,33 @@ describe('settings page', () => {
     }))
   })
 
+  it('asks the update banner to re-check when a rollout starts', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.includes('system-update')) return new Response(JSON.stringify(init?.method === 'POST' ? {
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main', target_revision: 'b'.repeat(40), nodes: [],
+      } : {
+        repository: 'hyudryu/SparkDeck', current_revision: 'a'.repeat(40),
+        target: { branch: 'main', revision: 'b'.repeat(40) },
+        up_to_date: false,
+        can_update: true, blockers: [], nodes: [{ id: 'local', name: 'Controller', local: true, online: true, current_revision: 'a'.repeat(40), blockers: [] }],
+      }), { status: init?.method === 'POST' ? 202 : 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ theme: 'system' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const recheck = vi.fn()
+    window.addEventListener('sparkdeck:update-check', recheck)
+    const user = userEvent.setup()
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+
+    await user.click(await screen.findByRole('button', { name: 'Update to main' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Update the cluster?' })
+    await user.click(within(confirmation).getByRole('button', { name: 'Start update' }))
+    await waitFor(() => expect(recheck).toHaveBeenCalled())
+    expect((recheck.mock.calls[0][0] as CustomEvent<{ hide?: boolean }>).detail?.hide).toBe(true)
+    window.removeEventListener('sparkdeck:update-check', recheck)
+  })
+
   it('shows the cluster as up to date when every node matches main', async () => {
     const revision = 'b'.repeat(40)
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {

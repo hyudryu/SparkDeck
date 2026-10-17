@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type FormEvent } from 'react'
-import { AlertTriangle, ArrowLeftRight, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Search, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowLeftRight, ArrowRight, Database, DownloadCloud, GripVertical, HardDrive, RefreshCw, Search, Square, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { StorageModel, StorageNode, StorageTransferJob } from '../api/types'
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -136,12 +136,14 @@ function JobCancelButton({ job, stopping, busy, onCancel }: { job: StorageTransf
   const download = job.kind === 'download'
   const selective = download && isSelectiveDownload(job)
   const blocked = download && job.status.toLowerCase() === 'running' && job.download_cancelable !== true && !stopping
+  const label = stopping ? 'Stopping...' : download ? job.phase === 'canceling' && job.error ? 'Retry stop' : 'Stop download' : `Cancel ${job.kind ?? 'transfer'}`
+  const iconOnly = download && !stopping && !(job.phase === 'canceling' && job.error)
   return <Button variant="tertiary" className={download ? 'storage-download-stop' : undefined}
     aria-label={download ? `Stop download of ${job.model_id} on ${job.target_node_name}` : `Cancel ${job.model_id} ${job.kind ?? 'transfer'}`}
     title={!blocked ? (download ? 'Stop downloading and keep cached files for resuming later.' : undefined) : selective ? 'Selective downloads cannot be stopped mid-flight; cached files are kept for resuming.' : 'Update this node agent to stop a running download safely.'}
     disabled={busy || stopping || blocked}
     onClick={onCancel}
-  >{stopping ? 'Stopping...' : download ? job.phase === 'canceling' && job.error ? 'Retry stop' : 'Stop download' : 'Cancel'}</Button>
+  >{iconOnly ? <Square size={13} aria-hidden="true" /> : label}</Button>
 }
 
 export function StoragePage() {
@@ -349,18 +351,21 @@ export function StoragePage() {
     const busyKey = `download:${node.id}:${model.model_id}`
     setBusy(busyKey)
     setError(undefined)
-    setNotice(undefined)
+    setNotice(`Preparing ${model.model_id} on ${node.name}...`)
     try {
       const result = await api.storage.finishDownload(node.id, model.model_id, model.revision)
       setQueuedJobs((current) => {
         const currentIds = new Set(current.map((job) => job.id))
         return [...current, ...(result.jobs ?? []).filter((job) => !currentIds.has(job.id))]
       })
-      setNotice(result.resumed_files
-        ? `Resumed ${model.model_id} on ${node.name} for its ${result.resumed_files.length} selected file${result.resumed_files.length === 1 ? '' : 's'}. The transfer queue tracks its progress.`
-        : `Queued ${model.model_id} to finish downloading on ${node.name}.`)
+      setNotice(result.resume_in_progress
+        ? `${model.model_id} is already downloading on ${node.name}; showing its live progress.`
+        : result.resumed_files
+          ? `Resumed ${model.model_id} on ${node.name} for its ${result.resumed_files.length} selected file${result.resumed_files.length === 1 ? '' : 's'}. The transfer queue tracks its progress.`
+          : `Queued ${model.model_id} to finish downloading on ${node.name}.`)
       resource.reload()
     } catch (reason) {
+      setNotice(undefined)
       setError(reason instanceof Error ? reason.message : 'Could not finish model download')
     } finally {
       setBusy(undefined)

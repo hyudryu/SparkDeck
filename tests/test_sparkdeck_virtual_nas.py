@@ -4432,6 +4432,123 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
             manager.virtual_nas.queue_download_and_transfer.await_count, 1,
         )
 
+    async def test_finish_returns_running_download_instead_of_starting_another(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.node_registry = FakeRegistry()
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [{
+            "id": "active-download", "kind": "download",
+            "model_id": "org/model", "source_node_id": "huggingface",
+            "target_node_id": "worker-a",
+            "requested_revision": RESOLVED_REVISION,
+            "revision": RESOLVED_REVISION,
+            "status": "running", "bytes_total": 20, "bytes_transferred": 5,
+            "created_at": 1,
+        }]}
+        manager.virtual_nas_transfer_preflight = AsyncMock()
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock()
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "worker-a", RESOLVED_REVISION,
+        )
+
+        self.assertEqual(result["job_ids"], ["active-download"])
+        self.assertTrue(result["resume_in_progress"])
+        self.assertEqual(result["jobs"][0]["status"], "running")
+        manager.virtual_nas_transfer_preflight.assert_not_awaited()
+        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
+
+    async def test_finish_returns_active_job_the_preflight_already_tracked(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.node_registry = FakeRegistry()
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.return_value = {"items": [{
+            "id": "active-transfer", "kind": "transfer",
+            "model_id": "org/model", "source_node_id": "worker-b",
+            "target_node_id": "worker-a",
+            "requested_revision": RESOLVED_REVISION,
+            "revision": RESOLVED_REVISION,
+            "status": "running", "bytes_total": 20, "bytes_transferred": 5,
+            "created_at": 1,
+        }]}
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "worker-a", "name": "Worker A", "models": []},
+        ])
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "release-1",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a", "has_partial_model_cache": True,
+                "download_eligible": False,
+                "download_reason": "Model preparation already running",
+                "active_job_id": "active-transfer",
+                "active_job_status": "running",
+            }],
+        })
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock()
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "worker-a", "release-1",
+        )
+
+        self.assertEqual(result["job_ids"], ["active-transfer"])
+        self.assertTrue(result["resume_in_progress"])
+        manager.virtual_nas.queue_download_and_transfer.assert_not_awaited()
+
+    async def test_finish_adopts_the_job_that_won_a_concurrent_queue_lock(self):
+        manager = Manager.__new__(Manager)
+        manager.settings = {"virtual_nas_enabled": True}
+        manager.node_registry = FakeRegistry()
+        winner = {
+            "id": "winner-download", "kind": "download",
+            "model_id": "org/model", "source_node_id": "huggingface",
+            "target_node_id": "worker-a",
+            "requested_revision": "release-1", "revision": RESOLVED_REVISION,
+            "status": "running", "bytes_total": 20, "bytes_transferred": 5,
+            "created_at": 1,
+        }
+        manager.virtual_nas = Mock()
+        manager.virtual_nas.list_transfers.side_effect = [
+            {"items": []},
+            {"items": [winner]},
+        ]
+        manager.model_cache_inventory = AsyncMock(return_value=[
+            {"id": "worker-a", "name": "Worker A", "models": []},
+        ])
+        manager.virtual_nas.resolve_download_revision = AsyncMock(return_value={
+            "requested_revision": "release-1",
+            "resolved_revision": RESOLVED_REVISION,
+            "size_bytes": 20,
+        })
+        manager.virtual_nas_transfer_preflight = AsyncMock(return_value={
+            "resolved_revision": RESOLVED_REVISION,
+            "download": {"size_bytes": 20},
+            "targets": [{
+                "node_id": "worker-a", "has_partial_model_cache": True,
+                "download_eligible": True,
+            }],
+        })
+        manager.virtual_nas.queue_download_and_transfer = AsyncMock(
+            side_effect=ValueError(
+                "an active model preparation already exists for node(s): worker-a"
+            ),
+        )
+
+        result = await manager.queue_virtual_nas_download(
+            "org/model", "worker-a", "release-1",
+        )
+
+        self.assertEqual(result["job_ids"], ["winner-download"])
+        self.assertTrue(result["resume_in_progress"])
+        self.assertEqual(manager.virtual_nas.list_transfers.call_count, 2)
+
     async def test_manager_finishes_selective_cache_at_its_pinned_non_main_revision(self):
         manager = Manager.__new__(Manager)
         manager.settings = {"virtual_nas_enabled": True}

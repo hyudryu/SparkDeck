@@ -1059,6 +1059,7 @@ export interface StorageTransferResult {
     status: string
   } | null
   resumed_files?: string[]
+  resume_in_progress?: boolean
   resolved_revision?: string
 }
 

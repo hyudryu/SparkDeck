@@ -2988,6 +2988,46 @@ class Manager:
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
+    def _active_download_job(
+        self, model_id: str, node_id: str, revisions: set[str],
+    ) -> dict | None:
+        """Return the live download for this model, node, and revision set."""
+        matches = [
+            job for job in self.virtual_nas.list_transfers()["items"]
+            if job.get("kind") == "download"
+            and job.get("model_id") == model_id
+            and job.get("target_node_id") == node_id
+            and job.get("status") in {"queued", "running"}
+            and revisions & {
+                str(job.get("requested_revision") or ""),
+                str(job.get("revision") or ""),
+            }
+        ]
+        return next(
+            (job for job in matches if job.get("status") == "running"),
+            matches[0] if matches else None,
+        )
+
+    def _adopt_live_download(
+        self, model_id: str, node_id: str, revisions: set[str], exc: ValueError,
+    ) -> dict:
+        """Return the winner of a concurrent resume instead of a conflict.
+
+        Two requests can both clear the active check before either enqueues;
+        the queue lock then rejects the loser as a duplicate. The winner's job
+        is already persisted, so hand it back instead of failing the click.
+        """
+        if "active model preparation already exists" not in str(exc):
+            raise exc
+        active = self._active_download_job(model_id, node_id, revisions)
+        if active is None:
+            raise exc
+        return {
+            "job_ids": [active["id"]],
+            "jobs": [self._public_virtual_nas_job(active)],
+            "resume_in_progress": True,
+        }
+
     async def queue_virtual_nas_download(
         self, model_id: str, node_id: str, revision: str | None = None,
     ) -> dict:
@@ -2997,6 +3037,20 @@ class Manager:
         if not node_id:
             raise ValueError("node_id must not be empty")
         requested_revision = validate_revision(revision) if revision is not None else None
+        # Resuming work that is already queued or running must return that job.
+        # The Storage page renders active work from the response, so answering
+        # with a conflict would leave the user staring at a disabled control
+        # while the download keeps running.
+        if requested_revision is not None:
+            active = self._active_download_job(
+                model_id, node_id, {requested_revision},
+            )
+            if active is not None:
+                return {
+                    "job_ids": [active["id"]],
+                    "jobs": [self._public_virtual_nas_job(active)],
+                    "resume_in_progress": True,
+                }
         recovered_resolution = None
         if requested_revision is None:
             previous_downloads = sorted(
@@ -3138,6 +3192,22 @@ class Manager:
         if not target.get("has_partial_model_cache"):
             raise LookupError("partial model cache not found on the selected node")
         if not target.get("download_eligible"):
+            # The preflight can reject a resume only because the same
+            # preparation is already active. Hand that job back so the caller
+            # shows its live progress instead of an error.
+            active_job_id = str(target.get("active_job_id") or "")
+            active = next((
+                job for job in self.virtual_nas.list_transfers()["items"]
+                if active_job_id
+                and str(job.get("id")) == active_job_id
+                and job.get("status") in {"queued", "running"}
+            ), None)
+            if active is not None:
+                return {
+                    "job_ids": [active["id"]],
+                    "jobs": [self._public_virtual_nas_job(active)],
+                    "resume_in_progress": True,
+                }
             raise RuntimeError(
                 str(target.get("download_reason") or "node is not eligible for download")
             )
@@ -3155,9 +3225,38 @@ class Manager:
                     f"node '{node_id}' does not support selective model file downloads; "
                     "update its SparkDeck agent"
                 )
+            try:
+                result = await self.virtual_nas.queue_download_and_transfer(
+                    model_id,
+                    resolved_revision,
+                    node_id,
+                    [],
+                    preflight["download"]["size_bytes"],
+                    requested_revision=requested_revision,
+                    require_partial_cache=True,
+                    download_cache_baseline_bytes=resolution.get(
+                        "download_cache_baseline_bytes"
+                    ),
+                    files=selective_resume,
+                )
+            except ValueError as exc:
+                adopted = self._adopt_live_download(
+                    model_id, node_id,
+                    {requested_revision, resolved_revision}, exc,
+                )
+                adopted["resumed_files"] = selective_resume
+                adopted["resolved_revision"] = resolved_revision
+                return adopted
+            jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
+            return {
+                "job_ids": result["job_ids"], "jobs": jobs,
+                "resumed_files": selective_resume,
+                "resolved_revision": resolved_revision,
+            }
+        try:
             result = await self.virtual_nas.queue_download_and_transfer(
                 model_id,
-                resolved_revision,
+                preflight["resolved_revision"],
                 node_id,
                 [],
                 preflight["download"]["size_bytes"],
@@ -3166,26 +3265,12 @@ class Manager:
                 download_cache_baseline_bytes=resolution.get(
                     "download_cache_baseline_bytes"
                 ),
-                files=selective_resume,
             )
-            jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
-            return {
-                "job_ids": result["job_ids"], "jobs": jobs,
-                "resumed_files": selective_resume,
-                "resolved_revision": resolved_revision,
-            }
-        result = await self.virtual_nas.queue_download_and_transfer(
-            model_id,
-            preflight["resolved_revision"],
-            node_id,
-            [],
-            preflight["download"]["size_bytes"],
-            requested_revision=requested_revision,
-            require_partial_cache=True,
-            download_cache_baseline_bytes=resolution.get(
-                "download_cache_baseline_bytes"
-            ),
-        )
+        except ValueError as exc:
+            return self._adopt_live_download(
+                model_id, node_id,
+                {requested_revision, resolved_revision}, exc,
+            )
         jobs = [self._public_virtual_nas_job(job) for job in result["jobs"]]
         return {"job_ids": result["job_ids"], "jobs": jobs}
 
@@ -23116,7 +23201,9 @@ class Manager:
                 # Card has no readable temperature sensor: omit it entirely.
                 continue
             nics.append({"name": self._nic_label(functions[0]), "temp": max(temps)})
-        nics.sort(key=lambda nic: nic["name"])
+        # Card identity keys follow filesystem iteration order, which differs
+        # across hosts; temperature keeps equal labels deterministic.
+        nics.sort(key=lambda nic: (nic["name"], nic["temp"]))
         return nics
 
     async def _gpu_total_gb(self) -> float | None:

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type
 import { Bug, Cable, Check, Cloud, DownloadCloud, ExternalLink, FileText, History, KeyRound, MonitorCog, Network, RefreshCw, Save, ShieldCheck, Tag, Waypoints, X } from 'lucide-react'
 import { Link, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
-import type { AppSettings, SystemUpdateNode } from '../api/types'
+import type { AppSettings, Deployment, SystemUpdateNode } from '../api/types'
 import { useAuth } from '../auth/AuthContext'
 import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
@@ -17,6 +17,22 @@ import { SPARKDECK_VERSION } from '../buildInfo'
 
 function shortRevision(value?: string) {
   return value ? value.slice(0, 8) : 'Unknown'
+}
+
+// Mirrors SparkDeckService._deployment_can_serve_inference: a degraded
+// grouped deployment still serves while one engine group is running, and
+// registered external endpoints are live. Those ids are routable and belong
+// in the default-model choices even before the gateway listing arrives.
+function deploymentServesInference(deployment: Deployment) {
+  if (deployment.status === 'running' || deployment.status === 'registered') return true
+  return (
+    deployment.status === 'degraded'
+    && deployment.deployment_mode === 'grouped_sharded'
+    && deployment.desired_state !== 'stopped'
+    && (deployment.instances ?? []).some(
+      (instance) => instance.status === 'running' && instance.desired_state !== 'stopped',
+    )
+  )
 }
 
 function nodeUpdateStatus(node: SystemUpdateNode, targetRevision?: string, active = false) {
@@ -453,7 +469,7 @@ export function SettingsPage() {
   const defaultModelOptions = useMemo(() => {
     const ids: string[] = []
     for (const deployment of deployments.data ?? []) {
-      if (deployment.status !== 'running') continue
+      if (!deploymentServesInference(deployment)) continue
       ids.push(...(deployment.served_models ?? []))
       if (deployment.served_model) ids.push(deployment.served_model)
       if (deployment.alias) ids.push(deployment.alias)
@@ -633,7 +649,7 @@ export function SettingsPage() {
         <Panel className="settings-section" aria-labelledby="default-model-title">
           <div className="settings-heading"><span><Waypoints size={18} /></span><div><h2 id="default-model-title">Default model</h2><p>Route API calls that request the reserved model name “default” to one of the served models.</p></div></div>
           <div className="settings-fields">
-            <label className="field wide-field"><span>Default model</span><select aria-label="Default model" value={form.default_model ?? ''} onChange={(event) => setForm({ ...form, default_model: event.target.value })} aria-describedby="default-model-help"><option value="">No default</option>{defaultModelsLoading && <option value="__loading__" disabled>Loading running models…</option>}{defaultModelOptions.map((id) => <option key={id} value={id}>{id}</option>)}</select><small id="default-model-help">Requests to /v1/chat/completions, /v1/completions, and /v1/responses with model “default” are routed to this model as if it had been named, and “default” appears in /v1/models while it is serving. Choose “No default” to disable the alias.</small></label>
+            <label className="field wide-field"><span>Default model</span><select aria-label="Default model" value={defaultModelsLoading ? '__loading__' : form.default_model ?? ''} onChange={(event) => setForm({ ...form, default_model: event.target.value })} aria-describedby="default-model-help"><option value="">No default</option>{defaultModelsLoading && <option value="__loading__" disabled>Loading running models…</option>}{defaultModelOptions.map((id) => <option key={id} value={id}>{id}</option>)}</select><small id="default-model-help">Requests to /v1/chat/completions, /v1/completions, and /v1/responses with model “default” are routed to this model as if it had been named, and “default” appears in /v1/models while it is serving. Choose “No default” to disable the alias.</small></label>
           </div>
         </Panel>
         <Panel className="settings-section">

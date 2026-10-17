@@ -8,6 +8,7 @@ import { UserNotConfirmedError } from '../auth/cognitoAuth'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { RequestRoutingPanel } from '../components/RequestRoutingPanel'
 import { LegalDialog } from '../components/LegalDialog'
+import { requestUpdateCheck } from '../components/UpdateBanner'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 import { DEFAULT_HISTORY_SAMPLE_SECONDS } from '../utils/historySettings'
@@ -81,6 +82,16 @@ function SoftwareUpdatePanel() {
     return () => window.clearTimeout(timer)
   }, [active, resource.loading, resource.reload])
 
+  // A rollout changes what the top banner should advertise. Notify it when
+  // this panel first sees an active rollout (possibly started elsewhere) and
+  // when the job settles; while it runs, the banner keeps watching on its own.
+  const updateWasActive = useRef(false)
+  useEffect(() => {
+    const jobActive = Boolean(resource.data?.job?.active)
+    if (jobActive !== updateWasActive.current) requestUpdateCheck()
+    updateWasActive.current = jobActive
+  }, [resource.data])
+
   const start = async () => {
     const targetRevision = resource.data?.target?.revision
     if (!targetRevision) return
@@ -96,6 +107,7 @@ function SoftwareUpdatePanel() {
     setActionError(undefined)
     try {
       await api.updates.start(targetRevision)
+      requestUpdateCheck({ hide: true })
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not start the cluster update')

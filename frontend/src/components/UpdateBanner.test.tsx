@@ -1,8 +1,8 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { UpdateBanner } from './UpdateBanner'
+import { UpdateBanner, requestUpdateCheck } from './UpdateBanner'
 import { api } from '../api/client'
 import type { SystemUpdateOverview } from '../api/types'
 
@@ -82,6 +82,34 @@ describe('UpdateBanner', () => {
     resolve({ ...availableOverview(), can_update: false, blockers: ['node offline'] })
     await waitFor(() => expect(overviewMock).toHaveResolved())
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('stays hidden while a rollout is already running', async () => {
+    overviewMock.mockResolvedValue({
+      ...availableOverview(),
+      job: {
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+        target_revision: 'abc1234567890', nodes: [],
+      },
+    })
+    renderBanner()
+    await waitFor(() => expect(overviewMock).toHaveBeenCalled())
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('re-checks when a page announces update progress', async () => {
+    overviewMock.mockResolvedValue(availableOverview('abc1234567890'))
+    renderBanner()
+    expect(await screen.findByRole('status')).toHaveTextContent(/Update available/)
+
+    overviewMock.mockResolvedValue({
+      ...availableOverview('abc1234567890'),
+      up_to_date: true,
+      can_update: false,
+      current_revision: 'abc1234567890',
+    })
+    act(() => requestUpdateCheck())
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   })
 
   it('dismissing hides the banner and remembers the revision', async () => {

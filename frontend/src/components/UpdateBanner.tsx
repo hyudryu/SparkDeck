@@ -5,6 +5,12 @@ import { api } from '../api/client'
 
 const DISMISSED_REVISION_KEY = 'sparkdeck.update-banner.dismissed-revision'
 const RECHECK_INTERVAL_MS = 10 * 60 * 1000
+const UPDATE_CHECK_EVENT = 'sparkdeck:update-check'
+
+/** Ask the banner to re-check now instead of waiting for its periodic poll. */
+export function requestUpdateCheck() {
+  window.dispatchEvent(new Event(UPDATE_CHECK_EVENT))
+}
 
 export function dismissedRevision(): string | null {
   return localStorage.getItem(DISMISSED_REVISION_KEY)
@@ -29,9 +35,9 @@ export function UpdateBanner({ controllerAvailable = true }: { controllerAvailab
         .then((overview) => {
           if (!isFresh()) return
           // Only advertise an update the cluster can actually install;
-          // "up to date" and blocked states stay quiet.
+          // "up to date", running, and blocked states stay quiet.
           setTargetRevision(
-            overview.up_to_date === false && overview.can_update
+            overview.up_to_date === false && overview.can_update && !overview.job?.active
               ? overview.target?.revision
               : undefined,
           )
@@ -43,11 +49,23 @@ export function UpdateBanner({ controllerAvailable = true }: { controllerAvailab
     }
     check()
     const interval = window.setInterval(check, RECHECK_INTERVAL_MS)
+    // Update work changes what the banner should advertise. Re-check when a
+    // page reports update progress, and when the user returns to this tab
+    // (covers updates finished outside the app, e.g. from a terminal).
+    const recheckWhenVisible = () => {
+      if (document.visibilityState === 'visible') check()
+    }
+    window.addEventListener(UPDATE_CHECK_EVENT, check)
+    window.addEventListener('focus', check)
+    document.addEventListener('visibilitychange', recheckWhenVisible)
     return () => {
       disposed = true
       latestRequest += 1
       controller?.abort()
       window.clearInterval(interval)
+      window.removeEventListener(UPDATE_CHECK_EVENT, check)
+      window.removeEventListener('focus', check)
+      document.removeEventListener('visibilitychange', recheckWhenVisible)
     }
   }, [controllerAvailable])
 

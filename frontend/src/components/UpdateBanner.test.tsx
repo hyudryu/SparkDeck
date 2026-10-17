@@ -36,6 +36,16 @@ function availableOverview(revision = 'abc1234567890'): SystemUpdateOverview {
   } as SystemUpdateOverview
 }
 
+function rolloutOverview(revision = 'abc1234567890'): SystemUpdateOverview {
+  return {
+    ...availableOverview(revision),
+    job: {
+      id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+      target_revision: revision, nodes: [],
+    },
+  }
+}
+
 function renderBanner(initialPath = '/dashboard') {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
@@ -110,6 +120,29 @@ describe('UpdateBanner', () => {
     })
     act(() => requestUpdateCheck())
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+  })
+
+  it('keeps the rollout cadence after a transient overview failure', async () => {
+    vi.useFakeTimers()
+    try {
+      overviewMock.mockResolvedValue(rolloutOverview())
+      renderBanner()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(overviewMock).toHaveBeenCalledTimes(1)
+
+      // The updater restarts the controller last; that outage must not
+      // downgrade the watch cadence to the normal ten-minute poll.
+      overviewMock.mockRejectedValueOnce(new Error('controller restarting'))
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(overviewMock).toHaveBeenCalledTimes(2)
+
+      overviewMock.mockResolvedValue(rolloutOverview())
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(overviewMock).toHaveBeenCalledTimes(3)
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('hides at once when a rollout starts, before the overview responds', async () => {

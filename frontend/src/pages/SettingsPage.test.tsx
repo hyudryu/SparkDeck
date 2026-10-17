@@ -148,6 +148,42 @@ describe('settings page', () => {
     await waitFor(() => expect(screen.getByRole('combobox', { name: 'Default model' })).toHaveValue('alpha-model'))
   })
 
+  it('offers currently running deployments without waiting for the gateway listing', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/v1/models') {
+        // The gateway rebuilds the whole routing catalog; the dropdown must
+        // not stay empty while that slower request is still in flight.
+        return new Promise<Response>(() => {})
+      }
+      let body: unknown = { items: [] }
+      if (path === '/api/v1/deployments') {
+        body = { items: [
+          {
+            id: 'run-1', alias: 'alpha-alias', runtime: 'vllm', kind: 'managed',
+            model: { repository: 'org/alpha' }, served_models: ['alpha-model'],
+            status: 'running',
+          },
+          {
+            id: 'stop-1', alias: 'beta-alias', runtime: 'vllm', kind: 'managed',
+            model: { repository: 'org/beta' }, served_models: ['beta-model'],
+            status: 'stopped',
+          },
+        ] }
+      } else if (path === '/api/v1/settings') {
+        body = { theme: 'system', default_model: '' }
+      }
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    await waitFor(() => expect(within(select).getByRole('option', { name: 'alpha-model' })).toBeInTheDocument())
+    // The deployment alias is a valid gateway selector, so it is offered too.
+    expect(within(select).getByRole('option', { name: 'alpha-alias' })).toBeInTheDocument()
+    expect(within(select).queryByRole('option', { name: 'beta-model' })).not.toBeInTheDocument()
+    expect(within(select).queryByRole('option', { name: 'beta-alias' })).not.toBeInTheDocument()
+  })
+
   it('keeps an unserved default model selected and can clear it to no default', async () => {
     let defaultModel = 'gone-model'
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

@@ -112,6 +112,27 @@ describe('UpdateBanner', () => {
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   })
 
+  it('hides at once when a rollout starts, before the overview responds', async () => {
+    overviewMock.mockResolvedValue(availableOverview('abc1234567890'))
+    renderBanner()
+    expect(await screen.findByRole('status')).toHaveTextContent(/Update available/)
+
+    let resolve!: (value: SystemUpdateOverview) => void
+    overviewMock.mockReturnValue(new Promise<SystemUpdateOverview>((r) => { resolve = r }))
+    act(() => requestUpdateCheck({ hide: true }))
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+
+    resolve({
+      ...availableOverview('abc1234567890'),
+      job: {
+        id: 'job-1', active: true, phase: 'preflight', target_branch: 'main',
+        target_revision: 'abc1234567890', nodes: [],
+      },
+    })
+    await waitFor(() => expect(overviewMock).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
   it('dismissing hides the banner and remembers the revision', async () => {
     const user = userEvent.setup()
     overviewMock.mockResolvedValue(availableOverview('aaa111'))

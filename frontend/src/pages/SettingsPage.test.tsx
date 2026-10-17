@@ -683,6 +683,7 @@ describe('settings page', () => {
     const confirmation = await screen.findByRole('dialog', { name: 'Update the cluster?' })
     await user.click(within(confirmation).getByRole('button', { name: 'Start update' }))
     await waitFor(() => expect(recheck).toHaveBeenCalled())
+    expect((recheck.mock.calls[0][0] as CustomEvent<{ hide?: boolean }>).detail?.hide).toBe(true)
     window.removeEventListener('sparkdeck:update-check', recheck)
   })
 

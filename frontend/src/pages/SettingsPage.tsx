@@ -82,13 +82,13 @@ function SoftwareUpdatePanel() {
     return () => window.clearTimeout(timer)
   }, [active, resource.loading, resource.reload])
 
-  // A rollout changes what the top banner should advertise: hide it when the
-  // update starts and re-check when the job settles, rather than waiting for
-  // the banner's ten-minute poll.
+  // A rollout changes what the top banner should advertise. Notify it when
+  // this panel first sees an active rollout (possibly started elsewhere) and
+  // when the job settles; while it runs, the banner keeps watching on its own.
   const updateWasActive = useRef(false)
   useEffect(() => {
     const jobActive = Boolean(resource.data?.job?.active)
-    if (updateWasActive.current && !jobActive) requestUpdateCheck()
+    if (jobActive !== updateWasActive.current) requestUpdateCheck()
     updateWasActive.current = jobActive
   }, [resource.data])
 
@@ -107,7 +107,7 @@ function SoftwareUpdatePanel() {
     setActionError(undefined)
     try {
       await api.updates.start(targetRevision)
-      requestUpdateCheck()
+      requestUpdateCheck({ hide: true })
       resource.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not start the cluster update')

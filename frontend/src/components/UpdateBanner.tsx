@@ -5,11 +5,12 @@ import { api } from '../api/client'
 
 const DISMISSED_REVISION_KEY = 'sparkdeck.update-banner.dismissed-revision'
 const RECHECK_INTERVAL_MS = 10 * 60 * 1000
+const ROLLOUT_RECHECK_INTERVAL_MS = 10 * 1000
 const UPDATE_CHECK_EVENT = 'sparkdeck:update-check'
 
-/** Ask the banner to re-check now instead of waiting for its periodic poll. */
-export function requestUpdateCheck() {
-  window.dispatchEvent(new Event(UPDATE_CHECK_EVENT))
+/** Ask the banner to re-check now; hide additionally drops the notice at once. */
+export function requestUpdateCheck(options: { hide?: boolean } = {}) {
+  window.dispatchEvent(new CustomEvent(UPDATE_CHECK_EVENT, { detail: options }))
 }
 
 export function dismissedRevision(): string | null {
@@ -23,48 +24,87 @@ export function UpdateBanner({ controllerAvailable = true }: { controllerAvailab
   useEffect(() => {
     if (!controllerAvailable) return
     let disposed = false
-    let controller: AbortController | undefined
+    let requestController: AbortController | undefined
     let latestRequest = 0
-    const check = () => {
-      controller?.abort()
-      const requestController = new AbortController()
+    let timer: number | undefined
+    let inFlight = false
+    let hideRequested = false
+
+    const schedule = (delay: number) => {
+      if (timer !== undefined) window.clearTimeout(timer)
+      timer = window.setTimeout(run, delay)
+    }
+
+    const run = () => {
+      timer = undefined
+      if (hideRequested) {
+        // An update just started: drop the notice before the authoritative
+        // overview has a chance to respond.
+        hideRequested = false
+        setTargetRevision(undefined)
+      }
+      requestController?.abort()
+      const request = new AbortController()
+      requestController = request
       const requestId = ++latestRequest
-      controller = requestController
-      const isFresh = () => !disposed && requestId === latestRequest && !requestController.signal.aborted
-      api.updates.overview(requestController.signal)
+      inFlight = true
+      const isFresh = () => !disposed && requestId === latestRequest && !request.signal.aborted
+      api.updates.overview(request.signal)
         .then((overview) => {
           if (!isFresh()) return
+          inFlight = false
           // Only advertise an update the cluster can actually install;
           // "up to date", running, and blocked states stay quiet.
+          const jobActive = Boolean(overview.job?.active)
           setTargetRevision(
-            overview.up_to_date === false && overview.can_update && !overview.job?.active
+            overview.up_to_date === false && overview.can_update && !jobActive
               ? overview.target?.revision
               : undefined,
           )
+          // Keep watching a running rollout so a failed or partial update
+          // re-advertises its revision without a trip back to Settings.
+          schedule(jobActive ? ROLLOUT_RECHECK_INTERVAL_MS : RECHECK_INTERVAL_MS)
         })
         .catch(() => {
+          if (!isFresh()) return
+          inFlight = false
           // A failed update check is never worth a banner.
-          if (isFresh()) setTargetRevision(undefined)
+          setTargetRevision(undefined)
+          schedule(RECHECK_INTERVAL_MS)
         })
     }
-    check()
-    const interval = window.setInterval(check, RECHECK_INTERVAL_MS)
-    // Update work changes what the banner should advertise. Re-check when a
-    // page reports update progress, and when the user returns to this tab
-    // (covers updates finished outside the app, e.g. from a terminal).
-    const recheckWhenVisible = () => {
-      if (document.visibilityState === 'visible') check()
+
+    // Focus and visibility events fire together when returning to a tab and
+    // their overview request probes every cluster node, so coalesce them.
+    const requestCheck = (hide = false) => {
+      if (hide) {
+        latestRequest += 1
+        hideRequested = true
+        setTargetRevision(undefined)
+      } else if (inFlight) {
+        return
+      }
+      schedule(0)
     }
-    window.addEventListener(UPDATE_CHECK_EVENT, check)
-    window.addEventListener('focus', check)
+
+    const onUpdateCheck = (event: Event) => {
+      requestCheck(Boolean((event as CustomEvent<{ hide?: boolean }>).detail?.hide))
+    }
+    const recheckWhenVisible = () => {
+      if (document.visibilityState === 'visible') requestCheck()
+    }
+
+    run()
+    window.addEventListener(UPDATE_CHECK_EVENT, onUpdateCheck)
+    window.addEventListener('focus', recheckWhenVisible)
     document.addEventListener('visibilitychange', recheckWhenVisible)
     return () => {
       disposed = true
       latestRequest += 1
-      controller?.abort()
-      window.clearInterval(interval)
-      window.removeEventListener(UPDATE_CHECK_EVENT, check)
-      window.removeEventListener('focus', check)
+      if (timer !== undefined) window.clearTimeout(timer)
+      requestController?.abort()
+      window.removeEventListener(UPDATE_CHECK_EVENT, onUpdateCheck)
+      window.removeEventListener('focus', recheckWhenVisible)
       document.removeEventListener('visibilitychange', recheckWhenVisible)
     }
   }, [controllerAvailable])

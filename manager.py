@@ -23158,7 +23158,9 @@ class Manager:
                 # Card has no readable temperature sensor: omit it entirely.
                 continue
             nics.append({"name": self._nic_label(functions[0]), "temp": max(temps)})
-        nics.sort(key=lambda nic: nic["name"])
+        # Card identity keys follow filesystem iteration order, which differs
+        # across hosts; temperature keeps equal labels deterministic.
+        nics.sort(key=lambda nic: (nic["name"], nic["temp"]))
         return nics
 
     async def _gpu_total_gb(self) -> float | None:

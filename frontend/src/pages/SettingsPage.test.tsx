@@ -148,6 +148,76 @@ describe('settings page', () => {
     await waitFor(() => expect(screen.getByRole('combobox', { name: 'Default model' })).toHaveValue('alpha-model'))
   })
 
+  it('offers inference-capable deployments while the gateway listing is pending', async () => {
+    const pendingDeployments: Array<(response: Response) => void> = []
+    const deploymentPayload = () => new Response(JSON.stringify({ items: [
+      {
+        id: 'run-1', alias: 'alpha-alias', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/alpha' }, served_models: ['alpha-model'],
+        status: 'running',
+      },
+      {
+        id: 'stop-1', alias: 'beta-alias', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/beta' }, served_models: ['beta-model'],
+        status: 'stopped',
+      },
+      {
+        // A degraded grouped deployment keeps serving while one engine
+        // group runs, so its ids stay routable.
+        id: 'degraded-live', alias: 'gamma-alias', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/gamma' }, served_models: ['gamma-model'],
+        status: 'degraded', desired_state: 'running', deployment_mode: 'grouped_sharded',
+        instances: [
+          { instance_id: 0, status: 'running', desired_state: 'running', node_names: ['Node 1'] },
+          { instance_id: 1, status: 'starting', desired_state: 'running', node_names: ['Node 2'] },
+        ],
+      },
+      {
+        id: 'degraded-down', alias: 'delta-alias', runtime: 'vllm', kind: 'managed',
+        model: { repository: 'org/delta' }, served_models: ['delta-model'],
+        status: 'degraded', desired_state: 'running', deployment_mode: 'grouped_sharded',
+        instances: [
+          { instance_id: 0, status: 'starting', desired_state: 'running', node_names: ['Node 1'] },
+        ],
+      },
+    ] }), { headers: { 'Content-Type': 'application/json' } })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path === '/v1/models') {
+        // The gateway rebuilds the whole routing catalog; the dropdown must
+        // not stay empty while that slower request is still in flight.
+        return new Promise<Response>(() => {})
+      }
+      if (path === '/api/v1/deployments') {
+        // Settings and the routing panel each load the catalog.
+        return new Promise<Response>((resolve) => { pendingDeployments.push(resolve) })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({ theme: 'system', default_model: '' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ items: [] }), { headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>)
+    const select = await screen.findByRole('combobox', { name: 'Default model' })
+    // The closed control reports the in-flight load instead of a settled
+    // "No default" choice.
+    await waitFor(() => expect(select).toHaveValue('__loading__'))
+    await waitFor(() => expect(pendingDeployments.length).toBeGreaterThan(0))
+    await act(async () => {
+      for (const resolve of pendingDeployments) resolve(deploymentPayload())
+    })
+    await waitFor(() => expect(within(select).getByRole('option', { name: 'alpha-model' })).toBeInTheDocument())
+    // The deployment alias is a valid gateway selector, so it is offered too.
+    expect(within(select).getByRole('option', { name: 'alpha-alias' })).toBeInTheDocument()
+    expect(within(select).getByRole('option', { name: 'gamma-model' })).toBeInTheDocument()
+    expect(within(select).queryByRole('option', { name: 'beta-model' })).not.toBeInTheDocument()
+    expect(within(select).queryByRole('option', { name: 'beta-alias' })).not.toBeInTheDocument()
+    expect(within(select).queryByRole('option', { name: 'delta-model' })).not.toBeInTheDocument()
+    expect(select).toHaveValue('')
+  })
+
   it('keeps an unserved default model selected and can clear it to no default', async () => {
     let defaultModel = 'gone-model'
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

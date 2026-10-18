@@ -99,6 +99,13 @@ _EXTERNAL_SNAPSHOT_MARKER = ".sparkdeck-external"
 _EXTERNAL_MARKER_CONTENT = b"comfyui\n"
 _EXTERNAL_PSEUDO_REVISION = "comfyui"
 _HF_XET_HIGH_PERFORMANCE = "HF_XET_HIGH_PERFORMANCE"
+# Dead CDN sockets leave the Hub writer blocked forever without ever raising,
+# so a writer whose cache bytes do not advance within this window is killed
+# and relaunched; the replacement resumes from the retained partials.
+_DOWNLOAD_STALL_TIMEOUT_SECONDS = 900.0
+_DOWNLOAD_STALL_POLL_SECONDS = 15.0
+_DOWNLOAD_STALL_RETRIES = 3
+_DOWNLOAD_STALL_BACKOFF_SECONDS = (15.0, 30.0, 60.0)
 _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
@@ -303,6 +310,10 @@ def selected_files_cache_bytes(
 
 class TransferCanceled(Exception):
     pass
+
+
+class DownloadStalled(Exception):
+    """The supervised writer made no cache progress and was killed for retry."""
 
 
 def validate_model_id(model_id: str) -> str:
@@ -1453,6 +1464,9 @@ class VirtualNAS:
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
         cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
+        stall_timeout_seconds: float | None = None,
+        stall_poll_seconds: float | None = None,
+        stall_retries: int | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
@@ -1467,15 +1481,59 @@ class VirtualNAS:
                     bandwidth_mbps=bandwidth_mbps,
                     cluster_bandwidth_mbps=cluster_bandwidth_mbps,
                     operation_id=operation_id,
+                    stall_timeout_seconds=stall_timeout_seconds,
+                    stall_poll_seconds=stall_poll_seconds,
+                    stall_retries=stall_retries,
                 )
+
+    def _download_cache_bytes(self, model_id: str) -> int:
+        """Total bytes the Hub writer has committed for this repository."""
+        total = 0
+        for dirpath, _directories, filenames in os.walk(
+                self._model_path(model_id) / "blobs"):
+            for name in filenames:
+                try:
+                    total += os.stat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    continue
+        return total
+
+    async def _watch_download_stall(
+        self, model_id: str, stall_event: asyncio.Event, *,
+        timeout_seconds: float, poll_seconds: float,
+    ) -> None:
+        last_total: int | None = None
+        last_change = time.monotonic()
+        while True:
+            await asyncio.sleep(poll_seconds)
+            try:
+                total = await asyncio.to_thread(self._download_cache_bytes, model_id)
+            except OSError:
+                continue
+            now = time.monotonic()
+            if total != last_total:
+                last_total = total
+                last_change = now
+            elif now - last_change >= timeout_seconds:
+                stall_event.set()
+                return
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
         cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
+        stall_timeout_seconds: float | None = None,
+        stall_poll_seconds: float | None = None,
+        stall_retries: int | None = None,
     ) -> dict[str, Any]:
-        """Run Hub's writer in an owned process; never cancel a writer thread."""
+        """Run Hub's writer in an owned process; never cancel a writer thread.
+
+        A writer whose CDN sockets die without raising would otherwise block
+        forever, so one that stops advancing the cache is killed and
+        relaunched up to the retry budget; each relaunch resumes from the
+        retained partials.
+        """
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
         if not _is_commit_sha(revision):
@@ -1495,9 +1553,62 @@ class VirtualNAS:
             raise TransferCanceled()
         state["done"].clear()
         state["active"] = True
+        timeout = (_DOWNLOAD_STALL_TIMEOUT_SECONDS if stall_timeout_seconds is None
+                   else stall_timeout_seconds)
+        poll = (_DOWNLOAD_STALL_POLL_SECONDS if stall_poll_seconds is None
+                else stall_poll_seconds)
+        attempts = 1 + max(0, _DOWNLOAD_STALL_RETRIES if stall_retries is None
+                           else stall_retries)
+        worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
+        # Share of the dispatched CLUSTER cap (see the selective worker
+        # above): the re-rate scales by the controller's value, never this
+        # node's possibly stale local setting. One rate file spans every
+        # relaunch, so a settings re-rate steers the replacement writer too.
+        rate_file = self._register_download_rate_file(
+            operation_id, worker_bps,
+            cluster_bytes_per_second=(
+                self._download_bandwidth_bytes_per_second(cluster_bandwidth_mbps)
+            ),
+        )
+        try:
+            for attempt in range(attempts):
+                try:
+                    return await self._run_supervised_download_attempt(
+                        model_id, revision, explicit_token, requested_revision,
+                        state, worker_bps=worker_bps, rate_file=rate_file,
+                        stall_timeout_seconds=timeout, stall_poll_seconds=poll,
+                    )
+                except DownloadStalled:
+                    if state["cancel"].is_set():
+                        raise TransferCanceled()
+                    if attempt + 1 >= attempts:
+                        raise RuntimeError(
+                            "Hugging Face download stalled: the writer made no "
+                            f"cache progress for {timeout:.0f}s across "
+                            f"{attempts} attempts; retry the download"
+                        )
+                    backoff = _DOWNLOAD_STALL_BACKOFF_SECONDS[min(
+                        attempt, len(_DOWNLOAD_STALL_BACKOFF_SECONDS) - 1)]
+                    try:
+                        await asyncio.wait_for(state["cancel"].wait(), backoff)
+                    except asyncio.TimeoutError:
+                        continue
+                    raise TransferCanceled()
+        finally:
+            if rate_file is not None:
+                self._release_download_rate_file(operation_id)
+            state["active"] = False
+            state["done"].set()
+
+    async def _run_supervised_download_attempt(
+        self, model_id: str, revision: str, explicit_token: str | None,
+        requested_revision: str, state: dict[str, Any], *,
+        worker_bps: float, rate_file: Path | None,
+        stall_timeout_seconds: float, stall_poll_seconds: float,
+    ) -> dict[str, Any]:
         process = None
-        cancel_wait = None
         completion = None
+        watch_tasks: list[asyncio.Task] = []
         try:
             if state["cancel"].is_set():
                 raise TransferCanceled()
@@ -1521,20 +1632,6 @@ class VirtualNAS:
                 process = await self._await_uncancelable(launch)
                 state["cancel"].set()
                 raise
-            worker_bps = self._download_bandwidth_bytes_per_second(
-                bandwidth_mbps,
-            )
-            # Share of the dispatched CLUSTER cap (see the selective
-            # worker above): the re-rate scales by the controller's value,
-            # never this node's possibly stale local setting.
-            rate_file = self._register_download_rate_file(
-                operation_id, worker_bps,
-                cluster_bytes_per_second=(
-                    self._download_bandwidth_bytes_per_second(
-                        cluster_bandwidth_mbps,
-                    )
-                ),
-            )
             payload_fields = {
                 "model_id": model_id, "revision": revision,
                 "parent_pid": os.getpid(),
@@ -1547,12 +1644,27 @@ class VirtualNAS:
                 payload_fields["rate_file"] = str(rate_file)
             payload = json.dumps(payload_fields)
             completion = asyncio.create_task(process.communicate(payload.encode()))
-            cancel_wait = asyncio.create_task(state["cancel"].wait())
-            await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
+            stall_event = asyncio.Event()
+            watch_tasks = [
+                asyncio.create_task(state["cancel"].wait()),
+                asyncio.create_task(stall_event.wait()),
+                asyncio.create_task(self._watch_download_stall(
+                    model_id, stall_event,
+                    timeout_seconds=stall_timeout_seconds,
+                    poll_seconds=stall_poll_seconds,
+                )),
+            ]
+            await asyncio.wait({completion, *watch_tasks},
+                              return_when=asyncio.FIRST_COMPLETED)
             if state["cancel"].is_set():
                 await self._stop_download_process(process)
                 await completion
                 raise TransferCanceled()
+            if stall_event.is_set():
+                # A dead CDN socket never raises; killing the writer hands
+                # the partials to the next attempt, which resumes from them.
+                await self._stop_download_process(process)
+                raise DownloadStalled()
             await completion
             if process.returncode != 0:
                 raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
@@ -1566,31 +1678,28 @@ class VirtualNAS:
             return {"ok": True, "model_id": model_id, "revision": revision,
                     "size_bytes": _nonnegative_int(model.get("size_bytes"))}
         finally:
-            self._release_download_rate_file(operation_id)
-            try:
-                async def finish_writer():
-                    while process is not None and process.returncode is None:
-                        try:
-                            await self._stop_download_process(process)
-                        except Exception:
-                            # An endpoint may time out, but the supervisor
-                            # keeps the model reservation until actual exit.
-                            state["stop_error"] = "download worker has not confirmed exit"
-                            await asyncio.sleep(1)
-                    state.pop("stop_error", None)
+            for task in watch_tasks:
+                task.cancel()
+            if watch_tasks:
+                await asyncio.gather(*watch_tasks, return_exceptions=True)
+            async def finish_writer():
+                while process is not None and process.returncode is None:
+                    try:
+                        await self._stop_download_process(process)
+                    except Exception:
+                        # An endpoint may time out, but the supervisor
+                        # keeps the model reservation until actual exit.
+                        state["stop_error"] = "download worker has not confirmed exit"
+                        await asyncio.sleep(1)
+                state.pop("stop_error", None)
 
+            try:
                 await self._await_uncancelable(finish_writer())
                 if completion is not None:
                     await self._await_uncancelable(completion)
             except Exception as exc:
                 state["stop_error"] = str(exc)
                 raise
-            finally:
-                if cancel_wait is not None:
-                    cancel_wait.cancel()
-                    await asyncio.gather(cancel_wait, return_exceptions=True)
-                state["active"] = False
-                state["done"].set()
 
     @_transfer_operation
     async def download_model_files_checked(

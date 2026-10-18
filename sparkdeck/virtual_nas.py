@@ -1560,10 +1560,20 @@ class VirtualNAS:
         timeout_seconds: float, poll_seconds: float,
         rate_file: Path | None = None,
     ) -> None:
-        last_progress: tuple[tuple[int, int, int], int | None] | None = None
+        last_progress: tuple[int, int, int] | None = None
+        last_io: int | None = None
         last_change = time.monotonic()
         while True:
             await asyncio.sleep(poll_seconds)
+            # Re-read the live cap each poll and derive the window from the
+            # base timeout every time, so both lowering and raising/removing
+            # a mid-pull cap take effect at the next kill decision.
+            bps = 0.0
+            if rate_file is not None:
+                try:
+                    bps = max(float(rate_file.read_text(encoding="utf-8")), 0.0)
+                except (OSError, ValueError):
+                    bps = 0.0
             try:
                 io_counter = self._worker_io_counter(pid)
                 progress = await asyncio.to_thread(
@@ -1571,22 +1581,19 @@ class VirtualNAS:
                     io_counter is None)
             except OSError:
                 continue
-            progress = (progress, io_counter)
-            window = timeout_seconds
-            if rate_file is not None:
-                # Re-read the live cap each poll: an administrator lowering
-                # the bandwidth mid-pull widens the window to match, so a
-                # throttled-but-healthy writer is never killed for pace.
-                try:
-                    bps = float(rate_file.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    bps = 0.0
-                window = _stall_window_seconds(timeout_seconds, bps)
+            # The worker's own rate-file poller keeps rchar creeping even on
+            # dead sockets: require the delta to look like network traffic
+            # for the live cap before it counts as progress.
+            io_moved = io_counter is not None and (
+                last_io is None or (io_counter != last_io
+                                    and io_counter - last_io
+                                    >= max(1.0, bps * poll_seconds * 0.25)))
             now = time.monotonic()
-            if progress != last_progress:
+            if progress != last_progress or io_moved:
                 last_progress = progress
+                last_io = io_counter
                 last_change = now
-            elif now - last_change >= window:
+            elif now - last_change >= _stall_window_seconds(timeout_seconds, bps):
                 stall_event.set()
                 return
 
@@ -1634,9 +1641,6 @@ class VirtualNAS:
         rate_file = None
         try:
             worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
-            # At a low effective cap the writer legitimately spends many
-            # minutes accumulating one chunk before any cache byte lands.
-            timeout = _stall_window_seconds(timeout, worker_bps)
             # Share of the dispatched CLUSTER cap (see the selective worker
             # above): the re-rate scales by the controller's value, never
             # this node's possibly stale local setting. One rate file spans
@@ -1739,23 +1743,28 @@ class VirtualNAS:
                 await self._stop_download_process(process)
                 await completion
                 raise TransferCanceled()
-            if stall_event.is_set():
-                # A dead CDN socket never raises; killing the writer hands
-                # the partials to the next attempt, which resumes from them.
-                await self._stop_download_process(process)
-                raise DownloadStalled()
-            await completion
-            if process.returncode != 0:
-                raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
-            (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
-            self._write_revision_ref(model_id, requested_revision, revision)
-            inventory = await asyncio.to_thread(self.inventory)
-            model = next((item for item in inventory if item.get("model_id") == model_id
-                          and self._has_revision(item, revision, requested_revision)), None)
-            if model is None:
-                raise RuntimeError("download finished without a complete requested revision")
-            return {"ok": True, "model_id": model_id, "revision": revision,
-                    "size_bytes": _nonnegative_int(model.get("size_bytes"))}
+            # A worker that finished in the same event-loop iteration as the
+            # stall fired has genuinely completed: prefer its result over a
+            # pointless relaunch.
+            if completion.done() or not stall_event.is_set():
+                await completion
+                if process.returncode != 0:
+                    raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
+                (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
+                self._write_revision_ref(model_id, requested_revision, revision)
+                inventory = await asyncio.to_thread(self.inventory)
+                model = next((item for item in inventory if item.get("model_id") == model_id
+                              and self._has_revision(item, revision, requested_revision)), None)
+                if model is None:
+                    raise RuntimeError("download finished without a complete requested revision")
+                return {"ok": True, "model_id": model_id, "revision": revision,
+                        "size_bytes": _nonnegative_int(model.get("size_bytes"))}
+            # A dead CDN socket never raises. The finally block reaps this
+            # writer (retrying a stop that transiently fails to confirm
+            # exit) before the exception reaches the retry loop, so a
+            # relaunch can never overlap a surviving writer; the next
+            # attempt resumes from the retained partials.
+            raise DownloadStalled()
         finally:
             for task in watch_tasks:
                 task.cancel()

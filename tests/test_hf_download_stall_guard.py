@@ -253,6 +253,32 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
                         stall_retries=0)
             self.assertEqual(len(attempts), 1)
 
+    async def test_rate_file_polling_does_not_mask_stall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            (root / "hub" / "models--org--model" / "blobs").mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [SLOW_FAIL_SCRIPT], processes, None)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+                patch.object(nas, "_worker_io_counter",
+                             side_effect=itertools.count(1_000_000)),
+            ):
+                # High cap: the live rate file makes the worker's poller tick
+                # rchar by a few bytes; that is not plausibly network traffic
+                # at this cap, so the frozen pull must still stall.
+                with self.assertRaisesRegex(RuntimeError, "stalled"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40, bandwidth_mbps=10000.0,
+                        stall_timeout_seconds=.4, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+            self.assertIsNotNone(processes[0].returncode)
+
     async def test_shared_cache_writes_do_not_mask_frozen_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

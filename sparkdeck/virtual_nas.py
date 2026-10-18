@@ -1961,6 +1961,7 @@ class VirtualNAS:
             dangling_file_count = 0
             plain_file_count = 0
             linked_outside_cache = False
+            payload_truncated = False
             for root, directories, files in os.walk(repository, followlinks=False):
                 if Path(root) == repository:
                     # Match export's exclusion before counting entries/bytes:
@@ -1988,12 +1989,16 @@ class VirtualNAS:
                             # payload below an external directory target would
                             # go uncounted without this charge.
                             if target and os.path.isdir(target):
-                                added, mounted = _external_directory_payload(
-                                    Path(target), hub_device, counted_file_keys,
-                                    cache_mount_file_keys,
+                                added, mounted, cut_short = (
+                                    _external_directory_payload(
+                                        Path(target), hub_device,
+                                        counted_file_keys, cache_mount_file_keys,
+                                    )
                                 )
                                 resolved_size_bytes += added
                                 resolved_mounted_bytes += mounted
+                                if cut_short:
+                                    payload_truncated = True
                         elif target and not os.path.isdir(target):
                             # Contained but broken: a transfer would recreate
                             # the dangling link at the receiving node.
@@ -2137,6 +2142,10 @@ class VirtualNAS:
             }
             if selective_files:
                 model["selective_files_by_revision"] = selective_files
+            if payload_truncated:
+                # An external directory traversal hit the entry cap, so the
+                # resolved sizes are a lower bound, not an exact payload size.
+                model["resolved_size_truncated"] = True
             if (
                 transfer_entry_count > _FILE_STREAM_MAX_ENTRIES
                 or linked_outside_cache
@@ -5138,14 +5147,15 @@ def _external_directory_payload(
     hub_device: int | None,
     counted_file_keys: set[tuple[int, int]],
     cache_mount_file_keys: set[tuple[int, int]],
-) -> tuple[int, int]:
-    """Return (bytes, cache-mount bytes) for files below a directory link.
+) -> tuple[int, int, bool]:
+    """Return (bytes, cache-mount bytes, truncated) for files below a link.
 
     Nested directory links are followed because their files are part of the
     payload reachable through the cache facade; a visited (device, inode) set
     for directories keeps cycles finite, and the entry cap bounds the cost of
     a link aimed at an enormous tree. Files dedup through the repository's
-    shared (device, inode) set.
+    shared (device, inode) set. ``truncated`` is true when the cap stopped the
+    traversal, meaning both totals are lower bounds, not exact sizes.
     """
     total = 0
     mounted = 0
@@ -5170,7 +5180,7 @@ def _external_directory_payload(
         for entry in entries:
             entries_seen += 1
             if entries_seen > _EXTERNAL_DIRECTORY_MAX_ENTRIES:
-                return total, mounted
+                return total, mounted, True
             try:
                 if entry.is_dir():
                     stack.append(Path(entry.path))
@@ -5190,7 +5200,7 @@ def _external_directory_payload(
             mounted += _charge_mount_bytes(
                 info, added, hub_device, cache_mount_file_keys,
             )
-    return total, mounted
+    return total, mounted, False
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

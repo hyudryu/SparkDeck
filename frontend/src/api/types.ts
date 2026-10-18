@@ -945,6 +945,9 @@ export interface StorageModel {
   // True when any cache entry resolves outside the repository directory, so
   // the payload is not contained in the cache (and not transferable).
   linked_outside_cache?: boolean
+  // True when measuring a linked external tree hit the traversal cap: the
+  // resolved and cache-mount sizes are lower bounds, not exact payload sizes.
+  resolved_size_truncated?: boolean
   // Best-effort full repository or selected-artifact size for partial caches,
   // looked up from the Hugging Face tree API. Absent when lookup failed.
   expected_size_bytes?: number

@@ -34,6 +34,7 @@ function modelCapacityBytes(model: StorageModel) {
 function modelLinkNotice(model: StorageModel) {
   const parts: string[] = []
   if (model.linked_outside_cache) parts.push('Weights linked outside cache')
+  if (model.resolved_size_truncated) parts.push('reported size is a lower bound')
   const dangling = model.dangling_file_count ?? 0
   if (dangling) parts.push(`${dangling} broken link${dangling === 1 ? '' : 's'}`)
   return parts.length ? ` · ${parts.join(', ')}` : ''

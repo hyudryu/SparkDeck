@@ -1015,6 +1015,7 @@ describe('StoragePage', () => {
           dangling_file_count: 0,
           plain_file_count: 3,
           linked_outside_cache: true,
+          resolved_size_truncated: true,
           file_count: 4,
         }],
       }],
@@ -1025,6 +1026,7 @@ describe('StoragePage', () => {
 
     const card = await screen.findByRole('region', { name: 'Storage on Mixed Node' })
     expect(card).toHaveTextContent('Weights linked outside cache')
+    expect(card).toHaveTextContent('reported size is a lower bound')
     expect(within(card).getByText('900 KB used')).toBeInTheDocument()
 
     const user = userEvent.setup()

@@ -915,6 +915,39 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model["plain_file_count"], 2)
             self.assertGreater(model["size_bytes"], len(payload))
 
+    async def test_external_directory_cap_marks_size_as_lower_bound(self):
+        # A capped external traversal must be flagged: the partial byte count
+        # is a lower bound, never presented as the exact payload size.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "hub"
+            repository = hub / "models--capped--model"
+            snapshot = repository / "snapshots" / ("c" * 40)
+            snapshot.mkdir(parents=True)
+            external = base / "models" / "capped-tree"
+            external.mkdir(parents=True)
+            for index in range(6):
+                (external / f"shard-{index}.safetensors").write_bytes(b"q" * 200)
+            try:
+                (snapshot / "weights").symlink_to(external, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"source filesystem cannot create test symlinks: {exc}")
+            original_cap = virtual_nas._EXTERNAL_DIRECTORY_MAX_ENTRIES
+            virtual_nas._EXTERNAL_DIRECTORY_MAX_ENTRIES = 3
+            try:
+                model = VirtualNAS(
+                    base, lambda: hub, FakeRegistry(), lambda: False,
+                ).inventory()[0]
+            finally:
+                virtual_nas._EXTERNAL_DIRECTORY_MAX_ENTRIES = original_cap
+
+            self.assertTrue(model["resolved_size_truncated"])
+            self.assertLess(model["resolved_size_bytes"], 6 * 200)
+            self.assertLessEqual(
+                model["cache_mount_size_bytes"], model["resolved_size_bytes"],
+            )
+            self.assertTrue(model["linked_outside_cache"])
+
     async def test_cache_mount_usage_is_deduplicated_across_repositories(self):
         # Two facades over one staging payload report the full resolved payload
         # per model but charge the cache mount's capacity only once, so the

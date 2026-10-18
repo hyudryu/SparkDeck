@@ -279,6 +279,32 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(attempts), 1)
             self.assertIsNotNone(processes[0].returncode)
 
+    async def test_missing_rate_file_keeps_the_dispatched_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            (root / "hub" / "models--org--model" / "blobs").mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [SLOW_FAIL_SCRIPT], processes, None)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+                patch.object(nas, "_register_download_rate_file",
+                             return_value=None),
+            ):
+                # The rate file was never written (e.g. TMPDIR full), but the
+                # worker still throttles at 0.001 Mbps from its payload: the
+                # window must come from that cap, not from treating the
+                # worker as uncapped, so a quiet pull is not killed.
+                with self.assertRaisesRegex(RuntimeError, "download failed"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40, bandwidth_mbps=0.001,
+                        stall_timeout_seconds=.4, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+
     async def test_shared_cache_writes_do_not_mask_frozen_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

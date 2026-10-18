@@ -1558,7 +1558,7 @@ class VirtualNAS:
     async def _watch_download_stall(
         self, model_id: str, pid: int, stall_event: asyncio.Event, *,
         timeout_seconds: float, poll_seconds: float,
-        rate_file: Path | None = None,
+        rate_file: Path | None = None, initial_bps: float = 0.0,
     ) -> None:
         last_progress: tuple[int, int, int] | None = None
         last_io: int | None = None
@@ -1567,13 +1567,16 @@ class VirtualNAS:
             await asyncio.sleep(poll_seconds)
             # Re-read the live cap each poll and derive the window from the
             # base timeout every time, so both lowering and raising/removing
-            # a mid-pull cap take effect at the next kill decision.
-            bps = 0.0
+            # a mid-pull cap take effect at the next kill decision. The
+            # worker throttles from its payload even when the live file was
+            # never written or has gone unreadable, so fall back to the
+            # dispatched cap rather than treating such a worker as uncapped.
+            bps = initial_bps
             if rate_file is not None:
                 try:
                     bps = max(float(rate_file.read_text(encoding="utf-8")), 0.0)
                 except (OSError, ValueError):
-                    bps = 0.0
+                    pass
             try:
                 io_counter = self._worker_io_counter(pid)
                 progress = await asyncio.to_thread(
@@ -1734,7 +1737,7 @@ class VirtualNAS:
                     model_id, process.pid, stall_event,
                     timeout_seconds=stall_timeout_seconds,
                     poll_seconds=stall_poll_seconds,
-                    rate_file=rate_file,
+                    rate_file=rate_file, initial_bps=worker_bps,
                 )),
             ]
             await asyncio.wait({completion, *watch_tasks},
@@ -1769,7 +1772,11 @@ class VirtualNAS:
             for task in watch_tasks:
                 task.cancel()
             if watch_tasks:
-                await asyncio.gather(*watch_tasks, return_exceptions=True)
+                # Drain the watcher before the reservation can be released: a
+                # second cancellation here must not leave the attempt
+                # teardown half-done with the writer still running.
+                await self._await_uncancelable(
+                    asyncio.gather(*watch_tasks, return_exceptions=True))
             async def finish_writer():
                 while process is not None and process.returncode is None:
                     try:

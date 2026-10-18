@@ -347,13 +347,19 @@ export function StoragePage() {
 
   const removeModel = async (node: StorageNode, model: StorageModel) => {
     if (model.deletable === false) return
+    // Deleting a repository removes the whole cache directory, so a mixed
+    // cache (plain files plus escaping links) loses its local data too; only a
+    // pure facade is link-only.
+    const plainFiles = model.plain_file_count ?? 0
     if (!await confirm({
       title: `Delete ${model.model_id}?`,
       message: model.externally_managed
         ? `Delete these weights from ${node.name}? The files will be deleted from ComfyUI's model folders. Copies on other nodes are not affected.`
-        : model.linked_outside_cache
+        : model.linked_outside_cache && plainFiles === 0
           ? `Delete the cached links to ${model.model_id} on ${node.name}? The linked weights stay where they are and keep using that space. Copies on other nodes are not affected.`
-          : `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
+          : model.linked_outside_cache
+            ? `Delete ${model.model_id} from ${node.name}? The ${plainFiles} locally cached file${plainFiles === 1 ? '' : 's'} on this node will be removed as well, while the linked external weights stay where they are. Copies on other nodes are not affected.`
+            : `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
       confirmLabel: 'Delete weights',
       danger: true,
     })) return
@@ -364,7 +370,9 @@ export function StoragePage() {
     try {
       await api.storage.removeModel(node.id, model.model_id)
       setNotice(model.linked_outside_cache
-        ? `Deleted the cached links to ${model.model_id} on ${node.name}. The linked weights remain in their external folder.`
+        ? plainFiles === 0
+          ? `Deleted the cached links to ${model.model_id} on ${node.name}. The linked weights remain in their external folder.`
+          : `Deleted ${model.model_id} from ${node.name}. Its local cache files were removed; the linked external weights remain in place.`
         : `Deleted ${model.model_id} from ${node.name}.`)
       resource.reload()
     } catch (reason) {

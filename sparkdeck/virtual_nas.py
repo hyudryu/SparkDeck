@@ -1920,6 +1920,10 @@ class VirtualNAS:
             hub_device: int | None = os.stat(hub).st_dev or None
         except OSError:
             hub_device = None
+        # Node-wide (device, inode) set: a payload shared by several
+        # repositories (two facades over one staging tree, cache-wide
+        # hardlinks) must charge the cache mount's capacity only once.
+        cache_mount_file_keys: set[tuple[int, int]] = set()
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -1951,10 +1955,11 @@ class VirtualNAS:
             # its link bytes.
             resolved_repository = repository.resolve()
             resolved_size_bytes = 0
-            resolved_off_device_bytes = 0
+            resolved_mounted_bytes = 0
             counted_file_keys: set[tuple[int, int]] = set()
             symlink_file_count = 0
             dangling_file_count = 0
+            plain_file_count = 0
             linked_outside_cache = False
             for root, directories, files in os.walk(repository, followlinks=False):
                 if Path(root) == repository:
@@ -1983,11 +1988,12 @@ class VirtualNAS:
                             # payload below an external directory target would
                             # go uncounted without this charge.
                             if target and os.path.isdir(target):
-                                added, off_device = _external_directory_payload(
+                                added, mounted = _external_directory_payload(
                                     Path(target), hub_device, counted_file_keys,
+                                    cache_mount_file_keys,
                                 )
                                 resolved_size_bytes += added
-                                resolved_off_device_bytes += off_device
+                                resolved_mounted_bytes += mounted
                         elif target and not os.path.isdir(target):
                             # Contained but broken: a transfer would recreate
                             # the dangling link at the receiving node.
@@ -2024,25 +2030,20 @@ class VirtualNAS:
                             target_stat, counted_file_keys,
                         )
                         resolved_size_bytes += added
-                        if (
-                            added
-                            and hub_device is not None
-                            and target_stat.st_dev != hub_device
-                        ):
-                            resolved_off_device_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            target_stat, added, hub_device, cache_mount_file_keys,
+                        )
                         if not Path(target).is_relative_to(resolved_repository):
                             linked_outside_cache = True
                     elif stat.S_ISREG(entry_stat.st_mode):
+                        plain_file_count += 1
                         added = _count_distinct_file_bytes(
                             entry_stat, counted_file_keys,
                         )
                         resolved_size_bytes += added
-                        if (
-                            added
-                            and hub_device is not None
-                            and entry_stat.st_dev != hub_device
-                        ):
-                            resolved_off_device_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            entry_stat, added, hub_device, cache_mount_file_keys,
+                        )
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions), incomplete_revisions,
             )
@@ -2100,12 +2101,17 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "resolved_size_bytes": resolved_size_bytes,
-                # Resolved payload occupying the cache mount's own filesystem;
-                # bytes reached through links to another mount are excluded so
-                # the capacity bar (measured against that mount) stays honest.
-                "cache_mount_size_bytes": resolved_size_bytes - resolved_off_device_bytes,
+                # Resolved payload occupying the cache mount's own filesystem
+                # after node-wide (device, inode) deduplication, so the
+                # capacity bar stays honest even when repositories share one
+                # staging payload. Off-mount bytes are excluded.
+                "cache_mount_size_bytes": resolved_mounted_bytes,
                 "symlink_file_count": symlink_file_count,
                 "dangling_file_count": dangling_file_count,
+                # Regular (non-link) file entries: tells a pure link facade
+                # from a mixed repository whose local files also sit in the
+                # cache and would be removed by a delete.
+                "plain_file_count": plain_file_count,
                 "linked_outside_cache": linked_outside_cache,
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
@@ -5096,23 +5102,83 @@ def _count_distinct_file_bytes(
     return info.st_size
 
 
+# An escaping directory link can aim at an arbitrarily large tree (a mistyped
+# broad path such as / included), so counting its payload is capped to keep one
+# facade from outliving the manager's inventory request timeout.
+_EXTERNAL_DIRECTORY_MAX_ENTRIES = 20_000
+
+
+def _charge_mount_bytes(
+    info: os.stat_result,
+    added: int,
+    hub_device: int | None,
+    cache_mount_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return the portion of ``added`` bytes that newly occupies the cache mount.
+
+    Bytes on another device never occupy the mount, and bytes already charged
+    by an earlier repository (two facades over one staging payload, cache-wide
+    hardlinks) are not charged again. A filesystem that reports no inode
+    identity cannot be deduplicated, so every file is charged in full there.
+    """
+    if not added:
+        return 0
+    if hub_device is not None and info.st_dev != hub_device:
+        return 0
+    if info.st_ino:
+        key = (info.st_dev, info.st_ino)
+        if key in cache_mount_file_keys:
+            return 0
+        cache_mount_file_keys.add(key)
+    return added
+
+
 def _external_directory_payload(
     target: Path,
     hub_device: int | None,
     counted_file_keys: set[tuple[int, int]],
+    cache_mount_file_keys: set[tuple[int, int]],
 ) -> tuple[int, int]:
-    """Return (bytes, off-mount bytes) for regular files below a directory link.
+    """Return (bytes, cache-mount bytes) for files below a directory link.
 
-    ``followlinks=False`` keeps the traversal from descending symlinked
-    sub-directories, so it cannot loop, and each regular file is charged once
-    per (device, inode) through the repository's shared dedup set.
+    Nested directory links are followed because their files are part of the
+    payload reachable through the cache facade; a visited (device, inode) set
+    for directories keeps cycles finite, and the entry cap bounds the cost of
+    a link aimed at an enormous tree. Files dedup through the repository's
+    shared (device, inode) set.
     """
     total = 0
-    off_device = 0
-    for root, _directories, files in os.walk(target, followlinks=False):
-        for name in files:
+    mounted = 0
+    visited_directories: set[tuple[int, int]] = set()
+    stack = [target]
+    entries_seen = 0
+    while stack:
+        current = stack.pop()
+        try:
+            current_stat = os.stat(current)
+        except OSError:
+            continue
+        if current_stat.st_ino:
+            directory_key = (current_stat.st_dev, current_stat.st_ino)
+            if directory_key in visited_directories:
+                continue
+            visited_directories.add(directory_key)
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > _EXTERNAL_DIRECTORY_MAX_ENTRIES:
+                return total, mounted
             try:
-                info = os.stat(os.path.join(root, name))
+                if entry.is_dir():
+                    stack.append(Path(entry.path))
+                    continue
+                # os.stat, not entry.stat: on Windows a cached scandir entry
+                # reports st_dev/st_ino of zero, which would defeat the
+                # (device, inode) dedup below.
+                info = os.stat(entry.path)
             except OSError:
                 continue
             if not stat.S_ISREG(info.st_mode):
@@ -5121,9 +5187,10 @@ def _external_directory_payload(
             if not added:
                 continue
             total += added
-            if hub_device is not None and info.st_dev != hub_device:
-                off_device += added
-    return total, off_device
+            mounted += _charge_mount_bytes(
+                info, added, hub_device, cache_mount_file_keys,
+            )
+    return total, mounted
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

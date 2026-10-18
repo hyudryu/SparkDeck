@@ -932,10 +932,16 @@ export interface StorageModel {
   // agents that predate the field.
   resolved_size_bytes?: number
   // Portion of resolved_size_bytes that sits on the cache mount's own
-  // filesystem; used for the capacity bar, which is measured on that mount.
+  // filesystem, deduplicated node-wide so repositories sharing one payload
+  // charge the capacity bar once. Used by the capacity bar, which is measured
+  // on that mount.
   cache_mount_size_bytes?: number
   symlink_file_count?: number
   dangling_file_count?: number
+  // Regular (non-link) file entries in the cache. A repository with both
+  // plain files and escaping links is a mixed cache: deleting it removes the
+  // local files as well as the links.
+  plain_file_count?: number
   // True when any cache entry resolves outside the repository directory, so
   // the payload is not contained in the cache (and not transferable).
   linked_outside_cache?: boolean

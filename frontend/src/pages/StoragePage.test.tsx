@@ -961,6 +961,7 @@ describe('StoragePage', () => {
           cache_mount_size_bytes: 0,
           symlink_file_count: 88,
           dangling_file_count: 0,
+          plain_file_count: 0,
           linked_outside_cache: true,
           partial: true,
           file_count: 93,
@@ -994,6 +995,47 @@ describe('StoragePage', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Delete weights' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       '/api/v1/storage/nodes/node-facade/models/deepseek-ai%2FDeepSeek-V4.1-Flash',
+      expect.objectContaining({ method: 'DELETE' }),
+    ))
+  })
+
+  it('discloses that deleting a mixed linked cache also removes local files', async () => {
+    const storage: StorageState = {
+      enabled: true,
+      jobs: [],
+      instructions: [],
+      nodes: [{
+        id: 'node-mixed', name: 'Mixed Node', online: true, total_size: 10_000_000_000,
+        models: [{
+          model_id: 'org/mixed-cache',
+          size_bytes: 900_000,
+          resolved_size_bytes: 1_900_000,
+          cache_mount_size_bytes: 900_000,
+          symlink_file_count: 1,
+          dangling_file_count: 0,
+          plain_file_count: 3,
+          linked_outside_cache: true,
+          file_count: 4,
+        }],
+      }],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json(storage))
+    vi.stubGlobal('fetch', fetchMock)
+    render(<StoragePage />)
+
+    const card = await screen.findByRole('region', { name: 'Storage on Mixed Node' })
+    expect(card).toHaveTextContent('Weights linked outside cache')
+    expect(within(card).getByText('900 KB used')).toBeInTheDocument()
+
+    const user = userEvent.setup()
+    await user.click(within(card).getByRole('button', { name: 'Delete org/mixed-cache from Mixed Node' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete org/mixed-cache?' })
+    expect(dialog).toHaveTextContent(
+      'The 3 locally cached files on this node will be removed as well, while the linked external weights stay where they are.',
+    )
+    await user.click(within(dialog).getByRole('button', { name: 'Delete weights' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/storage/nodes/node-mixed/models/org%2Fmixed-cache',
       expect.objectContaining({ method: 'DELETE' }),
     ))
   })

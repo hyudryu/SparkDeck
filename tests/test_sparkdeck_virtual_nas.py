@@ -867,6 +867,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(model["linked_outside_cache"])
             self.assertIs(model["transferable"], False)
             self.assertEqual(model["resolved_size_bytes"], 4096 + 2048)
+            self.assertEqual(model["plain_file_count"], 0)
             # Same filesystem as the cache hub: the payload does occupy the
             # cache mount's capacity budget, so it must not be excluded there.
             self.assertEqual(
@@ -910,7 +911,39 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(model.get("transferable"), False)
             self.assertEqual(model["resolved_size_bytes"], len(payload))
             self.assertEqual(model["cache_mount_size_bytes"], len(payload))
+            # The blob and the hardlinked snapshot copy are both plain entries.
+            self.assertEqual(model["plain_file_count"], 2)
             self.assertGreater(model["size_bytes"], len(payload))
+
+    async def test_cache_mount_usage_is_deduplicated_across_repositories(self):
+        # Two facades over one staging payload report the full resolved payload
+        # per model but charge the cache mount's capacity only once, so the
+        # node usage bar never double-counts the shared bytes.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "hub"
+            external = base / "models" / "shared"
+            external.mkdir(parents=True)
+            payload = external / "model.safetensors"
+            payload.write_bytes(b"z" * 8192)
+            for name in ("models--aaa--model", "models--bbb--model"):
+                snapshot = hub / name / "snapshots" / ("c" * 40)
+                snapshot.mkdir(parents=True)
+                try:
+                    (snapshot / "model.safetensors").symlink_to(payload)
+                except OSError as exc:
+                    self.skipTest(f"source filesystem cannot create test symlinks: {exc}")
+            nas = VirtualNAS(base, lambda: hub, FakeRegistry(), lambda: False)
+
+            models = nas.inventory()
+
+            self.assertEqual(
+                [model["model_id"] for model in models], ["aaa/model", "bbb/model"],
+            )
+            self.assertEqual(models[0]["resolved_size_bytes"], 8192)
+            self.assertEqual(models[0]["cache_mount_size_bytes"], 8192)
+            self.assertEqual(models[1]["resolved_size_bytes"], 8192)
+            self.assertEqual(models[1]["cache_mount_size_bytes"], 0)
 
     async def test_inventory_counts_payload_below_external_directory_link(self):
         # A snapshot that is a single directory symlink into an external tree
@@ -924,10 +957,18 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             snapshot.mkdir(parents=True)
             external = base / "models" / "dir-facade"
             (external / "sub").mkdir(parents=True)
+            nested = base / "models" / "nested-shards"
+            nested.mkdir(parents=True)
             (external / "model-00001.safetensors").write_bytes(b"a" * 3072)
             (external / "sub" / "model-00002.safetensors").write_bytes(b"b" * 1024)
+            (nested / "model-00003.safetensors").write_bytes(b"c" * 512)
             try:
                 (snapshot / "weights").symlink_to(external, target_is_directory=True)
+                # A nested directory link inside the external tree is part of
+                # the payload reachable through the facade and must be counted;
+                # a cycle back into the same tree must terminate the walk.
+                (external / "linked-sub").symlink_to(nested, target_is_directory=True)
+                (external / "loop").symlink_to(external, target_is_directory=True)
                 # A contained directory link to a missing target is a broken
                 # link: reported as dangling, not as linked outside the cache.
                 (snapshot / "broken-dir").symlink_to(
@@ -939,8 +980,9 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             model = nas.inventory()[0]
 
-            self.assertEqual(model["resolved_size_bytes"], 3072 + 1024)
-            self.assertEqual(model["cache_mount_size_bytes"], 3072 + 1024)
+            self.assertEqual(model["resolved_size_bytes"], 3072 + 1024 + 512)
+            self.assertEqual(model["cache_mount_size_bytes"], 3072 + 1024 + 512)
+            self.assertEqual(model["plain_file_count"], 0)
             self.assertTrue(model["linked_outside_cache"])
             self.assertEqual(model["dangling_file_count"], 1)
             self.assertIs(model["transferable"], False)

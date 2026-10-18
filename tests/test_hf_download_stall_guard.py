@@ -6,7 +6,9 @@ import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from sparkdeck.virtual_nas import DownloadStalled, TransferCanceled, VirtualNAS
+from sparkdeck.virtual_nas import (
+    DownloadStalled, TransferCanceled, VirtualNAS, _stall_window_seconds,
+)
 
 
 STALL_SCRIPT = (
@@ -26,6 +28,25 @@ SPARSE_SCRIPT = (
 )
 FAIL_SCRIPT = "import sys\nsys.exit(1)\n"
 OK_SCRIPT = "import sys\nsys.exit(0)\n"
+# Xet shared-layout staging: bytes land under the cache-wide hub/blobs.
+HUB_BLOBS_SCRIPT = (
+    "import sys,time\n"
+    "d=sys.argv[1]\n"
+    "open(d+'/growing.part','wb').close()\n"
+    "t=time.time(); n=0\n"
+    "while time.time()-t < 1.2:\n"
+    "    f=open(d+'/growing.part','r+b'); f.seek(n); f.write(b'x'*4096); f.close(); n+=4096; time.sleep(.05)\n"
+    "sys.exit(1)\n"
+)
+
+
+class StallWindowScalingTests(unittest.TestCase):
+    def test_low_caps_widen_the_window(self):
+        self.assertEqual(_stall_window_seconds(900.0, 0.0), 900.0)
+        # A 100 MB/s cap still commits a chunk well inside the base window.
+        self.assertEqual(_stall_window_seconds(900.0, 100e6), 900.0)
+        # A 1 KiB/s cap needs 2 * 64 MiB / 1 KiB-s to show one chunk.
+        self.assertGreater(_stall_window_seconds(900.0, 1024.0), 100_000.0)
 
 
 class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -166,6 +187,30 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
             ):
                 # The constant-size file holds mtime-only activity past the
                 # stall timeout: the writer must end by exit(1), not a kill.
+                with self.assertRaisesRegex(RuntimeError, "download failed"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40,
+                        stall_timeout_seconds=.5, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+
+    async def test_cache_wide_xet_staging_counts_as_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            staging = root / "hub" / "blobs"
+            staging.mkdir(parents=True)
+            (root / "hub" / "models--org--model" / "blobs").mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [HUB_BLOBS_SCRIPT], processes, staging)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+            ):
+                # Repository blobs never move; the payload grows under the
+                # cache-wide staging dir. The writer must end by exit(1).
                 with self.assertRaisesRegex(RuntimeError, "download failed"):
                     await nas._download_model_process(
                         "org/model", "a" * 40,

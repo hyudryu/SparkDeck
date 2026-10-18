@@ -106,6 +106,19 @@ _DOWNLOAD_STALL_TIMEOUT_SECONDS = 900.0
 _DOWNLOAD_STALL_POLL_SECONDS = 15.0
 _DOWNLOAD_STALL_RETRIES = 3
 _DOWNLOAD_STALL_BACKOFF_SECONDS = (15.0, 30.0, 60.0)
+# A healthy writer capped at N bytes/s may take chunk_size/N seconds to
+# persist anything visible, so the stall window must not be shorter than
+# that accumulation time (with slack) at the effective cap.
+_DOWNLOAD_STALL_MIN_PROGRESS_BYTES = 64 * 1024 * 1024
+_DOWNLOAD_STALL_WINDOW_FACTOR = 2.0
+
+
+def _stall_window_seconds(timeout_seconds: float, worker_bps: float) -> float:
+    """Widen the stall window enough for a capped writer to commit a chunk."""
+    if worker_bps > 0:
+        return max(timeout_seconds, _DOWNLOAD_STALL_WINDOW_FACTOR
+                   * _DOWNLOAD_STALL_MIN_PROGRESS_BYTES / worker_bps)
+    return timeout_seconds
 _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
@@ -1487,26 +1500,32 @@ class VirtualNAS:
                 )
 
     def _download_cache_progress(self, model_id: str) -> tuple[int, int, int]:
-        """(total bytes, newest write time, file count) for this repository.
+        """(total bytes, newest write time, file count) for this download.
 
-        The newest mtime matters as much as the total: Xet parallel
-        direct-addressed writes can push a blob's logical size to its final
-        value while interior ranges are still landing, so logical size alone
-        would read as frozen on a healthy pull.
+        The model repository's blobs are not authoritative on their own:
+        depending on the hf-xet version, payload and incomplete writes land
+        under the cache-wide `hub/blobs` (or the `hub/xet` CAS) until the
+        repository blob pointer appears. The newest mtime matters as much as
+        the total too: Xet parallel direct-addressed writes can push a
+        blob's logical size to its final value while interior ranges are
+        still landing, so logical size alone would read as frozen on a
+        healthy pull.
         """
+        hub = self._hub()
         total = 0
         newest_ns = 0
         count = 0
-        for dirpath, _directories, filenames in os.walk(
-                self._model_path(model_id) / "blobs"):
-            for name in filenames:
-                try:
-                    info = os.stat(os.path.join(dirpath, name))
-                except OSError:
-                    continue
-                total += info.st_size
-                count += 1
-                newest_ns = max(newest_ns, info.st_mtime_ns)
+        for root in (self._model_path(model_id) / "blobs", hub / "blobs",
+                     hub / "xet"):
+            for dirpath, _directories, filenames in os.walk(root):
+                for name in filenames:
+                    try:
+                        info = os.stat(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+                    total += info.st_size
+                    count += 1
+                    newest_ns = max(newest_ns, info.st_mtime_ns)
         return total, newest_ns, count
 
     async def _watch_download_stall(
@@ -1574,6 +1593,9 @@ class VirtualNAS:
         rate_file = None
         try:
             worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
+            # At a low effective cap the writer legitimately spends many
+            # minutes accumulating one chunk before any cache byte lands.
+            timeout = _stall_window_seconds(timeout, worker_bps)
             # Share of the dispatched CLUSTER cap (see the selective worker
             # above): the re-rate scales by the controller's value, never
             # this node's possibly stale local setting. One rate file spans

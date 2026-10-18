@@ -1959,10 +1959,19 @@ class VirtualNAS:
                 transfer_entry_count += len(directories) + len(files)
                 kept_directories = []
                 for name in directories:
-                    if (Path(root) / name).is_symlink():
-                        # Export cannot follow a symlinked directory, so this
-                        # repository is not self-contained on the node.
-                        linked_outside_cache = True
+                    source = Path(root) / name
+                    if source.is_symlink():
+                        # Export preserves directory links that stay inside the
+                        # repository (it rejects only escaping links), so flag
+                        # containment here rather than every directory link.
+                        try:
+                            escaped = not Path(os.path.realpath(source)).is_relative_to(
+                                resolved_repository,
+                            )
+                        except OSError:
+                            escaped = True
+                        if escaped:
+                            linked_outside_cache = True
                     else:
                         kept_directories.append(name)
                 directories[:] = kept_directories

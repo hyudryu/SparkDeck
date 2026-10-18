@@ -343,7 +343,9 @@ export function StoragePage() {
       title: `Delete ${model.model_id}?`,
       message: model.externally_managed
         ? `Delete these weights from ${node.name}? The files will be deleted from ComfyUI's model folders. Copies on other nodes are not affected.`
-        : `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
+        : model.linked_outside_cache
+          ? `Delete the cached links to ${model.model_id} on ${node.name}? The linked weights stay where they are and keep using that space. Copies on other nodes are not affected.`
+          : `Delete these weights from ${node.name}? Copies on other nodes are not affected.`,
       confirmLabel: 'Delete weights',
       danger: true,
     })) return
@@ -353,7 +355,9 @@ export function StoragePage() {
     setNotice(undefined)
     try {
       await api.storage.removeModel(node.id, model.model_id)
-      setNotice(`Deleted ${model.model_id} from ${node.name}.`)
+      setNotice(model.linked_outside_cache
+        ? `Deleted the cached links to ${model.model_id} on ${node.name}. The linked weights remain in their external folder.`
+        : `Deleted ${model.model_id} from ${node.name}.`)
       resource.reload()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not delete model weights')
@@ -465,7 +469,10 @@ export function StoragePage() {
               ...node.models.filter((model) => matchesModelSearch(model.model_id) && !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
             ]
             const used = node.models.reduce(
-              (total, model) => total + (model.externally_managed ? 0 : effectiveModelSize(model)),
+              // linked_outside_cache payloads live on some other backing
+              // filesystem; free_size is measured on the cache hub mount, so
+              // counting them here would mix mounts in the capacity bar.
+              (total, model) => total + (model.externally_managed || model.linked_outside_cache ? 0 : effectiveModelSize(model)),
               0,
             )
             // The capacity bar describes the Hugging Face cache mount, so its

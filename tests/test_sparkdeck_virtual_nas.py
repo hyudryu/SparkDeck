@@ -853,6 +853,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 (snapshot / "model-00001.safetensors").symlink_to(payload)
                 (snapshot / "model-00002.safetensors").symlink_to(second)
                 (snapshot / "missing.safetensors").symlink_to(external / "gone")
+                (snapshot / "external-dir").symlink_to(external, target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"source filesystem cannot create test symlinks: {exc}")
             nas = VirtualNAS(base, lambda: hub, FakeRegistry(), lambda: False)
@@ -885,9 +886,13 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             weights.write_bytes(payload)
             snapshot = repository / "snapshots" / ("c" * 40)
             snapshot.mkdir(parents=True)
+            (snapshot / "sub").mkdir()
             try:
                 (snapshot / "model.safetensors").symlink_to(weights)
                 os.link(weights, snapshot / "model-copy.safetensors")
+                # A directory alias inside the repository stays transferable:
+                # export preserves contained directory links.
+                (snapshot / "alias").symlink_to(snapshot / "sub", target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"source filesystem cannot create test links: {exc}")
             nas = VirtualNAS(Path(directory), lambda: hub, FakeRegistry(), lambda: False)

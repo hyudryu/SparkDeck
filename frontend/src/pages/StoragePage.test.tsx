@@ -964,7 +964,8 @@ describe('StoragePage', () => {
         }],
       }],
     }
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json(storage))
+    vi.stubGlobal('fetch', fetchMock)
     render(<StoragePage />)
 
     const card = await screen.findByRole('region', { name: 'Storage on Facade Node' })
@@ -978,5 +979,16 @@ describe('StoragePage', () => {
     const sizeCell = row.querySelector('[data-label="Size"]') as HTMLElement
     expect(sizeCell.textContent).toBe('510 GB · Weights linked outside cache')
     expect(row).not.toHaveTextContent('6.0 KB')
+
+    // Deleting a facade removes only the cache links, never the payload.
+    const user = userEvent.setup()
+    await user.click(within(card).getByRole('button', { name: 'Delete deepseek-ai/DeepSeek-V4.1-Flash from Facade Node' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete deepseek-ai/DeepSeek-V4.1-Flash?' })
+    expect(dialog).toHaveTextContent('Delete the cached links to deepseek-ai/DeepSeek-V4.1-Flash on Facade Node?')
+    await user.click(within(dialog).getByRole('button', { name: 'Delete weights' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/storage/nodes/node-facade/models/deepseek-ai%2FDeepSeek-V4.1-Flash',
+      expect.objectContaining({ method: 'DELETE' }),
+    ))
   })
 })

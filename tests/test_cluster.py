@@ -2591,6 +2591,47 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             volumes["/host/huggingface"]["bind"], "/root/.cache/huggingface"
         )
 
+    def test_hf_snapshot_model_binds_repo_root(self) -> None:
+        instance = Manager.__new__(Manager)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "hub" / "models--deepseek-ai--DeepSeek-V4.1-Flash-1017"
+            snapshot = repo / "snapshots" / "1bae0e1088993b9b82de08f59de5be5a34e42170"
+            (snapshot).mkdir(parents=True)
+            (repo / "blobs").mkdir()
+
+            volumes = instance._build_volumes(str(snapshot))
+
+            resolved_repo = str(repo.resolve())
+            self.assertEqual(
+                volumes, {resolved_repo: {"bind": resolved_repo, "mode": "rw"}}
+            )
+
+    def test_plain_local_model_bind_unchanged(self) -> None:
+        instance = Manager.__new__(Manager)
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "models" / "mymodel"
+            model.mkdir(parents=True)
+
+            volumes = instance._build_volumes(str(model))
+
+            resolved = str(model.resolve())
+            self.assertEqual(volumes, {resolved: {"bind": resolved, "mode": "rw"}})
+
+    def test_hf_snapshot_repo_root_shape_guard(self) -> None:
+        root = "/cache/hub/models--org--name"
+        self.assertEqual(
+            Manager._hf_snapshot_repo_root(f"{root}/snapshots/abc123"), root
+        )
+        # Not a hub-cache name / not a single revision segment: keep the old bind.
+        self.assertIsNone(
+            Manager._hf_snapshot_repo_root("/data/engraved/snapshots/abc123")
+        )
+        self.assertIsNone(
+            Manager._hf_snapshot_repo_root(f"{root}/snapshots/abc123/extra")
+        )
+        self.assertIsNone(Manager._hf_snapshot_repo_root(f"{root}/snapshots/"))
+        self.assertIsNone(Manager._hf_snapshot_repo_root("/snapshots/abc123"))
+
     def test_created_container_model_source_uses_node_runtime_provenance(self) -> None:
         instance = Manager.__new__(Manager)
         instance._resolve_local_path = mock.Mock(return_value=None)

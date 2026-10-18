@@ -14,6 +14,16 @@ STALL_SCRIPT = (
     "open(sys.argv[1],'ab').write(b'x'*64)\n"
     "while True: time.sleep(1)\n"
 )
+# Xet parallel direct-addressed reconstruction: constant logical size while
+# interior ranges keep landing (only mtimes move).
+SPARSE_SCRIPT = (
+    "import sys,time\n"
+    "f=open(sys.argv[1],'wb'); f.truncate(4096)\n"
+    "t=time.time(); i=0\n"
+    "while time.time()-t < 1.2:\n"
+    "    f.seek((i*64)%4096); f.write(b'x'*64); f.flush(); i+=1; time.sleep(.05)\n"
+    "sys.exit(1)\n"
+)
 FAIL_SCRIPT = "import sys\nsys.exit(1)\n"
 OK_SCRIPT = "import sys\nsys.exit(0)\n"
 
@@ -139,6 +149,44 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
                     stall_retries=2)
             self.assertTrue(result["ok"])
             self.assertEqual(len(attempts), 2)
+
+    async def test_sparse_direct_writes_are_not_false_stalls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            partial = root / "hub" / "models--org--model" / "blobs" / "p.incomplete"
+            partial.parent.mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [SPARSE_SCRIPT], processes, partial)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+            ):
+                # The constant-size file holds mtime-only activity past the
+                # stall timeout: the writer must end by exit(1), not a kill.
+                with self.assertRaisesRegex(RuntimeError, "download failed"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40,
+                        stall_timeout_seconds=.5, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+
+    async def test_rate_file_setup_failure_releases_operation_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            operation_id = str(uuid.uuid4())
+            with patch.object(nas, "_register_download_rate_file",
+                              side_effect=OSError("TMPDIR full")):
+                with self.assertRaises(OSError):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40, operation_id=operation_id,
+                        bandwidth_mbps=1.0)
+            state = nas._download_operations[operation_id]
+            self.assertFalse(state["active"])
+            self.assertTrue(state["done"].is_set())
 
     async def test_stall_event_is_internal_only(self):
         # DownloadStalled must never cross the public helper boundary: the

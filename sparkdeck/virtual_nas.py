@@ -1486,33 +1486,45 @@ class VirtualNAS:
                     stall_retries=stall_retries,
                 )
 
-    def _download_cache_bytes(self, model_id: str) -> int:
-        """Total bytes the Hub writer has committed for this repository."""
+    def _download_cache_progress(self, model_id: str) -> tuple[int, int, int]:
+        """(total bytes, newest write time, file count) for this repository.
+
+        The newest mtime matters as much as the total: Xet parallel
+        direct-addressed writes can push a blob's logical size to its final
+        value while interior ranges are still landing, so logical size alone
+        would read as frozen on a healthy pull.
+        """
         total = 0
+        newest_ns = 0
+        count = 0
         for dirpath, _directories, filenames in os.walk(
                 self._model_path(model_id) / "blobs"):
             for name in filenames:
                 try:
-                    total += os.stat(os.path.join(dirpath, name)).st_size
+                    info = os.stat(os.path.join(dirpath, name))
                 except OSError:
                     continue
-        return total
+                total += info.st_size
+                count += 1
+                newest_ns = max(newest_ns, info.st_mtime_ns)
+        return total, newest_ns, count
 
     async def _watch_download_stall(
         self, model_id: str, stall_event: asyncio.Event, *,
         timeout_seconds: float, poll_seconds: float,
     ) -> None:
-        last_total: int | None = None
+        last_progress: tuple[int, int, int] | None = None
         last_change = time.monotonic()
         while True:
             await asyncio.sleep(poll_seconds)
             try:
-                total = await asyncio.to_thread(self._download_cache_bytes, model_id)
+                progress = await asyncio.to_thread(
+                    self._download_cache_progress, model_id)
             except OSError:
                 continue
             now = time.monotonic()
-            if total != last_total:
-                last_total = total
+            if progress != last_progress:
+                last_progress = progress
                 last_change = now
             elif now - last_change >= timeout_seconds:
                 stall_event.set()
@@ -1559,18 +1571,21 @@ class VirtualNAS:
                 else stall_poll_seconds)
         attempts = 1 + max(0, _DOWNLOAD_STALL_RETRIES if stall_retries is None
                            else stall_retries)
-        worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
-        # Share of the dispatched CLUSTER cap (see the selective worker
-        # above): the re-rate scales by the controller's value, never this
-        # node's possibly stale local setting. One rate file spans every
-        # relaunch, so a settings re-rate steers the replacement writer too.
-        rate_file = self._register_download_rate_file(
-            operation_id, worker_bps,
-            cluster_bytes_per_second=(
-                self._download_bandwidth_bytes_per_second(cluster_bandwidth_mbps)
-            ),
-        )
+        rate_file = None
         try:
+            worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
+            # Share of the dispatched CLUSTER cap (see the selective worker
+            # above): the re-rate scales by the controller's value, never
+            # this node's possibly stale local setting. One rate file spans
+            # every relaunch, so a settings re-rate steers the replacement
+            # writer too.
+            rate_file = self._register_download_rate_file(
+                operation_id, worker_bps,
+                cluster_bytes_per_second=(
+                    self._download_bandwidth_bytes_per_second(
+                        cluster_bandwidth_mbps)
+                ),
+            )
             for attempt in range(attempts):
                 try:
                     return await self._run_supervised_download_attempt(

@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,16 @@ SPARSE_SCRIPT = (
 )
 FAIL_SCRIPT = "import sys\nsys.exit(1)\n"
 OK_SCRIPT = "import sys\nsys.exit(0)\n"
+SLOW_FAIL_SCRIPT = "import sys,time\ntime.sleep(1.2)\nsys.exit(1)\n"
+HUB_FOREVER_SCRIPT = (
+    "import sys,time\n"
+    "d=sys.argv[1]\n"
+    "open(d+'/g.part','wb').close()\n"
+    "n=0\n"
+    "while True:\n"
+    "    f=open(d+'/g.part','r+b'); f.seek(n); f.write(b'x'*64); f.close(); n+=64\n"
+    "    time.sleep(.05)\n"
+)
 # Xet shared-layout staging: bytes land under the cache-wide hub/blobs.
 HUB_BLOBS_SCRIPT = (
     "import sys,time\n"
@@ -217,6 +228,57 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
                         stall_timeout_seconds=.5, stall_poll_seconds=.05,
                         stall_retries=0)
             self.assertEqual(len(attempts), 1)
+
+    async def test_growing_worker_io_prevents_false_stall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            (root / "hub" / "models--org--model" / "blobs").mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [SLOW_FAIL_SCRIPT], processes, None)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+                patch.object(nas, "_worker_io_counter",
+                             side_effect=itertools.count(1)),
+            ):
+                # Nothing lands on disk, but the writer's read/write counter
+                # advances: bytes are flowing, so no kill.
+                with self.assertRaisesRegex(RuntimeError, "download failed"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40,
+                        stall_timeout_seconds=.4, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+
+    async def test_shared_cache_writes_do_not_mask_frozen_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            staging = root / "hub" / "blobs"
+            staging.mkdir(parents=True)
+            (root / "hub" / "models--org--model" / "blobs").mkdir(parents=True)
+            processes = []
+            attempts, fake_worker = self._fake_launch(
+                [HUB_FOREVER_SCRIPT], processes, staging)
+            with (
+                patch("sparkdeck.virtual_nas.asyncio.create_subprocess_exec",
+                      side_effect=fake_worker),
+                patch("sparkdeck.virtual_nas._DOWNLOAD_STALL_BACKOFF_SECONDS", (0.0,)),
+                patch.object(nas, "_worker_io_counter", return_value=7),
+            ):
+                # A concurrent pull grows the shared staging tree while this
+                # worker's own accounting stays frozen: shared activity must
+                # not mask the stall (worker-attributed signal wins).
+                with self.assertRaisesRegex(RuntimeError, "stalled"):
+                    await nas._download_model_process(
+                        "org/model", "a" * 40,
+                        stall_timeout_seconds=.4, stall_poll_seconds=.05,
+                        stall_retries=0)
+            self.assertEqual(len(attempts), 1)
+            self.assertIsNotNone(processes[0].returncode)
 
     async def test_rate_file_setup_failure_releases_operation_state(self):
         with tempfile.TemporaryDirectory() as directory:

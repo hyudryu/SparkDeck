@@ -1499,24 +1499,51 @@ class VirtualNAS:
                     stall_retries=stall_retries,
                 )
 
-    def _download_cache_progress(self, model_id: str) -> tuple[int, int, int]:
+    def _worker_io_counter(self, pid: int) -> int | None:
+        """rchar+wchar of the writer process, when the platform exposes it.
+
+        This attributes bytes to THIS writer: a concurrent pull sharing the
+        same cache can neither mask a stall nor fake progress on deployed
+        Linux agents, where this is the authoritative signal.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+        totals: dict[str, int] = {}
+        try:
+            with open(f"/proc/{pid}/io", encoding="ascii") as handle:
+                for line in handle:
+                    key, _, value = line.partition(":")
+                    try:
+                        totals[key] = int(value)
+                    except ValueError:
+                        pass
+        except OSError:
+            return None
+        return totals.get("rchar", 0) + totals.get("wchar", 0)
+
+    def _download_cache_progress(self, model_id: str,
+                                 shared: bool) -> tuple[int, int, int]:
         """(total bytes, newest write time, file count) for this download.
 
-        The model repository's blobs are not authoritative on their own:
-        depending on the hf-xet version, payload and incomplete writes land
-        under the cache-wide `hub/blobs` (or the `hub/xet` CAS) until the
-        repository blob pointer appears. The newest mtime matters as much as
-        the total too: Xet parallel direct-addressed writes can push a
-        blob's logical size to its final value while interior ranges are
-        still landing, so logical size alone would read as frozen on a
-        healthy pull.
+        The whole repository is walked, not just blobs/: in no-symlink cache
+        mode the finished file lands directly under snapshots/. When no
+        per-process IO accounting exists (non-Linux), the cache-wide
+        `hub/blobs` and `hub/xet` staging trees join in, since Xet payloads
+        may land there instead of the repository; with worker-attributed
+        accounting they would only mask stalls from concurrent pulls. The
+        newest mtime matters as much as the total too: Xet parallel
+        direct-addressed writes can push a blob's logical size to its final
+        value while interior ranges are still landing, so logical size alone
+        would read as frozen on a healthy pull.
         """
-        hub = self._hub()
+        roots = [self._model_path(model_id)]
+        if shared:
+            hub = self._hub()
+            roots.extend([hub / "blobs", hub / "xet"])
         total = 0
         newest_ns = 0
         count = 0
-        for root in (self._model_path(model_id) / "blobs", hub / "blobs",
-                     hub / "xet"):
+        for root in roots:
             for dirpath, _directories, filenames in os.walk(root):
                 for name in filenames:
                     try:
@@ -1529,23 +1556,37 @@ class VirtualNAS:
         return total, newest_ns, count
 
     async def _watch_download_stall(
-        self, model_id: str, stall_event: asyncio.Event, *,
+        self, model_id: str, pid: int, stall_event: asyncio.Event, *,
         timeout_seconds: float, poll_seconds: float,
+        rate_file: Path | None = None,
     ) -> None:
-        last_progress: tuple[int, int, int] | None = None
+        last_progress: tuple[tuple[int, int, int], int | None] | None = None
         last_change = time.monotonic()
         while True:
             await asyncio.sleep(poll_seconds)
             try:
+                io_counter = self._worker_io_counter(pid)
                 progress = await asyncio.to_thread(
-                    self._download_cache_progress, model_id)
+                    self._download_cache_progress, model_id,
+                    io_counter is None)
             except OSError:
                 continue
+            progress = (progress, io_counter)
+            window = timeout_seconds
+            if rate_file is not None:
+                # Re-read the live cap each poll: an administrator lowering
+                # the bandwidth mid-pull widens the window to match, so a
+                # throttled-but-healthy writer is never killed for pace.
+                try:
+                    bps = float(rate_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    bps = 0.0
+                window = _stall_window_seconds(timeout_seconds, bps)
             now = time.monotonic()
             if progress != last_progress:
                 last_progress = progress
                 last_change = now
-            elif now - last_change >= timeout_seconds:
+            elif now - last_change >= window:
                 stall_event.set()
                 return
 
@@ -1686,9 +1727,10 @@ class VirtualNAS:
                 asyncio.create_task(state["cancel"].wait()),
                 asyncio.create_task(stall_event.wait()),
                 asyncio.create_task(self._watch_download_stall(
-                    model_id, stall_event,
+                    model_id, process.pid, stall_event,
                     timeout_seconds=stall_timeout_seconds,
                     poll_seconds=stall_poll_seconds,
+                    rate_file=rate_file,
                 )),
             ]
             await asyncio.wait({completion, *watch_tasks},

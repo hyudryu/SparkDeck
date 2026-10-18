@@ -944,4 +944,39 @@ describe('StoragePage', () => {
     expect(within(row).getByText('13 GB of 43 GB')).toBeInTheDocument()
     expect(within(row).getByText('org/partial-model')).toHaveAttribute('title', 'org/partial-model')
   })
+
+  it('reports resolved payload bytes for symlinked weight facades', async () => {
+    const storage: StorageState = {
+      enabled: true,
+      jobs: [],
+      instructions: [],
+      nodes: [{
+        id: 'node-facade', name: 'Facade Node', online: true, total_size: 1_000_000_000_000,
+        models: [{
+          model_id: 'deepseek-ai/DeepSeek-V4.1-Flash',
+          size_bytes: 5968,
+          resolved_size_bytes: 510_313_351_864,
+          symlink_file_count: 88,
+          dangling_file_count: 0,
+          linked_outside_cache: true,
+          partial: true,
+          file_count: 93,
+        }],
+      }],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(json(storage)))
+    render(<StoragePage />)
+
+    const card = await screen.findByRole('region', { name: 'Storage on Facade Node' })
+    expect(within(card).getByText('deepseek-ai/DeepSeek-V4.1-Flash')).toBeInTheDocument()
+    expect(card).toHaveTextContent('510 GB')
+    expect(card).not.toHaveTextContent('6.0 KB')
+    expect(card).toHaveTextContent('Weights linked outside cache')
+
+    const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
+    const row = within(inventory).getByText('deepseek-ai/DeepSeek-V4.1-Flash').closest('.table-row') as HTMLElement
+    const sizeCell = row.querySelector('[data-label="Size"]') as HTMLElement
+    expect(sizeCell.textContent).toBe('510 GB · Weights linked outside cache')
+    expect(row).not.toHaveTextContent('6.0 KB')
+  })
 })

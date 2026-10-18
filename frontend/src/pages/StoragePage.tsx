@@ -16,8 +16,29 @@ function compareModelIdsDescending(leftModelId: string, rightModelId: string) {
   })
 }
 
+function effectiveModelSize(model: StorageModel) {
+  // size_bytes is lstat accounting (the wire an export would send); a
+  // symlink facade over externally stored weights reports only link bytes
+  // there. resolved_size_bytes is the distinct payload actually on the node.
+  return model.resolved_size_bytes ?? model.size_bytes
+}
+
+function modelLinkNotice(model: StorageModel) {
+  const parts: string[] = []
+  if (model.linked_outside_cache) parts.push('Weights linked outside cache')
+  const dangling = model.dangling_file_count ?? 0
+  if (dangling) parts.push(`${dangling} broken link${dangling === 1 ? '' : 's'}`)
+  return parts.length ? ` · ${parts.join(', ')}` : ''
+}
+
+function modelSizeText(model: StorageModel) {
+  return model.partial && model.expected_size_bytes
+    ? `${formatBytes(effectiveModelSize(model))} of ${formatBytes(model.expected_size_bytes)}`
+    : formatBytes(effectiveModelSize(model))
+}
+
 function compareModels(left: StorageModel, right: StorageModel) {
-  return right.size_bytes - left.size_bytes || compareModelIdsDescending(left.model_id, right.model_id)
+  return effectiveModelSize(right) - effectiveModelSize(left) || compareModelIdsDescending(left.model_id, right.model_id)
 }
 
 function isPartialModel(model: StorageModel) {
@@ -444,7 +465,7 @@ export function StoragePage() {
               ...node.models.filter((model) => matchesModelSearch(model.model_id) && !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
             ]
             const used = node.models.reduce(
-              (total, model) => total + (model.externally_managed ? 0 : model.size_bytes),
+              (total, model) => total + (model.externally_managed ? 0 : effectiveModelSize(model)),
               0,
             )
             // The capacity bar describes the Hugging Face cache mount, so its
@@ -512,7 +533,7 @@ export function StoragePage() {
                       disabled={!node.online || busy === `download:${node.id}:${model.model_id}` || busy === `delete:${node.id}:${model.model_id}`}
                       onClick={() => void finishDownload(node, model)}
                     ><AlertTriangle className="storage-partial-icon" size={15} aria-hidden="true" /></button> : <GripVertical size={15} aria-hidden="true" />}
-                    <div><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}{model.quantizations?.length ? ` · ${model.quantizations.join(', ')}` : ''}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}</small></div>
+                    <div><strong title={model.model_id}>{model.model_id}</strong><small>{modelSizeText(model)}{model.quantizations?.length ? ` · ${model.quantizations.join(', ')}` : ''}{model.revision && !model.externally_managed ? ` · ${model.revision}` : ''}{model.partial ? ' · Partial' : ''}{modelLinkNotice(model)}</small></div>
                     {model.deletable !== false && <Button
                       variant="tertiary"
                       aria-label={`Delete ${model.model_id} from ${node.name}`}
@@ -603,7 +624,7 @@ export function StoragePage() {
             <div className="table-row table-header" role="row"><span role="columnheader">Model</span><span role="columnheader">Size</span><span role="columnheader">Files</span><span role="columnheader">Node availability</span></div>
             {filteredInventory.map(({ model, nodes: locations }) => <div className="table-row" role="row" key={model.model_id}>
               <div role="cell" data-label="Model"><strong title={model.model_id}>{model.model_id}</strong><small>{model.partial ? 'Partial cache' : model.externally_managed ? 'Installed' : model.revision ?? 'Default revision'} · {formatTimestamp(model.last_modified)}</small></div>
-              <div role="cell" data-label="Size">{model.partial && model.expected_size_bytes ? `${formatBytes(model.size_bytes)} of ${formatBytes(model.expected_size_bytes)}` : formatBytes(model.size_bytes)}</div>
+              <div role="cell" data-label="Size">{modelSizeText(model)}{modelLinkNotice(model)}</div>
               <div role="cell" data-label="Files">{model.file_count ?? 'Not reported'}</div>
               <div role="cell" data-label="Node availability" className="storage-availability" aria-label={`Model availability for ${model.model_id}`}>{visibleNodes.map((node) => {
                 const location = locations.get(node.id)

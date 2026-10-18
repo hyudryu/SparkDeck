@@ -1938,29 +1938,68 @@ class VirtualNAS:
             file_count = 0
             transfer_entry_count = 1
             last_modified = 0.0
+            # size_bytes above stays the export/wire accounting (lstat). The
+            # fields below report the distinct bytes that actually exist on
+            # this node: each symlink is followed once and every regular file
+            # counts once per (device, inode), so hardlinked snapshot entries
+            # are not double-counted and a symlink facade over real weights
+            # (for example a /models staging tree) is not reported as only
+            # its link bytes.
+            resolved_repository = repository.resolve()
+            resolved_size_bytes = 0
+            counted_file_keys: set[tuple[int, int]] = set()
+            symlink_file_count = 0
+            dangling_file_count = 0
+            linked_outside_cache = False
             for root, directories, files in os.walk(repository, followlinks=False):
                 if Path(root) == repository:
                     # Match export's exclusion before counting entries/bytes:
                     # API listing caches consume neither wire nor staging space.
                     directories[:] = [name for name in directories if name != "trees"]
                 transfer_entry_count += len(directories) + len(files)
-                directories[:] = [
-                    name for name in directories
-                    if not (Path(root) / name).is_symlink()
-                ]
+                kept_directories = []
+                for name in directories:
+                    if (Path(root) / name).is_symlink():
+                        # Export cannot follow a symlinked directory, so this
+                        # repository is not self-contained on the node.
+                        linked_outside_cache = True
+                    else:
+                        kept_directories.append(name)
+                directories[:] = kept_directories
                 for name in files:
+                    link = Path(root) / name
                     try:
-                        stat = (Path(root) / name).lstat()
+                        entry_stat = link.lstat()
                     except OSError:
                         continue
-                    size_bytes += stat.st_size
+                    size_bytes += entry_stat.st_size
                     if (
                         name.endswith(".incomplete")
                         and name != _SELECTIVE_SNAPSHOT_MARKER
                     ):
-                        incomplete_size_bytes += stat.st_size
+                        incomplete_size_bytes += entry_stat.st_size
                     file_count += 1
-                    last_modified = max(last_modified, stat.st_mtime)
+                    last_modified = max(last_modified, entry_stat.st_mtime)
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        symlink_file_count += 1
+                        try:
+                            target_stat = os.stat(link)
+                            target = os.path.realpath(link)
+                        except OSError:
+                            dangling_file_count += 1
+                            continue
+                        if not stat.S_ISREG(target_stat.st_mode):
+                            dangling_file_count += 1
+                            continue
+                        resolved_size_bytes += _count_distinct_file_bytes(
+                            target_stat, counted_file_keys,
+                        )
+                        if not Path(target).is_relative_to(resolved_repository):
+                            linked_outside_cache = True
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        resolved_size_bytes += _count_distinct_file_bytes(
+                            entry_stat, counted_file_keys,
+                        )
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions), incomplete_revisions,
             )
@@ -2017,6 +2056,10 @@ class VirtualNAS:
             model = {
                 "model_id": model_id,
                 "size_bytes": size_bytes,
+                "resolved_size_bytes": resolved_size_bytes,
+                "symlink_file_count": symlink_file_count,
+                "dangling_file_count": dangling_file_count,
+                "linked_outside_cache": linked_outside_cache,
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
@@ -2041,7 +2084,14 @@ class VirtualNAS:
             }
             if selective_files:
                 model["selective_files_by_revision"] = selective_files
-            if transfer_entry_count > _FILE_STREAM_MAX_ENTRIES:
+            if (
+                transfer_entry_count > _FILE_STREAM_MAX_ENTRIES
+                or linked_outside_cache
+                or dangling_file_count
+            ):
+                # Export only sends bytes the receiving node can use: links to
+                # payloads outside the repository (or to nothing) would arrive
+                # as dangling entries, so such caches are not transferable.
                 model["transferable"] = False
             # A SentenceTransformers repository is served through
             # /v1/embeddings. The marker is evaluated here, on the node that
@@ -4980,6 +5030,23 @@ def _is_complete_repository(repository: Path) -> bool:
 # Safety valve for pathologies like a repository snapshot holding thousands
 # of loose files: inventory stays a summary, not a full file dump.
 _INVENTORY_FILE_LIMIT = 2000
+
+
+def _count_distinct_file_bytes(
+    info: os.stat_result, counted_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return bytes to add for one regular file, counting hardlinks once.
+
+    A filesystem that reports no inode identity (``st_ino`` of zero) cannot
+    be deduplicated, so every file is counted in full there.
+    """
+    if not info.st_ino:
+        return info.st_size
+    key = (info.st_dev, info.st_ino)
+    if key in counted_file_keys:
+        return 0
+    counted_file_keys.add(key)
+    return info.st_size
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

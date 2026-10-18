@@ -926,6 +926,16 @@ export interface DashboardData {
 export interface StorageModel {
   model_id: string
   size_bytes: number
+  // Distinct on-disk bytes reached by following symlinks (deduplicated by
+  // device/inode). A symlink facade over weights stored elsewhere reports
+  // only link bytes in size_bytes; this is the real payload size. Absent on
+  // agents that predate the field.
+  resolved_size_bytes?: number
+  symlink_file_count?: number
+  dangling_file_count?: number
+  // True when any cache entry resolves outside the repository directory, so
+  // the payload is not contained in the cache (and not transferable).
+  linked_outside_cache?: boolean
   // Best-effort full repository or selected-artifact size for partial caches,
   // looked up from the Hugging Face tree API. Absent when lookup failed.
   expected_size_bytes?: number

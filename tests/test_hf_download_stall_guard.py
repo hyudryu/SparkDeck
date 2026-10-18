@@ -332,6 +332,26 @@ class DownloadStallGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(attempts), 1)
             self.assertIsNotNone(processes[0].returncode)
 
+    async def test_removed_cap_keeps_the_polling_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nas = self._nas(root)
+            (root / "hub" / "models--org--model").mkdir(parents=True)
+            rate = root / "rate.txt"
+            rate.write_text("1000000000", encoding="utf-8")
+            stall = asyncio.Event()
+            with patch.object(nas, "_worker_io_counter",
+                              side_effect=itertools.count(1_000_000)):
+                watch = asyncio.create_task(nas._watch_download_stall(
+                    "org/model", 0, stall, timeout_seconds=.4,
+                    poll_seconds=.05, rate_file=rate, initial_bps=1e9))
+                await asyncio.sleep(.2)
+                rate.write_text("0", encoding="utf-8")  # cap removed
+                # The started-capped worker's poller still ticks rchar by a
+                # few bytes: the filter must keep filtering.
+                await asyncio.wait_for(stall.wait(), 2)
+            watch.cancel()
+
     async def test_rate_file_setup_failure_releases_operation_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

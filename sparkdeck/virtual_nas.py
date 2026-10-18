@@ -1586,11 +1586,15 @@ class VirtualNAS:
                 continue
             # The worker's own rate-file poller keeps rchar creeping even on
             # dead sockets: require the delta to look like network traffic
-            # for the live cap before it counts as progress.
+            # before it counts as progress. The floor stays at the larger of
+            # the live and dispatched caps because a worker that started
+            # capped keeps its poller thread even after the cap is removed;
+            # the window above still tracks the live value.
+            io_floor = max(bps, initial_bps)
             io_moved = io_counter is not None and (
                 last_io is None or (io_counter != last_io
                                     and io_counter - last_io
-                                    >= max(1.0, bps * poll_seconds * 0.25)))
+                                    >= max(1.0, io_floor * poll_seconds * 0.25)))
             now = time.monotonic()
             if progress != last_progress or io_moved:
                 last_progress = progress

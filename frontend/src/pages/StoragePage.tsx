@@ -23,6 +23,14 @@ function effectiveModelSize(model: StorageModel) {
   return model.resolved_size_bytes ?? model.size_bytes
 }
 
+function modelCapacityBytes(model: StorageModel) {
+  // The capacity bar is measured against the cache hub mount, so only bytes
+  // that occupy that mount count: same-mount link payloads do, payloads
+  // reached on another mount (or owned by ComfyUI) do not.
+  if (model.externally_managed) return 0
+  return model.cache_mount_size_bytes ?? effectiveModelSize(model)
+}
+
 function modelLinkNotice(model: StorageModel) {
   const parts: string[] = []
   if (model.linked_outside_cache) parts.push('Weights linked outside cache')
@@ -469,10 +477,10 @@ export function StoragePage() {
               ...node.models.filter((model) => matchesModelSearch(model.model_id) && !activeJobs.has(model.model_id)).sort(compareModels).map((model) => model.model_id),
             ]
             const used = node.models.reduce(
-              // linked_outside_cache payloads live on some other backing
-              // filesystem; free_size is measured on the cache hub mount, so
-              // counting them here would mix mounts in the capacity bar.
-              (total, model) => total + (model.externally_managed || model.linked_outside_cache ? 0 : effectiveModelSize(model)),
+              // Only bytes on the cache mount's own filesystem count here;
+              // free_size is measured on that mount, so mixing in off-mount
+              // payloads would make the capacity bar dishonest.
+              (total, model) => total + modelCapacityBytes(model),
               0,
             )
             // The capacity bar describes the Hugging Face cache mount, so its

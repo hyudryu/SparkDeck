@@ -867,6 +867,11 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(model["linked_outside_cache"])
             self.assertIs(model["transferable"], False)
             self.assertEqual(model["resolved_size_bytes"], 4096 + 2048)
+            # Same filesystem as the cache hub: the payload does occupy the
+            # cache mount's capacity budget, so it must not be excluded there.
+            self.assertEqual(
+                model["cache_mount_size_bytes"], model["resolved_size_bytes"],
+            )
             # Wire accounting stays lstat-based: the link entries are tiny.
             self.assertLess(model["size_bytes"], 4096)
             self.assertNotIn(str(external), json.dumps(models))
@@ -904,7 +909,43 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model["linked_outside_cache"])
             self.assertIsNot(model.get("transferable"), False)
             self.assertEqual(model["resolved_size_bytes"], len(payload))
+            self.assertEqual(model["cache_mount_size_bytes"], len(payload))
             self.assertGreater(model["size_bytes"], len(payload))
+
+    async def test_inventory_counts_payload_below_external_directory_link(self):
+        # A snapshot that is a single directory symlink into an external tree
+        # has no file entries to follow, so the payload must be counted through
+        # the directory link itself with the same inode dedup.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            hub = base / "hub"
+            repository = hub / "models--dirfacade--model"
+            snapshot = repository / "snapshots" / ("c" * 40)
+            snapshot.mkdir(parents=True)
+            external = base / "models" / "dir-facade"
+            (external / "sub").mkdir(parents=True)
+            (external / "model-00001.safetensors").write_bytes(b"a" * 3072)
+            (external / "sub" / "model-00002.safetensors").write_bytes(b"b" * 1024)
+            try:
+                (snapshot / "weights").symlink_to(external, target_is_directory=True)
+                # A contained directory link to a missing target is a broken
+                # link: reported as dangling, not as linked outside the cache.
+                (snapshot / "broken-dir").symlink_to(
+                    snapshot / "nope", target_is_directory=True,
+                )
+            except OSError as exc:
+                self.skipTest(f"source filesystem cannot create test symlinks: {exc}")
+            nas = VirtualNAS(base, lambda: hub, FakeRegistry(), lambda: False)
+
+            model = nas.inventory()[0]
+
+            self.assertEqual(model["resolved_size_bytes"], 3072 + 1024)
+            self.assertEqual(model["cache_mount_size_bytes"], 3072 + 1024)
+            self.assertTrue(model["linked_outside_cache"])
+            self.assertEqual(model["dangling_file_count"], 1)
+            self.assertIs(model["transferable"], False)
+            self.assertLess(model["size_bytes"], 3072)
+            self.assertNotIn(str(external), json.dumps([model]))
 
     async def test_snapshot_file_inventory_enforces_cap_during_traversal(self):
         with tempfile.TemporaryDirectory() as directory:

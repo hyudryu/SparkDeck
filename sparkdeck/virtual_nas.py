@@ -1916,6 +1916,10 @@ class VirtualNAS:
         hub = self._hub()
         if not hub.is_dir():
             return _external_comfyui_inventory(self._external_model_roots_provider())
+        try:
+            hub_device: int | None = os.stat(hub).st_dev or None
+        except OSError:
+            hub_device = None
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -1947,6 +1951,7 @@ class VirtualNAS:
             # its link bytes.
             resolved_repository = repository.resolve()
             resolved_size_bytes = 0
+            resolved_off_device_bytes = 0
             counted_file_keys: set[tuple[int, int]] = set()
             symlink_file_count = 0
             dangling_file_count = 0
@@ -1965,13 +1970,28 @@ class VirtualNAS:
                         # repository (it rejects only escaping links), so flag
                         # containment here rather than every directory link.
                         try:
-                            escaped = not Path(os.path.realpath(source)).is_relative_to(
+                            target = os.path.realpath(source)
+                            escaped = not Path(target).is_relative_to(
                                 resolved_repository,
                             )
                         except OSError:
                             escaped = True
+                            target = ""
                         if escaped:
                             linked_outside_cache = True
+                            # The walk never descends a directory link, so the
+                            # payload below an external directory target would
+                            # go uncounted without this charge.
+                            if target and os.path.isdir(target):
+                                added, off_device = _external_directory_payload(
+                                    Path(target), hub_device, counted_file_keys,
+                                )
+                                resolved_size_bytes += added
+                                resolved_off_device_bytes += off_device
+                        elif target and not os.path.isdir(target):
+                            # Contained but broken: a transfer would recreate
+                            # the dangling link at the receiving node.
+                            dangling_file_count += 1
                     else:
                         kept_directories.append(name)
                 directories[:] = kept_directories
@@ -2000,15 +2020,29 @@ class VirtualNAS:
                         if not stat.S_ISREG(target_stat.st_mode):
                             dangling_file_count += 1
                             continue
-                        resolved_size_bytes += _count_distinct_file_bytes(
+                        added = _count_distinct_file_bytes(
                             target_stat, counted_file_keys,
                         )
+                        resolved_size_bytes += added
+                        if (
+                            added
+                            and hub_device is not None
+                            and target_stat.st_dev != hub_device
+                        ):
+                            resolved_off_device_bytes += added
                         if not Path(target).is_relative_to(resolved_repository):
                             linked_outside_cache = True
                     elif stat.S_ISREG(entry_stat.st_mode):
-                        resolved_size_bytes += _count_distinct_file_bytes(
+                        added = _count_distinct_file_bytes(
                             entry_stat, counted_file_keys,
                         )
+                        resolved_size_bytes += added
+                        if (
+                            added
+                            and hub_device is not None
+                            and entry_stat.st_dev != hub_device
+                        ):
+                            resolved_off_device_bytes += added
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions), incomplete_revisions,
             )
@@ -2066,6 +2100,10 @@ class VirtualNAS:
                 "model_id": model_id,
                 "size_bytes": size_bytes,
                 "resolved_size_bytes": resolved_size_bytes,
+                # Resolved payload occupying the cache mount's own filesystem;
+                # bytes reached through links to another mount are excluded so
+                # the capacity bar (measured against that mount) stays honest.
+                "cache_mount_size_bytes": resolved_size_bytes - resolved_off_device_bytes,
                 "symlink_file_count": symlink_file_count,
                 "dangling_file_count": dangling_file_count,
                 "linked_outside_cache": linked_outside_cache,
@@ -5056,6 +5094,36 @@ def _count_distinct_file_bytes(
         return 0
     counted_file_keys.add(key)
     return info.st_size
+
+
+def _external_directory_payload(
+    target: Path,
+    hub_device: int | None,
+    counted_file_keys: set[tuple[int, int]],
+) -> tuple[int, int]:
+    """Return (bytes, off-mount bytes) for regular files below a directory link.
+
+    ``followlinks=False`` keeps the traversal from descending symlinked
+    sub-directories, so it cannot loop, and each regular file is charged once
+    per (device, inode) through the repository's shared dedup set.
+    """
+    total = 0
+    off_device = 0
+    for root, _directories, files in os.walk(target, followlinks=False):
+        for name in files:
+            try:
+                info = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            added = _count_distinct_file_bytes(info, counted_file_keys)
+            if not added:
+                continue
+            total += added
+            if hub_device is not None and info.st_dev != hub_device:
+                off_device += added
+    return total, off_device
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

@@ -956,6 +956,9 @@ describe('StoragePage', () => {
           model_id: 'deepseek-ai/DeepSeek-V4.1-Flash',
           size_bytes: 5968,
           resolved_size_bytes: 510_313_351_864,
+          // The payload sits in an external folder on another mount, so none
+          // of it occupies the cache mount the capacity bar is measured on.
+          cache_mount_size_bytes: 0,
           symlink_file_count: 88,
           dangling_file_count: 0,
           linked_outside_cache: true,
@@ -973,6 +976,9 @@ describe('StoragePage', () => {
     expect(card).toHaveTextContent('510 GB')
     expect(card).not.toHaveTextContent('6.0 KB')
     expect(card).toHaveTextContent('Weights linked outside cache')
+    // Off-mount payload: displayed in full, but excluded from the mount's
+    // capacity usage bar.
+    expect(within(card).getByText('0 B used')).toBeInTheDocument()
 
     const inventory = screen.getByRole('table', { name: 'Model storage inventory' })
     const row = within(inventory).getByText('deepseek-ai/DeepSeek-V4.1-Flash').closest('.table-row') as HTMLElement

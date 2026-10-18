@@ -931,6 +931,9 @@ export interface StorageModel {
   // only link bytes in size_bytes; this is the real payload size. Absent on
   // agents that predate the field.
   resolved_size_bytes?: number
+  // Portion of resolved_size_bytes that sits on the cache mount's own
+  // filesystem; used for the capacity bar, which is measured on that mount.
+  cache_mount_size_bytes?: number
   symlink_file_count?: number
   dangling_file_count?: number
   // True when any cache entry resolves outside the repository directory, so

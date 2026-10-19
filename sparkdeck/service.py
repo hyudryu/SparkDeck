@@ -3805,25 +3805,13 @@ class SparkDeckService:
                         model, artifact, resolved_revision,
                         extensions=(".ninfer",),
                     )
-                if _is_path_reference(model) and any(
-                    item != LOCAL_NODE_ID for item in requested_node_ids
-                ):
+                if any(item != LOCAL_NODE_ID for item in requested_node_ids):
                     # A container-only path (for example a snapshot below the
                     # image's HF_HOME) must keep Manager's cache bind flow;
                     # only a host-backed path is checked on the worker hosts.
-                    availability = await self._local_path_availability(
-                        model, requested_node_ids,
+                    await self._require_host_path_on_nodes(
+                        model, settings, requested_node_ids,
                     )
-                    if self._path_is_host_backed(model, settings, availability):
-                        missing = [
-                            node_id for node_id, available
-                            in availability.items() if not available
-                        ]
-                        if missing:
-                            raise ValueError(
-                                "local model path is not available on selected "
-                                "node(s): " + ", ".join(missing)
-                            )
                 launch_body = self._cluster_launch_body(
                     runtime, model, alias, deployment_id, identity, settings,
                     requested_node_ids, mode, llama_artifact=None,
@@ -4250,24 +4238,12 @@ class SparkDeckService:
                 f"{record.runtime.value} deployments support single and "
                 "replicated layouts, not sharded"
             )
-        if record.runtime.value in _CACHE_EXTERNAL_RUNTIMES and _is_path_reference(
-            model
-        ):
+        if record.runtime.value in _CACHE_EXTERNAL_RUNTIMES:
             # TensorFold path bookmarks can now target remote nodes; their
             # weights resolve outside the cache inventory, so revalidate the
             # host directory on every member before Manager persists a
             # topology that contains an unreadable rank.
-            availability = await self._local_path_availability(model, selected_ids)
-            if self._path_is_host_backed(model, settings, availability):
-                missing = [
-                    node_id for node_id, available in availability.items()
-                    if not available
-                ]
-                if missing:
-                    raise ValueError(
-                        "local model path is not available on selected node(s): "
-                        + ", ".join(missing)
-                    )
+            await self._require_host_path_on_nodes(model, settings, selected_ids)
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
         if record.runtime.value not in _CACHE_EXTERNAL_RUNTIMES:
@@ -4644,6 +4620,29 @@ class SparkDeckService:
                 + ", ".join(missing)
             )
 
+    async def _require_host_path_on_nodes(
+        self, model: str, settings: dict[str, Any] | None,
+        node_ids: list[str],
+    ) -> None:
+        """Reject a host-backed path model missing from a selected node.
+
+        Container-internal cache paths are left to Manager's cache bind flow.
+        """
+        if not _is_path_reference(model):
+            return
+        availability = await self._local_path_availability(model, node_ids)
+        if not self._path_is_host_backed(model, settings, availability):
+            return
+        missing = [
+            node_id for node_id, available in availability.items()
+            if not available
+        ]
+        if missing:
+            raise ValueError(
+                "local model path is not available on selected node(s): "
+                + ", ".join(missing)
+            )
+
     @staticmethod
     def _declares_local_model(settings: dict[str, Any] | None) -> bool:
         """Whether the record was persisted as a host-path model."""
@@ -4698,20 +4697,9 @@ class SparkDeckService:
         node_ids = list(dict.fromkeys(node_ids))
         if not node_ids:
             return
-        availability = await self._local_path_availability(repository, node_ids)
-        if not self._path_is_host_backed(
-            repository, deployment.get("settings"), availability,
-        ):
-            return
-        missing = [
-            node_id for node_id, available in availability.items()
-            if not available
-        ]
-        if missing:
-            raise ValueError(
-                "local model path is not available on selected node(s): "
-                + ", ".join(missing)
-            )
+        await self._require_host_path_on_nodes(
+            repository, deployment.get("settings"), node_ids,
+        )
 
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
@@ -5825,23 +5813,10 @@ class SparkDeckService:
                 raise ValueError(
                     "select the nodes for the additional deployment"
                 )
-            repository = str((deployment.get("model") or {}).get("repository") or "")
-            if _is_path_reference(repository):
-                availability = await self._local_path_availability(
-                    repository, node_ids,
-                )
-                if self._path_is_host_backed(
-                    repository, deployment.get("settings"), availability,
-                ):
-                    missing = [
-                        node_id for node_id, available in availability.items()
-                        if not available
-                    ]
-                    if missing:
-                        raise ValueError(
-                            "local model path is not available on selected "
-                            "node(s): " + ", ".join(missing)
-                        )
+            await self._require_host_path_on_nodes(
+                str((deployment.get("model") or {}).get("repository") or ""),
+                deployment.get("settings"), node_ids,
+            )
             result = await self.manager.add_deployment_instance(target, node_ids)
             if not result.get("ok"):
                 raise RuntimeError(
@@ -5969,6 +5944,18 @@ class SparkDeckService:
             # before Manager mutates any container.
             await self._validate_start_path_members(
                 deployment, owner or linked, instance,
+            )
+        if (
+            action == "start"
+            and str(deployment.get("runtime") or "") in _RELAUNCH_UNVALIDATED_RUNTIMES
+            and (node_ids or additional_node_ids)
+        ):
+            # These runtimes skip the cache-shaped start validation, so their
+            # explicit relaunch/add-node selections still need the path probe.
+            await self._require_host_path_on_nodes(
+                str((deployment.get("model") or {}).get("repository") or ""),
+                deployment.get("settings"),
+                list(node_ids or additional_node_ids or []),
             )
         if discovered is None and action == "stop" and instance is None:
             # Persist intent before the first container call. A failed or

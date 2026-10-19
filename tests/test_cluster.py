@@ -2668,6 +2668,17 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "unknown",
         )
 
+        container.exec_run.reset_mock()
+        container.exec_run.side_effect = None
+        container.exec_run.return_value = (0, b"")
+        self.assertEqual(
+            instance._created_container_model_source(
+                container, "/cache/models/org--model/snapshots/rev",
+            ),
+            "public_repository",
+        )
+        container.exec_run.assert_not_called()
+
     def test_launched_model_source_only_trusts_host_directories(self) -> None:
         instance = Manager.__new__(Manager)
         instance._resolve_local_path = mock.Mock(side_effect=lambda model: (

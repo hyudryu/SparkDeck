@@ -12074,7 +12074,10 @@ class Manager:
         otherwise return None.  Handles ``~`` expansion and normalises
         ``//`` to ``/``.
         """
-        if not model_path or not model_path.startswith(("/", "~")):
+        if not model_path or not (
+            model_path.startswith(("/", "~"))
+            or re.match(r"[A-Za-z]:[\\/]", model_path)
+        ):
             return None
         expanded = str(Path(model_path).expanduser().resolve())
         return expanded if Path(expanded).is_dir() else None
@@ -12085,6 +12088,12 @@ class Manager:
             return "local"
         if not str(model or "").strip():
             return "unknown"
+        if model.startswith(("/", "~")) or re.match(r"[A-Za-z]:[\\/]", model):
+            # An absolute path that is not a host directory came from the
+            # image's Hugging Face cache bind or was baked into the image.
+            # Persisting local here would make restart-time path validation
+            # require a host mount the deployment never had.
+            return "public_repository"
         try:
             result = container.exec_run(["test", "-e", "--", str(model)])
             exit_code = getattr(result, "exit_code", None)

@@ -1524,6 +1524,33 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.create_deployment.assert_not_awaited()
 
+    async def test_tensorfold_explicit_restart_rejects_a_node_without_the_path(self):
+        self.service.store.add_deployment(Deployment(
+            id="tf-restart", alias="TF restart", runtime=RuntimeKind.TENSORFOLD,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("/mnt/share/weights"),
+            settings={
+                "manager_deployment_id": "cluster-tf",
+                "model_source": "local",
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.deployments = [{
+            "id": "cluster-tf", "launch_settings": {},
+            "node_ids": ["remote-1"], "members": [],
+        }]
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                "tf-restart", "start", ["remote-1"],
+            )
+
+        self.manager.deployment_action.assert_not_awaited()
+
     async def test_launch_keeps_container_cache_paths_off_the_host_path_probe(self):
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.node_has_local_path = AsyncMock(return_value=False)

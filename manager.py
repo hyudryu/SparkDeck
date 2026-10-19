@@ -3366,14 +3366,17 @@ class Manager:
         if node_id == LOCAL_NODE_ID:
             return self._resolve_local_path(path) is not None
         try:
-            await self.node_registry.request(
+            # /api/agent routes run on the worker itself; management routes
+            # such as /api/disk-manager are forwarded back to the controller
+            # and would report the controller's filesystem instead.
+            result = await self.node_registry.request(
                 node_id, "GET",
-                f"/api/disk-manager/browse?path={quote(path, safe='')}",
+                f"/api/agent/local-path?path={quote(path, safe='')}",
                 timeout=15,
             )
         except Exception:
             return False
-        return True
+        return bool((result or {}).get("exists") is True)
 
     async def node_has_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],

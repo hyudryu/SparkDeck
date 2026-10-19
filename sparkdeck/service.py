@@ -3808,9 +3808,22 @@ class SparkDeckService:
                 if _is_path_reference(model) and any(
                     item != LOCAL_NODE_ID for item in requested_node_ids
                 ):
-                    await self._require_local_path_on_nodes(
+                    # A container-only path (for example a snapshot below the
+                    # image's HF_HOME) must keep Manager's cache bind flow;
+                    # only a host-backed path is checked on the worker hosts.
+                    availability = await self._local_path_availability(
                         model, requested_node_ids,
                     )
+                    if self._path_is_host_backed(model, settings, availability):
+                        missing = [
+                            node_id for node_id, available
+                            in availability.items() if not available
+                        ]
+                        if missing:
+                            raise ValueError(
+                                "local model path is not available on selected "
+                                "node(s): " + ", ".join(missing)
+                            )
                 launch_body = self._cluster_launch_body(
                     runtime, model, alias, deployment_id, identity, settings,
                     requested_node_ids, mode, llama_artifact=None,
@@ -4617,6 +4630,70 @@ class SparkDeckService:
         """Whether the record was persisted as a host-path model."""
         return str((settings or {}).get("model_source") or "") == "local"
 
+    def _path_is_host_backed(
+        self, model: str, settings: dict[str, Any] | None,
+        availability: dict[str, bool],
+    ) -> bool:
+        """Whether a syntactic path names a host directory, not a cache path.
+
+        Container-internal cache paths also look like paths, so only a
+        controller mount, a persisted local classification, or a selected
+        node exposing the directory promotes the model to the host-path flow.
+        """
+        return (
+            self._resolved_local_path(model) is not None
+            or self._declares_local_model(settings)
+            or any(availability.values())
+        )
+
+    async def _validate_start_path_members(
+        self, deployment: dict[str, Any], cluster: dict[str, Any] | None,
+        instance: int | None,
+    ) -> None:
+        """Verify a path model on the fixed nodes an instance start will use.
+
+        Grouped-sharded instance actions dispatch without an explicit node
+        selection, so the saved members are the authoritative targets.
+        """
+        repository = str((deployment.get("model") or {}).get("repository") or "")
+        if not _is_path_reference(repository):
+            return
+        node_ids: list[str] = []
+        for member in (cluster or {}).get("members") or []:
+            if not isinstance(member, dict) or not member.get("node_id"):
+                continue
+            if instance is not None:
+                try:
+                    member_instance = int(member.get("instance_id") or 0)
+                except (TypeError, ValueError):
+                    member_instance = 0
+                if member_instance != instance:
+                    continue
+            node_ids.append(str(member["node_id"]))
+        if not node_ids:
+            node_ids = [
+                str(item) for item in
+                (deployment.get("settings") or {}).get("node_ids") or []
+                if str(item).strip()
+            ]
+        node_ids = list(dict.fromkeys(node_ids))
+        if not node_ids:
+            return
+        availability = await self._local_path_availability(repository, node_ids)
+        if not self._path_is_host_backed(
+            repository, deployment.get("settings"), availability,
+        ):
+            return
+        missing = [
+            node_id for node_id, available in availability.items()
+            if not available
+        ]
+        if missing:
+            raise ValueError(
+                "local model path is not available on selected node(s): "
+                + ", ".join(missing)
+            )
+
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
         launch_settings: dict[str, Any] | None,
@@ -4638,10 +4715,8 @@ class SparkDeckService:
                 availability = await self._local_path_availability(
                     repository, node_ids,
                 )
-                is_local_path = (
-                    self._resolved_local_path(repository) is not None
-                    or self._declares_local_model(settings)
-                    or any(availability.values())
+                is_local_path = self._path_is_host_backed(
+                    repository, settings, availability,
                 )
         # llama.cpp GGUFs that live in a node's Hugging Face cache run on any
         # prepared node; only artifacts at absolute controller-local paths are
@@ -5852,6 +5927,13 @@ class SparkDeckService:
             raise ValueError(
                 "instance cannot be combined with a node selection"
             )
+        if action == "start" and node_ids is None and additional_node_ids is None:
+            # Grouped instance starts and plain restarts dispatch without an
+            # explicit selection; check a shared path on their fixed members
+            # before Manager mutates any container.
+            await self._validate_start_path_members(
+                deployment, owner or linked, instance,
+            )
         if discovered is None and action == "stop" and instance is None:
             # Persist intent before the first container call. A failed or
             # partially completed stop must still prevent queued inference or
@@ -6382,11 +6464,7 @@ class SparkDeckService:
         if not _is_path_reference(model):
             return None
         availability = await self._local_path_availability(model, node_ids)
-        if not (
-            self._resolved_local_path(model) is not None
-            or self._declares_local_model(settings)
-            or any(availability.values())
-        ):
+        if not self._path_is_host_backed(model, settings, availability):
             return None
         cluster_nodes = {
             str(node.get("id")): str(node.get("name") or node.get("id"))

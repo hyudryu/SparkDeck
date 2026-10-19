@@ -1508,6 +1508,23 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared["job_ids"], [])
         self.assertEqual(prepared["plan"]["targets"], plan["targets"])
 
+    async def test_launch_keeps_container_cache_paths_off_the_host_path_probe(self):
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        created = await self.service.create_deployment({
+            "model": "/cache/models/org--model/snapshots/rev",
+            "alias": "container cache path", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        }, launch=True)
+
+        # The path is probed to classify it, but a container-only path does
+        # not reject the launch when no host exposes it.
+        self.assertEqual(created["status"], "starting")
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/cache/models/org--model/snapshots/rev",
+        )
+
     async def test_saved_bookmark_accepts_the_detail_editor_contract(self):
         await self.service.create_deployment({
             "model": "org/model", "alias": "bookmark", "runtime": "vllm",

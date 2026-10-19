@@ -621,6 +621,39 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             "remote-1", "/mnt/share/weights",
         )
 
+    async def test_group_instance_start_rejects_a_member_without_the_path(self):
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service._validate_start_path_members(
+                {"model": {"repository": "/mnt/share/weights"},
+                 "settings": {"model_source": "local"}},
+                {"members": [
+                    {"node_id": "local", "instance_id": 0},
+                    {"node_id": "remote-1", "instance_id": 1},
+                ]},
+                1,
+            )
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/mnt/share/weights",
+        )
+
+    async def test_group_instance_start_accepts_a_member_with_the_path(self):
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=True)
+
+        await self.service._validate_start_path_members(
+            {"model": {"repository": "/mnt/share/weights"},
+             "settings": {"model_source": "local"}},
+            {"members": [{"node_id": "remote-1", "instance_id": 1}]},
+            1,
+        )
+
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/mnt/share/weights",
+        )
+
     async def test_start_keeps_cache_flow_for_container_cache_paths(self):
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.node_has_local_path = AsyncMock(return_value=False)

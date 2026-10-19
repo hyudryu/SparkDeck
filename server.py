@@ -1206,6 +1206,27 @@ async def agent_remove_image(image_id: str, req: Request):
         raise HTTPException(500, str(exc)[:500]) from exc
 
 
+@app.get("/api/agent/local-path")
+async def agent_local_path(path: str, req: Request):
+    """Report whether an absolute model directory exists on this node.
+
+    This route lives under ``/api/agent`` so a joined worker executes it
+    locally instead of forwarding it to the controller; a controller-only
+    filesystem check would misreport shared NAS mounts on every worker.
+    """
+    _require_agent(req)
+    if not isinstance(path, str) or not path.strip():
+        raise HTTPException(400, "path is required")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(400, "path must be absolute")
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)[:500]) from exc
+    return {"path": str(resolved), "exists": resolved.is_dir()}
+
+
 @app.get("/api/agent/virtual-nas/inventory")
 async def agent_virtual_nas_inventory(req: Request):
     _require_agent(req)

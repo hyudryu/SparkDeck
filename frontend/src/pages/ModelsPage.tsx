@@ -80,7 +80,9 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
   }
 }
 
-const isLocalModelPath = (model: string) => model.startsWith('/') || model.startsWith('~')
+const isLocalModelPath = (model: string) => (
+  model.startsWith('/') || model.startsWith('~') || /^[A-Za-z]:[\\/]/.test(model)
+)
 
 // A GGUF artifact is controller-local when it names a file on this machine
 // instead of a path inside the shared Hugging Face cache.

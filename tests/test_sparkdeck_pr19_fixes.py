@@ -583,22 +583,29 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["_base_url"], "http://127.0.0.1:8020")
         self.assertEqual(replacement["sparkdeck_record_id"], started["id"])
 
-    async def test_start_rejects_remote_node_for_controller_local_models(self):
-        self.manager.deployments = [{
-            "id": "cluster-1", "status": "stopped", "engine": "vllm",
-            "model": "/models/weights",
-        }]
-        self.service.store.add_deployment(Deployment(
-            id="dep-local", alias="local weights", runtime=RuntimeKind.VLLM,
-            kind=DeploymentKind.MANAGED, model=ModelIdentity("/models/weights"),
-            settings={"manager_deployment_id": "cluster-1"},
-        ))
-        self.manager.deployment_action = AsyncMock(return_value={"ok": True, "errors": []})
+    async def test_start_rejects_remote_node_without_the_local_model_path(self):
         self.manager._resolve_local_path = Mock(return_value="/models/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
 
-        with self.assertRaisesRegex(ValueError, "controller-local model paths"):
-            await self.service.deployment_action("dep-local", "start", node_ids=["remote-1"])
-        self.manager.deployment_action.assert_not_awaited()
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service._validate_start_selection(
+                {"model": {"repository": "/models/weights"}, "settings": {}},
+                ["remote-1"], None,
+            )
+
+    async def test_start_allows_remote_node_with_the_local_model_path(self):
+        self.manager._resolve_local_path = Mock(return_value="/models/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=True)
+
+        revision = await self.service._validate_start_selection(
+            {"model": {"repository": "/models/weights"}, "settings": {}},
+            ["local", "remote-1"], None,
+        )
+
+        self.assertIsNone(revision)
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/models/weights",
+        )
 
     async def test_llama_cpp_local_artifact_start_bypasses_hf_cache(self):
         self.service.store.add_deployment(Deployment(

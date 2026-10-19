@@ -3352,6 +3352,29 @@ class Manager:
             node_id, VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
         )
 
+    async def node_has_local_path(self, node_id: str, path: str) -> bool:
+        """Report whether a model directory exists at *path* on one node.
+
+        Shared NAS mounts (for example SparkNest) expose the same absolute
+        path on every host, so a path-backed deployment is launchable on each
+        node that has the directory rather than on the controller only.
+        """
+        if not isinstance(path, str) or not (
+            path.startswith(("/", "~")) or re.match(r"[A-Za-z]:[\\/]", path)
+        ):
+            return False
+        if node_id == LOCAL_NODE_ID:
+            return self._resolve_local_path(path) is not None
+        try:
+            await self.node_registry.request(
+                node_id, "GET",
+                f"/api/disk-manager/browse?path={quote(path, safe='')}",
+                timeout=15,
+            )
+        except Exception:
+            return False
+        return True
+
     async def node_has_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
     ) -> bool:

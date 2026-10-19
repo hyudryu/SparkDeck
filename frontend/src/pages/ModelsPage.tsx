@@ -88,9 +88,18 @@ const isLocalArtifact = (artifact?: string) => Boolean(
   artifact && (/^\//.test(artifact) || artifact.startsWith('~') || /^[A-Za-z]:[\\/]/.test(artifact)),
 )
 
+// Only llama.cpp owns a controller-only artifact. A path model on another
+// runtime can be a shared NAS directory (SparkNest), so its nodes are gated
+// by the per-node path preflight instead of assuming controller locality.
 const isControllerArtifact = (deployment: Deployment) => (
+  deployment.runtime === 'llama.cpp'
+  && (isLocalModelPath(deployment.model_id) || isLocalArtifact(deployment.settings.artifact))
+)
+
+const isLocalPathDeployment = (deployment: Deployment) => (
   isLocalModelPath(deployment.model_id)
-  || (deployment.runtime === 'llama.cpp' && isLocalArtifact(deployment.settings.artifact))
+  && !isControllerArtifact(deployment)
+  && (deployment.managed || isDiscoveredExternal(deployment))
 )
 
 // Strata downloads its own pinned checkpoint into the container's data
@@ -268,6 +277,14 @@ const canPromoteDiscovered = (deployment: Deployment) => (
   && deployment.promotable !== false
   && !deployment.has_start_hook
   && !deployment.has_stop_hook
+)
+
+// Saved bookmarks and direct promotion prepare cache weights, while path
+// deployments need the per-node directory preflight on every start.
+const deploymentNeedsStartPlan = (deployment: Deployment) => (
+  deployment.status === 'saved'
+  || Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
+  || isLocalPathDeployment(deployment)
 )
 
 // Scalar flags the structured argument editor manages; everything else in a
@@ -467,13 +484,11 @@ export function ModelsPage() {
   const [launchSeed, setLaunchSeed] = useState<string>()
   // Per-node preparation plan for launching a saved deployment: which nodes
   // hold the weights, which can receive them, and which are blocked (for
-  // example by free disk space on the model-cache volume).
+  // example by free disk space on the model-cache volume). Path deployments
+  // reuse it to report which nodes expose the shared model directory.
   const startPreflight = useResource(
     (signal) => {
-      if (!startSelection || !(
-        startSelection.deployment.status === 'saved'
-        || (startSelection.deployment.direct_start && canPromoteDiscovered(startSelection.deployment))
-      )) {
+      if (!startSelection || !deploymentNeedsStartPlan(startSelection.deployment)) {
         throw new Error('No preparable deployment selected')
       }
       const selectableIds = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
@@ -483,10 +498,7 @@ export function ModelsPage() {
     [startSelection?.deployment.id],
     Boolean(
       startSelection
-      && (
-        startSelection.deployment.status === 'saved'
-        || (startSelection.deployment.direct_start && canPromoteDiscovered(startSelection.deployment))
-      )
+      && deploymentNeedsStartPlan(startSelection.deployment)
       && !isControllerArtifact(startSelection.deployment)
       && !runtimeSelfManagesWeights(startSelection.deployment)
       && nodes.data?.length,
@@ -1491,6 +1503,7 @@ export function ModelsPage() {
       deployment.status === 'saved'
       || Boolean(deployment.direct_start && canPromoteDiscovered(deployment))
     ) && !isControllerArtifact(deployment)
+      && !isLocalPathDeployment(deployment)
       && !runtimeSelfManagesWeights(deployment)
     setBusy(deployment.id)
     setStartError(undefined)
@@ -1561,6 +1574,11 @@ export function ModelsPage() {
     if (isControllerArtifact(deployment)) {
       return new Set(localNodeId ? [localNodeId] : [])
     }
+    if (isLocalPathDeployment(deployment)) {
+      // The cluster cache cannot see host paths above the Hugging Face cache;
+      // availability comes from the per-node path preflight instead.
+      return new Set<string>()
+    }
     if (runtimeSelfManagesWeights(deployment)) {
       // Every node is launchable: the container fetches its own pinned
       // checkpoint into its data volume on first start.
@@ -1618,7 +1636,7 @@ export function ModelsPage() {
     const targetCount = flexibleParallel ? (flexibleCounts[0] ?? 0) : required
     let nodeIds = saved.slice(0, targetCount)
     if (nodeIds.length < targetCount) {
-      const candidates = deployment.managed
+      const candidates = deployment.managed && !isLocalPathDeployment(deployment)
         ? selectableNodes.filter((node) => deploymentWeightedNodes(deployment).has(node.id))
         : [...selectableNodes].sort((left, right) => (
           (usableGpuCount(right) ?? 0) - (usableGpuCount(left) ?? 0)
@@ -2630,9 +2648,11 @@ export function ModelsPage() {
         const preparableLaunch = savedLaunch || adoptingDirect
         const converting = canPromoteDiscovered(deployment) && !adoptingDirect
         const controllerArtifact = isControllerArtifact(deployment)
+        const localPath = isLocalPathDeployment(deployment)
         const selfManagedWeights = runtimeSelfManagesWeights(deployment)
+        const planNeeded = preparableLaunch || localPath
         const weighted = deploymentWeightedNodes(deployment)
-        const plan = preparableLaunch && !controllerArtifact && !selfManagedWeights ? startPreflight.data : undefined
+        const plan = planNeeded && !controllerArtifact && !selfManagedWeights ? startPreflight.data : undefined
         const planTargets = new Map((plan?.targets ?? []).map((target) => [target.node_id, target]))
         // Nodes without weights stay launchable whenever any of their own
         // preparation paths (transfer, Hugging Face download, or transfer
@@ -2665,7 +2685,7 @@ export function ModelsPage() {
                   ?? target?.transfer_after_download_reason
                   ?? 'Model weights not cached and the node cannot receive them')]
           }))
-        const weightWarnings = preparableLaunch ? Object.fromEntries((nodes.data ?? [])
+        const weightWarnings = planNeeded ? Object.fromEntries((nodes.data ?? [])
           .filter((node) => allowedIds.includes(node.id)
             && !(planTargets.get(node.id)?.has_required_weights ?? weighted.has(node.id)))
           .map((node) => [node.id, 'Weights need to be transferred before launch'])) : undefined
@@ -2680,10 +2700,10 @@ export function ModelsPage() {
           ? validDirectParallelSelection(deployment, selectedNodes)
           : nodeIds.length === required
         const allEligible = nodeIds.every((id) => allowedIds.includes(id) && nodes.data?.some((node) => node.id === id && isNodeSelectable(node)))
-        const planReady = !preparableLaunch || controllerArtifact || selfManagedWeights
+        const planReady = !planNeeded || controllerArtifact || selfManagedWeights
           || (!startPreflight.loading && !startPreflight.error)
         const ready = directLifecycle || (!nodes.loading && !nodes.error && planReady && exactCount && allEligible)
-        const needsPrep = preparableLaunch && !controllerArtifact && nodeIds.some((id) => (
+        const needsPrep = planNeeded && !localPath && !controllerArtifact && nodeIds.some((id) => (
           !(planTargets.get(id)?.has_required_weights ?? weighted.has(id))
         ))
         const transferTargets = nodeIds
@@ -2713,19 +2733,19 @@ export function ModelsPage() {
               ? fixedTargets.length
                 ? `This externally controlled deployment will start on its existing fixed ${fixedTargets.length === 1 ? 'target' : 'targets'} (${fixedTargets.join(', ')}). It cannot be relocated from this card. Confirm to continue.`
                 : 'This externally controlled deployment will start on the fixed targets owned by its external start command. SparkDeck cannot relocate or verify those targets from this card. Confirm to continue.'
-              : <>{flexibleParallel ? `TP${deployment.settings.tensor_parallel_size ?? deployment.parallel_rank_count} uses ${deployment.parallel_rank_count} GPU ranks and can run on ${parallelCountText}.` : sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : adoptingDirect ? 'SparkDeck will adopt this direct-discovered runtime and start it across the selected nodes.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</>}</p>
+              : <>{flexibleParallel ? `TP${deployment.settings.tensor_parallel_size ?? deployment.parallel_rank_count} uses ${deployment.parallel_rank_count} GPU ranks and can run on ${parallelCountText}.` : sharded ? `TP${deployment.settings.tensor_parallel_size ?? required} requires exactly ${required} nodes.` : `Select ${required === 1 ? 'the node' : `exactly ${required} nodes`} to run ${deployment.model_id} on.`} {controllerArtifact ? 'This local artifact can run only on the controller.' : localPath ? 'The model directory must exist at the same path on every selected node; nodes without it are unavailable.' : adoptingDirect ? 'SparkDeck will adopt this direct-discovered runtime and start it across the selected nodes.' : !deployment.managed ? 'SparkDeck will promote this discovered runtime into a managed deployment across the selected nodes.' : savedLaunch ? 'Nodes without the weights receive them automatically via Virtual NAS; nodes without enough free cache space are unavailable.' : 'Nodes without the complete model weights are disabled.'}</>}</p>
             {startError && <p className="form-error" role="alert">{startError}</p>}
             {startNotice && <p className="inline-success" role="status">{startNotice}</p>}
             {transferNotice && <p className="field-note" role="status">{transferNotice}</p>}
-            {!directLifecycle && !controllerArtifact && !selfManagedWeights && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
-            {!directLifecycle && preparableLaunch && !controllerArtifact && !selfManagedWeights && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
+            {!directLifecycle && !controllerArtifact && !localPath && !selfManagedWeights && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!directLifecycle && planNeeded && !controllerArtifact && !selfManagedWeights && startPreflight.error && <ErrorState message={`Preparation plan: ${startPreflight.error}`} onRetry={startPreflight.reload} />}
             {!directLifecycle && <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={nodeIds}
               onChange={(next) => setStartSelection({ deployment, nodeIds: next.length <= (flexibleParallel ? deployment.parallel_rank_count ?? required : required) ? next : nodeIds })}
-              loading={nodes.loading || (!controllerArtifact && !selfManagedWeights && (modelCache.loading || (preparableLaunch && startPreflight.loading)))}
+              loading={nodes.loading || (!controllerArtifact && !selfManagedWeights && ((!localPath && modelCache.loading) || (planNeeded && startPreflight.loading)))}
               error={nodes.error}
-              onRetry={() => { nodes.reload(); modelCache.reload(); if (preparableLaunch) startPreflight.reload() }}
+              onRetry={() => { nodes.reload(); if (!localPath) modelCache.reload(); if (planNeeded) startPreflight.reload() }}
               multiple={flexibleParallel || required > 1}
               disabled={startBusy}
               allowedIds={allowedIds}
@@ -2734,7 +2754,7 @@ export function ModelsPage() {
               localLabel={localLabel}
               primaryId={nodeIds[0]}
               legend={layoutLegend(deployment.deployment_mode, required)}
-              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : adoptingDirect ? `Choose where to adopt this runtime. SparkDeck verifies or prepares ${deployment.model_id} on every selected node before promotion.` : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${flexibleParallel ? 'GPU ranks are divided evenly across the selected nodes.' : layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
+              help={controllerArtifact ? 'Local model artifacts can run only on the controller.' : localPath ? `Choose nodes that expose ${deployment.model_id}. The directory is mounted at the same path on each node, so a shared NAS copy is launchable wherever it exists. ${layoutHelp(deployment.deployment_mode)}` : adoptingDirect ? `Choose where to adopt this runtime. SparkDeck verifies or prepares ${deployment.model_id} on every selected node before promotion.` : !deployment.managed ? `Choose the nodes SparkDeck should manage for this imported runtime. ${flexibleParallel ? 'GPU ranks are divided evenly across the selected nodes.' : layoutHelp(deployment.deployment_mode)}` : savedLaunch ? `Choose where to launch. SparkDeck tracks which nodes hold ${deployment.model_id} and moves the weights to the rest via Virtual NAS.` : `Only nodes with ${deployment.model_id} already cached can be selected. ${layoutHelp(deployment.deployment_mode)}`}
             />}
             {!directLifecycle && needsPrep && nodeIds.length > 1 && <label className="field"><span>Hub download seed (optional)</span>
               <select
@@ -2749,7 +2769,7 @@ export function ModelsPage() {
               </select>
               <small>One selected node downloads the GGUF from Hugging Face and the rest receive copies over the cluster network. Pick a node to control where that download runs.</small>
             </label>}
-            {!directLifecycle && !flexibleParallel && allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. Free up model-cache space or copy the weights in Storage first.</p>}
+            {!directLifecycle && !flexibleParallel && allowedIds.length < required && <p className="field-note">Only {allowedIds.length} of {required} required {required === 1 ? 'node is' : 'nodes are'} launchable. {localPath ? 'Mount the model directory on the remaining nodes first.' : 'Free up model-cache space or copy the weights in Storage first.'}</p>}
             {!directLifecycle && !exactCount && <p className="field-note" role="status">{flexibleParallel ? `Select ${parallelCountText}; every selected node must have enough GPUs for its share of the ${deployment.parallel_rank_count} ranks.` : `Select exactly ${required} ${required === 1 ? 'node' : 'nodes'} to continue.`}</p>}
             <div className="modal-actions"><Button type="button" disabled={startBusy} onClick={() => setStartSelection(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || startBusy} onClick={() => void confirmStart()}><Play size={15} /> {startBusy ? (startNotice ? 'Preparing…' : converting ? 'Converting…' : 'Starting…') : directLifecycle ? 'Confirm start' : adoptingDirect ? `Start on ${nodeIds.length} ${nodeIds.length === 1 ? 'node' : 'nodes'}` : converting ? `Make managed on ${required} ${required === 1 ? 'node' : 'nodes'}` : needsPrep ? `Transfer & launch on ${required} ${required === 1 ? 'node' : 'nodes'}` : `Launch on ${required} ${required === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>

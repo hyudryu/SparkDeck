@@ -104,6 +104,7 @@ _RELAUNCH_UNVALIDATED_RUNTIMES = frozenset((
     RuntimeKind.TENSORFOLD.value, RuntimeKind.STRATA.value,
 ))
 
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -3566,10 +3567,6 @@ class SparkDeckService:
                 raise ValueError(
                     "NInfer managed deployments require a .ninfer artifact"
                 )
-            resolve_local = getattr(self.manager, "_resolve_local_path", None)
-            model_is_local_path = bool(
-                resolve_local and resolve_local(model)
-            )
             if (
                 runtime in (RuntimeKind.LLAMA_CPP, RuntimeKind.NINFER)
                 and kind is DeploymentKind.MANAGED
@@ -3717,13 +3714,9 @@ class SparkDeckService:
 
             if requested_node_ids is not None:
                 if any(item != "local" for item in requested_node_ids):
-                    # Controller-local models can never run remotely, whatever
-                    # the runtime: reject the mixed selection at save time
-                    # instead of producing an unlaunchable bookmark.
-                    if model_is_local_path:
-                        raise ValueError(
-                            "local model paths can only be saved for the controller node"
-                        )
+                    # A path-backed model may live on a shared mount, so its
+                    # per-node availability is verified at launch instead of
+                    # rejecting remote nodes at save time.
                     if runtime is RuntimeKind.LLAMA_CPP and (
                         artifact_is_local
                         or (not artifact and _public_model_id(model) == "local-model")
@@ -3799,6 +3792,12 @@ class SparkDeckService:
                     ninfer_artifact = self._hub_relative_llama_artifact(
                         model, artifact, resolved_revision,
                         extensions=(".ninfer",),
+                    )
+                if self._resolved_local_path(model) and any(
+                    item != LOCAL_NODE_ID for item in requested_node_ids
+                ):
+                    await self._require_local_path_on_nodes(
+                        model, requested_node_ids,
                     )
                 launch_body = self._cluster_launch_body(
                     runtime, model, alias, deployment_id, identity, settings,
@@ -4551,14 +4550,56 @@ class SparkDeckService:
             )
         return selected
 
+    def _resolved_local_path(self, model: str) -> str | None:
+        """Resolve *model* to a host directory on the controller, if it is one.
+
+        Container-internal cache paths such as ``/cache/models/...`` start
+        with a slash but are not host paths; Manager's resolver is the
+        authority that separates the two.
+        """
+        resolve_local = getattr(self.manager, "_resolve_local_path", None)
+        if not callable(resolve_local) or not model:
+            return None
+        try:
+            return resolve_local(model)
+        except Exception:
+            return None
+
+    async def _local_path_available(self, node_id: str, model: str) -> bool:
+        """Whether *model* resolves to a directory on one selected node."""
+        if node_id == LOCAL_NODE_ID:
+            return self._resolved_local_path(model) is not None
+        check = getattr(self.manager, "node_has_local_path", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(await check(node_id, model))
+        except Exception:
+            return False
+
+    async def _require_local_path_on_nodes(
+        self, model: str, node_ids: list[str],
+    ) -> None:
+        availability = await asyncio.gather(
+            *(self._local_path_available(node_id, model) for node_id in node_ids),
+        )
+        missing = [
+            node_id for node_id, available in zip(node_ids, availability)
+            if not available
+        ]
+        if missing:
+            raise ValueError(
+                "local model path is not available on selected node(s): "
+                + ", ".join(missing)
+            )
+
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
         launch_settings: dict[str, Any] | None,
     ) -> str | None:
         """Validate weights and select an immutable cached default when unpinned."""
         repository = str((deployment.get("model") or {}).get("repository") or "")
-        resolve_local = getattr(self.manager, "_resolve_local_path", None)
-        is_local_path = bool(repository and resolve_local and resolve_local(repository))
+        is_local_path = bool(repository and self._resolved_local_path(repository))
         # llama.cpp GGUFs that live in a node's Hugging Face cache run on any
         # prepared node; only artifacts at absolute controller-local paths are
         # pinned to the controller.
@@ -4571,15 +4612,24 @@ class SparkDeckService:
             deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
             and (not artifact or _artifact_is_controller_local(artifact))
         )
-        if (is_local_path or controller_artifact) and any(
-            item != "local" for item in node_ids
-        ):
+        if controller_artifact and any(item != "local" for item in node_ids):
             raise ValueError(
-                "controller-local model paths can only run on the controller node"
-                if is_local_path else
                 "llama.cpp model artifacts can only run on the controller node"
             )
-        if is_local_path or controller_artifact or not repository:
+        if is_local_path:
+            if (
+                deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
+                and any(item != "local" for item in node_ids)
+            ):
+                raise ValueError(
+                    "controller-local model paths can only run on the controller node"
+                )
+            # A path may be a shared NAS mount present on several nodes, so
+            # verify it on every selected host instead of assuming controller
+            # locality. There are no cache weights or revision to resolve.
+            await self._require_local_path_on_nodes(repository, node_ids)
+            return None
+        if controller_artifact or not repository:
             return
         # A recipe-launched cluster pins its revision in the persisted launch
         # args, not in the deployment identity — prefer that when present.
@@ -5189,14 +5239,8 @@ class SparkDeckService:
             )
 
         launch_model = str(settings.get("model") or container.get("model") or "")
-        resolve_local = getattr(self.manager, "_resolve_local_path", None)
-        if (
-            launch_model and callable(resolve_local) and resolve_local(launch_model)
-            and any(node_id != LOCAL_NODE_ID for node_id in node_ids)
-        ):
-            raise ValueError(
-                "controller-local model paths can only run on the controller node"
-            )
+        if self._resolved_local_path(launch_model):
+            await self._require_local_path_on_nodes(launch_model, node_ids)
 
         launch_image = container.get("image")
         if direct_recovery is not None:
@@ -6204,11 +6248,9 @@ class SparkDeckService:
             (direct_recovery[0].get("model") if direct_recovery else None)
             or (deployment.get("model") or {}).get("repository") or ""
         )
-        resolve_local = getattr(self.manager, "_resolve_local_path", None)
-        if resolve_local and resolve_local(model):
-            raise ValueError(
-                "local model paths are not distributed through Virtual NAS"
-            )
+        # A path-backed model resolves through a mount on each node instead of
+        # Virtual NAS, so preparation reports per-node path availability rather
+        # than a transfer plan.
         if not model:
             raise ValueError("deployment does not reference a Hugging Face model")
         revision = (
@@ -6270,6 +6312,72 @@ class SparkDeckService:
         except Exception:
             return None
         return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
+
+    async def _local_path_preparation_plan(
+        self, model: str, revision: str, node_ids: list[str],
+    ) -> dict[str, Any]:
+        """Report which selected nodes expose a path-backed model directory.
+
+        Path models are bind-mounted from the host at the same absolute path,
+        so a directory on a shared NAS is launchable wherever it exists.
+        Nothing is downloaded or transferred: nodes without the path are
+        ineligible for the launch.
+        """
+        cluster_nodes = {
+            str(node.get("id")): str(node.get("name") or node.get("id"))
+            for node in await self.manager.cluster_nodes()
+        }
+        availability = await asyncio.gather(
+            *(self._local_path_available(node_id, model) for node_id in node_ids),
+        )
+        targets: list[dict[str, Any]] = []
+        for node_id, available in zip(node_ids, availability):
+            targets.append({
+                "node_id": node_id,
+                "node_name": cluster_nodes.get(node_id, node_id),
+                "eligible": available,
+                "reason": None if available
+                else "Model path is not available on this node",
+                "free_bytes": None,
+                "required_free_bytes": None,
+                "active_job_id": None,
+                "active_job_status": None,
+                "active_job_kind": None,
+                "has_preparation_conflict": False,
+                "preparation_conflict_reason": None,
+                "has_required_weights": available,
+                "has_model_cache": False,
+                "download_eligible": False,
+                "download_reason": None,
+                "transfer_after_download_eligible": False,
+                "transfer_after_download_reason": None,
+                "transfer_after_download_required_free_bytes": None,
+            })
+        missing = [target for target in targets if not target["has_required_weights"]]
+        return {
+            "enabled": True,
+            "model_id": model,
+            "revision": revision,
+            "resolved_revision": None,
+            "source": None,
+            "sources": [],
+            "download": None,
+            "download_error": None,
+            "targets": targets,
+            "staging_reserve_bytes": 0,
+            "node_ids": list(node_ids),
+            "eligible": not missing,
+            "action": "ready",
+            "download_node_id": None,
+            "download_node_ids": [],
+            "transfer_target_node_ids": [],
+            "reason": (
+                "; ".join(
+                    f"{target['node_name']}: {target['reason']}"
+                    for target in missing
+                )
+            ) or None,
+        }
 
     async def _llama_preparation_plan(
         self, model: str, revision: str, files: list[str],
@@ -6516,6 +6624,10 @@ class SparkDeckService:
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )
+        if self._resolved_local_path(model):
+            return await self._local_path_preparation_plan(
+                model, revision, node_ids,
+            )
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
@@ -6553,6 +6665,14 @@ class SparkDeckService:
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )
+        if self._resolved_local_path(model):
+            return {
+                "workflow_id": None, "job_ids": [], "jobs": [],
+                "node_ids": list(node_ids), "action": "ready",
+                "plan": await self._local_path_preparation_plan(
+                    model, revision, node_ids,
+                ),
+            }
         files = self._llama_selective_artifact(deployment, model)
         if deployment.get("runtime") == RuntimeKind.STRATA.value:
             # Nothing to transfer: the container fetches its own pinned

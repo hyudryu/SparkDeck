@@ -1460,24 +1460,53 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             4,
         )
 
-    async def test_local_model_directory_rejects_remote_nodes_for_any_runtime(self):
+    async def test_local_model_directory_saves_for_remote_nodes(self):
         model_dir = Path(self.temp.name) / "local-model"
         model_dir.mkdir()
         self.manager._resolve_local_path = Mock(return_value=str(model_dir))
-        with self.assertRaisesRegex(ValueError, "local model paths"):
-            await self.service.create_deployment({
-                "model": str(model_dir), "alias": "local-vllm",
-                "runtime": "vllm",
-                "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
-            })
 
-        # The controller-only selection stays saveable.
         created = await self.service.create_deployment({
             "model": str(model_dir), "alias": "local-vllm",
             "runtime": "vllm",
-            "node_ids": ["local"], "deployment_mode": "single",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
         })
+
         self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["node_ids"], ["local", "remote-1"])
+
+    async def test_preflight_reports_local_path_availability_per_node(self):
+        model_dir = Path(self.temp.name) / "local-model"
+        model_dir.mkdir()
+        self.manager._resolve_local_path = Mock(
+            side_effect=lambda path: str(model_dir) if path == str(model_dir) else None,
+        )
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+        created = await self.service.create_deployment({
+            "model": str(model_dir), "alias": "local-vllm",
+            "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+        })
+
+        plan = await self.service.deployment_preparation_preflight(
+            created["id"], ["local", "remote-1"],
+        )
+        prepared = await self.service.deployment_prepare(
+            created["id"], ["local", "remote-1"],
+        )
+
+        targets = {target["node_id"]: target for target in plan["targets"]}
+        self.assertTrue(targets["local"]["has_required_weights"])
+        self.assertTrue(targets["local"]["eligible"])
+        self.assertFalse(targets["remote-1"]["has_required_weights"])
+        self.assertFalse(targets["remote-1"]["eligible"])
+        self.assertEqual(targets["remote-1"]["reason"],
+                         "Model path is not available on this node")
+        self.assertEqual(plan["action"], "ready")
+        self.assertFalse(plan["eligible"])
+        self.assertIn("Worker", plan["reason"])
+        self.assertEqual(prepared["action"], "ready")
+        self.assertEqual(prepared["job_ids"], [])
+        self.assertEqual(prepared["plan"]["targets"], plan["targets"])
 
     async def test_saved_bookmark_accepts_the_detail_editor_contract(self):
         await self.service.create_deployment({

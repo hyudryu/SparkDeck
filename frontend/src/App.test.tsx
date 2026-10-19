@@ -2172,6 +2172,48 @@ describe('model deployments', () => {
     expect(dialog).toHaveTextContent('This local artifact can run only on the controller')
   })
 
+  it('starts a shared path deployment on every node that exposes the directory', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      const method = init?.method ?? 'GET'
+      if (path === '/api/v1/deployments/dep-path/prepare/preflight' && method === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: '/mnt/sparknest/models/deepseek', revision: 'main',
+          targets: [
+            { node_id: 'local', node_name: 'Controller', eligible: true, has_required_weights: true },
+            { node_id: 'node-2', node_name: 'Worker', eligible: true, has_required_weights: true },
+          ],
+          node_ids: ['local', 'node-2'], eligible: true, action: 'ready',
+          download_node_ids: [], transfer_target_node_ids: [], reason: null,
+          staging_reserve_bytes: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      const body = path.includes('/api/v1/deployments') ? { items: [{
+        id: 'dep-path', alias: 'Shared path', runtime: 'vllm', kind: 'managed',
+        model: { repository: '/mnt/sparknest/models/deepseek' }, status: 'stopped',
+        settings: { tensor_parallel_size: 2 }, node_ids: ['local', 'node-2'],
+        deployment_mode: 'sharded', required_node_count: 2,
+      }] } : path.includes('/api/v1/nodes') ? { items: [
+        { id: 'local', name: 'Controller', local: true, online: true, docker_ready: true, selectable: true, stats: { gpus: [{}] } },
+        { id: 'node-2', name: 'Worker', online: true, docker_ready: true, selectable: true, stats: { gpus: [{}] } },
+      ] } : path.includes('/api/v1/model-cache') ? { nodes: [] } : {}
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(<MemoryRouter><ModelsPage /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Shared path' })
+    const controller = within(dialog).getByRole('checkbox', { name: /Controller/ })
+    const worker = within(dialog).getByRole('checkbox', { name: /Worker/ })
+    expect(controller).toBeChecked()
+    expect(worker).toBeChecked()
+    expect(worker).toBeEnabled()
+    expect(dialog).not.toHaveTextContent('can run only on the controller')
+    expect(within(dialog).getByRole('button', { name: 'Launch on 2 nodes' })).toBeEnabled()
+  })
+
   it('launches a saved deployment after transferring weights via Virtual NAS', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input, init) => {

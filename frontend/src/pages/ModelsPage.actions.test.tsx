@@ -705,6 +705,7 @@ describe('models page running actions', () => {
       if (path === '/api/v1/deployments/dep-path/prepare/preflight' && method === 'POST') {
         return new Response(JSON.stringify({
           enabled: true, model_id: '/mnt/share/model', revision: 'main',
+          path_backed: true,
           targets: pathTargets, node_ids: pathTargets.map((target) => target.node_id),
           eligible: true, action: 'ready', download_node_ids: [],
           transfer_target_node_ids: [], reason: null, staging_reserve_bytes: 0,

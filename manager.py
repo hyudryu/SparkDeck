@@ -12094,6 +12094,16 @@ class Manager:
             return "unknown"
         return "local" if exit_code == 0 else "public_repository"
 
+    def _launched_model_source(self, model: str) -> str:
+        """Provenance for a launch that uses a host path or a Hub repository.
+
+        Only a directory mounted on the node counts as local. A path that
+        merely exists inside the container can come from the image's HF cache
+        bind and must not be mistaken for a host model directory, which would
+        make later restart validation reject every member.
+        """
+        return "local" if self._resolve_local_path(model) else "public_repository"
+
     def _image_hf_cache_target(self, image: str | None) -> str:
         """Return the Hugging Face cache directory declared by *image*.
 
@@ -17846,9 +17856,7 @@ class Manager:
             if summary is not None:
                 # Report a bind-mounted host path as local so benchmark
                 # results do not aggregate it under a public repository key.
-                summary["model_source"] = self._created_container_model_source(
-                    container, model,
-                )
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -17977,9 +17985,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = self._created_container_model_source(
-                    container, model,
-                )
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18116,9 +18122,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = self._created_container_model_source(
-                    container, model,
-                )
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18294,9 +18298,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = self._created_container_model_source(
-                    container, model,
-                )
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18845,9 +18847,7 @@ class Manager:
             prepared_watch["volume"] = data_volume
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = self._created_container_model_source(
-                    container, model,
-                )
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:

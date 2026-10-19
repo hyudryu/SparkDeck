@@ -1508,6 +1508,22 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared["job_ids"], [])
         self.assertEqual(prepared["plan"]["targets"], plan["targets"])
 
+    async def test_saved_tensorfold_path_rejects_a_member_without_the_directory(self):
+        created = await self.service.create_deployment({
+            "model": "/mnt/share/weights", "alias": "TF path",
+            "runtime": "tensorfold",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                created["id"], "start", ["remote-1"],
+            )
+
+        self.manager.create_deployment.assert_not_awaited()
+
     async def test_launch_keeps_container_cache_paths_off_the_host_path_probe(self):
         self.manager._resolve_local_path = Mock(return_value=None)
         self.manager.node_has_local_path = AsyncMock(return_value=False)

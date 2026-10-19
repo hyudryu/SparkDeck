@@ -4250,6 +4250,24 @@ class SparkDeckService:
                 f"{record.runtime.value} deployments support single and "
                 "replicated layouts, not sharded"
             )
+        if record.runtime.value in _CACHE_EXTERNAL_RUNTIMES and _is_path_reference(
+            model
+        ):
+            # TensorFold path bookmarks can now target remote nodes; their
+            # weights resolve outside the cache inventory, so revalidate the
+            # host directory on every member before Manager persists a
+            # topology that contains an unreadable rank.
+            availability = await self._local_path_availability(model, selected_ids)
+            if self._path_is_host_backed(model, settings, availability):
+                missing = [
+                    node_id for node_id, available in availability.items()
+                    if not available
+                ]
+                if missing:
+                    raise ValueError(
+                        "local model path is not available on selected node(s): "
+                        + ", ".join(missing)
+                    )
         deployment_dict = record.to_dict()
         deployment_dict["settings"] = settings
         if record.runtime.value not in _CACHE_EXTERNAL_RUNTIMES:
@@ -6516,6 +6534,7 @@ class SparkDeckService:
             "enabled": True,
             "model_id": model,
             "revision": revision,
+            "path_backed": True,
             "resolved_revision": None,
             "source": None,
             "sources": [],

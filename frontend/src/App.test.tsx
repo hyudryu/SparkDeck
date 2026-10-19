@@ -2180,6 +2180,7 @@ describe('model deployments', () => {
       if (path === '/api/v1/deployments/dep-path/prepare/preflight' && method === 'POST') {
         return new Response(JSON.stringify({
           enabled: true, model_id: '/mnt/sparknest/models/deepseek', revision: 'main',
+          path_backed: true,
           targets: [
             { node_id: 'local', node_name: 'Controller', eligible: true, has_required_weights: true },
             { node_id: 'node-2', node_name: 'Worker', eligible: true, has_required_weights: true },

@@ -3364,7 +3364,8 @@ class Manager:
         ):
             return False
         if node_id == LOCAL_NODE_ID:
-            return self._resolve_local_path(path) is not None
+            resolved = await asyncio.to_thread(self._resolve_local_path, path)
+            return resolved is not None
         try:
             # /api/agent routes run on the worker itself; management routes
             # such as /api/disk-manager are forwarded back to the controller
@@ -17843,10 +17844,11 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                # The cache-relative artifact only exists for public Hub
-                # repositories; report that provenance so benchmark results
-                # aggregate under the public model instead of a local key.
-                summary["model_source"] = "public_repository"
+                # Report a bind-mounted host path as local so benchmark
+                # results do not aggregate it under a public repository key.
+                summary["model_source"] = self._created_container_model_source(
+                    container, model,
+                )
             return summary
 
         try:
@@ -17975,7 +17977,9 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._created_container_model_source(
+                    container, model,
+                )
             return summary
 
         try:
@@ -18112,7 +18116,9 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._created_container_model_source(
+                    container, model,
+                )
             return summary
 
         try:
@@ -18288,7 +18294,9 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._created_container_model_source(
+                    container, model,
+                )
             return summary
 
         try:
@@ -18837,7 +18845,9 @@ class Manager:
             prepared_watch["volume"] = data_volume
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._created_container_model_source(
+                    container, model,
+                )
             return summary
 
         try:

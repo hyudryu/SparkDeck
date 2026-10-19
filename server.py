@@ -1217,14 +1217,20 @@ async def agent_local_path(path: str, req: Request):
     _require_agent(req)
     if not isinstance(path, str) or not path.strip():
         raise HTTPException(400, "path is required")
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        raise HTTPException(400, "path must be absolute")
-    try:
+
+    def check() -> dict:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("path must be absolute")
+        # A stale NFS mount can block a stat indefinitely; keep it off the
+        # agent's event loop so health and management routes stay responsive.
         resolved = candidate.resolve()
+        return {"path": str(resolved), "exists": resolved.is_dir()}
+
+    try:
+        return await asyncio.to_thread(check)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(400, str(exc)[:500]) from exc
-    return {"path": str(resolved), "exists": resolved.is_dir()}
 
 
 @app.get("/api/agent/virtual-nas/inventory")

@@ -1817,6 +1817,27 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager.add_deployment_instance.assert_awaited()
 
+    async def test_add_instance_rejects_a_node_without_the_shared_path(self):
+        self.service.store.add_deployment(Deployment(
+            id="grow-path", alias="TP4 path", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("/mnt/share/weights"),
+            settings={
+                "manager_deployment_id": "cluster-grow",
+                "model_source": "local",
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.add_deployment_instance = AsyncMock(return_value={"ok": True})
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                "grow-path", "add_instance", ["remote-1"],
+            )
+
+        self.manager.add_deployment_instance.assert_not_awaited()
+
     async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
         saved = await self.service.create_deployment({
             "model": "org/model", "alias": "Managed", "runtime": "sglang",

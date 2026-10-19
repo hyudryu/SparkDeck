@@ -4593,7 +4593,8 @@ class SparkDeckService:
     async def _local_path_available(self, node_id: str, model: str) -> bool:
         """Whether *model* resolves to a directory on one selected node."""
         if node_id == LOCAL_NODE_ID:
-            return self._resolved_local_path(model) is not None
+            resolved = await asyncio.to_thread(self._resolved_local_path, model)
+            return resolved is not None
         check = getattr(self.manager, "node_has_local_path", None)
         if not callable(check):
             return False
@@ -5806,6 +5807,23 @@ class SparkDeckService:
                 raise ValueError(
                     "select the nodes for the additional deployment"
                 )
+            repository = str((deployment.get("model") or {}).get("repository") or "")
+            if _is_path_reference(repository):
+                availability = await self._local_path_availability(
+                    repository, node_ids,
+                )
+                if self._path_is_host_backed(
+                    repository, deployment.get("settings"), availability,
+                ):
+                    missing = [
+                        node_id for node_id, available in availability.items()
+                        if not available
+                    ]
+                    if missing:
+                        raise ValueError(
+                            "local model path is not available on selected "
+                            "node(s): " + ", ".join(missing)
+                        )
             result = await self.manager.add_deployment_instance(target, node_ids)
             if not result.get("ok"):
                 raise RuntimeError(

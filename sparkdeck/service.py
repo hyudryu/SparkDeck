@@ -105,6 +105,18 @@ _RELAUNCH_UNVALIDATED_RUNTIMES = frozenset((
 ))
 
 
+def _is_path_reference(model: str) -> bool:
+    """True when *model* looks like a filesystem path rather than a repo id.
+
+    Container-internal cache paths such as ``/cache/models/...`` also match;
+    callers decide whether a path reference is actually host-backed by
+    probing the selected nodes.
+    """
+    if not isinstance(model, str) or not model:
+        return False
+    return model.startswith(("/", "~")) or bool(re.match(r"[A-Za-z]:[\\/]", model))
+
+
 # Only this many trailing bytes per stream of a lifecycle hook's output are
 # retained for the completion log; the rest is drained and discarded.
 _EXTERNAL_HOOK_OUTPUT_TAIL = 65536
@@ -3793,7 +3805,7 @@ class SparkDeckService:
                         model, artifact, resolved_revision,
                         extensions=(".ninfer",),
                     )
-                if self._resolved_local_path(model) and any(
+                if _is_path_reference(model) and any(
                     item != LOCAL_NODE_ID for item in requested_node_ids
                 ):
                     await self._require_local_path_on_nodes(
@@ -4577,14 +4589,21 @@ class SparkDeckService:
         except Exception:
             return False
 
+    async def _local_path_availability(
+        self, model: str, node_ids: list[str],
+    ) -> dict[str, bool]:
+        """Probe every selected node for one host model directory."""
+        results = await asyncio.gather(
+            *(self._local_path_available(node_id, model) for node_id in node_ids),
+        )
+        return dict(zip(node_ids, results))
+
     async def _require_local_path_on_nodes(
         self, model: str, node_ids: list[str],
     ) -> None:
-        availability = await asyncio.gather(
-            *(self._local_path_available(node_id, model) for node_id in node_ids),
-        )
+        availability = await self._local_path_availability(model, node_ids)
         missing = [
-            node_id for node_id, available in zip(node_ids, availability)
+            node_id for node_id, available in availability.items()
             if not available
         ]
         if missing:
@@ -4593,13 +4612,37 @@ class SparkDeckService:
                 + ", ".join(missing)
             )
 
+    @staticmethod
+    def _declares_local_model(settings: dict[str, Any] | None) -> bool:
+        """Whether the record was persisted as a host-path model."""
+        return str((settings or {}).get("model_source") or "") == "local"
+
     async def _validate_start_selection(
         self, deployment: dict[str, Any], node_ids: list[str],
         launch_settings: dict[str, Any] | None,
     ) -> str | None:
         """Validate weights and select an immutable cached default when unpinned."""
         repository = str((deployment.get("model") or {}).get("repository") or "")
-        is_local_path = bool(repository and self._resolved_local_path(repository))
+        settings = deployment.get("settings") or {}
+        is_llama = deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
+        availability: dict[str, bool] | None = None
+        is_local_path = False
+        if _is_path_reference(repository):
+            if is_llama:
+                is_local_path = self._resolved_local_path(repository) is not None
+            else:
+                # A syntactic path is host-backed when the controller mounts
+                # it, the record was already classified as local, or any
+                # selected worker exposes it. A container-internal cache path
+                # matches none of those and keeps the cache/artifact flow.
+                availability = await self._local_path_availability(
+                    repository, node_ids,
+                )
+                is_local_path = (
+                    self._resolved_local_path(repository) is not None
+                    or self._declares_local_model(settings)
+                    or any(availability.values())
+                )
         # llama.cpp GGUFs that live in a node's Hugging Face cache run on any
         # prepared node; only artifacts at absolute controller-local paths are
         # pinned to the controller.
@@ -4617,17 +4660,26 @@ class SparkDeckService:
                 "llama.cpp model artifacts can only run on the controller node"
             )
         if is_local_path:
-            if (
-                deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
-                and any(item != "local" for item in node_ids)
-            ):
+            if is_llama and any(item != "local" for item in node_ids):
                 raise ValueError(
                     "controller-local model paths can only run on the controller node"
                 )
             # A path may be a shared NAS mount present on several nodes, so
             # verify it on every selected host instead of assuming controller
             # locality. There are no cache weights or revision to resolve.
-            await self._require_local_path_on_nodes(repository, node_ids)
+            if availability is None:
+                availability = await self._local_path_availability(
+                    repository, node_ids,
+                )
+            missing = [
+                node_id for node_id, available in availability.items()
+                if not available
+            ]
+            if missing:
+                raise ValueError(
+                    "local model path is not available on selected node(s): "
+                    + ", ".join(missing)
+                )
             return None
         if controller_artifact or not repository:
             return
@@ -5239,7 +5291,10 @@ class SparkDeckService:
             )
 
         launch_model = str(settings.get("model") or container.get("model") or "")
-        if self._resolved_local_path(launch_model):
+        if (
+            self._resolved_local_path(launch_model)
+            or self._declares_local_model(settings)
+        ):
             await self._require_local_path_on_nodes(launch_model, node_ids)
 
         launch_image = container.get("image")
@@ -6313,25 +6368,32 @@ class SparkDeckService:
             return None
         return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
 
-    async def _local_path_preparation_plan(
+    async def _path_preparation_plan(
         self, model: str, revision: str, node_ids: list[str],
-    ) -> dict[str, Any]:
-        """Report which selected nodes expose a path-backed model directory.
+        settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Report per-node availability of a host-path model directory.
 
-        Path models are bind-mounted from the host at the same absolute path,
-        so a directory on a shared NAS is launchable wherever it exists.
-        Nothing is downloaded or transferred: nodes without the path are
-        ineligible for the launch.
+        Returns ``None`` when *model* is not host-backed: a container-internal
+        cache path also looks like a path, so it stays on the Hugging Face
+        preparation flow unless the controller mounts the directory, the
+        record is marked local, or a selected node exposes it.
         """
+        if not _is_path_reference(model):
+            return None
+        availability = await self._local_path_availability(model, node_ids)
+        if not (
+            self._resolved_local_path(model) is not None
+            or self._declares_local_model(settings)
+            or any(availability.values())
+        ):
+            return None
         cluster_nodes = {
             str(node.get("id")): str(node.get("name") or node.get("id"))
             for node in await self.manager.cluster_nodes()
         }
-        availability = await asyncio.gather(
-            *(self._local_path_available(node_id, model) for node_id in node_ids),
-        )
         targets: list[dict[str, Any]] = []
-        for node_id, available in zip(node_ids, availability):
+        for node_id, available in availability.items():
             targets.append({
                 "node_id": node_id,
                 "node_name": cluster_nodes.get(node_id, node_id),
@@ -6624,10 +6686,11 @@ class SparkDeckService:
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )
-        if self._resolved_local_path(model):
-            return await self._local_path_preparation_plan(
-                model, revision, node_ids,
-            )
+        path_plan = await self._path_preparation_plan(
+            model, revision, node_ids, deployment.get("settings"),
+        )
+        if path_plan is not None:
+            return path_plan
         files = self._llama_selective_artifact(deployment, model)
         if files is not None:
             return await self._llama_preparation_plan(model, revision, files, node_ids)
@@ -6665,13 +6728,14 @@ class SparkDeckService:
         deployment, model, revision = await self._preparable_deployment_model(
             deployment_id,
         )
-        if self._resolved_local_path(model):
+        path_plan = await self._path_preparation_plan(
+            model, revision, node_ids, deployment.get("settings"),
+        )
+        if path_plan is not None:
             return {
                 "workflow_id": None, "job_ids": [], "jobs": [],
                 "node_ids": list(node_ids), "action": "ready",
-                "plan": await self._local_path_preparation_plan(
-                    model, revision, node_ids,
-                ),
+                "plan": path_plan,
             }
         files = self._llama_selective_artifact(deployment, model)
         if deployment.get("runtime") == RuntimeKind.STRATA.value:

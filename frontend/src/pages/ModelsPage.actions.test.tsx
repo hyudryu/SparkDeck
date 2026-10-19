@@ -685,6 +685,75 @@ describe('models page running actions', () => {
     })
   })
 
+  it('grows a path deployment on nodes that expose the directory', async () => {
+    const user = userEvent.setup()
+    const pathDeployment = {
+      ...runningDeployment,
+      id: 'dep-path', alias: 'Path model', model: { repository: '/mnt/share/model' },
+      node_ids: ['worker-1'], selected_nodes: [{ id: 'worker-1', name: 'Node 4' }],
+    }
+    const pathTargets = [
+      { node_id: 'local', node_name: 'Controller', eligible: true, has_required_weights: true },
+      { node_id: 'worker-1', node_name: 'Node 4', eligible: true, has_required_weights: true },
+      { node_id: 'worker-2', node_name: 'Node 3', eligible: true, has_required_weights: true },
+      { node_id: 'worker-3', node_name: 'Node 2', eligible: false, has_required_weights: false, reason: 'Model path is not available on this node' },
+      { node_id: 'worker-4', node_name: 'Node 1', eligible: false, has_required_weights: false, reason: 'Model path is not available on this node' },
+    ]
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      const method = init?.method ?? 'GET'
+      if (path === '/api/v1/deployments/dep-path/prepare/preflight' && method === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: '/mnt/share/model', revision: 'main',
+          targets: pathTargets, node_ids: pathTargets.map((target) => target.node_id),
+          eligible: true, action: 'ready', download_node_ids: [],
+          transfer_target_node_ids: [], reason: null, staging_reserve_bytes: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [pathDeployment] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/nodes') {
+        return new Response(JSON.stringify({ items: nodes }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/model-cache') {
+        return new Response(JSON.stringify({ nodes: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/recipes') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/onboarding') {
+        return new Response(JSON.stringify({ role: 'controller', node: { id: 'local', name: 'Controller', port: 9000, access_urls: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path === '/api/v1/settings') {
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify(pathDeployment), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    renderPage()
+
+    await screen.findByText('Path model')
+    await user.click(screen.getByRole('button', { name: 'More actions for Path model' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Launch on additional nodes…' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Add nodes to Path model' })
+    expect(within(dialog).getByRole('checkbox', { name: /Node 4/ })).toBeDisabled()
+    expect(within(dialog).getByRole('checkbox', { name: /Node 2/ })).toBeDisabled()
+    expect(within(dialog).getAllByText(/Model path is not available on this node/).length).toBe(2)
+    const node3 = within(dialog).getByRole('checkbox', { name: /Node 3/ })
+    expect(node3).toBeEnabled()
+    await user.click(node3)
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+
+    await waitFor(() => {
+      const start = fetchMock.mock.calls.find(([callPath, init]) => (
+        String(callPath).endsWith('/deployments/dep-path/start') && init?.method === 'POST'
+      ))
+      expect(start).toBeDefined()
+      expect(JSON.parse(String(start?.[1]?.body))).toEqual({ additional_node_ids: ['worker-2'] })
+    })
+  })
+
   it('grows a Strata deployment without waiting for the model cache', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

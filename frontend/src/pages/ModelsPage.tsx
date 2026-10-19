@@ -506,6 +506,27 @@ export function ModelsPage() {
   )
   const [additionalLaunch, setAdditionalLaunch] = useState<{ deployment: Deployment; currentIds: string[]; additionalIds: string[] }>()
   const [additionalError, setAdditionalError] = useState<string>()
+  // Path deployments grow replicas on nodes that expose the same directory;
+  // their availability is not visible in the Hugging Face cache, so the
+  // additional-nodes picker uses the same per-node path preflight.
+  const additionalPreflight = useResource(
+    (signal) => {
+      if (!additionalLaunch || !isLocalPathDeployment(additionalLaunch.deployment)) {
+        throw new Error('No path deployment selected')
+      }
+      const selectableIds = (nodes.data ?? []).filter(isNodeSelectable).map((node) => node.id)
+      if (!selectableIds.length) throw new Error('No selectable nodes')
+      return api.deployments.preparePreflight(
+        additionalLaunch.deployment.id, selectableIds, signal,
+      )
+    },
+    [additionalLaunch?.deployment.id],
+    Boolean(
+      additionalLaunch
+      && isLocalPathDeployment(additionalLaunch.deployment)
+      && nodes.data?.length,
+    ),
+  )
   const [addInstanceLaunch, setAddInstanceLaunch] = useState<{ deployment: Deployment; nodeIds: string[] }>()
   const [addInstanceError, setAddInstanceError] = useState<string>()
   useEffect(() => {
@@ -2781,13 +2802,18 @@ export function ModelsPage() {
         const occupied = occupiedNodeReasons(resource.data ?? [], deployment.id, deployment.runtime)
         const weighted = deploymentWeightedNodes(deployment)
         const selfManagedWeights = runtimeSelfManagesWeights(deployment)
-        // Gate on the cache predicate only: cached nodes that are offline or
-        // Docker-unready stay in allowedIds so the selector reports their
+        const localPath = isLocalPathDeployment(deployment)
+        const pathTargets = new Map((additionalPreflight.data?.targets ?? []).map((target) => [target.node_id, target]))
+        const hasWeights = (id: string) => localPath
+          ? Boolean(pathTargets.get(id)?.has_required_weights)
+          : weighted.has(id)
+        // Gate on the cache/path predicate only: ready nodes that are offline
+        // or Docker-unready stay in allowedIds so the selector reports their
         // real status ("Offline", "Docker unavailable") instead of a
         // misleading "weights not cached".
-        const cachedIds = (nodes.data ?? []).filter((node) => !occupied[node.id] && !currentIds.includes(node.id) && weighted.has(node.id)).map((node) => node.id)
+        const cachedIds = (nodes.data ?? []).filter((node) => !occupied[node.id] && !currentIds.includes(node.id) && hasWeights(node.id)).map((node) => node.id)
         const allowedIds = [...currentIds.filter((id) => !occupied[id]), ...cachedIds]
-        const unavailableReasons = { ...Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, 'Model weights not cached'])), ...occupied }
+        const unavailableReasons = { ...Object.fromEntries((nodes.data ?? []).filter((node) => !allowedIds.includes(node.id)).map((node) => [node.id, localPath ? pathTargets.get(node.id)?.reason ?? 'Model path is not available on this node' : 'Model weights not cached'])), ...occupied }
         const additionalBusy = busy === deployment.id
         const ready = additionalIds.length > 0 && [...currentIds, ...additionalIds].every((id) => allowedIds.includes(id)) && !nodes.loading && !nodes.error
         return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !additionalBusy && setAdditionalLaunch(undefined)}>
@@ -2795,14 +2821,15 @@ export function ModelsPage() {
             <div className="modal-heading"><div><p className="eyebrow">Launch on additional nodes</p><h2 id="additional-nodes-title">Add nodes to {deployment.alias}</h2></div><button className="icon-button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)} aria-label="Close dialog">×</button></div>
             <p className="modal-description">Currently running on {selectedNodeLabel(nodes.data ?? [], currentIds, localLabel)}. Choose the nodes that should also run {deployment.model_id}; the running nodes stay selected. SparkDeck relaunches the deployment, so existing replicas restart briefly.</p>
             {additionalError && <p className="form-error" role="alert">{additionalError}</p>}
-            {!selfManagedWeights && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {!selfManagedWeights && !localPath && modelCache.error && <ErrorState message={`Model weights: ${modelCache.error}`} onRetry={modelCache.reload} />}
+            {localPath && additionalPreflight.error && <ErrorState message={`Model path: ${additionalPreflight.error}`} onRetry={additionalPreflight.reload} />}
             <NodeSelector
               nodes={nodes.data ?? []}
               selectedIds={[...currentIds, ...additionalIds]}
               onChange={(next) => setAdditionalLaunch({ deployment, currentIds, additionalIds: next.filter((id) => !currentIds.includes(id)) })}
-              loading={nodes.loading || (!selfManagedWeights && modelCache.loading)}
+              loading={nodes.loading || (!selfManagedWeights && (localPath ? additionalPreflight.loading : modelCache.loading))}
               error={nodes.error}
-              onRetry={() => { nodes.reload(); modelCache.reload() }}
+              onRetry={() => { nodes.reload(); if (localPath) additionalPreflight.reload(); else modelCache.reload() }}
               multiple
               disabled={additionalBusy}
               requiredIds={currentIds}
@@ -2811,7 +2838,7 @@ export function ModelsPage() {
               localLabel={localLabel}
               primaryId={currentIds[0]}
               legend="Additional nodes · parallel instances"
-              help={selfManagedWeights ? `Additional nodes run their own complete copy of ${deployment.model_id}; each container fetches its own checkpoint into its data volume on first start.` : `Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
+              help={selfManagedWeights ? `Additional nodes run their own complete copy of ${deployment.model_id}; each container fetches its own checkpoint into its data volume on first start.` : localPath ? `Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes that expose the same model directory can join, and the running nodes above cannot be removed here.` : `Additional nodes run their own complete copy of ${deployment.model_id}. Only nodes with the model already cached can join, and the running nodes above cannot be removed here.`}
             />
             <div className="modal-actions"><Button type="button" disabled={additionalBusy} onClick={() => setAdditionalLaunch(undefined)}>Cancel</Button><Button variant="primary" disabled={!ready || additionalBusy} onClick={() => void confirmAdditionalLaunch()}><Play size={15} /> {additionalBusy ? 'Launching…' : `Launch on ${additionalIds.length} ${additionalIds.length === 1 ? 'node' : 'nodes'}`}</Button></div>
           </section>

@@ -607,6 +607,33 @@ class DeploymentLifecycleFixTests(unittest.IsolatedAsyncioTestCase):
             "remote-1", "/models/weights",
         )
 
+    async def test_start_allows_remote_only_model_path_without_a_controller_mount(self):
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.node_has_local_path = AsyncMock(return_value=True)
+
+        revision = await self.service._validate_start_selection(
+            {"model": {"repository": "/mnt/share/weights"}, "settings": {}},
+            ["remote-1"], None,
+        )
+
+        self.assertIsNone(revision)
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/mnt/share/weights",
+        )
+
+    async def test_start_keeps_cache_flow_for_container_cache_paths(self):
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+        self.manager.model_cache_inventory = AsyncMock(return_value=[])
+
+        with self.assertRaisesRegex(ValueError, "model weights are not available"):
+            await self.service._validate_start_selection(
+                {"model": {"repository": "/cache/models/org--model/snapshots/rev"},
+                 "settings": {}},
+                ["remote-1"], None,
+            )
+        self.manager.model_cache_inventory.assert_awaited_once()
+
     async def test_llama_cpp_local_artifact_start_bypasses_hf_cache(self):
         self.service.store.add_deployment(Deployment(
             id="dep-llama", alias="gguf", runtime=RuntimeKind.LLAMA_CPP,

@@ -12017,6 +12017,31 @@ class Manager:
 
     # ---------- local path auto-mount ----------
     @staticmethod
+    def _hf_snapshot_repo_root(path: str) -> str | None:
+        """Return the HF hub-cache repo root when *path* is a snapshot dir.
+
+        A ``hub/models--<owner>--<name>/snapshots/<revision>`` directory is a
+        farm of relative symlinks into ``../../blobs/<sha>``.  Binding only the
+        snapshot directory into a container leaves every one of those links
+        dangling, because ``blobs/`` lives outside the bind.  Binding the repo
+        root instead keeps the snapshot tree and the blob store inside one
+        mount, so the links resolve at the same absolute path the engine was
+        given — including when the cache is a network filesystem mount.
+        """
+        marker = "/snapshots/"
+        index = path.rfind(marker)
+        if index <= 0:
+            return None
+        remainder = path[index + len(marker):]
+        if not remainder or "/" in remainder:
+            return None
+        repo = path[:index]
+        name = repo.rsplit("/", 1)[-1]
+        if not name.startswith("models--") or "--" not in name[len("models--"):]:
+            return None
+        return repo
+
+    @staticmethod
     def _resolve_local_path(model_path: str) -> str | None:
         """Return the expanded absolute path if *model_path* is a local path,
         otherwise return None.  Handles ``~`` expansion and normalises
@@ -12120,6 +12145,10 @@ class Manager:
             else None
         )
         local_model = self._resolve_local_path(model)
+        if local_model:
+            # _build_volumes() binds the repo root for HF snapshot layout;
+            # accept exactly what a fresh managed launch would create.
+            local_model = self._hf_snapshot_repo_root(local_model) or local_model
         local_target = str(local_model).rstrip("/\\") if local_model else None
 
         def _matches_managed_bind(source: str, destination: str) -> bool:
@@ -12205,7 +12234,10 @@ class Manager:
         # Local model path
         local = self._resolve_local_path(model_path)
         if local:
-            volumes[local] = {"bind": local, "mode": "rw"}
+            # HF snapshot dirs only work when their blob store travels with
+            # them; bind the repo root for that layout (no-op otherwise).
+            bind = self._hf_snapshot_repo_root(local) or local
+            volumes[bind] = {"bind": bind, "mode": "rw"}
         return volumes
 
     def _resolved_hf_token(self, explicit: str | None = None) -> str:

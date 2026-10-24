@@ -19,6 +19,7 @@ with patch("docker.from_env", return_value=Mock()):
     import server
 
 from manager import Manager
+import manager as manager_module
 from sparkdeck import embedding_worker as worker_module
 from sparkdeck import embeddings as embeddings_module
 from sparkdeck.embeddings import (
@@ -576,6 +577,70 @@ class EmbeddingDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         await manager.embedding_models()
 
         inventory.assert_awaited_once()
+
+    async def test_discovery_does_not_wait_for_a_slow_cache_walk(self):
+        release = asyncio.Event()
+
+        async def slow_inventory():
+            await release.wait()
+            return [embedding_node("local")]
+
+        inventory = AsyncMock(side_effect=slow_inventory)
+        manager = bare_manager(model_cache_inventory=inventory)
+
+        started = time.monotonic()
+        with patch.object(manager_module, "_EMBEDDING_DISCOVERY_MAX_WAIT", 0.05):
+            discovered = await manager.embedding_models(discovery=True)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(discovered, {"enabled": True, "models": []})
+        inventory.assert_awaited_once()
+
+        # The walk keeps running and its result becomes the next answer.
+        release.set()
+        await manager._embedding_inventory_task
+        refreshed = await manager.embedding_models(discovery=True)
+
+        self.assertEqual(
+            [model["model_id"] for model in refreshed["models"]], [MODEL_ID],
+        )
+
+    async def test_discovery_serves_the_last_snapshot_instead_of_waiting(self):
+        release = asyncio.Event()
+
+        async def slow_inventory():
+            await release.wait()
+            return [embedding_node("node-2")]
+
+        inventory = AsyncMock(side_effect=slow_inventory)
+        manager = bare_manager(model_cache_inventory=inventory)
+        manager._embedding_inventory_cache = (
+            time.time() - 60, [embedding_node("local")],
+        )
+
+        started = time.monotonic()
+        discovered = await manager.embedding_models(discovery=True)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(discovered["models"][0]["node_ids"], ["local"])
+
+        release.set()
+        await manager._embedding_inventory_task
+        inventory.assert_awaited_once()
+        refreshed = await manager.embedding_models(discovery=True)
+
+        self.assertEqual(refreshed["models"][0]["node_ids"], ["node-2"])
+
+    async def test_discovery_answers_empty_when_the_walk_fails(self):
+        manager = bare_manager(
+            model_cache_inventory=AsyncMock(side_effect=RuntimeError("no nodes")),
+        )
+
+        discovered = await manager.embedding_models(discovery=True)
+
+        self.assertEqual(discovered, {"enabled": True, "models": []})
 
     async def test_status_reports_runtime_state_without_installing(self):
         runtime = Mock()
@@ -1156,6 +1221,37 @@ class EmbeddingHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             MODEL_ID, [model["id"] for model in response.json()["data"]],
         )
+
+    async def test_models_answers_without_waiting_on_a_stalled_cache_walk(self):
+        release = asyncio.Event()
+
+        async def stalled_inventory():
+            await release.wait()
+            return []
+
+        manager = server.manager
+        previous_cache = getattr(manager, "_embedding_inventory_cache", None)
+        previous_task = getattr(manager, "_embedding_inventory_task", None)
+        manager._embedding_inventory_cache = None
+        manager._embedding_inventory_task = None
+        try:
+            with patch.object(
+                manager, "model_cache_inventory",
+                AsyncMock(side_effect=stalled_inventory),
+            ), patch.object(manager_module, "_EMBEDDING_DISCOVERY_MAX_WAIT", 0.05):
+                response = await asyncio.wait_for(
+                    self.client.get("/v1/models"), 5,
+                )
+        finally:
+            release.set()
+            task = getattr(manager, "_embedding_inventory_task", None)
+            if task is not None:
+                await asyncio.shield(task)
+            manager._embedding_inventory_cache = previous_cache
+            manager._embedding_inventory_task = previous_task
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data", response.json())
 
     async def test_embeddings_route_returns_an_openai_response(self):
         embed = AsyncMock(return_value={

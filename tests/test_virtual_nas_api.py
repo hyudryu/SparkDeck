@@ -589,6 +589,28 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("ephemeral", response.text)
 
+    async def test_agent_local_path_reports_directory_presence(self):
+        with patch.object(server, "_require_agent"), tempfile.TemporaryDirectory() as directory:
+            present = await self.client.get(
+                "/api/agent/local-path", params={"path": directory},
+            )
+            missing = await self.client.get(
+                "/api/agent/local-path", params={"path": os.path.join(directory, "missing")},
+            )
+
+        self.assertEqual(present.status_code, 200)
+        self.assertTrue(present.json()["exists"])
+        self.assertEqual(missing.status_code, 200)
+        self.assertFalse(missing.json()["exists"])
+
+    async def test_agent_local_path_rejects_a_relative_path(self):
+        with patch.object(server, "_require_agent"):
+            response = await self.client.get(
+                "/api/agent/local-path", params={"path": "models/local"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+
     async def test_agent_health_advertises_download_bandwidth_cap(self):
         with patch.object(server, "_require_agent"):
             response = await self.client.get("/api/agent/health")
@@ -957,6 +979,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_forwardable_path("/api/v1/storage"))
         self.assertTrue(is_forwardable_path("/api/v1/storage/transfers"))
         self.assertFalse(is_forwardable_path("/api/agent/virtual-nas/inventory"))
+        self.assertFalse(is_forwardable_path("/api/agent/local-path"))
 
 
 class VirtualNASInventoryTests(unittest.TestCase):

@@ -1039,6 +1039,8 @@ export interface StorageTransferPreflight {
 
 export interface RecipePreparationPlan extends StorageTransferPreflight {
   node_ids: string[]
+  // The model is a host directory mounted on each node, not Hub cache data.
+  path_backed?: boolean
   eligible: boolean
   action: 'ready' | 'transfer' | 'download'
   download_node_id?: string | null

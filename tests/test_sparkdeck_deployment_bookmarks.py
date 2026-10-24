@@ -1460,24 +1460,113 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             4,
         )
 
-    async def test_local_model_directory_rejects_remote_nodes_for_any_runtime(self):
+    async def test_local_model_directory_saves_for_remote_nodes(self):
         model_dir = Path(self.temp.name) / "local-model"
         model_dir.mkdir()
         self.manager._resolve_local_path = Mock(return_value=str(model_dir))
-        with self.assertRaisesRegex(ValueError, "local model paths"):
-            await self.service.create_deployment({
-                "model": str(model_dir), "alias": "local-vllm",
-                "runtime": "vllm",
-                "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
-            })
 
-        # The controller-only selection stays saveable.
         created = await self.service.create_deployment({
             "model": str(model_dir), "alias": "local-vllm",
             "runtime": "vllm",
-            "node_ids": ["local"], "deployment_mode": "single",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
         })
+
         self.assertEqual(created["status"], "saved")
+        self.assertEqual(created["node_ids"], ["local", "remote-1"])
+
+    async def test_preflight_reports_local_path_availability_per_node(self):
+        model_dir = Path(self.temp.name) / "local-model"
+        model_dir.mkdir()
+        self.manager._resolve_local_path = Mock(
+            side_effect=lambda path: str(model_dir) if path == str(model_dir) else None,
+        )
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+        created = await self.service.create_deployment({
+            "model": str(model_dir), "alias": "local-vllm",
+            "runtime": "vllm",
+            "node_ids": ["local", "remote-1"], "deployment_mode": "replicated",
+        })
+
+        plan = await self.service.deployment_preparation_preflight(
+            created["id"], ["local", "remote-1"],
+        )
+        prepared = await self.service.deployment_prepare(
+            created["id"], ["local", "remote-1"],
+        )
+
+        targets = {target["node_id"]: target for target in plan["targets"]}
+        self.assertTrue(targets["local"]["has_required_weights"])
+        self.assertTrue(targets["local"]["eligible"])
+        self.assertFalse(targets["remote-1"]["has_required_weights"])
+        self.assertFalse(targets["remote-1"]["eligible"])
+        self.assertEqual(targets["remote-1"]["reason"],
+                         "Model path is not available on this node")
+        self.assertEqual(plan["action"], "ready")
+        self.assertFalse(plan["eligible"])
+        self.assertIn("Worker", plan["reason"])
+        self.assertEqual(prepared["action"], "ready")
+        self.assertEqual(prepared["job_ids"], [])
+        self.assertEqual(prepared["plan"]["targets"], plan["targets"])
+
+    async def test_saved_tensorfold_path_rejects_a_member_without_the_directory(self):
+        created = await self.service.create_deployment({
+            "model": "/mnt/share/weights", "alias": "TF path",
+            "runtime": "tensorfold",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        })
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                created["id"], "start", ["remote-1"],
+            )
+
+        self.manager.create_deployment.assert_not_awaited()
+
+    async def test_tensorfold_explicit_restart_rejects_a_node_without_the_path(self):
+        self.service.store.add_deployment(Deployment(
+            id="tf-restart", alias="TF restart", runtime=RuntimeKind.TENSORFOLD,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("/mnt/share/weights"),
+            settings={
+                "manager_deployment_id": "cluster-tf",
+                "model_source": "local",
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.deployments = [{
+            "id": "cluster-tf", "launch_settings": {},
+            "node_ids": ["remote-1"], "members": [],
+        }]
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+        self.manager.deployment_action = AsyncMock(
+            return_value={"ok": True, "errors": []},
+        )
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                "tf-restart", "start", ["remote-1"],
+            )
+
+        self.manager.deployment_action.assert_not_awaited()
+
+    async def test_launch_keeps_container_cache_paths_off_the_host_path_probe(self):
+        self.manager._resolve_local_path = Mock(return_value=None)
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        created = await self.service.create_deployment({
+            "model": "/cache/models/org--model/snapshots/rev",
+            "alias": "container cache path", "runtime": "vllm",
+            "node_ids": ["remote-1"], "deployment_mode": "single",
+        }, launch=True)
+
+        # The path is probed to classify it, but a container-only path does
+        # not reject the launch when no host exposes it.
+        self.assertEqual(created["status"], "starting")
+        self.manager.node_has_local_path.assert_awaited_once_with(
+            "remote-1", "/cache/models/org--model/snapshots/rev",
+        )
 
     async def test_saved_bookmark_accepts_the_detail_editor_contract(self):
         await self.service.create_deployment({
@@ -1770,6 +1859,27 @@ class DeploymentBookmarkTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.manager.add_deployment_instance.assert_awaited()
+
+    async def test_add_instance_rejects_a_node_without_the_shared_path(self):
+        self.service.store.add_deployment(Deployment(
+            id="grow-path", alias="TP4 path", runtime=RuntimeKind.VLLM,
+            kind=DeploymentKind.MANAGED,
+            model=ModelIdentity("/mnt/share/weights"),
+            settings={
+                "manager_deployment_id": "cluster-grow",
+                "model_source": "local",
+            },
+        ), "http://127.0.0.1:8000")
+        self.manager.add_deployment_instance = AsyncMock(return_value={"ok": True})
+        self.manager._resolve_local_path = Mock(return_value="/mnt/share/weights")
+        self.manager.node_has_local_path = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(ValueError, "local model path is not available"):
+            await self.service.deployment_action(
+                "grow-path", "add_instance", ["remote-1"],
+            )
+
+        self.manager.add_deployment_instance.assert_not_awaited()
 
     async def test_external_endpoints_do_not_reserve_unadvertised_repository_selectors(self):
         saved = await self.service.create_deployment({

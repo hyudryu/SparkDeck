@@ -1182,7 +1182,7 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
             await manager.http.aclose()
             await service.close()
 
-    async def test_discovered_local_model_rejects_remote_promotion(self):
+    async def test_discovered_local_model_rejects_remote_promotion_without_the_path(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = FakeManager()
             manager.list_containers.return_value = [{
@@ -1194,11 +1194,12 @@ class DeletionAndCancellationTests(unittest.IsolatedAsyncioTestCase):
                 },
             }]
             manager._resolve_local_path = Mock(return_value=Path("C:/models/actual-model"))
+            manager.node_has_local_path = AsyncMock(return_value=False)
             manager._recovered_deployment_launch_settings = Mock(return_value={})
             manager.create_deployment = AsyncMock()
             service = SparkDeckService(manager, Path(directory))
 
-            with self.assertRaisesRegex(ValueError, "controller-local model paths"):
+            with self.assertRaisesRegex(ValueError, "local model path is not available"):
                 await service.deployment_action(
                     "container:external-local", "start", ["local", "worker-1"],
                 )

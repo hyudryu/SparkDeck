@@ -4571,12 +4571,17 @@ class SparkDeckService:
             deployment.get("runtime") == RuntimeKind.LLAMA_CPP.value
             and (not artifact or _artifact_is_controller_local(artifact))
         )
-        if (is_local_path or controller_artifact) and any(
+        # A model path on a shared network mount (NFS/CIFS/FUSE) resolves to
+        # the same absolute path on every node that mounts it, so it is not
+        # controller-local disk and must not be pinned to the controller.
+        shared_local_path = is_local_path and _is_shared_network_path(repository)
+        local_disk_path = is_local_path and not shared_local_path
+        if (local_disk_path or controller_artifact) and any(
             item != "local" for item in node_ids
         ):
             raise ValueError(
                 "controller-local model paths can only run on the controller node"
-                if is_local_path else
+                if local_disk_path else
                 "llama.cpp model artifacts can only run on the controller node"
             )
         if is_local_path or controller_artifact or not repository:
@@ -5192,6 +5197,7 @@ class SparkDeckService:
         resolve_local = getattr(self.manager, "_resolve_local_path", None)
         if (
             launch_model and callable(resolve_local) and resolve_local(launch_model)
+            and not _is_shared_network_path(launch_model)
             and any(node_id != LOCAL_NODE_ID for node_id in node_ids)
         ):
             raise ValueError(
@@ -10463,6 +10469,66 @@ def _is_missing_deployment_error(exc: Exception) -> bool:
         "deployment not found",
         "cluster deployment not found",
     }
+
+
+_SHARED_MOUNT_FSTYPES = frozenset({
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "virtiofs", "ceph",
+    "glusterfs", "lustre", "afs", "davfs", "juicefs", "beegfs", "gpfs",
+})
+
+
+def _path_mount_fstype(path: str) -> str | None:
+    """Return the filesystem type of the longest mount backing *path*."""
+    try:
+        target = os.path.realpath(str(path))
+        with open(
+            "/proc/self/mountinfo", "r", encoding="utf-8", errors="replace",
+        ) as handle:
+            lines = handle.readlines()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    best_point = ""
+    best_type: str | None = None
+    for line in lines:
+        head, separator, tail = line.partition(" - ")
+        if not separator:
+            continue
+        fields = head.split()
+        if len(fields) < 5:
+            continue
+        point = (
+            fields[4]
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\134", "\\")
+        )
+        if point != "/" and not (
+            target == point or target.startswith(point.rstrip("/") + "/")
+        ):
+            continue
+        if point == "/" or len(point) > len(best_point):
+            best_point = point
+            tail_fields = tail.split()
+            best_type = tail_fields[0] if tail_fields else None
+    return best_type
+
+
+def _is_shared_network_path(path: str | None) -> bool:
+    """True when *path* lives on a network or userspace (FUSE) mount.
+
+    Such a path is served by a shared store, not by this host's disk: every
+    node that mounts it sees the same tree at the same absolute path, so a
+    multi-node launch is legitimate.  Whether a given node actually has the
+    mount is still decided per node by the launch's mount validation, which
+    fails that node loudly instead of serving a different model.
+    """
+    if not path:
+        return False
+    fstype = _path_mount_fstype(path)
+    if not fstype:
+        return False
+    normalized = fstype.lower()
+    return normalized.startswith("fuse") or normalized in _SHARED_MOUNT_FSTYPES
 
 
 def _artifact_is_controller_local(artifact: str | None) -> bool:

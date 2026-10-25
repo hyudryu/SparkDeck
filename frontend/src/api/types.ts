@@ -926,6 +926,28 @@ export interface DashboardData {
 export interface StorageModel {
   model_id: string
   size_bytes: number
+  // Distinct on-disk bytes reached by following symlinks (deduplicated by
+  // device/inode). A symlink facade over weights stored elsewhere reports
+  // only link bytes in size_bytes; this is the real payload size. Absent on
+  // agents that predate the field.
+  resolved_size_bytes?: number
+  // Portion of resolved_size_bytes that sits on the cache mount's own
+  // filesystem, deduplicated node-wide so repositories sharing one payload
+  // charge the capacity bar once. Used by the capacity bar, which is measured
+  // on that mount.
+  cache_mount_size_bytes?: number
+  symlink_file_count?: number
+  dangling_file_count?: number
+  // Regular (non-link) file entries in the cache. A repository with both
+  // plain files and escaping links is a mixed cache: deleting it removes the
+  // local files as well as the links.
+  plain_file_count?: number
+  // True when any cache entry resolves outside the repository directory, so
+  // the payload is not contained in the cache (and not transferable).
+  linked_outside_cache?: boolean
+  // True when measuring a linked external tree hit the traversal cap: the
+  // resolved and cache-mount sizes are lower bounds, not exact payload sizes.
+  resolved_size_truncated?: boolean
   // Best-effort full repository or selected-artifact size for partial caches,
   // looked up from the Hugging Face tree API. Absent when lookup failed.
   expected_size_bytes?: number

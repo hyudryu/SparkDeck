@@ -1916,6 +1916,14 @@ class VirtualNAS:
         hub = self._hub()
         if not hub.is_dir():
             return _external_comfyui_inventory(self._external_model_roots_provider())
+        try:
+            hub_device: int | None = os.stat(hub).st_dev or None
+        except OSError:
+            hub_device = None
+        # Node-wide (device, inode) set: a payload shared by several
+        # repositories (two facades over one staging tree, cache-wide
+        # hardlinks) must charge the cache mount's capacity only once.
+        cache_mount_file_keys: set[tuple[int, int]] = set()
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -1938,29 +1946,109 @@ class VirtualNAS:
             file_count = 0
             transfer_entry_count = 1
             last_modified = 0.0
+            # size_bytes above stays the export/wire accounting (lstat). The
+            # fields below report the distinct bytes that actually exist on
+            # this node: each symlink is followed once and every regular file
+            # counts once per (device, inode), so hardlinked snapshot entries
+            # are not double-counted and a symlink facade over real weights
+            # (for example a /models staging tree) is not reported as only
+            # its link bytes.
+            resolved_repository = repository.resolve()
+            resolved_size_bytes = 0
+            resolved_mounted_bytes = 0
+            counted_file_keys: set[tuple[int, int]] = set()
+            symlink_file_count = 0
+            dangling_file_count = 0
+            plain_file_count = 0
+            linked_outside_cache = False
+            payload_truncated = False
             for root, directories, files in os.walk(repository, followlinks=False):
                 if Path(root) == repository:
                     # Match export's exclusion before counting entries/bytes:
                     # API listing caches consume neither wire nor staging space.
                     directories[:] = [name for name in directories if name != "trees"]
                 transfer_entry_count += len(directories) + len(files)
-                directories[:] = [
-                    name for name in directories
-                    if not (Path(root) / name).is_symlink()
-                ]
+                kept_directories = []
+                for name in directories:
+                    source = Path(root) / name
+                    if source.is_symlink():
+                        # Export preserves directory links that stay inside the
+                        # repository (it rejects only escaping links), so flag
+                        # containment here rather than every directory link.
+                        try:
+                            target = os.path.realpath(source)
+                            escaped = not Path(target).is_relative_to(
+                                resolved_repository,
+                            )
+                        except OSError:
+                            escaped = True
+                            target = ""
+                        if escaped:
+                            linked_outside_cache = True
+                            # The walk never descends a directory link, so the
+                            # payload below an external directory target would
+                            # go uncounted without this charge.
+                            if target and os.path.isdir(target):
+                                added, mounted, cut_short = (
+                                    _external_directory_payload(
+                                        Path(target), hub_device,
+                                        counted_file_keys, cache_mount_file_keys,
+                                    )
+                                )
+                                resolved_size_bytes += added
+                                resolved_mounted_bytes += mounted
+                                if cut_short:
+                                    payload_truncated = True
+                        elif target and not os.path.isdir(target):
+                            # Contained but broken: a transfer would recreate
+                            # the dangling link at the receiving node.
+                            dangling_file_count += 1
+                    else:
+                        kept_directories.append(name)
+                directories[:] = kept_directories
                 for name in files:
+                    link = Path(root) / name
                     try:
-                        stat = (Path(root) / name).lstat()
+                        entry_stat = link.lstat()
                     except OSError:
                         continue
-                    size_bytes += stat.st_size
+                    size_bytes += entry_stat.st_size
                     if (
                         name.endswith(".incomplete")
                         and name != _SELECTIVE_SNAPSHOT_MARKER
                     ):
-                        incomplete_size_bytes += stat.st_size
+                        incomplete_size_bytes += entry_stat.st_size
                     file_count += 1
-                    last_modified = max(last_modified, stat.st_mtime)
+                    last_modified = max(last_modified, entry_stat.st_mtime)
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        symlink_file_count += 1
+                        try:
+                            target_stat = os.stat(link)
+                            target = os.path.realpath(link)
+                        except OSError:
+                            dangling_file_count += 1
+                            continue
+                        if not stat.S_ISREG(target_stat.st_mode):
+                            dangling_file_count += 1
+                            continue
+                        added = _count_distinct_file_bytes(
+                            target_stat, counted_file_keys,
+                        )
+                        resolved_size_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            target_stat, added, hub_device, cache_mount_file_keys,
+                        )
+                        if not Path(target).is_relative_to(resolved_repository):
+                            linked_outside_cache = True
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        plain_file_count += 1
+                        added = _count_distinct_file_bytes(
+                            entry_stat, counted_file_keys,
+                        )
+                        resolved_size_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            entry_stat, added, hub_device, cache_mount_file_keys,
+                        )
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions), incomplete_revisions,
             )
@@ -2017,6 +2105,19 @@ class VirtualNAS:
             model = {
                 "model_id": model_id,
                 "size_bytes": size_bytes,
+                "resolved_size_bytes": resolved_size_bytes,
+                # Resolved payload occupying the cache mount's own filesystem
+                # after node-wide (device, inode) deduplication, so the
+                # capacity bar stays honest even when repositories share one
+                # staging payload. Off-mount bytes are excluded.
+                "cache_mount_size_bytes": resolved_mounted_bytes,
+                "symlink_file_count": symlink_file_count,
+                "dangling_file_count": dangling_file_count,
+                # Regular (non-link) file entries: tells a pure link facade
+                # from a mixed repository whose local files also sit in the
+                # cache and would be removed by a delete.
+                "plain_file_count": plain_file_count,
+                "linked_outside_cache": linked_outside_cache,
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
@@ -2041,7 +2142,18 @@ class VirtualNAS:
             }
             if selective_files:
                 model["selective_files_by_revision"] = selective_files
-            if transfer_entry_count > _FILE_STREAM_MAX_ENTRIES:
+            if payload_truncated:
+                # An external directory traversal hit the entry cap, so the
+                # resolved sizes are a lower bound, not an exact payload size.
+                model["resolved_size_truncated"] = True
+            if (
+                transfer_entry_count > _FILE_STREAM_MAX_ENTRIES
+                or linked_outside_cache
+                or dangling_file_count
+            ):
+                # Export only sends bytes the receiving node can use: links to
+                # payloads outside the repository (or to nothing) would arrive
+                # as dangling entries, so such caches are not transferable.
                 model["transferable"] = False
             # A SentenceTransformers repository is served through
             # /v1/embeddings. The marker is evaluated here, on the node that
@@ -4980,6 +5092,115 @@ def _is_complete_repository(repository: Path) -> bool:
 # Safety valve for pathologies like a repository snapshot holding thousands
 # of loose files: inventory stays a summary, not a full file dump.
 _INVENTORY_FILE_LIMIT = 2000
+
+
+def _count_distinct_file_bytes(
+    info: os.stat_result, counted_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return bytes to add for one regular file, counting hardlinks once.
+
+    A filesystem that reports no inode identity (``st_ino`` of zero) cannot
+    be deduplicated, so every file is counted in full there.
+    """
+    if not info.st_ino:
+        return info.st_size
+    key = (info.st_dev, info.st_ino)
+    if key in counted_file_keys:
+        return 0
+    counted_file_keys.add(key)
+    return info.st_size
+
+
+# An escaping directory link can aim at an arbitrarily large tree (a mistyped
+# broad path such as / included), so counting its payload is capped to keep one
+# facade from outliving the manager's inventory request timeout.
+_EXTERNAL_DIRECTORY_MAX_ENTRIES = 20_000
+
+
+def _charge_mount_bytes(
+    info: os.stat_result,
+    added: int,
+    hub_device: int | None,
+    cache_mount_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return the portion of ``added`` bytes that newly occupies the cache mount.
+
+    Bytes on another device never occupy the mount, and bytes already charged
+    by an earlier repository (two facades over one staging payload, cache-wide
+    hardlinks) are not charged again. A filesystem that reports no inode
+    identity cannot be deduplicated, so every file is charged in full there.
+    """
+    if not added:
+        return 0
+    if hub_device is not None and info.st_dev != hub_device:
+        return 0
+    if info.st_ino:
+        key = (info.st_dev, info.st_ino)
+        if key in cache_mount_file_keys:
+            return 0
+        cache_mount_file_keys.add(key)
+    return added
+
+
+def _external_directory_payload(
+    target: Path,
+    hub_device: int | None,
+    counted_file_keys: set[tuple[int, int]],
+    cache_mount_file_keys: set[tuple[int, int]],
+) -> tuple[int, int, bool]:
+    """Return (bytes, cache-mount bytes, truncated) for files below a link.
+
+    Nested directory links are followed because their files are part of the
+    payload reachable through the cache facade; a visited (device, inode) set
+    for directories keeps cycles finite, and the entry cap bounds the cost of
+    a link aimed at an enormous tree. Files dedup through the repository's
+    shared (device, inode) set. ``truncated`` is true when the cap stopped the
+    traversal, meaning both totals are lower bounds, not exact sizes.
+    """
+    total = 0
+    mounted = 0
+    visited_directories: set[tuple[int, int]] = set()
+    stack = [target]
+    entries_seen = 0
+    while stack:
+        current = stack.pop()
+        try:
+            current_stat = os.stat(current)
+        except OSError:
+            continue
+        if current_stat.st_ino:
+            directory_key = (current_stat.st_dev, current_stat.st_ino)
+            if directory_key in visited_directories:
+                continue
+            visited_directories.add(directory_key)
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > _EXTERNAL_DIRECTORY_MAX_ENTRIES:
+                return total, mounted, True
+            try:
+                if entry.is_dir():
+                    stack.append(Path(entry.path))
+                    continue
+                # os.stat, not entry.stat: on Windows a cached scandir entry
+                # reports st_dev/st_ino of zero, which would defeat the
+                # (device, inode) dedup below.
+                info = os.stat(entry.path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            added = _count_distinct_file_bytes(info, counted_file_keys)
+            if not added:
+                continue
+            total += added
+            mounted += _charge_mount_bytes(
+                info, added, hub_device, cache_mount_file_keys,
+            )
+    return total, mounted, False
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

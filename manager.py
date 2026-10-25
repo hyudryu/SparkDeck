@@ -3366,6 +3366,12 @@ class Manager:
         if node_id == LOCAL_NODE_ID:
             resolved = await asyncio.to_thread(self._resolve_local_path, path)
             return resolved is not None
+        if path.startswith("~"):
+            # The agent would expand ~ to its own home and report the
+            # directory, but exec-form launch commands receive the literal
+            # reference, which no shell inside the container expands — a
+            # remote node can never serve a tilde path.
+            return False
         try:
             # /api/agent routes run on the worker itself; management routes
             # such as /api/disk-manager are forwarded back to the controller

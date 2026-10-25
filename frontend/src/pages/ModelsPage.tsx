@@ -90,12 +90,23 @@ const isLocalArtifact = (artifact?: string) => Boolean(
   artifact && (/^\//.test(artifact) || artifact.startsWith('~') || /^[A-Za-z]:[\\/]/.test(artifact)),
 )
 
+// A standalone managed container (no saved bookmark, no Manager cluster node
+// set) has no cluster to relaunch through, so Manager rejects every remote
+// start selection for it: its path model stays pinned to the controller node
+// that already runs it.
+const isStandaloneDeployment = (deployment: Deployment) => (
+  deployment.managed
+  && deployment.status !== 'saved'
+  && !deployment.node_ids?.length
+)
+
 // Only llama.cpp owns a controller-only artifact. A path model on another
 // runtime can be a shared NAS directory (SparkNest), so its nodes are gated
 // by the per-node path preflight instead of assuming controller locality.
 const isControllerArtifact = (deployment: Deployment) => (
-  deployment.runtime === 'llama.cpp'
-  && (isLocalModelPath(deployment.model_id) || isLocalArtifact(deployment.settings.artifact))
+  (deployment.runtime === 'llama.cpp'
+    && (isLocalModelPath(deployment.model_id) || isLocalArtifact(deployment.settings.artifact)))
+  || (isStandaloneDeployment(deployment) && isLocalModelPath(deployment.model_id))
 )
 
 const isLocalPathDeployment = (deployment: Deployment) => (
@@ -106,9 +117,11 @@ const isLocalPathDeployment = (deployment: Deployment) => (
 
 // Strata downloads its own pinned checkpoint into the container's data
 // volume on first start, so no node ever needs the model cached and no
-// weight-transfer preparation step applies to it.
+// weight-transfer preparation step applies to it. A path-backed Strata
+// deployment instead reads a shared host directory, so it joins the
+// per-node path preflight like every other runtime.
 const runtimeSelfManagesWeights = (deployment: Deployment) => (
-  deployment.runtime === 'strata'
+  deployment.runtime === 'strata' && !isLocalPathDeployment(deployment)
 )
 
 // "Target nodes" alone is ambiguous: a selection can mean one model split

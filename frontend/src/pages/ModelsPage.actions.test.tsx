@@ -755,6 +755,101 @@ describe('models page running actions', () => {
     })
   })
 
+  it('pins a standalone path container to the controller it runs on', async () => {
+    const user = userEvent.setup()
+    // A standalone managed container (no saved bookmark, no Manager cluster
+    // node set) cannot be relocated: Manager relaunches only clustered
+    // deployments, so remote path selection would be rejected at start.
+    const standalone = {
+      ...runningDeployment,
+      id: 'dep-standalone', alias: 'Standalone path', status: 'stopped',
+      desired_state: 'stopped', managed: true,
+      model: { repository: '/mnt/share/model' },
+      node_ids: undefined, selected_nodes: undefined,
+    }
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [standalone] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+
+    await screen.findByText('Standalone path')
+    await user.click(screen.getByRole('button', { name: 'Start' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Start Standalone path' })
+    expect(within(dialog).getByText(/This local artifact can run only on the controller/)).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Controller/ })).toBeEnabled()
+    expect(within(dialog).getByRole('radio', { name: /Node 4/ })).toBeDisabled()
+    expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeDisabled()
+    // No preparation plan: a standalone container launches in place.
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith('/prepare/preflight'))).toBe(false)
+
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => (
+        String(path).endsWith('/dep-standalone/start') && init?.method === 'POST'
+      ))
+      expect(request).toBeDefined()
+      expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['local'])
+    })
+  })
+
+  it('launches a saved Strata path deployment on nodes that expose the directory', async () => {
+    const user = userEvent.setup()
+    // Strata fetches its own checkpoint only for hub models; a path-backed
+    // Strata deployment reads a shared host directory and must run the
+    // per-node path preflight instead of being pinned to the controller.
+    const strataPath = {
+      ...runningDeployment, alias: 'Strata path', runtime: 'strata',
+      status: 'saved', desired_state: 'stopped', managed: true,
+      model: { repository: '/mnt/share/model' },
+      node_ids: ['local'], required_node_count: 1,
+    }
+    const original = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/deployments') {
+        return new Response(JSON.stringify({ items: [strataPath] }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/prepare/preflight') && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          enabled: true, model_id: '/mnt/share/model', revision: 'main',
+          path_backed: true,
+          targets: [
+            { node_id: 'local', node_name: 'Controller', eligible: true, has_required_weights: true },
+            { node_id: 'worker-1', node_name: 'Node 4', eligible: true, has_required_weights: true },
+            { node_id: 'worker-2', node_name: 'Node 3', eligible: false, has_required_weights: false, reason: 'Model path is not available on this node' },
+          ],
+          node_ids: ['local', 'worker-1', 'worker-2'],
+          eligible: true, action: 'ready', download_node_ids: [],
+          transfer_target_node_ids: [], reason: null, staging_reserve_bytes: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return original(input, init)
+    })
+    renderPage()
+
+    await screen.findByText('Strata path')
+    await user.click(screen.getByRole('button', { name: 'Launch' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Launch Strata path' })
+    expect(within(dialog).getByText(/The model directory must exist at the same path/)).toBeInTheDocument()
+    expect(within(dialog).getByRole('radio', { name: /Node 4/ })).toBeEnabled()
+    expect(within(dialog).getByRole('radio', { name: /Node 3/ })).toBeDisabled()
+    await user.click(within(dialog).getByRole('radio', { name: /Node 4/ }))
+    await user.click(within(dialog).getByRole('button', { name: 'Launch on 1 node' }))
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([callPath, callInit]) => (
+        String(callPath).endsWith('/dep-1/start') && callInit?.method === 'POST'
+      ))
+      expect(request).toBeDefined()
+      expect(JSON.parse(String(request?.[1]?.body)).node_ids).toEqual(['worker-1'])
+    })
+  })
+
   it('grows a Strata deployment without waiting for the model cache', async () => {
     const user = userEvent.setup()
     fetchMock.mockImplementation(async (input) => {

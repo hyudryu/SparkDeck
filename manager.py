@@ -3406,6 +3406,39 @@ class Manager:
             node_id, VIRTUAL_NAS_DOWNLOAD_BANDWIDTH_CAPABILITY,
         )
 
+    async def node_has_local_path(self, node_id: str, path: str) -> bool:
+        """Report whether a model directory exists at *path* on one node.
+
+        Shared NAS mounts (for example SparkNest) expose the same absolute
+        path on every host, so a path-backed deployment is launchable on each
+        node that has the directory rather than on the controller only.
+        """
+        if not isinstance(path, str) or not (
+            path.startswith(("/", "~")) or re.match(r"[A-Za-z]:[\\/]", path)
+        ):
+            return False
+        if node_id == LOCAL_NODE_ID:
+            resolved = await asyncio.to_thread(self._resolve_local_path, path)
+            return resolved is not None
+        if path.startswith("~"):
+            # The agent would expand ~ to its own home and report the
+            # directory, but exec-form launch commands receive the literal
+            # reference, which no shell inside the container expands — a
+            # remote node can never serve a tilde path.
+            return False
+        try:
+            # /api/agent routes run on the worker itself; management routes
+            # such as /api/disk-manager are forwarded back to the controller
+            # and would report the controller's filesystem instead.
+            result = await self.node_registry.request(
+                node_id, "GET",
+                f"/api/agent/local-path?path={quote(path, safe='')}",
+                timeout=15,
+            )
+        except Exception:
+            return False
+        return bool((result or {}).get("exists") is True)
+
     async def node_has_model_files(
         self, node_id: str, model_id: str, revision: str, filenames: list[str],
     ) -> bool:
@@ -12101,7 +12134,10 @@ class Manager:
         otherwise return None.  Handles ``~`` expansion and normalises
         ``//`` to ``/``.
         """
-        if not model_path or not model_path.startswith(("/", "~")):
+        if not model_path or not (
+            model_path.startswith(("/", "~"))
+            or re.match(r"[A-Za-z]:[\\/]", model_path)
+        ):
             return None
         expanded = str(Path(model_path).expanduser().resolve())
         return expanded if Path(expanded).is_dir() else None
@@ -12112,6 +12148,12 @@ class Manager:
             return "local"
         if not str(model or "").strip():
             return "unknown"
+        if model.startswith(("/", "~")) or re.match(r"[A-Za-z]:[\\/]", model):
+            # An absolute path that is not a host directory came from the
+            # image's Hugging Face cache bind or was baked into the image.
+            # Persisting local here would make restart-time path validation
+            # require a host mount the deployment never had.
+            return "public_repository"
         try:
             result = container.exec_run(["test", "-e", "--", str(model)])
             exit_code = getattr(result, "exit_code", None)
@@ -12120,6 +12162,16 @@ class Manager:
         except Exception:
             return "unknown"
         return "local" if exit_code == 0 else "public_repository"
+
+    def _launched_model_source(self, model: str) -> str:
+        """Provenance for a launch that uses a host path or a Hub repository.
+
+        Only a directory mounted on the node counts as local. A path that
+        merely exists inside the container can come from the image's HF cache
+        bind and must not be mistaken for a host model directory, which would
+        make later restart validation reject every member.
+        """
+        return "local" if self._resolve_local_path(model) else "public_repository"
 
     def _image_hf_cache_target(self, image: str | None) -> str:
         """Return the Hugging Face cache directory declared by *image*.
@@ -17871,10 +17923,9 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                # The cache-relative artifact only exists for public Hub
-                # repositories; report that provenance so benchmark results
-                # aggregate under the public model instead of a local key.
-                summary["model_source"] = "public_repository"
+                # Report a bind-mounted host path as local so benchmark
+                # results do not aggregate it under a public repository key.
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18003,7 +18054,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18140,7 +18191,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18316,7 +18367,7 @@ class Manager:
             )
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:
@@ -18865,7 +18916,7 @@ class Manager:
             prepared_watch["volume"] = data_volume
             summary = self._container_summary(container)
             if summary is not None:
-                summary["model_source"] = "public_repository"
+                summary["model_source"] = self._launched_model_source(model)
             return summary
 
         try:

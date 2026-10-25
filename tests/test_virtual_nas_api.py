@@ -589,6 +589,68 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("ephemeral", response.text)
 
+    async def test_agent_local_path_reports_directory_presence(self):
+        with patch.object(server, "_require_agent"), tempfile.TemporaryDirectory() as directory:
+            present = await self.client.get(
+                "/api/agent/local-path", params={"path": directory},
+            )
+            missing = await self.client.get(
+                "/api/agent/local-path", params={"path": os.path.join(directory, "missing")},
+            )
+
+        self.assertEqual(present.status_code, 200)
+        self.assertTrue(present.json()["exists"])
+        self.assertEqual(missing.status_code, 200)
+        self.assertFalse(missing.json()["exists"])
+
+    async def test_agent_local_path_rejects_a_relative_path(self):
+        with patch.object(server, "_require_agent"):
+            response = await self.client.get(
+                "/api/agent/local-path", params={"path": "models/local"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+
+    async def test_worker_probe_never_trusts_a_tilde_path(self):
+        # The agent would expand ~ to its own home and report the directory,
+        # but exec-form launch commands receive the literal reference, which
+        # no shell inside the container expands — a remote node can never
+        # serve a tilde path.
+        registry_request = AsyncMock(return_value={"exists": True})
+        with (
+            patch.object(server.manager, "cluster_nodes", AsyncMock(
+                return_value=[{"id": "remote-1", "name": "remote-1"}],
+            )),
+            patch.object(
+                server.manager, "node_registry",
+                SimpleNamespace(request=registry_request),
+            ),
+        ):
+            available = await server.manager.node_has_local_path(
+                "remote-1", "~/models/weights",
+            )
+
+        self.assertFalse(available)
+        registry_request.assert_not_awaited()
+
+    async def test_worker_probe_still_checks_absolute_paths(self):
+        registry_request = AsyncMock(return_value={"exists": True})
+        with (
+            patch.object(server.manager, "cluster_nodes", AsyncMock(
+                return_value=[{"id": "remote-1", "name": "remote-1"}],
+            )),
+            patch.object(
+                server.manager, "node_registry",
+                SimpleNamespace(request=registry_request),
+            ),
+        ):
+            available = await server.manager.node_has_local_path(
+                "remote-1", "/mnt/share/weights",
+            )
+
+        self.assertTrue(available)
+        registry_request.assert_awaited_once()
+
     async def test_agent_health_advertises_download_bandwidth_cap(self):
         with patch.object(server, "_require_agent"):
             response = await self.client.get("/api/agent/health")
@@ -957,6 +1019,7 @@ class VirtualNASApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_forwardable_path("/api/v1/storage"))
         self.assertTrue(is_forwardable_path("/api/v1/storage/transfers"))
         self.assertFalse(is_forwardable_path("/api/agent/virtual-nas/inventory"))
+        self.assertFalse(is_forwardable_path("/api/agent/local-path"))
 
 
 class VirtualNASInventoryTests(unittest.TestCase):

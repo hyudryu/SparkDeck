@@ -2668,6 +2668,34 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "unknown",
         )
 
+        container.exec_run.reset_mock()
+        container.exec_run.side_effect = None
+        container.exec_run.return_value = (0, b"")
+        self.assertEqual(
+            instance._created_container_model_source(
+                container, "/cache/models/org--model/snapshots/rev",
+            ),
+            "public_repository",
+        )
+        container.exec_run.assert_not_called()
+
+    def test_launched_model_source_only_trusts_host_directories(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._resolve_local_path = mock.Mock(side_effect=lambda model: (
+            "/mnt/share/models" if model == "/mnt/share/models" else None
+        ))
+
+        self.assertEqual(
+            instance._launched_model_source("/mnt/share/models"), "local",
+        )
+        # A path that only exists inside the container's HF cache bind is not
+        # a host directory and must not persist local provenance.
+        self.assertEqual(
+            instance._launched_model_source("/cache/models/org--model/snapshots/rev"),
+            "public_repository",
+        )
+        self.assertEqual(instance._launched_model_source("org/model"), "public_repository")
+
     def test_hf_token_is_masked_publicly_and_exported_to_containers(self) -> None:
         instance = Manager.__new__(Manager)
         instance.settings = {"hf_token": "hf_test_secret", "hf_cache": ""}

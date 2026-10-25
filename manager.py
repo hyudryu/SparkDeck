@@ -176,6 +176,27 @@ logger = logging.getLogger(__name__)
 # Embedding discovery is served on the inference protocol, where a client may
 # poll /v1/models far more often than a cache can meaningfully change.
 _EMBEDDING_DISCOVERY_TTL = 15.0
+# A walk over a multi-terabyte cache takes seconds, which a client reading a
+# model listing cannot tell apart from an endpoint that never answers. A
+# discovery caller with no snapshot yet gives the walk this long and then
+# answers without embedding entries, leaving the refresh running.
+_EMBEDDING_DISCOVERY_MAX_WAIT = 1.0
+
+
+def _log_embedding_discovery_failure(task: asyncio.Task) -> None:
+    """Report a background refresh no caller is left to await.
+
+    A discovery caller may answer before the refresh it started finishes, so
+    without this a failed walk surfaces only as an unretrieved task exception
+    rather than as the discovery failure it is.
+    """
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.warning("embedding model discovery failed", exc_info=error)
+
+
 HF_CREDENTIAL_CLI_OPTIONS = {"--hf-token", "--hf_token"}
 SENSITIVE_CREDENTIAL_CLI_OPTIONS = HF_CREDENTIAL_CLI_OPTIONS | {
     "--api-key", "--api_key", "--token", "--auth-token", "--auth_token",
@@ -2434,7 +2455,7 @@ class Manager:
             models.append({"model_id": str(model.get("model_id") or ""), **descriptor})
         return [model for model in models if model["model_id"]]
 
-    async def _embedding_inventory(self) -> list[dict]:
+    async def _embedding_inventory(self, *, discovery: bool = False) -> list[dict] | None:
         """Return a recently sampled model-cache inventory for discovery.
 
         Discovery deliberately uses the plain inventory rather than the
@@ -2442,23 +2463,50 @@ class Manager:
         OpenAI clients and must not wait on per-model Hub metadata lookups.
         Concurrent callers share one fan-out, and the result is held briefly so
         a polling client cannot turn a cache walk into a per-request cost.
+
+        A ``discovery`` caller never waits for a walk to finish: it answers
+        from the last completed snapshot and lets the refresh keep running.
+        The walk costs seconds on a large cache far more often than the cache
+        changes, and a listing that blocks on it is indistinguishable from an
+        endpoint that never answers. ``None`` says no walk has completed yet.
         """
         cached = getattr(self, "_embedding_inventory_cache", None)
         if cached and time.time() - cached[0] < _EMBEDDING_DISCOVERY_TTL:
             return cached[1]
         task = getattr(self, "_embedding_inventory_task", None)
         if task is None or task.done():
-            task = asyncio.create_task(self.model_cache_inventory())
+            task = asyncio.create_task(self._refresh_embedding_inventory())
+            task.add_done_callback(_log_embedding_discovery_failure)
             self._embedding_inventory_task = task
+        if not discovery:
+            return await asyncio.shield(task)
+        if cached is not None:
+            # One more poll on the older snapshot is cheaper than making the
+            # client's listing wait out a walk it did not ask for.
+            return cached[1]
         try:
-            nodes = await asyncio.shield(task)
-        finally:
-            if task.done() and self._embedding_inventory_task is task:
-                self._embedding_inventory_task = None
+            await asyncio.wait_for(
+                asyncio.shield(task), _EMBEDDING_DISCOVERY_MAX_WAIT,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            # A walk that fails is the listing's problem only when a request
+            # needs routing; discovery already has an answer it can give.
+            return None
+        return task.result()
+
+    async def _refresh_embedding_inventory(self) -> list[dict]:
+        """Walk the cluster cache and publish the result as the snapshot.
+
+        The refresh stores its own result so a discovery caller that answered
+        early still leaves the next poll with an inventory to serve.
+        """
+        nodes = await self.model_cache_inventory()
         self._embedding_inventory_cache = (time.time(), nodes)
         return nodes
 
-    async def embedding_models(self) -> dict:
+    async def embedding_models(self, *, discovery: bool = False) -> dict:
         """List the embedding models cached anywhere in the cluster.
 
         One model id is always served by exactly one revision, chosen across
@@ -2467,10 +2515,16 @@ class Manager:
         node holding another revision would silently mix incompatible vector
         spaces in whatever store the caller is filling. Nodes holding a
         different revision are therefore not advertised as serving that model.
+
+        ``discovery`` is for a caller that advertises models rather than
+        routing a request — ``/v1/models`` — and answers from the last
+        completed inventory without waiting on the cache walk.
         """
         if not self.embeddings_enabled():
             return {"enabled": False, "models": []}
-        nodes = await self._embedding_inventory()
+        nodes = await self._embedding_inventory(discovery=discovery)
+        if nodes is None:
+            return {"enabled": True, "models": []}
         # model id -> revision -> descriptors seen on each node holding it
         seen: dict[str, dict[str, list[dict]]] = {}
         for node in nodes:

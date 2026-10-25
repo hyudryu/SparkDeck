@@ -7987,9 +7987,13 @@ class SparkDeckService:
         ``/v1/models`` is how clients discover chat deployments, so a cache
         scan that goes wrong — an unreachable node, an unreadable manifest —
         must drop the embedding entries rather than break the whole listing.
+        The scan also runs on the client's clock, so discovery answers from the
+        last completed inventory instead of waiting for the walk: a listing
+        that takes seconds reads as an endpoint that is not answering.
         """
         try:
-            return list((await self.manager.embedding_models()).get("models") or [])
+            discovered = await self.manager.embedding_models(discovery=True)
+            return list(discovered.get("models") or [])
         except Exception:
             logger.warning("embedding model discovery failed", exc_info=True)
             return []

@@ -99,6 +99,26 @@ _EXTERNAL_SNAPSHOT_MARKER = ".sparkdeck-external"
 _EXTERNAL_MARKER_CONTENT = b"comfyui\n"
 _EXTERNAL_PSEUDO_REVISION = "comfyui"
 _HF_XET_HIGH_PERFORMANCE = "HF_XET_HIGH_PERFORMANCE"
+# Dead CDN sockets leave the Hub writer blocked forever without ever raising,
+# so a writer whose cache bytes do not advance within this window is killed
+# and relaunched; the replacement resumes from the retained partials.
+_DOWNLOAD_STALL_TIMEOUT_SECONDS = 900.0
+_DOWNLOAD_STALL_POLL_SECONDS = 15.0
+_DOWNLOAD_STALL_RETRIES = 3
+_DOWNLOAD_STALL_BACKOFF_SECONDS = (15.0, 30.0, 60.0)
+# A healthy writer capped at N bytes/s may take chunk_size/N seconds to
+# persist anything visible, so the stall window must not be shorter than
+# that accumulation time (with slack) at the effective cap.
+_DOWNLOAD_STALL_MIN_PROGRESS_BYTES = 64 * 1024 * 1024
+_DOWNLOAD_STALL_WINDOW_FACTOR = 2.0
+
+
+def _stall_window_seconds(timeout_seconds: float, worker_bps: float) -> float:
+    """Widen the stall window enough for a capped writer to commit a chunk."""
+    if worker_bps > 0:
+        return max(timeout_seconds, _DOWNLOAD_STALL_WINDOW_FACTOR
+                   * _DOWNLOAD_STALL_MIN_PROGRESS_BYTES / worker_bps)
+    return timeout_seconds
 _COMFYUI_MODEL_BUNDLES = (
     (
         "Lightricks/LTX-2.5",
@@ -303,6 +323,10 @@ def selected_files_cache_bytes(
 
 class TransferCanceled(Exception):
     pass
+
+
+class DownloadStalled(Exception):
+    """The supervised writer made no cache progress and was killed for retry."""
 
 
 def validate_model_id(model_id: str) -> str:
@@ -1453,6 +1477,9 @@ class VirtualNAS:
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
         cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
+        stall_timeout_seconds: float | None = None,
+        stall_poll_seconds: float | None = None,
+        stall_retries: int | None = None,
     ) -> dict[str, Any]:
         model_id = validate_model_id(model_id)
         lock = self._process_download_locks.setdefault(model_id, asyncio.Lock())
@@ -1467,15 +1494,132 @@ class VirtualNAS:
                     bandwidth_mbps=bandwidth_mbps,
                     cluster_bandwidth_mbps=cluster_bandwidth_mbps,
                     operation_id=operation_id,
+                    stall_timeout_seconds=stall_timeout_seconds,
+                    stall_poll_seconds=stall_poll_seconds,
+                    stall_retries=stall_retries,
                 )
+
+    def _worker_io_counter(self, pid: int) -> int | None:
+        """rchar+wchar of the writer process, when the platform exposes it.
+
+        This attributes bytes to THIS writer: a concurrent pull sharing the
+        same cache can neither mask a stall nor fake progress on deployed
+        Linux agents, where this is the authoritative signal.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+        totals: dict[str, int] = {}
+        try:
+            with open(f"/proc/{pid}/io", encoding="ascii") as handle:
+                for line in handle:
+                    key, _, value = line.partition(":")
+                    try:
+                        totals[key] = int(value)
+                    except ValueError:
+                        pass
+        except OSError:
+            return None
+        return totals.get("rchar", 0) + totals.get("wchar", 0)
+
+    def _download_cache_progress(self, model_id: str,
+                                 shared: bool) -> tuple[int, int, int]:
+        """(total bytes, newest write time, file count) for this download.
+
+        The whole repository is walked, not just blobs/: in no-symlink cache
+        mode the finished file lands directly under snapshots/. When no
+        per-process IO accounting exists (non-Linux), the cache-wide
+        `hub/blobs` and `hub/xet` staging trees join in, since Xet payloads
+        may land there instead of the repository; with worker-attributed
+        accounting they would only mask stalls from concurrent pulls. The
+        newest mtime matters as much as the total too: Xet parallel
+        direct-addressed writes can push a blob's logical size to its final
+        value while interior ranges are still landing, so logical size alone
+        would read as frozen on a healthy pull.
+        """
+        roots = [self._model_path(model_id)]
+        if shared:
+            hub = self._hub()
+            roots.extend([hub / "blobs", hub / "xet"])
+        total = 0
+        newest_ns = 0
+        count = 0
+        for root in roots:
+            for dirpath, _directories, filenames in os.walk(root):
+                for name in filenames:
+                    try:
+                        info = os.stat(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+                    total += info.st_size
+                    count += 1
+                    newest_ns = max(newest_ns, info.st_mtime_ns)
+        return total, newest_ns, count
+
+    async def _watch_download_stall(
+        self, model_id: str, pid: int, stall_event: asyncio.Event, *,
+        timeout_seconds: float, poll_seconds: float,
+        rate_file: Path | None = None, initial_bps: float = 0.0,
+    ) -> None:
+        last_progress: tuple[int, int, int] | None = None
+        last_io: int | None = None
+        last_change = time.monotonic()
+        while True:
+            await asyncio.sleep(poll_seconds)
+            # Re-read the live cap each poll and derive the window from the
+            # base timeout every time, so both lowering and raising/removing
+            # a mid-pull cap take effect at the next kill decision. The
+            # worker throttles from its payload even when the live file was
+            # never written or has gone unreadable, so fall back to the
+            # dispatched cap rather than treating such a worker as uncapped.
+            bps = initial_bps
+            if rate_file is not None:
+                try:
+                    bps = max(float(rate_file.read_text(encoding="utf-8")), 0.0)
+                except (OSError, ValueError):
+                    pass
+            try:
+                io_counter = self._worker_io_counter(pid)
+                progress = await asyncio.to_thread(
+                    self._download_cache_progress, model_id,
+                    io_counter is None)
+            except OSError:
+                continue
+            # The worker's own rate-file poller keeps rchar creeping even on
+            # dead sockets: require the delta to look like network traffic
+            # before it counts as progress. The floor stays at the larger of
+            # the live and dispatched caps because a worker that started
+            # capped keeps its poller thread even after the cap is removed;
+            # the window above still tracks the live value.
+            io_floor = max(bps, initial_bps)
+            io_moved = io_counter is not None and (
+                last_io is None or (io_counter != last_io
+                                    and io_counter - last_io
+                                    >= max(1.0, io_floor * poll_seconds * 0.25)))
+            now = time.monotonic()
+            if progress != last_progress or io_moved:
+                last_progress = progress
+                last_io = io_counter
+                last_change = now
+            elif now - last_change >= _stall_window_seconds(timeout_seconds, bps):
+                stall_event.set()
+                return
 
     async def _supervised_download_model_process(
         self, model_id: str, revision: str, explicit_token: str | None = None,
         requested_revision: str | None = None, bandwidth_mbps: float | None = None,
         cluster_bandwidth_mbps: float | None = None,
         *, operation_id: str | None = None,
+        stall_timeout_seconds: float | None = None,
+        stall_poll_seconds: float | None = None,
+        stall_retries: int | None = None,
     ) -> dict[str, Any]:
-        """Run Hub's writer in an owned process; never cancel a writer thread."""
+        """Run Hub's writer in an owned process; never cancel a writer thread.
+
+        A writer whose CDN sockets die without raising would otherwise block
+        forever, so one that stops advancing the cache is killed and
+        relaunched up to the retry budget; each relaunch resumes from the
+        retained partials.
+        """
         model_id = validate_model_id(model_id)
         revision = validate_revision(revision)
         if not _is_commit_sha(revision):
@@ -1495,9 +1639,65 @@ class VirtualNAS:
             raise TransferCanceled()
         state["done"].clear()
         state["active"] = True
+        timeout = (_DOWNLOAD_STALL_TIMEOUT_SECONDS if stall_timeout_seconds is None
+                   else stall_timeout_seconds)
+        poll = (_DOWNLOAD_STALL_POLL_SECONDS if stall_poll_seconds is None
+                else stall_poll_seconds)
+        attempts = 1 + max(0, _DOWNLOAD_STALL_RETRIES if stall_retries is None
+                           else stall_retries)
+        rate_file = None
+        try:
+            worker_bps = self._download_bandwidth_bytes_per_second(bandwidth_mbps)
+            # Share of the dispatched CLUSTER cap (see the selective worker
+            # above): the re-rate scales by the controller's value, never
+            # this node's possibly stale local setting. One rate file spans
+            # every relaunch, so a settings re-rate steers the replacement
+            # writer too.
+            rate_file = self._register_download_rate_file(
+                operation_id, worker_bps,
+                cluster_bytes_per_second=(
+                    self._download_bandwidth_bytes_per_second(
+                        cluster_bandwidth_mbps)
+                ),
+            )
+            for attempt in range(attempts):
+                try:
+                    return await self._run_supervised_download_attempt(
+                        model_id, revision, explicit_token, requested_revision,
+                        state, worker_bps=worker_bps, rate_file=rate_file,
+                        stall_timeout_seconds=timeout, stall_poll_seconds=poll,
+                    )
+                except DownloadStalled:
+                    if state["cancel"].is_set():
+                        raise TransferCanceled()
+                    if attempt + 1 >= attempts:
+                        raise RuntimeError(
+                            "Hugging Face download stalled: the writer made no "
+                            f"cache progress for {timeout:.0f}s across "
+                            f"{attempts} attempts; retry the download"
+                        )
+                    backoff = _DOWNLOAD_STALL_BACKOFF_SECONDS[min(
+                        attempt, len(_DOWNLOAD_STALL_BACKOFF_SECONDS) - 1)]
+                    try:
+                        await asyncio.wait_for(state["cancel"].wait(), backoff)
+                    except asyncio.TimeoutError:
+                        continue
+                    raise TransferCanceled()
+        finally:
+            if rate_file is not None:
+                self._release_download_rate_file(operation_id)
+            state["active"] = False
+            state["done"].set()
+
+    async def _run_supervised_download_attempt(
+        self, model_id: str, revision: str, explicit_token: str | None,
+        requested_revision: str, state: dict[str, Any], *,
+        worker_bps: float, rate_file: Path | None,
+        stall_timeout_seconds: float, stall_poll_seconds: float,
+    ) -> dict[str, Any]:
         process = None
-        cancel_wait = None
         completion = None
+        watch_tasks: list[asyncio.Task] = []
         try:
             if state["cancel"].is_set():
                 raise TransferCanceled()
@@ -1521,20 +1721,6 @@ class VirtualNAS:
                 process = await self._await_uncancelable(launch)
                 state["cancel"].set()
                 raise
-            worker_bps = self._download_bandwidth_bytes_per_second(
-                bandwidth_mbps,
-            )
-            # Share of the dispatched CLUSTER cap (see the selective
-            # worker above): the re-rate scales by the controller's value,
-            # never this node's possibly stale local setting.
-            rate_file = self._register_download_rate_file(
-                operation_id, worker_bps,
-                cluster_bytes_per_second=(
-                    self._download_bandwidth_bytes_per_second(
-                        cluster_bandwidth_mbps,
-                    )
-                ),
-            )
             payload_fields = {
                 "model_id": model_id, "revision": revision,
                 "parent_pid": os.getpid(),
@@ -1547,50 +1733,72 @@ class VirtualNAS:
                 payload_fields["rate_file"] = str(rate_file)
             payload = json.dumps(payload_fields)
             completion = asyncio.create_task(process.communicate(payload.encode()))
-            cancel_wait = asyncio.create_task(state["cancel"].wait())
-            await asyncio.wait({completion, cancel_wait}, return_when=asyncio.FIRST_COMPLETED)
+            stall_event = asyncio.Event()
+            watch_tasks = [
+                asyncio.create_task(state["cancel"].wait()),
+                asyncio.create_task(stall_event.wait()),
+                asyncio.create_task(self._watch_download_stall(
+                    model_id, process.pid, stall_event,
+                    timeout_seconds=stall_timeout_seconds,
+                    poll_seconds=stall_poll_seconds,
+                    rate_file=rate_file, initial_bps=worker_bps,
+                )),
+            ]
+            await asyncio.wait({completion, *watch_tasks},
+                              return_when=asyncio.FIRST_COMPLETED)
             if state["cancel"].is_set():
                 await self._stop_download_process(process)
                 await completion
                 raise TransferCanceled()
-            await completion
-            if process.returncode != 0:
-                raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
-            (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
-            self._write_revision_ref(model_id, requested_revision, revision)
-            inventory = await asyncio.to_thread(self.inventory)
-            model = next((item for item in inventory if item.get("model_id") == model_id
-                          and self._has_revision(item, revision, requested_revision)), None)
-            if model is None:
-                raise RuntimeError("download finished without a complete requested revision")
-            return {"ok": True, "model_id": model_id, "revision": revision,
-                    "size_bytes": _nonnegative_int(model.get("size_bytes"))}
+            # A worker that finished in the same event-loop iteration as the
+            # stall fired has genuinely completed: prefer its result over a
+            # pointless relaunch.
+            if completion.done() or not stall_event.is_set():
+                await completion
+                if process.returncode != 0:
+                    raise RuntimeError("Hugging Face download failed; verify repository access, revision, credentials, and network")
+                (self._model_path(model_id) / "snapshots" / revision / _SELECTIVE_SNAPSHOT_MARKER).unlink(missing_ok=True)
+                self._write_revision_ref(model_id, requested_revision, revision)
+                inventory = await asyncio.to_thread(self.inventory)
+                model = next((item for item in inventory if item.get("model_id") == model_id
+                              and self._has_revision(item, revision, requested_revision)), None)
+                if model is None:
+                    raise RuntimeError("download finished without a complete requested revision")
+                return {"ok": True, "model_id": model_id, "revision": revision,
+                        "size_bytes": _nonnegative_int(model.get("size_bytes"))}
+            # A dead CDN socket never raises. The finally block reaps this
+            # writer (retrying a stop that transiently fails to confirm
+            # exit) before the exception reaches the retry loop, so a
+            # relaunch can never overlap a surviving writer; the next
+            # attempt resumes from the retained partials.
+            raise DownloadStalled()
         finally:
-            self._release_download_rate_file(operation_id)
-            try:
-                async def finish_writer():
-                    while process is not None and process.returncode is None:
-                        try:
-                            await self._stop_download_process(process)
-                        except Exception:
-                            # An endpoint may time out, but the supervisor
-                            # keeps the model reservation until actual exit.
-                            state["stop_error"] = "download worker has not confirmed exit"
-                            await asyncio.sleep(1)
-                    state.pop("stop_error", None)
+            for task in watch_tasks:
+                task.cancel()
+            if watch_tasks:
+                # Drain the watcher before the reservation can be released: a
+                # second cancellation here must not leave the attempt
+                # teardown half-done with the writer still running.
+                await self._await_uncancelable(
+                    asyncio.gather(*watch_tasks, return_exceptions=True))
+            async def finish_writer():
+                while process is not None and process.returncode is None:
+                    try:
+                        await self._stop_download_process(process)
+                    except Exception:
+                        # An endpoint may time out, but the supervisor
+                        # keeps the model reservation until actual exit.
+                        state["stop_error"] = "download worker has not confirmed exit"
+                        await asyncio.sleep(1)
+                state.pop("stop_error", None)
 
+            try:
                 await self._await_uncancelable(finish_writer())
                 if completion is not None:
                     await self._await_uncancelable(completion)
             except Exception as exc:
                 state["stop_error"] = str(exc)
                 raise
-            finally:
-                if cancel_wait is not None:
-                    cancel_wait.cancel()
-                    await asyncio.gather(cancel_wait, return_exceptions=True)
-                state["active"] = False
-                state["done"].set()
 
     @_transfer_operation
     async def download_model_files_checked(
@@ -1916,6 +2124,14 @@ class VirtualNAS:
         hub = self._hub()
         if not hub.is_dir():
             return _external_comfyui_inventory(self._external_model_roots_provider())
+        try:
+            hub_device: int | None = os.stat(hub).st_dev or None
+        except OSError:
+            hub_device = None
+        # Node-wide (device, inode) set: a payload shared by several
+        # repositories (two facades over one staging tree, cache-wide
+        # hardlinks) must charge the cache mount's capacity only once.
+        cache_mount_file_keys: set[tuple[int, int]] = set()
         models = []
         for repository in sorted(hub.glob("models--*--*")):
             if not repository.is_dir() or repository.is_symlink():
@@ -1938,29 +2154,109 @@ class VirtualNAS:
             file_count = 0
             transfer_entry_count = 1
             last_modified = 0.0
+            # size_bytes above stays the export/wire accounting (lstat). The
+            # fields below report the distinct bytes that actually exist on
+            # this node: each symlink is followed once and every regular file
+            # counts once per (device, inode), so hardlinked snapshot entries
+            # are not double-counted and a symlink facade over real weights
+            # (for example a /models staging tree) is not reported as only
+            # its link bytes.
+            resolved_repository = repository.resolve()
+            resolved_size_bytes = 0
+            resolved_mounted_bytes = 0
+            counted_file_keys: set[tuple[int, int]] = set()
+            symlink_file_count = 0
+            dangling_file_count = 0
+            plain_file_count = 0
+            linked_outside_cache = False
+            payload_truncated = False
             for root, directories, files in os.walk(repository, followlinks=False):
                 if Path(root) == repository:
                     # Match export's exclusion before counting entries/bytes:
                     # API listing caches consume neither wire nor staging space.
                     directories[:] = [name for name in directories if name != "trees"]
                 transfer_entry_count += len(directories) + len(files)
-                directories[:] = [
-                    name for name in directories
-                    if not (Path(root) / name).is_symlink()
-                ]
+                kept_directories = []
+                for name in directories:
+                    source = Path(root) / name
+                    if source.is_symlink():
+                        # Export preserves directory links that stay inside the
+                        # repository (it rejects only escaping links), so flag
+                        # containment here rather than every directory link.
+                        try:
+                            target = os.path.realpath(source)
+                            escaped = not Path(target).is_relative_to(
+                                resolved_repository,
+                            )
+                        except OSError:
+                            escaped = True
+                            target = ""
+                        if escaped:
+                            linked_outside_cache = True
+                            # The walk never descends a directory link, so the
+                            # payload below an external directory target would
+                            # go uncounted without this charge.
+                            if target and os.path.isdir(target):
+                                added, mounted, cut_short = (
+                                    _external_directory_payload(
+                                        Path(target), hub_device,
+                                        counted_file_keys, cache_mount_file_keys,
+                                    )
+                                )
+                                resolved_size_bytes += added
+                                resolved_mounted_bytes += mounted
+                                if cut_short:
+                                    payload_truncated = True
+                        elif target and not os.path.isdir(target):
+                            # Contained but broken: a transfer would recreate
+                            # the dangling link at the receiving node.
+                            dangling_file_count += 1
+                    else:
+                        kept_directories.append(name)
+                directories[:] = kept_directories
                 for name in files:
+                    link = Path(root) / name
                     try:
-                        stat = (Path(root) / name).lstat()
+                        entry_stat = link.lstat()
                     except OSError:
                         continue
-                    size_bytes += stat.st_size
+                    size_bytes += entry_stat.st_size
                     if (
                         name.endswith(".incomplete")
                         and name != _SELECTIVE_SNAPSHOT_MARKER
                     ):
-                        incomplete_size_bytes += stat.st_size
+                        incomplete_size_bytes += entry_stat.st_size
                     file_count += 1
-                    last_modified = max(last_modified, stat.st_mtime)
+                    last_modified = max(last_modified, entry_stat.st_mtime)
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        symlink_file_count += 1
+                        try:
+                            target_stat = os.stat(link)
+                            target = os.path.realpath(link)
+                        except OSError:
+                            dangling_file_count += 1
+                            continue
+                        if not stat.S_ISREG(target_stat.st_mode):
+                            dangling_file_count += 1
+                            continue
+                        added = _count_distinct_file_bytes(
+                            target_stat, counted_file_keys,
+                        )
+                        resolved_size_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            target_stat, added, hub_device, cache_mount_file_keys,
+                        )
+                        if not Path(target).is_relative_to(resolved_repository):
+                            linked_outside_cache = True
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        plain_file_count += 1
+                        added = _count_distinct_file_bytes(
+                            entry_stat, counted_file_keys,
+                        )
+                        resolved_size_bytes += added
+                        resolved_mounted_bytes += _charge_mount_bytes(
+                            entry_stat, added, hub_device, cache_mount_file_keys,
+                        )
             incomplete_revision_bytes = _incomplete_snapshot_reusable_bytes(
                 repository, set(snapshot_revisions), incomplete_revisions,
             )
@@ -2017,6 +2313,19 @@ class VirtualNAS:
             model = {
                 "model_id": model_id,
                 "size_bytes": size_bytes,
+                "resolved_size_bytes": resolved_size_bytes,
+                # Resolved payload occupying the cache mount's own filesystem
+                # after node-wide (device, inode) deduplication, so the
+                # capacity bar stays honest even when repositories share one
+                # staging payload. Off-mount bytes are excluded.
+                "cache_mount_size_bytes": resolved_mounted_bytes,
+                "symlink_file_count": symlink_file_count,
+                "dangling_file_count": dangling_file_count,
+                # Regular (non-link) file entries: tells a pure link facade
+                # from a mixed repository whose local files also sit in the
+                # cache and would be removed by a delete.
+                "plain_file_count": plain_file_count,
+                "linked_outside_cache": linked_outside_cache,
                 "file_count": file_count,
                 "transfer_entry_count": transfer_entry_count,
                 "snapshot_files": snapshot_files,
@@ -2041,7 +2350,18 @@ class VirtualNAS:
             }
             if selective_files:
                 model["selective_files_by_revision"] = selective_files
-            if transfer_entry_count > _FILE_STREAM_MAX_ENTRIES:
+            if payload_truncated:
+                # An external directory traversal hit the entry cap, so the
+                # resolved sizes are a lower bound, not an exact payload size.
+                model["resolved_size_truncated"] = True
+            if (
+                transfer_entry_count > _FILE_STREAM_MAX_ENTRIES
+                or linked_outside_cache
+                or dangling_file_count
+            ):
+                # Export only sends bytes the receiving node can use: links to
+                # payloads outside the repository (or to nothing) would arrive
+                # as dangling entries, so such caches are not transferable.
                 model["transferable"] = False
             # A SentenceTransformers repository is served through
             # /v1/embeddings. The marker is evaluated here, on the node that
@@ -4980,6 +5300,115 @@ def _is_complete_repository(repository: Path) -> bool:
 # Safety valve for pathologies like a repository snapshot holding thousands
 # of loose files: inventory stays a summary, not a full file dump.
 _INVENTORY_FILE_LIMIT = 2000
+
+
+def _count_distinct_file_bytes(
+    info: os.stat_result, counted_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return bytes to add for one regular file, counting hardlinks once.
+
+    A filesystem that reports no inode identity (``st_ino`` of zero) cannot
+    be deduplicated, so every file is counted in full there.
+    """
+    if not info.st_ino:
+        return info.st_size
+    key = (info.st_dev, info.st_ino)
+    if key in counted_file_keys:
+        return 0
+    counted_file_keys.add(key)
+    return info.st_size
+
+
+# An escaping directory link can aim at an arbitrarily large tree (a mistyped
+# broad path such as / included), so counting its payload is capped to keep one
+# facade from outliving the manager's inventory request timeout.
+_EXTERNAL_DIRECTORY_MAX_ENTRIES = 20_000
+
+
+def _charge_mount_bytes(
+    info: os.stat_result,
+    added: int,
+    hub_device: int | None,
+    cache_mount_file_keys: set[tuple[int, int]],
+) -> int:
+    """Return the portion of ``added`` bytes that newly occupies the cache mount.
+
+    Bytes on another device never occupy the mount, and bytes already charged
+    by an earlier repository (two facades over one staging payload, cache-wide
+    hardlinks) are not charged again. A filesystem that reports no inode
+    identity cannot be deduplicated, so every file is charged in full there.
+    """
+    if not added:
+        return 0
+    if hub_device is not None and info.st_dev != hub_device:
+        return 0
+    if info.st_ino:
+        key = (info.st_dev, info.st_ino)
+        if key in cache_mount_file_keys:
+            return 0
+        cache_mount_file_keys.add(key)
+    return added
+
+
+def _external_directory_payload(
+    target: Path,
+    hub_device: int | None,
+    counted_file_keys: set[tuple[int, int]],
+    cache_mount_file_keys: set[tuple[int, int]],
+) -> tuple[int, int, bool]:
+    """Return (bytes, cache-mount bytes, truncated) for files below a link.
+
+    Nested directory links are followed because their files are part of the
+    payload reachable through the cache facade; a visited (device, inode) set
+    for directories keeps cycles finite, and the entry cap bounds the cost of
+    a link aimed at an enormous tree. Files dedup through the repository's
+    shared (device, inode) set. ``truncated`` is true when the cap stopped the
+    traversal, meaning both totals are lower bounds, not exact sizes.
+    """
+    total = 0
+    mounted = 0
+    visited_directories: set[tuple[int, int]] = set()
+    stack = [target]
+    entries_seen = 0
+    while stack:
+        current = stack.pop()
+        try:
+            current_stat = os.stat(current)
+        except OSError:
+            continue
+        if current_stat.st_ino:
+            directory_key = (current_stat.st_dev, current_stat.st_ino)
+            if directory_key in visited_directories:
+                continue
+            visited_directories.add(directory_key)
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > _EXTERNAL_DIRECTORY_MAX_ENTRIES:
+                return total, mounted, True
+            try:
+                if entry.is_dir():
+                    stack.append(Path(entry.path))
+                    continue
+                # os.stat, not entry.stat: on Windows a cached scandir entry
+                # reports st_dev/st_ino of zero, which would defeat the
+                # (device, inode) dedup below.
+                info = os.stat(entry.path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            added = _count_distinct_file_bytes(info, counted_file_keys)
+            if not added:
+                continue
+            total += added
+            mounted += _charge_mount_bytes(
+                info, added, hub_device, cache_mount_file_keys,
+            )
+    return total, mounted, False
 
 
 def _snapshot_files_by_revision(repository: Path) -> dict[str, list[str]]:

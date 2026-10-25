@@ -490,6 +490,79 @@ class DiscoveredDeploymentDetailTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_path_backed_discovered_container_preflight_reports_node_paths(self):
+        # A path-backed container launch is validated per node by the agent
+        # probe, so the preflight works without a promotion contract: the
+        # plan reports which hosts expose the shared directory.
+        card = {
+            "id": "container:path-model", "alias": "path model", "runtime": "vllm",
+            "kind": "external", "model": {"repository": "/mnt/share/weights"},
+            "status": "stopped", "settings": {},
+        }
+        container = {
+            "name": "path-model", "image": "example/vllm:latest",
+            "model": "/mnt/share/weights",
+            "load_settings": {"engine": "vllm"},
+        }
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "_resolve_local_path", Mock(return_value=None)),
+            patch.object(
+                server.manager, "node_has_local_path", AsyncMock(return_value=True),
+            ),
+            patch.object(server.manager, "cluster_nodes", AsyncMock(return_value=[
+                {"id": "local", "name": "Controller"},
+                {"id": "remote-1", "name": "Remote"},
+            ])),
+        ):
+            response = await self.client.post(
+                "/api/v1/deployments/container:path-model/prepare/preflight",
+                json={"node_ids": ["local", "remote-1"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["path_backed"])
+
+    async def test_container_cache_path_keeps_the_promotion_gate(self):
+        # A container-internal cache path is not host-backed, so a discovered
+        # container without a promotable direct-start contract is still
+        # refused the cache-weight preparation flow.
+        card = {
+            "id": "container:cache-model", "alias": "cache model", "runtime": "vllm",
+            "kind": "external",
+            "model": {"repository": "/cache/models/org--m/snapshots/r"},
+            "status": "stopped", "settings": {},
+        }
+        container = {
+            "name": "cache-model", "image": "example/vllm:latest",
+            "model": "/cache/models/org--m/snapshots/r",
+            "load_settings": {"engine": "vllm"},
+        }
+        with (
+            patch.object(server.sparkdeck, "deployments", AsyncMock(return_value=[card])),
+            patch.object(
+                server.sparkdeck, "_resolve_discovered_container",
+                AsyncMock(return_value=container),
+            ),
+            patch.object(server.manager, "_resolve_local_path", Mock(return_value=None)),
+            patch.object(
+                server.manager, "node_has_local_path", AsyncMock(return_value=False),
+            ),
+        ):
+            response = await self.client.post(
+                "/api/v1/deployments/container:cache-model/prepare/preflight",
+                json={"node_ids": ["local", "remote-1"]},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "cannot prepare weights before promotion", response.json()["detail"],
+        )
+
     async def test_discovered_vllm_detail_surfaces_container_flags(self):
         card = {
             "id": "container:vllm-dspark", "alias": "dspark", "runtime": "vllm",

@@ -6364,7 +6364,7 @@ class SparkDeckService:
         return bytes(stdout_tail), bytes(stderr_tail)
 
     async def _preparable_deployment_model(
-        self, deployment_id: str,
+        self, deployment_id: str, node_ids: list[str] | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """Resolve a saved or safely promotable deployment for preparation."""
         deployment = self.store.deployment(deployment_id, include_private=True)
@@ -6377,6 +6377,20 @@ class SparkDeckService:
                 runtime,
                 container.get("model") or container.get("served_model"),
             )
+            model = str((deployment.get("model") or {}).get("repository") or "")
+            if node_ids and _is_path_reference(model):
+                # A path-backed container launch is validated per node by the
+                # agent probe; the plan only reports which hosts expose the
+                # directory, so it needs no launch contract or promotion. A
+                # container-internal cache path is not host-backed and keeps
+                # the promotion gate below for the cache flow.
+                availability = await self._local_path_availability(
+                    model, node_ids,
+                )
+                if self._path_is_host_backed(
+                    model, deployment.get("settings"), availability,
+                ):
+                    return deployment, model, "main"
             if not (
                 deployment.get("direct_start")
                 and deployment.get("promotable") is True
@@ -6786,7 +6800,7 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Plan per-node weight preparation for a saved or promoted launch."""
         deployment, model, revision = await self._preparable_deployment_model(
-            deployment_id,
+            deployment_id, node_ids,
         )
         path_plan = await self._path_preparation_plan(
             model, revision, node_ids, deployment.get("settings"),
@@ -6828,7 +6842,7 @@ class SparkDeckService:
     ) -> dict[str, Any]:
         """Queue Virtual NAS preparation for a saved or promoted launch."""
         deployment, model, revision = await self._preparable_deployment_model(
-            deployment_id,
+            deployment_id, node_ids,
         )
         path_plan = await self._path_preparation_plan(
             model, revision, node_ids, deployment.get("settings"),

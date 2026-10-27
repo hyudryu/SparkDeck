@@ -127,11 +127,45 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[1]?.[1]).toEqual([{ role: 'user', content: 'Load test' }])
 
     await act(async () => {
-      finishers[0]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 200, output_tokens_per_second: 20 } })
-      finishers[1]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 300, output_tokens_per_second: 25 } })
+      finishers[0]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 200, output_tokens_per_second: 20, completion_tokens: 100 } })
+      finishers[1]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 300, output_tokens_per_second: 25, completion_tokens: 100 } })
     })
 
-    expect(await screen.findByText('2 concurrent runs · combined 45.0 tok/s · TTFT 200 ms – 300 ms · identical output')).toBeInTheDocument()
+    // The combined rate divides total completion tokens by the shared
+    // wall-clock window, so only its shape is asserted.
+    expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
+  })
+
+  it('replays one representative answer per earlier group when concurrency returns to one', async () => {
+    let call = 0
+    const results: ChatStreamResult[] = [
+      { message: { role: 'assistant', content: 'Branch one' }, reasoning: '', metrics: {} },
+      { message: { role: 'assistant', content: 'Branch two' }, reasoning: '', metrics: {} },
+      { message: { role: 'assistant', content: 'Solo answer' }, reasoning: '', metrics: {} },
+    ]
+    vi.mocked(api.chatStream).mockImplementation(() => Promise.resolve(results[call++]!))
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'First')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Branch one')).toBeInTheDocument()
+    await screen.findByText('Branch two')
+
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '1')
+    await user.type(composer, 'Second')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Solo answer')).toBeInTheDocument()
+
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(3))
+    expect(vi.mocked(api.chatStream).mock.calls[2]?.[1]).toEqual([
+      { role: 'user', content: 'First' },
+      { role: 'assistant', content: 'Branch one' },
+      { role: 'user', content: 'Second' },
+    ])
   })
 
   it('keeps concurrent sessions as independent history branches on follow-up turns', async () => {

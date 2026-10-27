@@ -35,6 +35,8 @@ interface ConversationMessage {
   groupId?: string
   runIndex?: number
   runTotal?: number
+  startedAt?: number
+  endedAt?: number
 }
 
 const CONCURRENCY_OPTIONS = [1, 2, 4, 8, 16]
@@ -126,17 +128,29 @@ function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics
 }
 
 // Shown once every run of a concurrent send has finished: aggregate serving
-// throughput, the spread in time-to-first-token, and whether the engine
-// produced byte-identical answers across the sessions.
+// throughput over the shared wall-clock window (summing the per-run average
+// rates would overstate it when runs finish at different times), the spread
+// in time-to-first-token, and whether the engine produced byte-identical
+// answers across the sessions.
 function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   if (runs.length < 2 || runs.some((run) => run.streaming)) return null
-  const ttfts = runs.map((run) => run.metrics?.ttft_ms).filter((value): value is number => value !== undefined)
-  const rates = runs.map((run) => run.metrics?.output_tokens_per_second).filter((value): value is number => value !== undefined)
-  const outputsMatch = runs.every((run) => run.content === runs[0]?.content)
   const parts = [`${runs.length} concurrent runs`]
-  if (rates.length === runs.length) parts.push(`combined ${rates.reduce((sum, rate) => sum + rate, 0).toFixed(1)} tok/s`)
+  const tokens = runs.map((run) => run.metrics?.completion_tokens)
+  const starts = runs.map((run) => run.startedAt)
+  const ends = runs.map((run) => run.endedAt)
+  if (tokens.every((value): value is number => value !== undefined)
+    && starts.every((value): value is number => value !== undefined)
+    && ends.every((value): value is number => value !== undefined)) {
+    const windowMs = Math.max(1, Math.max(...ends) - Math.min(...starts))
+    const totalTokens = tokens.reduce((sum, count) => sum + count, 0)
+    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s`)
+  }
+  const ttfts = runs.map((run) => run.metrics?.ttft_ms).filter((value): value is number => value !== undefined)
   if (ttfts.length === runs.length) parts.push(`TTFT ${formatTtft(Math.min(...ttfts))} – ${formatTtft(Math.max(...ttfts))}`)
-  parts.push(outputsMatch ? 'identical output' : 'outputs differ')
+  const completed = runs.every((run) => !run.stopped && !run.failed && run.content.length > 0)
+  parts.push(completed
+    ? (runs.every((run) => run.content === runs[0]?.content) ? 'identical output' : 'outputs differ')
+    : 'incomplete runs')
   return <p className="concurrency-summary">{parts.join(' · ')}</p>
 }
 
@@ -322,13 +336,27 @@ export function ChatPage() {
       groupId,
       runIndex: groupId ? index + 1 : undefined,
       runTotal: groupId ? runTotal : undefined,
+      startedAt: Date.now(),
     }))
     // Each concurrent session replays only its own past answers, so the
-    // sessions stay independent branches of the same conversation.
+    // sessions stay independent branches of the same conversation. A plain
+    // (unrun) send replays the first usable answer of each earlier group —
+    // every branch would otherwise duplicate into the next prompt.
+    const representativeByGroup = new Map<string, string>()
+    for (const entry of messages) {
+      if (entry.role === 'assistant' && entry.groupId && !entry.failed && entry.content.trim()
+        && !representativeByGroup.has(entry.groupId)) {
+        representativeByGroup.set(entry.groupId, entry.id)
+      }
+    }
     const historyFor = (runIndex: number | undefined) => [...messages, userMessage]
       .filter((message) => message.role !== 'assistant'
         || (message.content.trim() && !message.failed
-          && (runIndex === undefined || message.runIndex === undefined || message.runIndex === runIndex)))
+          && (message.groupId === undefined
+            ? true
+            : runIndex === undefined
+              ? representativeByGroup.get(message.groupId) === message.id
+              : message.runIndex === runIndex)))
       .map(toRequestMessage)
 
     const controllers = assistantMessages.map(() => new AbortController())
@@ -358,13 +386,14 @@ export function ChatPage() {
           reasoning: result.reasoning || current.reasoning,
           metrics: result.metrics,
           streaming: false,
+          endedAt: Date.now(),
         }))
       } catch (reason) {
         const stopped = reason instanceof Error && reason.name === 'AbortError'
         setMessages((current) => current.flatMap((entry) => {
           if (entry.id !== message.id) return [entry]
           if (!stopped && !entry.content && !entry.reasoning) return []
-          return [{ ...entry, streaming: false, stopped, failed: !stopped }]
+          return [{ ...entry, streaming: false, stopped, failed: !stopped, endedAt: Date.now() }]
         }))
         if (!stopped) setError(reason instanceof Error ? reason.message : 'The model did not respond')
       } finally {

@@ -96,6 +96,83 @@ describe('ChatPage', () => {
     expect(screen.getByRole('button', { name: 'Send message' })).toBeInTheDocument()
   })
 
+  it('fans one prompt out into concurrent sessions with per-run labels and a combined summary', async () => {
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        options?.onUpdate?.({
+          content: 'Shared answer',
+          metrics: { ttft_ms: 200 + index * 100, output_tokens_per_second: 20 },
+        })
+      })
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'Load test')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('reasoner · Run 1 of 2')).toBeInTheDocument()
+    expect(screen.getByText('reasoner · Run 2 of 2')).toBeInTheDocument()
+    expect(await screen.findAllByText('Shared answer')).toHaveLength(2)
+    expect(screen.queryByText(/^2 concurrent runs/)).not.toBeInTheDocument()
+
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[1]).toEqual([{ role: 'user', content: 'Load test' }])
+    expect(vi.mocked(api.chatStream).mock.calls[1]?.[1]).toEqual([{ role: 'user', content: 'Load test' }])
+
+    await act(async () => {
+      finishers[0]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 200, output_tokens_per_second: 20 } })
+      finishers[1]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 300, output_tokens_per_second: 25 } })
+    })
+
+    expect(await screen.findByText('2 concurrent runs · combined 45.0 tok/s · TTFT 200 ms – 300 ms · identical output')).toBeInTheDocument()
+  })
+
+  it('keeps concurrent sessions as independent history branches on follow-up turns', async () => {
+    let call = 0
+    const results: ChatStreamResult[] = [
+      { message: { role: 'assistant', content: 'Branch one' }, reasoning: '', metrics: {} },
+      { message: { role: 'assistant', content: 'Branch two' }, reasoning: '', metrics: {} },
+      { message: { role: 'assistant', content: 'Second one' }, reasoning: '', metrics: {} },
+      { message: { role: 'assistant', content: 'Second two' }, reasoning: '', metrics: {} },
+    ]
+    vi.mocked(api.chatStream).mockImplementation(() => Promise.resolve(results[call++]!))
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'First')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    expect(await screen.findByText('Branch one')).toBeInTheDocument()
+    expect(await screen.findByText('Branch two')).toBeInTheDocument()
+
+    await user.type(composer, 'Second')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    expect(await screen.findByText('Second two')).toBeInTheDocument()
+
+    // Run 1 replays only its own answer; run 2 only its own.
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(4))
+    expect(vi.mocked(api.chatStream).mock.calls[2]?.[1]).toEqual([
+      { role: 'user', content: 'First' },
+      { role: 'assistant', content: 'Branch one' },
+      { role: 'user', content: 'Second' },
+    ])
+    expect(vi.mocked(api.chatStream).mock.calls[3]?.[1]).toEqual([
+      { role: 'user', content: 'First' },
+      { role: 'assistant', content: 'Branch two' },
+      { role: 'user', content: 'Second' },
+    ])
+  })
+
   it('omits the prompt-processing metric when the engine does not measure it', async () => {
     vi.mocked(api.chatStream).mockResolvedValue({
       message: { role: 'assistant', content: 'Done' },

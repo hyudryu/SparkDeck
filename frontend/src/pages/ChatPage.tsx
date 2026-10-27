@@ -128,6 +128,30 @@ function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics
   )
 }
 
+// The thinking body scrolls in its own 240px box (styles.css), so the outer
+// conversation's follow-the-bottom logic never reaches text that overflows
+// it. This keeps the newest thinking line visible while reasoning streams,
+// pausing the moment the reader scrolls up and resuming once they return.
+const SCROLL_STICK_THRESHOLD_PX = 80
+
+function stickToBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_THRESHOLD_PX
+}
+
+function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasoning: string }) {
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef(true)
+  useEffect(() => {
+    const body = bodyRef.current
+    if (body && streaming && stickToBottomRef.current) body.scrollTop = body.scrollHeight
+  }, [reasoning, streaming])
+  return (
+    <div ref={bodyRef} onScroll={(event) => {
+      stickToBottomRef.current = stickToBottom(event.currentTarget)
+    }}>{reasoning}</div>
+  )
+}
+
 // Shown once every run of a concurrent send has finished: aggregate serving
 // throughput over the shared wall-clock window (summing the per-run average
 // rates would overstate it when runs finish at different times), the spread
@@ -164,7 +188,7 @@ function AssistantMessage({ message, className }: { message: ConversationMessage
         {message.reasoning && (
           <details className="reasoning-block" open={message.streaming && !message.content ? true : undefined}>
             <summary>{message.streaming ? 'Thinking…' : 'Thinking'}</summary>
-            <div>{message.reasoning}</div>
+            <ReasoningBlock streaming={message.streaming === true} reasoning={message.reasoning} />
           </details>
         )}
         {message.content ? <div className={`message-content${message.streaming ? ' is-streaming' : ''}`}><Suspense fallback={<div className="markdown-fallback">{message.content}</div>}><MarkdownContent content={message.content} /></Suspense></div> : (
@@ -493,8 +517,7 @@ export function ChatPage() {
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
       <section ref={conversationRef} className="conversation" aria-label="Conversation" onScroll={(event) => {
-        const target = event.currentTarget
-        shouldAutoScrollRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 80
+        shouldAutoScrollRef.current = stickToBottom(event.currentTarget)
       }}>
         {messages.length === 0 ? (
           <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>

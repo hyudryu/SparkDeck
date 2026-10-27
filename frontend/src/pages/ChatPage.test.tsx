@@ -241,6 +241,50 @@ describe('ChatPage', () => {
     ])
   })
 
+  it('follows streaming thinking text until the reader scrolls the thinking box up, then resumes at the bottom', async () => {
+    let streamOptions: ChatStreamOptions | undefined
+    let finishStream: ((result: ChatStreamResult) => void) | undefined
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      streamOptions = options
+      return new Promise((resolve) => {
+        finishStream = resolve
+        options?.onUpdate?.({ reasoning: 'First thought.' })
+      })
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 500 })
+    try {
+      const user = userEvent.setup()
+      render(<ChatPage />)
+      const composer = await screen.findByRole('textbox', { name: 'Message' })
+      await user.type(composer, 'Think out loud')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+      const body = await screen.findByText('First thought.')
+      expect(body.scrollTop).toBe(500)
+
+      body.scrollTop = 0
+      act(() => streamOptions?.onUpdate?.({ reasoning: ' Second thought.' }))
+      expect(body.scrollTop).toBe(500)
+
+      body.scrollTop = 0
+      fireEvent.scroll(body)
+      act(() => streamOptions?.onUpdate?.({ reasoning: ' Third thought.' }))
+      expect(body.scrollTop).toBe(0)
+
+      body.scrollTop = 450
+      fireEvent.scroll(body)
+      act(() => streamOptions?.onUpdate?.({ reasoning: ' Fourth thought.' }))
+      expect(body.scrollTop).toBe(500)
+
+      await act(async () => finishStream?.({
+        message: { role: 'assistant', content: '' },
+        reasoning: '', metrics: {},
+      }))
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
+
   it('omits the prompt-processing metric when the engine does not measure it', async () => {
     vi.mocked(api.chatStream).mockResolvedValue({
       message: { role: 'assistant', content: 'Done' },

@@ -29,8 +29,17 @@ interface ConversationMessage {
   streaming?: boolean
   stopped?: boolean
   failed?: boolean
+  // Concurrent sends share a group id; runIndex (1-based) identifies which
+  // parallel session an answer belongs to so follow-up turns replay only
+  // their own branch of the history.
+  groupId?: string
+  runIndex?: number
+  runTotal?: number
+  startedAt?: number
+  endedAt?: number
 }
 
+const CONCURRENCY_OPTIONS = [1, 2, 4, 8, 16]
 const ACCEPTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 const ACCEPTED_VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/quicktime'])
 const ACCEPTED_MEDIA_INPUT = [...ACCEPTED_IMAGE_TYPES, ...ACCEPTED_VIDEO_TYPES].join(',')
@@ -118,6 +127,43 @@ function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics
   )
 }
 
+// Shown once every run of a concurrent send has finished: aggregate serving
+// throughput over the shared wall-clock window (summing the per-run average
+// rates would overstate it when runs finish at different times), the spread
+// in time-to-first-token, and whether the engine produced byte-identical
+// answers across the sessions.
+function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
+  if (runs.length < 2 || runs.some((run) => run.streaming)) return null
+  const parts = [`${runs.length} concurrent runs`]
+  const tokens = runs.map((run) => run.metrics?.completion_tokens)
+  const starts = runs.map((run) => run.startedAt)
+  const ends = runs.map((run) => run.endedAt)
+  if (tokens.every((value): value is number => value !== undefined)
+    && starts.every((value): value is number => value !== undefined)
+    && ends.every((value): value is number => value !== undefined)) {
+    const windowMs = Math.max(1, Math.max(...ends) - Math.min(...starts))
+    const totalTokens = tokens.reduce((sum, count) => sum + count, 0)
+    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s`)
+  }
+  const ttfts = runs.map((run) => run.metrics?.ttft_ms).filter((value): value is number => value !== undefined)
+  if (ttfts.length === runs.length) parts.push(`TTFT ${formatTtft(Math.min(...ttfts))} – ${formatTtft(Math.max(...ttfts))}`)
+  const completed = runs.every((run) => !run.stopped && !run.failed && run.content.length > 0)
+  parts.push(completed
+    ? (runs.every((run) => run.content === runs[0]?.content) ? 'identical output' : 'outputs differ')
+    : 'incomplete runs')
+  return <p className="concurrency-summary">{parts.join(' · ')}</p>
+}
+
+const toRequestMessage = ({ role, content, media }: ConversationMessage): ChatMessage => ({
+  role,
+  content: media?.length ? [
+    ...(content ? [{ type: 'text' as const, text: content }] : []),
+    ...media.map((item) => item.kind === 'video'
+      ? ({ type: 'video_url' as const, video_url: { url: item.dataUrl } })
+      : ({ type: 'image_url' as const, image_url: { url: item.dataUrl } })),
+  ] : content,
+})
+
 export function ChatPage() {
   const deployments = useResource((signal) => api.deployments.list(signal))
   const running = useMemo(() => deployments.data?.filter((item) => (
@@ -136,7 +182,8 @@ export function ChatPage() {
   const [dragging, setDragging] = useState(false)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string>()
-  const abortRef = useRef<AbortController | null>(null)
+  const [concurrency, setConcurrency] = useState(1)
+  const abortRef = useRef<AbortController[]>([])
   const messageIdRef = useRef(0)
   const attachmentIdRef = useRef(0)
   const attachmentsRef = useRef<ChatMediaAttachment[]>([])
@@ -148,7 +195,7 @@ export function ChatPage() {
   const shouldAutoScrollRef = useRef(true)
   const selectedModel = model || running[0]?.alias || ''
 
-  useEffect(() => () => abortRef.current?.abort(), [])
+  useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   useEffect(() => {
     const conversation = conversationRef.current
     if (conversation && shouldAutoScrollRef.current) conversation.scrollTop = conversation.scrollHeight
@@ -272,76 +319,99 @@ export function ChatPage() {
     const attachedMedia = [...attachmentsRef.current]
     if ((!content && !attachedMedia.length) || !selectedModel || sending) return
 
+    const runTotal = concurrency
+    const groupId = runTotal > 1 ? `group-${++messageIdRef.current}` : undefined
     const userMessage: ConversationMessage = {
       id: `message-${++messageIdRef.current}`,
       role: 'user',
       content,
       media: attachedMedia,
     }
-    const assistantId = `message-${++messageIdRef.current}`
-    const assistantMessage: ConversationMessage = {
-      id: assistantId,
+    const assistantMessages: ConversationMessage[] = Array.from({ length: runTotal }, (_, index) => ({
+      id: `message-${++messageIdRef.current}`,
       role: 'assistant',
       content: '',
       model: selectedModel,
       streaming: true,
+      groupId,
+      runIndex: groupId ? index + 1 : undefined,
+      runTotal: groupId ? runTotal : undefined,
+      startedAt: Date.now(),
+    }))
+    // Each concurrent session replays only its own past answers, so the
+    // sessions stay independent branches of the same conversation. A plain
+    // (unrun) send replays the first usable answer of each earlier group —
+    // every branch would otherwise duplicate into the next prompt.
+    const representativeByGroup = new Map<string, string>()
+    for (const entry of messages) {
+      if (entry.role === 'assistant' && entry.groupId && !entry.failed && entry.content.trim()
+        && !representativeByGroup.has(entry.groupId)) {
+        representativeByGroup.set(entry.groupId, entry.id)
+      }
     }
-    const history = [...messages, userMessage]
-    const requestMessages: ChatMessage[] = history
-      .filter((message) => message.role !== 'assistant' || (message.content.trim() && !message.failed))
-      .map(({ role, content: messageContent, media: messageMedia }) => ({
-        role,
-        content: messageMedia?.length ? [
-          ...(messageContent ? [{ type: 'text' as const, text: messageContent }] : []),
-          ...messageMedia.map((item) => item.kind === 'video'
-            ? ({ type: 'video_url' as const, video_url: { url: item.dataUrl } })
-            : ({ type: 'image_url' as const, image_url: { url: item.dataUrl } })),
-        ] : messageContent,
-      }))
-    const controller = new AbortController()
-    abortRef.current = controller
+    const historyFor = (runIndex: number | undefined) => [...messages, userMessage]
+      .filter((message) => message.role !== 'assistant'
+        || (message.content.trim() && !message.failed
+          && (message.groupId === undefined
+            ? true
+            : runIndex === undefined
+              ? representativeByGroup.get(message.groupId) === message.id
+              : message.runIndex === runIndex)))
+      .map(toRequestMessage)
+
+    const controllers = assistantMessages.map(() => new AbortController())
+    abortRef.current = [...abortRef.current, ...controllers]
     shouldAutoScrollRef.current = true
-    setMessages([...history, assistantMessage])
+    setMessages([...messages, userMessage, ...assistantMessages])
     setDraft('')
     replaceAttachments([])
     setAttachmentError(undefined)
     setSending(true)
     setError(undefined)
 
+    const runAssistant = async (message: ConversationMessage, controller: AbortController) => {
+      try {
+        const result = await api.chatStream(selectedModel, historyFor(message.runIndex), {
+          signal: controller.signal,
+          onUpdate: (update) => updateMessage(message.id, (current) => ({
+            ...current,
+            content: current.content + (update.content ?? ''),
+            reasoning: (current.reasoning ?? '') + (update.reasoning ?? ''),
+            metrics: update.metrics ?? current.metrics,
+          })),
+        })
+        updateMessage(message.id, (current) => ({
+          ...current,
+          content: result.message.content || current.content,
+          reasoning: result.reasoning || current.reasoning,
+          metrics: result.metrics,
+          streaming: false,
+          endedAt: Date.now(),
+        }))
+      } catch (reason) {
+        const stopped = reason instanceof Error && reason.name === 'AbortError'
+        setMessages((current) => current.flatMap((entry) => {
+          if (entry.id !== message.id) return [entry]
+          if (!stopped && !entry.content && !entry.reasoning) return []
+          return [{ ...entry, streaming: false, stopped, failed: !stopped, endedAt: Date.now() }]
+        }))
+        if (!stopped) setError(reason instanceof Error ? reason.message : 'The model did not respond')
+      } finally {
+        abortRef.current = abortRef.current.filter((entry) => entry !== controller)
+      }
+    }
+
     try {
-      const result = await api.chatStream(selectedModel, requestMessages, {
-        signal: controller.signal,
-        onUpdate: (update) => updateMessage(assistantId, (message) => ({
-          ...message,
-          content: message.content + (update.content ?? ''),
-          reasoning: (message.reasoning ?? '') + (update.reasoning ?? ''),
-          metrics: update.metrics ?? message.metrics,
-        })),
-      })
-      updateMessage(assistantId, (message) => ({
-        ...message,
-        content: result.message.content || message.content,
-        reasoning: result.reasoning || message.reasoning,
-        metrics: result.metrics,
-        streaming: false,
-      }))
-    } catch (reason) {
-      const stopped = reason instanceof Error && reason.name === 'AbortError'
-      setMessages((current) => current.flatMap((message) => {
-        if (message.id !== assistantId) return [message]
-        if (!stopped && !message.content && !message.reasoning) return []
-        return [{ ...message, streaming: false, stopped, failed: !stopped }]
-      }))
-      if (!stopped) setError(reason instanceof Error ? reason.message : 'The model did not respond')
+      await Promise.all(assistantMessages.map((message, index) => runAssistant(message, controllers[index]!)))
     } finally {
-      if (abortRef.current === controller) abortRef.current = null
       setSending(false)
     }
   }
 
-  const stop = () => abortRef.current?.abort()
+  const stop = () => abortRef.current.forEach((controller) => controller.abort())
   const clear = () => {
-    abortRef.current?.abort()
+    abortRef.current.forEach((controller) => controller.abort())
+    abortRef.current = []
     setMessages([])
     replaceAttachments([])
     setAttachmentError(undefined)
@@ -360,6 +430,7 @@ export function ChatPage() {
       <div className="chat-toolbar">
         <label className="field inline-field"><span>Model</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)} disabled={running.length === 0 || sending}><option value="">Select a running model</option>{running.map((item) => <option key={item.id} value={item.alias}>{item.alias} · {item.runtime}</option>)}</select></label>
         {selectedModel && running.find((item) => item.alias === selectedModel) && <RuntimeMark runtime={running.find((item) => item.alias === selectedModel)!.runtime} />}
+        <label className="field inline-field"><span>Concurrency</span><select value={String(concurrency)} onChange={(event) => setConcurrency(Number(event.target.value))} disabled={running.length === 0 || sending}>{CONCURRENCY_OPTIONS.map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'session' : 'sessions'}</option>)}</select></label>
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
@@ -382,7 +453,7 @@ export function ChatPage() {
           <article className="message message-assistant" key={message.id}>
             <div className="message-avatar" aria-hidden="true"><Bot size={16} /></div>
             <div className="assistant-message-body">
-              <p className="message-author">{message.model}</p>
+              <p className="message-author">{message.model}{message.runTotal ? ` · Run ${message.runIndex} of ${message.runTotal}` : ''}</p>
               {message.reasoning && (
                 <details className="reasoning-block" open={message.streaming && !message.content ? true : undefined}>
                   <summary>{message.streaming ? 'Thinking…' : 'Thinking'}</summary>
@@ -395,6 +466,9 @@ export function ChatPage() {
               {message.stopped && <p className="generation-stopped">Response stopped</p>}
               {message.failed && <p className="generation-failed">Response interrupted</p>}
               <ResponseMetrics metrics={message.metrics} streaming={message.streaming} />
+              {message.groupId && message.runIndex === message.runTotal
+                ? <ConcurrencySummary runs={messages.filter((entry) => entry.groupId === message.groupId)} />
+                : null}
             </div>
           </article>
         ))}

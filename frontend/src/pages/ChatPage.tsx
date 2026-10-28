@@ -697,7 +697,12 @@ export function ChatPage() {
         }))
       } catch (reason) {
         const stopped = reason instanceof Error && reason.name === 'AbortError'
-        streamDeltasRef.current.delete(message.id)
+        // Flush published-but-unrendered chunks before the cleanup so a
+        // stop or failure cannot drop a session's trailing partial output
+        // (with concurrent streams even a whole partial answer can still be
+        // buffered behind another session's leading update, which would
+        // then fail the empty-content check below and remove the response).
+        applyStreamDeltas()
         setMessages((current) => current.flatMap((entry) => {
           if (entry.id !== message.id) return [entry]
           if (!stopped && !entry.content && !entry.reasoning) return []

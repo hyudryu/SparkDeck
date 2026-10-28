@@ -1039,6 +1039,44 @@ describe('ChatPage', () => {
     expect(screen.getByText(/TTFT 300 ms – 300 ms/)).toBeInTheDocument()
   })
 
+  it('keeps buffered stream output when a concurrent run stops before the next frame', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const rejecters: Array<(reason: Error) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = rejecters.length
+      return new Promise<ChatStreamResult>((_resolve, reject) => {
+        rejecters.push(reject)
+        updates[index] = options?.onUpdate
+      })
+    })
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('option', { name: 'reasoner' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stop mid-stream')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+    await screen.findByRole('log', { name: 'Session 1' })
+
+    // Session 1's chunk renders on the frame's leading edge; session 2's
+    // lands inside the open frame window and is still buffered when both
+    // streams fail. Everything already published over SSE must survive the
+    // interruption, including the entire second answer.
+    act(() => updates[0]?.({ content: 'Visible chunk' }))
+    act(() => updates[1]?.({ content: 'Buffered chunk' }))
+    await act(async () => {
+      rejecters[0]?.(new Error('GPU worker stopped'))
+      rejecters[1]?.(new Error('GPU worker stopped'))
+    })
+
+    const grid = container.querySelector('.chat-panes') as HTMLElement
+    expect(within(grid).getByText('Visible chunk')).toBeInTheDocument()
+    expect(within(grid).getByText('Buffered chunk')).toBeInTheDocument()
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(2)
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop generating' })).not.toBeInTheDocument())
+  })
+
   it('keeps following panes whose queued scroll event lands after streaming grew past the stick threshold', async () => {
     const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
     const finishers: Array<(result: ChatStreamResult) => void> = []

@@ -148,6 +148,29 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[1]?.[2]?.seed).toBe(2)
   })
 
+  it('keeps a surviving answer in its own pane when an earlier run fails before content', async () => {
+    let call = 0
+    vi.mocked(api.chatStream).mockImplementation(() => (++call === 1
+      ? Promise.reject(new Error('run one died'))
+      : Promise.resolve({ message: { role: 'assistant', content: 'Survivor' }, reasoning: '', metrics: {} })))
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'Fail one')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    // Removing run 1 (it failed before producing content) compacts the
+    // group's array, yet run 2's answer must stay with Session 2 and the
+    // column count must not collapse.
+    await screen.findByText('Survivor')
+    expect(within(screen.getByRole('log', { name: 'Session 2' })).getByText('Survivor')).toBeInTheDocument()
+    expect(within(screen.getByRole('log', { name: 'Session 1' })).queryByText('Survivor')).not.toBeInTheDocument()
+    expect(document.querySelectorAll('.chat-pane')).toHaveLength(2)
+  })
+
   it('lists each running model name once across deployments sharing it', async () => {
     vi.mocked(api.deployments.list).mockResolvedValue([
       { id: 'a', alias: 'shared', runtime: 'vllm', status: 'running' } as never,

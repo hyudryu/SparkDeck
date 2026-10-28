@@ -299,8 +299,10 @@ export function ChatPage() {
   // many full-height columns, each an independent chat with its own scroll.
   // The count is the widest group in the history so earlier branches keep
   // their column even after the concurrency selector is turned back down.
+  // runTotal (not the live runs length) keeps failed runs that were dropped
+  // before producing content from collapsing a session column.
   const paneCount = useMemo(() => renderEntries.reduce(
-    (max, entry) => entry.kind === 'runs' ? Math.max(max, entry.runs.length) : max,
+    (max, entry) => entry.kind === 'runs' ? Math.max(max, entry.runs[0]?.runTotal ?? entry.runs.length) : max,
     1,
   ), [renderEntries])
 
@@ -576,11 +578,15 @@ export function ChatPage() {
                   onScroll={(event) => { paneStickToBottom.current[paneIndex] = stickToBottom(event.currentTarget) }}
                 >
                   <p className="chat-pane-label">Session {paneIndex + 1}</p>
-                  {renderEntries.map((entry) => entry.kind === 'runs' ? (
-                    entry.runs[paneIndex]
-                      ? <AssistantMessage key={entry.runs[paneIndex]!.id} className="message message-assistant" message={entry.runs[paneIndex]!} runLabel={false} />
-                      : null
-                  ) : entry.message.role === 'user' ? (
+                  {renderEntries.map((entry) => entry.kind === 'runs' ? (() => {
+                    // Assign by the stable runIndex, never array position: a
+                    // run that fails before producing content is removed from
+                    // the group, and the survivors must stay with their own
+                    // session so the panes keep showing the history that is
+                    // actually replayed to the model.
+                    const run = entry.runs.find((item) => item.runIndex === paneIndex + 1)
+                    return run ? <AssistantMessage key={run.id} className="message message-assistant" message={run} runLabel={false} /> : null
+                  })() : entry.message.role === 'user' ? (
                     <UserBubble key={entry.message.id} message={entry.message} />
                   ) : (
                     <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} />

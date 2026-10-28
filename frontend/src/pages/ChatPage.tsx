@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
 import { ArrowUp, Bot, Gauge, Paperclip, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
-import type { ChatMessage, ChatResponseMetrics } from '../api/types'
+import type { ChatMessage, ChatResponseMetrics, Deployment } from '../api/types'
 import { Button, ErrorState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 
@@ -243,6 +243,18 @@ const toRequestMessage = ({ role, content, media }: ConversationMessage): ChatMe
   ] : content,
 })
 
+// Request ids the gateway matches against this deployment, mirroring the
+// backend's public id resolution: explicit runtime served names (what the
+// engine advertises on /v1/models) first, falling back to the UI alias.
+// Sending one of these ids — rather than a deployment-specific alias —
+// keeps the request eligible for rotation across every deployment serving
+// the same name.
+const deploymentPublicModelIds = (item: Deployment): string[] => {
+  const configured = (item.served_models ?? []).map((name) => name.trim()).filter(Boolean)
+  const single = item.served_model?.trim()
+  return configured.length ? configured : single ? [single] : [item.alias.trim()]
+}
+
 export function ChatPage() {
   const deployments = useResource((signal) => api.deployments.list(signal))
   const running = useMemo(() => deployments.data?.filter((item) => (
@@ -253,11 +265,25 @@ export function ChatPage() {
     // decision payload, but it is not a chat target.
     && item.runtime !== 'laya'
   )) ?? [], [deployments.data])
-  // The gateway routes /v1 requests by model name and picks an owning
-  // deployment itself, so deployments sharing an alias are one chat target:
-  // the dropdown lists each running model name once, not one option per
-  // deployment.
-  const modelNames = useMemo(() => Array.from(new Set(running.map((item) => item.alias))), [running])
+  // The gateway routes /v1 requests by the request's model id and rotates
+  // the owning deployment when several share it, so the dropdown lists each
+  // public serving name once — not one option per deployment — and sends
+  // that name so shared models keep load-balancing across clusters. The
+  // gateway resolves an exact alias match before other deployments' served
+  // names (service._live_candidates_for_model_id), so when a deployment's
+  // serving name is shadowed by another deployment's alias, its own alias is
+  // also offered as the only unambiguous selector for it.
+  const modelNames = useMemo(() => {
+    const aliases = new Set(running.map((item) => item.alias.trim()).filter(Boolean))
+    const names: string[] = []
+    for (const item of running) {
+      const ids = deploymentPublicModelIds(item)
+      for (const id of ids) if (id && !names.includes(id)) names.push(id)
+      const own = item.alias.trim()
+      if (own && !names.includes(own) && ids.some((id) => id !== own && aliases.has(id))) names.push(own)
+    }
+    return names
+  }, [running])
   const [model, setModel] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])
@@ -278,6 +304,14 @@ export function ChatPage() {
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
   const selectedModel = model || modelNames[0] || ''
+  // Mirrors the gateway's selector precedence: an exact alias match wins
+  // over other deployments' served names, so the runtime mark attributes the
+  // request to the same deployment the gateway would route it to.
+  const selectedDeployment = useMemo(() => selectedModel
+    ? running.find((item) => item.alias.trim() === selectedModel)
+      ?? running.find((item) => deploymentPublicModelIds(item).includes(selectedModel))
+    : undefined,
+  [running, selectedModel])
 
   const renderEntries = useMemo(() => {
     const entries: RenderEntry[] = []
@@ -555,7 +589,7 @@ export function ChatPage() {
       {deployments.error && <ErrorState message={deployments.error} onRetry={deployments.reload} />}
       <div className="chat-toolbar">
         <label className="field inline-field"><span>Model</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)} disabled={running.length === 0 || sending}><option value="">Select a running model</option>{modelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
-        {selectedModel && running.find((item) => item.alias === selectedModel) && <RuntimeMark runtime={running.find((item) => item.alias === selectedModel)!.runtime} />}
+        {selectedDeployment && <RuntimeMark runtime={selectedDeployment.runtime} />}
         <label className="field inline-field"><span>Concurrency</span><select value={String(concurrency)} onChange={(event) => setConcurrency(Number(event.target.value))} disabled={running.length === 0 || sending}>{CONCURRENCY_OPTIONS.map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'session' : 'sessions'}</option>)}</select></label>
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
       </div>

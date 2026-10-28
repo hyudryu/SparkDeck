@@ -243,7 +243,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .deployment-log-tabs button[aria-selected="true"] { color: var(--text-primary); background: var(--bg-surface); box-shadow: 0 1px 4px rgba(0, 0, 0, .08); }
 .deployment-log-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
-.chat-page { min-height: 100dvh; display: flex; flex-direction: column; padding-bottom: 28px; }
+/* Fixed viewport height so the conversation box is height-bounded: with a
+   min-height the flex column grows with content and panes expand the page
+   instead of scrolling inside themselves. */
+.chat-page { height: 100dvh; display: flex; flex-direction: column; padding-bottom: 28px; }
 .chat-page .page-header { margin-bottom: 20px; }
 .chat-toolbar { display: flex; align-items: flex-end; gap: 12px; padding: 10px 16px; background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 12px 12px 0 0; }
 .inline-field { width: min(360px, 100%); grid-template-columns: auto minmax(0, 1fr); align-items: center; }.inline-field select { min-height: 34px; padding-block: 5px; }
@@ -290,11 +293,17 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
    full-height chat panes: the box itself stops scrolling and each pane
    follows its own newest content, like separate chats side by side. */
 .conversation.has-panes { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-.chat-panes { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
-.chat-pane { min-width: 0; padding: 18px 14px 28px; overflow-y: auto; border-left: 1px solid var(--border-subtle); scroll-behavior: smooth; }
+/* Grid rows must be height-bounded (minmax(0, 1fr) rather than the default
+   auto) or the longest answer sizes its row to content and every pane
+   expands instead of scrolling down on its own. auto-fit wraps sessions
+   into implicit rows when they exceed the columns that fit, so both the
+   explicit first row and every generated row need the bound. */
+.chat-panes { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); grid-template-rows: minmax(0, 1fr); grid-auto-rows: minmax(0, 1fr); }
+.chat-pane { min-width: 0; min-height: 0; padding: 18px 14px 28px; overflow-y: auto; border-left: 1px solid var(--border-subtle); scroll-behavior: smooth; }
 .chat-pane:first-child { border-left: 0; }
 .chat-pane .message { width: 100%; margin-inline: 0; }
 .chat-pane-label { margin: 0 0 16px; color: var(--text-secondary); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.chat-pane-hint { color: var(--text-tertiary); font-size: 12px; }
 .conversation-footer { flex: 0 0 auto; padding: 4px 18px 12px; border-top: 1px solid var(--border-subtle); }
 .conversation-footer .concurrency-summary { margin-top: 8px; padding-top: 0; border-top: 0; }
 .conversation-footer .concurrency-summary + .concurrency-summary { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border-subtle); }
@@ -662,7 +671,7 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
   .usage-member { grid-template-columns: 1fr; }.usage-member .row-actions { width: 100%; justify-content: flex-start; }.usage-pricing-fields { grid-template-columns: 1fr; }.usage-pricing-actions { align-items: flex-start; flex-direction: column; }.usage-pricing-actions .button { width: 100%; }
   .usage-range-panel { grid-template-columns: 1fr; gap: 16px; }
   .modal-backdrop { align-items: end; padding: 0; }.modal { width: 100%; max-height: calc(100dvh - 24px); padding: 20px 16px calc(20px + env(safe-area-inset-bottom)); border-radius: 14px 14px 0 0; }
-  .chat-page { min-height: calc(100dvh - 52px); padding-bottom: max(12px, env(safe-area-inset-bottom)); }.chat-page .page-header { display: none; }.chat-toolbar { flex-wrap: wrap; }.inline-field { width: 100%; }.privacy-note { width: 100%; margin-left: 0; }.conversation { min-height: 300px; padding: 12px; }.composer { position: sticky; bottom: 0; }
+  .chat-page { height: auto; min-height: calc(100dvh - 52px); padding-bottom: max(12px, env(safe-area-inset-bottom)); }.chat-page .page-header { display: none; }.chat-toolbar { flex-wrap: wrap; }.inline-field { width: 100%; }.privacy-note { width: 100%; margin-left: 0; }.conversation { min-height: 300px; padding: 12px; }.composer { position: sticky; bottom: 0; }
   .compare-selectors { grid-template-columns: 1fr; }.versus { width: auto; height: 18px; }.compare-submit { align-items: flex-end; }.compare-submit p { max-width: 55%; }
   .sync-state { align-items: flex-start; flex-direction: column; }.sync-actions { flex-wrap: wrap; }
   .pull-panel { grid-template-columns: 1fr; gap: 16px; }.pull-panel form { grid-template-columns: 1fr; }.image-row { grid-template-columns: auto minmax(0, 1fr) auto; }.image-size { grid-column: 2; }.image-row > .button { grid-column: 3; grid-row: 1 / 3; }

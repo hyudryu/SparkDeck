@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
-import { ArrowUp, Bot, Gauge, Paperclip, Square, Trash2, X } from 'lucide-react'
+import { ArrowUp, Bot, Gauge, Maximize2, Minimize2, Paperclip, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { ChatMessage, ChatResponseMetrics, Deployment } from '../api/types'
+import { useChatFullscreen } from '../components/AppShell'
 import { Button, ErrorState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 
@@ -138,12 +139,24 @@ function stickToBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_THRESHOLD_PX
 }
 
+// The conversation and pane boxes set `scroll-behavior: smooth`, which would
+// turn each programmatic follow into an animation whose intermediate scroll
+// events land farther than the stick threshold from the bottom and flip the
+// reader's "stuck to bottom" flag off, killing auto-follow until they scroll
+// back down. Follow jumps therefore force instant behavior.
+function followToBottom(el: HTMLElement) {
+  const previous = el.style.scrollBehavior
+  el.style.scrollBehavior = 'auto'
+  el.scrollTop = el.scrollHeight
+  el.style.scrollBehavior = previous
+}
+
 function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasoning: string }) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
   useEffect(() => {
     const body = bodyRef.current
-    if (body && streaming && stickToBottomRef.current) body.scrollTop = body.scrollHeight
+    if (body && streaming && stickToBottomRef.current) followToBottom(body)
   }, [reasoning, streaming])
   return (
     <div ref={bodyRef} onScroll={(event) => {
@@ -264,6 +277,7 @@ const deploymentPublicModelIds = (item: Deployment): string[] => {
 }
 
 export function ChatPage() {
+  const { fullscreen, setFullscreen } = useChatFullscreen()
   const deployments = useResource((signal) => api.deployments.list(signal))
   const running = useMemo(() => deployments.data?.filter((item) => (
     item.status === 'running'
@@ -342,16 +356,29 @@ export function ChatPage() {
   // The count is the widest group in the history so earlier branches keep
   // their column even after the concurrency selector is turned back down.
   // runTotal (not the live runs length) keeps failed runs that were dropped
-  // before producing content from collapsing a session column.
-  const paneCount = useMemo(() => renderEntries.reduce(
+  // before producing content from collapsing a session column. The live
+  // selector is folded in so choosing N splits the box into N boxes right
+  // away, previewing the fan-out the next send will produce.
+  const historyPaneCount = useMemo(() => renderEntries.reduce(
     (max, entry) => entry.kind === 'runs' ? Math.max(max, entry.runs[0]?.runTotal ?? entry.runs.length) : max,
     1,
   ), [renderEntries])
+  const paneCount = Math.max(historyPaneCount, sending ? historyPaneCount : concurrency)
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
+  // Escape drops back out of full-window mode, mirroring the drawer's
+  // Escape-to-close behaviour.
+  useEffect(() => {
+    if (!fullscreen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [fullscreen, setFullscreen])
   useEffect(() => {
     const conversation = conversationRef.current
-    if (conversation && shouldAutoScrollRef.current) conversation.scrollTop = conversation.scrollHeight
+    if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
   }, [messages])
   // Panes scroll on their own (the outer box stops scrolling), so each one
   // follows its own newest content until its reader scrolls up.
@@ -359,7 +386,7 @@ export function ChatPage() {
   const paneStickToBottom = useRef<boolean[]>([])
   useEffect(() => {
     paneRefs.current.forEach((pane, index) => {
-      if (pane && paneStickToBottom.current[index] !== false) pane.scrollTop = pane.scrollHeight
+      if (pane && paneStickToBottom.current[index] !== false) followToBottom(pane)
     })
   }, [messages, paneCount])
   // Keep file drops outside the composer from navigating the page away.
@@ -587,7 +614,7 @@ export function ChatPage() {
   }
 
   return (
-    <div className="page chat-page">
+    <div className={`page chat-page${fullscreen ? ' is-fullscreen' : ''}`}>
       <PageHeader
         eyebrow="Inference workspace"
         title="Chat"
@@ -600,16 +627,27 @@ export function ChatPage() {
         {selectedDeployment && <RuntimeMark runtime={selectedDeployment.runtime} />}
         <label className="field inline-field"><span>Concurrency</span><select value={String(concurrency)} onChange={(event) => setConcurrency(Number(event.target.value))} disabled={running.length === 0 || sending}>{CONCURRENCY_OPTIONS.map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'session' : 'sessions'}</option>)}</select></label>
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
+        {/* Full-window mode hides the page header, so its Clear action moves
+            here to stay reachable. */}
+        {fullscreen && messages.length > 0 && <Button type="button" variant="tertiary" onClick={clear}><Trash2 size={15} /> Clear</Button>}
+        <Button
+          type="button"
+          variant="tertiary"
+          className="chat-expand-button"
+          aria-pressed={fullscreen}
+          title={fullscreen ? 'Exit full window (Esc)' : 'Fill the whole window'}
+          onClick={() => setFullscreen(!fullscreen)}
+        >
+          {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}{fullscreen ? 'Exit full window' : 'Full window'}
+        </Button>
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
       <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
         shouldAutoScrollRef.current = stickToBottom(event.currentTarget)
       }}>
-        {messages.length === 0 ? (
-          <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
-        ) : paneCount > 1 ? (
+        {paneCount > 1 ? (
           <>
-            <div className="chat-panes">
+            <div className={`chat-panes${paneCount >= 4 ? ' is-compact' : ''}`}>
               {Array.from({ length: paneCount }, (_, paneIndex) => (
                 <div
                   key={paneIndex}
@@ -620,6 +658,9 @@ export function ChatPage() {
                   onScroll={(event) => { paneStickToBottom.current[paneIndex] = stickToBottom(event.currentTarget) }}
                 >
                   <p className="chat-pane-label">Session {paneIndex + 1}</p>
+                  {messages.length === 0 && paneIndex === 0 && (
+                    <p className="chat-pane-hint">Send a prompt and it fans out to {paneCount} independent sessions.</p>
+                  )}
                   {renderEntries.map((entry) => entry.kind === 'runs' ? (() => {
                     // Assign by the stable runIndex, never array position: a
                     // run that fails before producing content is removed from
@@ -642,6 +683,8 @@ export function ChatPage() {
                 : [])}
             </div>
           </>
+        ) : messages.length === 0 ? (
+          <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
         ) : renderEntries.map((entry) => entry.kind === 'runs' ? (
           entry.runs.map((run) => <AssistantMessage key={run.id} className="message message-assistant" message={run} />)
         ) : entry.message.role === 'user' ? (

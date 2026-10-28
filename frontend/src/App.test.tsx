@@ -386,6 +386,53 @@ describe('SparkDeck application shell', () => {
     expect(await screen.findByRole('button', { name: 'Switch to light mode' })).toBeInTheDocument()
     expect(document.documentElement.dataset.theme).toBe('dark')
   })
+
+  it('fills the window and drops the sidebar while chat is expanded', async () => {
+    const user = userEvent.setup()
+    render(<MemoryRouter initialEntries={['/chat']}><App /></MemoryRouter>)
+
+    const toggle = await screen.findByRole('button', { name: 'Full window' })
+    expect(document.querySelector('.app-shell')).not.toHaveClass('chat-fullscreen')
+
+    await user.click(toggle)
+    expect(document.querySelector('.app-shell')).toHaveClass('chat-fullscreen')
+    expect(document.querySelector('.chat-page')).toHaveClass('is-fullscreen')
+
+    await user.click(screen.getByRole('link', { name: 'Dashboard' }))
+    await screen.findByRole('heading', { name: 'Dashboard' })
+    expect(document.querySelector('.app-shell')).not.toHaveClass('chat-fullscreen')
+  })
+
+  it('drops full-window chat when the controller becomes unavailable', async () => {
+    const user = userEvent.setup()
+    let controllerReachable = true
+    fetchMock.mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.includes('/api/v1/onboarding')) {
+        return new Response(JSON.stringify({
+          role: 'worker',
+          node: { id: 'spark-2', name: 'Worker Two', port: 7878, access_urls: [] },
+          controller_url: 'http://100.64.0.10:7878',
+          controller_reachable: controllerReachable,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ items: [], total: 0 }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    render(<MemoryRouter initialEntries={['/chat']}><App /></MemoryRouter>)
+    await user.click(await screen.findByRole('button', { name: 'Full window' }))
+    expect(document.querySelector('.app-shell')).toHaveClass('chat-fullscreen')
+
+    // App unmounts the routes (and with them the chat's exit toggle) without a
+    // pathname change, so the outage screen must not stay stranded in
+    // full-window mode with no sidebar and no way back.
+    controllerReachable = false
+    window.dispatchEvent(new Event('sparkdeck:onboarding-changed'))
+    expect(await screen.findByRole('heading', { name: 'Controller unavailable' })).toBeInTheDocument()
+    expect(document.querySelector('.app-shell')).not.toHaveClass('chat-fullscreen')
+  })
 })
 
 describe('model discovery', () => {

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatStreamOptions } from '../api/client'
 import { api } from '../api/client'
 import type { ChatStreamResult } from '../api/types'
+import { ChatFullscreenContext } from '../components/AppShell'
 import { ChatPage } from './ChatPage'
 
 vi.mock('../api/client', () => ({
@@ -194,6 +195,28 @@ describe('ChatPage', () => {
     // The dispatch-to-close wall clock (16.7 tok/s over 12.0 s) must not be
     // used, or the rate would be diluted by prefill/queueing time.
     expect(await screen.findByText(/^2 concurrent runs · combined 16\.9 tok\/s over 11\.8 s \(decode only\) · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
+  })
+
+  it('splits the conversation into N panes as soon as N sessions are selected', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner' })
+    expect(screen.getByText('How can I help?')).toBeInTheDocument()
+
+    // Choosing a concurrency splits the box into that many session columns
+    // immediately, before any prompt is sent, previewing the fan-out.
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '4')
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(4)
+    expect(screen.getByRole('log', { name: 'Session 4' })).toBeInTheDocument()
+    expect(container.querySelector('.conversation.has-panes')).toBeInTheDocument()
+    expect(screen.queryByText('How can I help?')).not.toBeInTheDocument()
+
+    // Turning the selector back down on an empty conversation returns to the
+    // single empty state.
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '1')
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(0)
+    expect(screen.getByText('How can I help?')).toBeInTheDocument()
   })
 
   it('keeps a surviving answer in its own pane when an earlier run fails before content', async () => {
@@ -406,6 +429,81 @@ describe('ChatPage', () => {
         message: { role: 'assistant', content: '' },
         reasoning: '', metrics: {},
       }))
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
+
+  it('follows streaming panes with an instant jump so the smooth-scroll animation cannot drop the stick', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        updates[index] = options?.onUpdate
+      })
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 900 })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('option', { name: 'reasoner' })
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+      await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stream together')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+      await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+      await screen.findByRole('log', { name: 'Session 1' })
+      const panes = Array.from(container.querySelectorAll<HTMLElement>('.chat-pane'))
+      expect(panes).toHaveLength(2)
+
+      // CSS gives the panes `scroll-behavior: smooth`; a follow assignment that
+      // inherits it animates, and the animation's intermediate scroll events
+      // flip the stick flag off. Every programmatic jump must therefore run
+      // with instant behavior (restoring the element's own style afterwards).
+      type Jump = { pane: number; to: number; behavior: string }
+      const jumps: Jump[] = []
+      panes.forEach((pane, index) => {
+        let stored = 0
+        Object.defineProperty(pane, 'scrollTop', {
+          configurable: true,
+          get: () => stored,
+          set: (value: number) => {
+            stored = value
+            // Only the component's follow jumps set instant behavior; the
+            // test's own assignments stay untracked.
+            if (pane.style.scrollBehavior === 'auto') {
+              jumps.push({ pane: index, to: value, behavior: pane.style.scrollBehavior })
+            }
+          },
+        })
+      })
+
+      act(() => updates[0]?.({ content: 'First half of answer' }))
+      act(() => updates[1]?.({ content: 'Second half of answer' }))
+      expect(jumps.some((jump) => jump.pane === 0 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
+      expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
+      panes.forEach((pane) => expect(pane.style.scrollBehavior).toBe(''))
+
+      // Scrolling a pane up still pauses only that pane's follow.
+      const before = jumps.filter((jump) => jump.pane === 0).length
+      panes[0]!.scrollTop = 0
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' more' }))
+      expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before)
+      expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900)).toBe(true)
+
+      // Returning to the bottom resumes the follow.
+      panes[0]!.scrollTop = 900
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' tail' }))
+      expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before + 1)
+
+      await act(async () => {
+        finishers[0]?.({ message: { role: 'assistant', content: 'First half of answer more tail' }, reasoning: '', metrics: {} })
+        finishers[1]?.({ message: { role: 'assistant', content: 'Second half of answer' }, reasoning: '', metrics: {} })
+      })
     } finally {
       delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
     }
@@ -764,5 +862,53 @@ describe('ChatPage', () => {
     dropOnComposer(container, [new File([bytes], 'large.mp4', { type: 'video/mp4' })])
 
     expect(await screen.findByRole('alert')).toHaveTextContent('exceeds the 16 MB per-video limit')
+  })
+
+  it('asks the shell to enter full-window mode from the toolbar toggle', async () => {
+    const user = userEvent.setup()
+    const setFullscreen = vi.fn()
+    render(
+      <ChatFullscreenContext.Provider value={{ fullscreen: false, setFullscreen }}>
+        <ChatPage />
+      </ChatFullscreenContext.Provider>,
+    )
+
+    const toggle = await screen.findByRole('button', { name: 'Full window' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+    await user.click(toggle)
+    expect(setFullscreen).toHaveBeenCalledWith(true)
+  })
+
+  it('marks the page fullscreen and exits on Escape', async () => {
+    const setFullscreen = vi.fn()
+    const { container } = render(
+      <ChatFullscreenContext.Provider value={{ fullscreen: true, setFullscreen }}>
+        <ChatPage />
+      </ChatFullscreenContext.Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Message' })
+    expect(container.querySelector('.chat-page')).toHaveClass('is-fullscreen')
+    const toggle = screen.getByRole('button', { name: 'Exit full window' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'true')
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(setFullscreen).toHaveBeenCalledWith(false)
+  })
+
+  it('compacts pane text once four or more sessions are shown', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const twoPaneGrid = container.querySelector('.chat-panes')
+    expect(twoPaneGrid).not.toHaveClass('is-compact')
+    expect(within(twoPaneGrid as HTMLElement).getAllByRole('log')).toHaveLength(2)
+
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '4')
+    const compactGrid = container.querySelector('.chat-panes')
+    expect(compactGrid).toHaveClass('is-compact')
+    expect(within(compactGrid as HTMLElement).getAllByRole('log')).toHaveLength(4)
   })
 })

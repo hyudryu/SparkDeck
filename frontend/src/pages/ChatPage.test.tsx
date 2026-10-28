@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatStreamOptions } from '../api/client'
 import { api } from '../api/client'
 import type { ChatStreamResult } from '../api/types'
+import { ChatFullscreenContext } from '../components/AppShell'
 import { ChatPage } from './ChatPage'
 
 vi.mock('../api/client', () => ({
@@ -813,5 +814,53 @@ describe('ChatPage', () => {
     dropOnComposer(container, [new File([bytes], 'large.mp4', { type: 'video/mp4' })])
 
     expect(await screen.findByRole('alert')).toHaveTextContent('exceeds the 16 MB per-video limit')
+  })
+
+  it('asks the shell to enter full-window mode from the toolbar toggle', async () => {
+    const user = userEvent.setup()
+    const setFullscreen = vi.fn()
+    render(
+      <ChatFullscreenContext.Provider value={{ fullscreen: false, setFullscreen }}>
+        <ChatPage />
+      </ChatFullscreenContext.Provider>,
+    )
+
+    const toggle = await screen.findByRole('button', { name: 'Full window' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+    await user.click(toggle)
+    expect(setFullscreen).toHaveBeenCalledWith(true)
+  })
+
+  it('marks the page fullscreen and exits on Escape', async () => {
+    const setFullscreen = vi.fn()
+    const { container } = render(
+      <ChatFullscreenContext.Provider value={{ fullscreen: true, setFullscreen }}>
+        <ChatPage />
+      </ChatFullscreenContext.Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Message' })
+    expect(container.querySelector('.chat-page')).toHaveClass('is-fullscreen')
+    const toggle = screen.getByRole('button', { name: 'Exit full window' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'true')
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(setFullscreen).toHaveBeenCalledWith(false)
+  })
+
+  it('compacts pane text once four or more sessions are shown', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const twoPaneGrid = container.querySelector('.chat-panes')
+    expect(twoPaneGrid).not.toHaveClass('is-compact')
+    expect(within(twoPaneGrid as HTMLElement).getAllByRole('log')).toHaveLength(2)
+
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '4')
+    const compactGrid = container.querySelector('.chat-panes')
+    expect(compactGrid).toHaveClass('is-compact')
+    expect(within(compactGrid as HTMLElement).getAllByRole('log')).toHaveLength(4)
   })
 })

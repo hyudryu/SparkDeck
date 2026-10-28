@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
-import { ArrowUp, Bot, Gauge, Paperclip, Square, Trash2, X } from 'lucide-react'
+import { ArrowUp, Bot, Gauge, Maximize2, Minimize2, Paperclip, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { ChatMessage, ChatResponseMetrics, Deployment } from '../api/types'
+import { useChatFullscreen } from '../components/AppShell'
 import { Button, ErrorState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
 
@@ -268,6 +269,7 @@ const deploymentPublicModelIds = (item: Deployment): string[] => {
 }
 
 export function ChatPage() {
+  const { fullscreen, setFullscreen } = useChatFullscreen()
   const deployments = useResource((signal) => api.deployments.list(signal))
   const running = useMemo(() => deployments.data?.filter((item) => (
     item.status === 'running'
@@ -356,6 +358,16 @@ export function ChatPage() {
   const paneCount = Math.max(historyPaneCount, sending ? historyPaneCount : concurrency)
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
+  // Escape drops back out of full-window mode, mirroring the drawer's
+  // Escape-to-close behaviour.
+  useEffect(() => {
+    if (!fullscreen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [fullscreen, setFullscreen])
   useEffect(() => {
     const conversation = conversationRef.current
     if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
@@ -594,7 +606,7 @@ export function ChatPage() {
   }
 
   return (
-    <div className="page chat-page">
+    <div className={`page chat-page${fullscreen ? ' is-fullscreen' : ''}`}>
       <PageHeader
         eyebrow="Inference workspace"
         title="Chat"
@@ -607,6 +619,19 @@ export function ChatPage() {
         {selectedDeployment && <RuntimeMark runtime={selectedDeployment.runtime} />}
         <label className="field inline-field"><span>Concurrency</span><select value={String(concurrency)} onChange={(event) => setConcurrency(Number(event.target.value))} disabled={running.length === 0 || sending}>{CONCURRENCY_OPTIONS.map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'session' : 'sessions'}</option>)}</select></label>
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
+        {/* Full-window mode hides the page header, so its Clear action moves
+            here to stay reachable. */}
+        {fullscreen && messages.length > 0 && <Button type="button" variant="tertiary" onClick={clear}><Trash2 size={15} /> Clear</Button>}
+        <Button
+          type="button"
+          variant="tertiary"
+          className="chat-expand-button"
+          aria-pressed={fullscreen}
+          title={fullscreen ? 'Exit full window (Esc)' : 'Fill the whole window'}
+          onClick={() => setFullscreen(!fullscreen)}
+        >
+          {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}{fullscreen ? 'Exit full window' : 'Full window'}
+        </Button>
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
       <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
@@ -614,7 +639,7 @@ export function ChatPage() {
       }}>
         {paneCount > 1 ? (
           <>
-            <div className="chat-panes">
+            <div className={`chat-panes${paneCount >= 4 ? ' is-compact' : ''}`}>
               {Array.from({ length: paneCount }, (_, paneIndex) => (
                 <div
                   key={paneIndex}

@@ -1134,4 +1134,65 @@ describe('ChatPage', () => {
       delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
     }
   })
+
+  it('holds the pane follow when a streaming reflow shrinks the content and clamps scrollTop down', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        updates[index] = options?.onUpdate
+      })
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 900 })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('option', { name: 'reasoner' })
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+      await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stream code')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+      await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+      await screen.findByRole('log', { name: 'Session 1' })
+      const panes = Array.from(container.querySelectorAll<HTMLElement>('.chat-pane'))
+      const jumps: Array<{ pane: number; to: number }> = []
+      panes.forEach((pane, index) => {
+        let stored = 0
+        Object.defineProperty(pane, 'scrollTop', {
+          configurable: true,
+          get: () => stored,
+          set: (value: number) => {
+            stored = value
+            jumps.push({ pane: index, to: value })
+          },
+        })
+      })
+      act(() => updates[0]?.({ content: '```python\nimport os\n' }))
+      await streamFrame()
+
+      // The pattern a reader feels inside streaming code blocks: a markdown
+      // re-parse (an open fence completing into a <pre>) shrinks the pane,
+      // the browser clamps scrollTop down, and the delivered scroll event
+      // reports a big upward move the reader never made. Because the content
+      // is shorter than at the last check, the follow must survive it and
+      // keep following once the block grows again.
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 300 })
+      panes[0]!.scrollTop = 200
+      fireEvent.scroll(panes[0]!)
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 1100 })
+      act(() => updates[0]?.({ content: 'print(os.getcwd())\n' }))
+      expect(jumps.some((jump) => jump.pane === 0 && jump.to === 1100)).toBe(true)
+
+      await act(async () => {
+        finishers[0]?.({ message: { role: 'assistant', content: '```python\nimport os\nprint(os.getcwd())\n' }, reasoning: '', metrics: {} })
+        finishers[1]?.({ message: { role: 'assistant', content: 'second' }, reasoning: '', metrics: {} })
+      })
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
 })

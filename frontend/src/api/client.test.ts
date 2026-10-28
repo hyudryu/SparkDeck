@@ -127,6 +127,48 @@ describe('API client adapters', () => {
     await response.body?.cancel()
   })
 
+  it('smooths the streamed output rate and throttles metric republishing while every chunk streams text', async () => {
+    // Twelve chunks whose engine timing ramps from 30 to 140 tok/s. Read raw,
+    // the pill would jump across that whole range chunk by chunk.
+    const chunks = Array.from({ length: 12 }, (_, index) =>
+      `data: {"choices":[{"delta":{"content":"line ${index} "}}],"timings":{"predicted_per_second":${20 + (index + 1) * 10}}}\n\n`)
+    const payload = `${chunks.join('')}data: [DONE]\n\n`
+    const response = new Response(payload, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(response))
+    // Each performance.now() call advances the clock 80 ms: publishes land at
+    // 80 ms cadence, well under the 250 ms metric republish interval.
+    let clock = 0
+    vi.spyOn(performance, 'now').mockImplementation(() => {
+      const value = clock
+      clock += 80
+      return value
+    })
+    const updates: ChatStreamUpdate[] = []
+
+    const result = await api.chatStream('reasoner', [{ role: 'user', content: 'Code please' }], {
+      onUpdate: (update) => updates.push(update),
+    })
+
+    // Text still streams every chunk even when metrics are held back.
+    expect(updates.filter((update) => update.content !== undefined)).toHaveLength(12)
+    const rates = updates
+      .map((update) => update.metrics?.output_tokens_per_second)
+      .filter((rate): rate is number => rate !== undefined)
+    expect(rates.length).toBeGreaterThanOrEqual(2)
+    expect(updates.filter((update) => update.metrics === undefined).length).toBeGreaterThanOrEqual(8)
+    // The second published sample is an average drifting from the first
+    // observed value toward the engine's much newer one — neither raw value —
+    // so the pill moves smoothly instead of snapping to each timing.
+    expect(rates[0]).toBe(30)
+    expect(rates[1]).toBeGreaterThan(30)
+    expect(rates[1]).toBeLessThan(70)
+    // The measurement shown once the stream closes is the unfiltered one.
+    expect(result.metrics.output_tokens_per_second).toBe(140)
+    await response.body?.cancel()
+  })
+
   it('surfaces an error sent inside an otherwise successful SSE response', async () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(
       'data: {"error":{"message":"GPU worker stopped"}}\n\ndata: [DONE]\n\n',

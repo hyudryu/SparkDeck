@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
 import { ArrowUp, Bot, Gauge, Maximize2, Minimize2, Paperclip, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
 import type { ChatMessage, ChatResponseMetrics, ChatStreamUpdate, Deployment } from '../api/types'
@@ -172,8 +172,16 @@ function stickToBottom(el: HTMLElement) {
 // doing (a programmatic follow only ever moves down), so it is the sole
 // unstick trigger; holding or moving down keeps the follow, and arriving
 // within the threshold re-arms it.
-function nextStickState(el: HTMLElement, previousTop: number, wasStuck: boolean) {
+// A re-parse of streaming markdown can also shrink the box — an open code
+// fence completing into a <pre> reflows, for instance — and the browser then
+// clamps scrollTop down to the new bottom, delivering a scroll event that
+// looks exactly like the reader scrolled up. While the content is shorter
+// than at the last check the drop belongs to that clamp, so the follow is
+// held; a genuine reader exit shows up on the next event, once the content
+// has stopped shrinking.
+function nextStickState(el: HTMLElement, previousTop: number, previousHeight: number, wasStuck: boolean) {
   if (stickToBottom(el)) return true
+  if (el.scrollHeight < previousHeight - 1) return wasStuck
   return wasStuck && previousTop - el.scrollTop <= 2
 }
 
@@ -189,20 +197,31 @@ function followToBottom(el: HTMLElement) {
   el.style.scrollBehavior = previous
 }
 
+// Follows run as layout effects, not passive ones: a passive effect fires
+// after the browser has already painted the frame in which the streamed
+// content grew, so every growth shows one frame at the stale scroll offset
+// before the snap — the wiggle readers see inside growing code blocks, where
+// content arrives line by line and never word-wraps. A layout effect pins
+// the bottom before the frame is ever visible.
 function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasoning: string }) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
   const lastTopRef = useRef(0)
-  useEffect(() => {
+  const lastHeightRef = useRef(0)
+  useLayoutEffect(() => {
     const body = bodyRef.current
     if (body && streaming && stickToBottomRef.current) followToBottom(body)
-    if (body) lastTopRef.current = body.scrollTop
+    if (body) {
+      lastTopRef.current = body.scrollTop
+      lastHeightRef.current = body.scrollHeight
+    }
   }, [reasoning, streaming])
   return (
     <div ref={bodyRef} onScroll={(event) => {
       const body = event.currentTarget
-      stickToBottomRef.current = nextStickState(body, lastTopRef.current, stickToBottomRef.current)
+      stickToBottomRef.current = nextStickState(body, lastTopRef.current, lastHeightRef.current, stickToBottomRef.current)
       lastTopRef.current = body.scrollTop
+      lastHeightRef.current = body.scrollHeight
     }}>{reasoning}</div>
   )
 }
@@ -369,6 +388,7 @@ export function ChatPage() {
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
   const conversationLastTopRef = useRef(0)
+  const conversationLastHeightRef = useRef(0)
   const selectedModel = model || modelNames[0] || ''
   // Mirrors the gateway's selector precedence: an exact alias match wins
   // over other deployments' served names, so the runtime mark attributes the
@@ -455,10 +475,13 @@ export function ChatPage() {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [fullscreen, setFullscreen])
-  useEffect(() => {
+  useLayoutEffect(() => {
     const conversation = conversationRef.current
     if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
-    if (conversation) conversationLastTopRef.current = conversation.scrollTop
+    if (conversation) {
+      conversationLastTopRef.current = conversation.scrollTop
+      conversationLastHeightRef.current = conversation.scrollHeight
+    }
   }, [messages])
   // Panes scroll on their own (the outer box stops scrolling), so each one
   // follows its own newest content until its reader scrolls up, using the
@@ -467,10 +490,14 @@ export function ChatPage() {
   const paneRefs = useRef<Array<HTMLDivElement | null>>([])
   const paneStickToBottom = useRef<boolean[]>([])
   const paneLastScrollTop = useRef<number[]>([])
-  useEffect(() => {
+  const paneLastHeight = useRef<number[]>([])
+  useLayoutEffect(() => {
     paneRefs.current.forEach((pane, index) => {
       if (pane && paneStickToBottom.current[index] !== false) followToBottom(pane)
-      if (pane) paneLastScrollTop.current[index] = pane.scrollTop
+      if (pane) {
+        paneLastScrollTop.current[index] = pane.scrollTop
+        paneLastHeight.current[index] = pane.scrollHeight
+      }
     })
   }, [messages, paneCount])
   // Keep file drops outside the composer from navigating the page away.
@@ -667,6 +694,7 @@ export function ChatPage() {
     shouldAutoScrollRef.current = true
     paneStickToBottom.current = []
     paneLastScrollTop.current = []
+    paneLastHeight.current = []
     setMessages([...messages, userMessage, ...assistantMessages])
     setDraft('')
     replaceAttachments([])
@@ -728,6 +756,7 @@ export function ChatPage() {
     streamDeltasRef.current.clear()
     paneStickToBottom.current = []
     paneLastScrollTop.current = []
+    paneLastHeight.current = []
     setMessages([])
     replaceAttachments([])
     setAttachmentError(undefined)
@@ -765,8 +794,9 @@ export function ChatPage() {
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
       <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
         const box = event.currentTarget
-        shouldAutoScrollRef.current = nextStickState(box, conversationLastTopRef.current, shouldAutoScrollRef.current)
+        shouldAutoScrollRef.current = nextStickState(box, conversationLastTopRef.current, conversationLastHeightRef.current, shouldAutoScrollRef.current)
         conversationLastTopRef.current = box.scrollTop
+        conversationLastHeightRef.current = box.scrollHeight
       }}>
         {paneCount > 1 ? (
           <>
@@ -787,9 +817,11 @@ export function ChatPage() {
                     paneStickToBottom.current[paneIndex] = nextStickState(
                       pane,
                       paneLastScrollTop.current[paneIndex] ?? pane.scrollTop,
+                      paneLastHeight.current[paneIndex] ?? pane.scrollHeight,
                       paneStickToBottom.current[paneIndex] ?? true,
                     )
                     paneLastScrollTop.current[paneIndex] = pane.scrollTop
+                    paneLastHeight.current[paneIndex] = pane.scrollHeight
                   }}
                 >
                   <p className="chat-pane-label">Session {paneIndex + 1}</p>

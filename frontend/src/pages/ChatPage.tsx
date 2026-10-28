@@ -138,12 +138,24 @@ function stickToBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_THRESHOLD_PX
 }
 
+// The conversation and pane boxes set `scroll-behavior: smooth`, which would
+// turn each programmatic follow into an animation whose intermediate scroll
+// events land farther than the stick threshold from the bottom and flip the
+// reader's "stuck to bottom" flag off, killing auto-follow until they scroll
+// back down. Follow jumps therefore force instant behavior.
+function followToBottom(el: HTMLElement) {
+  const previous = el.style.scrollBehavior
+  el.style.scrollBehavior = 'auto'
+  el.scrollTop = el.scrollHeight
+  el.style.scrollBehavior = previous
+}
+
 function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasoning: string }) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
   useEffect(() => {
     const body = bodyRef.current
-    if (body && streaming && stickToBottomRef.current) body.scrollTop = body.scrollHeight
+    if (body && streaming && stickToBottomRef.current) followToBottom(body)
   }, [reasoning, streaming])
   return (
     <div ref={bodyRef} onScroll={(event) => {
@@ -346,7 +358,7 @@ export function ChatPage() {
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   useEffect(() => {
     const conversation = conversationRef.current
-    if (conversation && shouldAutoScrollRef.current) conversation.scrollTop = conversation.scrollHeight
+    if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
   }, [messages])
   // Panes scroll on their own (the outer box stops scrolling), so each one
   // follows its own newest content until its reader scrolls up.
@@ -354,7 +366,7 @@ export function ChatPage() {
   const paneStickToBottom = useRef<boolean[]>([])
   useEffect(() => {
     paneRefs.current.forEach((pane, index) => {
-      if (pane && paneStickToBottom.current[index] !== false) pane.scrollTop = pane.scrollHeight
+      if (pane && paneStickToBottom.current[index] !== false) followToBottom(pane)
     })
   }, [messages, paneCount])
   // Keep file drops outside the composer from navigating the page away.

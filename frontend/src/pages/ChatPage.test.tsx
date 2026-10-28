@@ -385,6 +385,81 @@ describe('ChatPage', () => {
     }
   })
 
+  it('follows streaming panes with an instant jump so the smooth-scroll animation cannot drop the stick', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        updates[index] = options?.onUpdate
+      })
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 900 })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('option', { name: 'reasoner' })
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+      await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stream together')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+      await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+      await screen.findByRole('log', { name: 'Session 1' })
+      const panes = Array.from(container.querySelectorAll<HTMLElement>('.chat-pane'))
+      expect(panes).toHaveLength(2)
+
+      // CSS gives the panes `scroll-behavior: smooth`; a follow assignment that
+      // inherits it animates, and the animation's intermediate scroll events
+      // flip the stick flag off. Every programmatic jump must therefore run
+      // with instant behavior (restoring the element's own style afterwards).
+      type Jump = { pane: number; to: number; behavior: string }
+      const jumps: Jump[] = []
+      panes.forEach((pane, index) => {
+        let stored = 0
+        Object.defineProperty(pane, 'scrollTop', {
+          configurable: true,
+          get: () => stored,
+          set: (value: number) => {
+            stored = value
+            // Only the component's follow jumps set instant behavior; the
+            // test's own assignments stay untracked.
+            if (pane.style.scrollBehavior === 'auto') {
+              jumps.push({ pane: index, to: value, behavior: pane.style.scrollBehavior })
+            }
+          },
+        })
+      })
+
+      act(() => updates[0]?.({ content: 'First half of answer' }))
+      act(() => updates[1]?.({ content: 'Second half of answer' }))
+      expect(jumps.some((jump) => jump.pane === 0 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
+      expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
+      panes.forEach((pane) => expect(pane.style.scrollBehavior).toBe(''))
+
+      // Scrolling a pane up still pauses only that pane's follow.
+      const before = jumps.filter((jump) => jump.pane === 0).length
+      panes[0]!.scrollTop = 0
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' more' }))
+      expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before)
+      expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900)).toBe(true)
+
+      // Returning to the bottom resumes the follow.
+      panes[0]!.scrollTop = 900
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' tail' }))
+      expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before + 1)
+
+      await act(async () => {
+        finishers[0]?.({ message: { role: 'assistant', content: 'First half of answer more tail' }, reasoning: '', metrics: {} })
+        finishers[1]?.({ message: { role: 'assistant', content: 'Second half of answer' }, reasoning: '', metrics: {} })
+      })
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
+
   it('omits the prompt-processing metric when the engine does not measure it', async () => {
     vi.mocked(api.chatStream).mockResolvedValue({
       message: { role: 'assistant', content: 'Done' },

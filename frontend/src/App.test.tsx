@@ -386,6 +386,22 @@ describe('SparkDeck application shell', () => {
     expect(await screen.findByRole('button', { name: 'Switch to light mode' })).toBeInTheDocument()
     expect(document.documentElement.dataset.theme).toBe('dark')
   })
+
+  it('fills the window and drops the sidebar while chat is expanded', async () => {
+    const user = userEvent.setup()
+    render(<MemoryRouter initialEntries={['/chat']}><App /></MemoryRouter>)
+
+    const toggle = await screen.findByRole('button', { name: 'Full window' })
+    expect(document.querySelector('.app-shell')).not.toHaveClass('chat-fullscreen')
+
+    await user.click(toggle)
+    expect(document.querySelector('.app-shell')).toHaveClass('chat-fullscreen')
+    expect(document.querySelector('.chat-page')).toHaveClass('is-fullscreen')
+
+    await user.click(screen.getByRole('link', { name: 'Dashboard' }))
+    await screen.findByRole('heading', { name: 'Dashboard' })
+    expect(document.querySelector('.app-shell')).not.toHaveClass('chat-fullscreen')
+  })
 })
 
 describe('model discovery', () => {

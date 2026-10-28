@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Activity,
   Boxes,
@@ -50,6 +50,24 @@ function resolvedTheme(): ResolvedTheme {
   return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
 }
 
+// The chat page asks the shell to drop the sidebar and let the conversation
+// fill the whole window. The state lives in AppShell (not ChatPage) so that
+// navigating away always restores the sidebar even though ChatPage unmounts.
+interface ChatFullscreenState {
+  fullscreen: boolean
+  setFullscreen: (value: boolean) => void
+}
+
+// Exported so tests can drive full-window mode without mounting the shell.
+export const ChatFullscreenContext = createContext<ChatFullscreenState>({
+  fullscreen: false,
+  setFullscreen: () => {},
+})
+
+export function useChatFullscreen() {
+  return useContext(ChatFullscreenContext)
+}
+
 export function AppShell({
   children,
   controllerAvailable = true,
@@ -61,6 +79,7 @@ export function AppShell({
 }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('sparkdeck.sidebar') === 'collapsed')
+  const [chatFullscreen, setChatFullscreen] = useState(false)
   const [theme, setTheme] = useState<ResolvedTheme>(resolvedTheme)
   const [themeSyncing, setThemeSyncing] = useState(false)
   const [themeStatus, setThemeStatus] = useState('')
@@ -73,6 +92,12 @@ export function AppShell({
   const current = navigation.find((item) => (item.end ? location.pathname === '/' : location.pathname.startsWith(item.to)))
 
   useEffect(() => setDrawerOpen(false), [location.pathname])
+
+  // Leaving the chat page always brings the sidebar back: ChatPage unmounts
+  // while the shell keeps this state, so reset it on any other route.
+  useEffect(() => {
+    if (!location.pathname.startsWith('/chat')) setChatFullscreen(false)
+  }, [location.pathname])
 
   useEffect(() => {
     if (!controllerAvailable) return
@@ -232,7 +257,7 @@ export function AppShell({
   }
 
   return (
-    <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}`}>
+    <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''}${chatFullscreen ? ' chat-fullscreen' : ''}`}>
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className={`sidebar ${drawerOpen ? 'drawer-open' : ''}`} aria-label="Primary navigation">
         <div className="brand-row">
@@ -307,7 +332,11 @@ export function AppShell({
             <span className="mobile-brand-mark" aria-hidden="true" />
           </header>
         </div>
-        <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>
+        <main id="main-content" className="main-content" tabIndex={-1}>
+          <ChatFullscreenContext.Provider value={{ fullscreen: chatFullscreen, setFullscreen: setChatFullscreen }}>
+            {children}
+          </ChatFullscreenContext.Provider>
+        </main>
       </div>
     </div>
   )

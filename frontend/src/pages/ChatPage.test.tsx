@@ -96,7 +96,7 @@ describe('ChatPage', () => {
     expect(screen.getByRole('button', { name: 'Send message' })).toBeInTheDocument()
   })
 
-  it('fans one prompt out into concurrent sessions with per-run labels and a combined summary', async () => {
+  it('fans one prompt out into side-by-side session panes with a combined summary', async () => {
     const finishers: Array<(result: ChatStreamResult) => void> = []
     vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
       const index = finishers.length
@@ -117,8 +117,11 @@ describe('ChatPage', () => {
     await user.type(composer, 'Load test')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
 
-    expect(await screen.findByText('reasoner · Run 1 of 2')).toBeInTheDocument()
-    expect(screen.getByText('reasoner · Run 2 of 2')).toBeInTheDocument()
+    // Each session becomes its own full-height pane; the pane's own label
+    // identifies the session, replacing the old 'Run i of n' author suffix.
+    expect(await screen.findByRole('log', { name: 'Session 1' })).toBeInTheDocument()
+    expect(screen.getByRole('log', { name: 'Session 2' })).toBeInTheDocument()
+    expect(screen.queryByText(/Run \d+ of \d+/)).not.toBeInTheDocument()
     expect(await screen.findAllByText('Shared answer')).toHaveLength(2)
     expect(screen.queryByText(/^2 concurrent runs/)).not.toBeInTheDocument()
 
@@ -133,14 +136,14 @@ describe('ChatPage', () => {
 
     // The combined rate divides total completion tokens by the shared
     // wall-clock window, so only its shape is asserted.
-    expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
+    expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s \(TTFT included\) · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
 
-    // The sessions sit side by side in one grid array with the combined
-    // summary spanning the row beneath them, and each session samples the
-    // shared prompt with its own seed.
-    expect(container.querySelectorAll('.run-grid')).toHaveLength(1)
-    expect(container.querySelectorAll('.run-grid .run-cell')).toHaveLength(2)
-    expect(container.querySelector('.run-grid > .concurrency-summary')).toBeInTheDocument()
+    // The sessions sit in independent panes with the combined summary in a
+    // footer beneath them, and each session samples the shared prompt with
+    // its own seed.
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(2)
+    expect(container.querySelector('.conversation.has-panes')).toBeInTheDocument()
+    expect(container.querySelector('.conversation-footer .concurrency-summary')).toBeInTheDocument()
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[2]?.seed).toBe(1)
     expect(vi.mocked(api.chatStream).mock.calls[1]?.[2]?.seed).toBe(2)
   })
@@ -192,7 +195,8 @@ describe('ChatPage', () => {
     await user.selectOptions(screen.getByLabelText('Concurrency'), '1')
     await user.type(composer, 'Second')
     await user.click(screen.getByRole('button', { name: 'Send message' }))
-    expect(await screen.findByText('Solo answer')).toBeInTheDocument()
+    // Single-session answers show in every pane of the split history.
+    expect(await screen.findAllByText('Solo answer')).toHaveLength(2)
 
     await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(3))
     expect(vi.mocked(api.chatStream).mock.calls[2]?.[1]).toEqual([

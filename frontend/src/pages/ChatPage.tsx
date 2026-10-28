@@ -156,7 +156,9 @@ function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasonin
 // throughput over the shared wall-clock window (summing the per-run average
 // rates would overstate it when runs finish at different times), the spread
 // in time-to-first-token, and whether the engine produced byte-identical
-// answers across the sessions.
+// answers across the sessions. The window runs from request dispatch to
+// stream close, so unlike a session's own Output speed it includes queueing
+// and time-to-first-token; the label says so to keep the two apart.
 function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   if (runs.length < 2 || runs.some((run) => run.streaming)) return null
   const parts = [`${runs.length} concurrent runs`]
@@ -168,7 +170,7 @@ function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
     && ends.every((value): value is number => value !== undefined)) {
     const windowMs = Math.max(1, Math.max(...ends) - Math.min(...starts))
     const totalTokens = tokens.reduce((sum, count) => sum + count, 0)
-    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s`)
+    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s (TTFT included)`)
   }
   const ttfts = runs.map((run) => run.metrics?.ttft_ms).filter((value): value is number => value !== undefined)
   if (ttfts.length === runs.length) parts.push(`TTFT ${formatTtft(Math.min(...ttfts))} – ${formatTtft(Math.max(...ttfts))}`)
@@ -179,12 +181,31 @@ function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   return <p className="concurrency-summary">{parts.join(' · ')}</p>
 }
 
-function AssistantMessage({ message, className }: { message: ConversationMessage; className: string }) {
+function UserBubble({ message }: { message: ConversationMessage }) {
+  return (
+    <article className="message message-user">
+      <div className="user-message-content">
+        {message.media?.length ? <div className="user-message-media">{message.media.map((item) => item.kind === 'video'
+          ? <video key={item.id} src={item.dataUrl} controls preload="metadata" aria-label={`Attached ${item.name}`} />
+          : <img key={item.id} src={item.dataUrl} alt={`Attached ${item.name}`} />)}</div> : null}
+        {message.content && <div className="user-message-text">{message.content}</div>}
+      </div>
+    </article>
+  )
+}
+
+// runLabel is dropped inside a session pane, where the pane's own header
+// already identifies which concurrent session an answer belongs to.
+function AssistantMessage({ message, className, runLabel = true }: {
+  message: ConversationMessage
+  className: string
+  runLabel?: boolean
+}) {
   return (
     <article className={className}>
       <div className="message-avatar" aria-hidden="true"><Bot size={16} /></div>
       <div className="assistant-message-body">
-        <p className="message-author">{message.model}{message.runTotal ? ` · Run ${message.runIndex} of ${message.runTotal}` : ''}</p>
+        <p className="message-author">{message.model}{runLabel && message.runTotal ? ` · Run ${message.runIndex} of ${message.runTotal}` : ''}</p>
         {message.reasoning && (
           <details className="reasoning-block" open={message.streaming && !message.content ? true : undefined}>
             <summary>{message.streaming ? 'Thinking…' : 'Thinking'}</summary>
@@ -202,10 +223,12 @@ function AssistantMessage({ message, className }: { message: ConversationMessage
   )
 }
 
-// Conversation is rendered as user / assistant singles plus one grid entry
-// per concurrent-send group, so its runs sit side by side in an array
-// instead of stacking as separate blocks. Runs of a group are always
-// appended together, so contiguously shared group ids mean one entry.
+// Conversation is rendered as user / assistant singles plus one entry per
+// concurrent-send group. Once any group exists the whole box splits into
+// that many independent session panes (see the pane rendering below), each
+// replaying the shared turns and its own branch of each group. Runs of a
+// group are always appended together, so contiguously shared group ids mean
+// one entry.
 type RenderEntry
   = { kind: 'single'; message: ConversationMessage }
   | { kind: 'runs'; groupId: string; runs: ConversationMessage[] }
@@ -272,12 +295,31 @@ export function ChatPage() {
     }
     return entries
   }, [messages])
+  // One pane per concurrent session: the conversation box splits into this
+  // many full-height columns, each an independent chat with its own scroll.
+  // The count is the widest group in the history so earlier branches keep
+  // their column even after the concurrency selector is turned back down.
+  // runTotal (not the live runs length) keeps failed runs that were dropped
+  // before producing content from collapsing a session column.
+  const paneCount = useMemo(() => renderEntries.reduce(
+    (max, entry) => entry.kind === 'runs' ? Math.max(max, entry.runs[0]?.runTotal ?? entry.runs.length) : max,
+    1,
+  ), [renderEntries])
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   useEffect(() => {
     const conversation = conversationRef.current
     if (conversation && shouldAutoScrollRef.current) conversation.scrollTop = conversation.scrollHeight
   }, [messages])
+  // Panes scroll on their own (the outer box stops scrolling), so each one
+  // follows its own newest content until its reader scrolls up.
+  const paneRefs = useRef<Array<HTMLDivElement | null>>([])
+  const paneStickToBottom = useRef<boolean[]>([])
+  useEffect(() => {
+    paneRefs.current.forEach((pane, index) => {
+      if (pane && paneStickToBottom.current[index] !== false) pane.scrollTop = pane.scrollHeight
+    })
+  }, [messages, paneCount])
   // Keep file drops outside the composer from navigating the page away.
   useEffect(() => {
     const preventDropNavigation = (event: DragEvent) => {
@@ -440,6 +482,7 @@ export function ChatPage() {
     const controllers = assistantMessages.map(() => new AbortController())
     abortRef.current = [...abortRef.current, ...controllers]
     shouldAutoScrollRef.current = true
+    paneStickToBottom.current = []
     setMessages([...messages, userMessage, ...assistantMessages])
     setDraft('')
     replaceAttachments([])
@@ -494,6 +537,7 @@ export function ChatPage() {
   const clear = () => {
     abortRef.current.forEach((controller) => controller.abort())
     abortRef.current = []
+    paneStickToBottom.current = []
     setMessages([])
     replaceAttachments([])
     setAttachmentError(undefined)
@@ -516,25 +560,50 @@ export function ChatPage() {
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
-      <section ref={conversationRef} className="conversation" aria-label="Conversation" onScroll={(event) => {
+      <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
         shouldAutoScrollRef.current = stickToBottom(event.currentTarget)
       }}>
         {messages.length === 0 ? (
           <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
-        ) : renderEntries.map((entry) => entry.kind === 'runs' ? (
-          <div className="run-grid" key={entry.groupId} role="group" aria-label={`${entry.runs[0]?.model ?? 'Model'} · ${entry.runs.length} concurrent sessions`}>
-            {entry.runs.map((message) => <AssistantMessage key={message.id} className="run-cell" message={message} />)}
-            <ConcurrencySummary runs={entry.runs} />
-          </div>
-        ) : entry.message.role === 'user' ? (
-          <article className="message message-user" key={entry.message.id}>
-            <div className="user-message-content">
-              {entry.message.media?.length ? <div className="user-message-media">{entry.message.media.map((item) => item.kind === 'video'
-                ? <video key={item.id} src={item.dataUrl} controls preload="metadata" aria-label={`Attached ${item.name}`} />
-                : <img key={item.id} src={item.dataUrl} alt={`Attached ${item.name}`} />)}</div> : null}
-              {entry.message.content && <div className="user-message-text">{entry.message.content}</div>}
+        ) : paneCount > 1 ? (
+          <>
+            <div className="chat-panes">
+              {Array.from({ length: paneCount }, (_, paneIndex) => (
+                <div
+                  key={paneIndex}
+                  className="chat-pane"
+                  role="log"
+                  aria-label={`Session ${paneIndex + 1}`}
+                  ref={(element) => { paneRefs.current[paneIndex] = element }}
+                  onScroll={(event) => { paneStickToBottom.current[paneIndex] = stickToBottom(event.currentTarget) }}
+                >
+                  <p className="chat-pane-label">Session {paneIndex + 1}</p>
+                  {renderEntries.map((entry) => entry.kind === 'runs' ? (() => {
+                    // Assign by the stable runIndex, never array position: a
+                    // run that fails before producing content is removed from
+                    // the group, and the survivors must stay with their own
+                    // session so the panes keep showing the history that is
+                    // actually replayed to the model.
+                    const run = entry.runs.find((item) => item.runIndex === paneIndex + 1)
+                    return run ? <AssistantMessage key={run.id} className="message message-assistant" message={run} runLabel={false} /> : null
+                  })() : entry.message.role === 'user' ? (
+                    <UserBubble key={entry.message.id} message={entry.message} />
+                  ) : (
+                    <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} />
+                  ))}
+                </div>
+              ))}
             </div>
-          </article>
+            <div className="conversation-footer">
+              {renderEntries.flatMap((entry) => entry.kind === 'runs'
+                ? [<ConcurrencySummary key={entry.groupId} runs={entry.runs} />]
+                : [])}
+            </div>
+          </>
+        ) : renderEntries.map((entry) => entry.kind === 'runs' ? (
+          entry.runs.map((run) => <AssistantMessage key={run.id} className="message message-assistant" message={run} />)
+        ) : entry.message.role === 'user' ? (
+          <UserBubble key={entry.message.id} message={entry.message} />
         ) : (
           <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} />
         ))}

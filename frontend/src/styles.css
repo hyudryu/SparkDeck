@@ -286,6 +286,10 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .response-metrics > div { display: flex; gap: 5px; padding: 4px 8px; color: var(--text-tertiary); background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 999px; font-size: 10px; }
 .response-metrics dt::after { content: ':'; }.response-metrics dd { color: var(--text-secondary); font-variant-numeric: tabular-nums; font-weight: 600; }
 .concurrency-summary { margin-top: 10px; padding-top: 8px; color: var(--text-secondary); border-top: 1px dashed var(--border-subtle); font-size: 11px; font-variant-numeric: tabular-nums; }
+.run-grid { width: min(1100px, 100%); margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 14px; }
+.run-grid + .run-grid, .message + .run-grid, .run-grid + .message { margin-top: 24px; }
+.run-cell { min-width: 0; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; padding: 14px; background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 14px; }
+.run-grid > .concurrency-summary { grid-column: 1 / -1; margin: 2px 0 0; }
 .chat-error { width: min(820px, 100%); margin: 18px auto 0; }
 .composer { position: relative; width: min(860px, calc(100% - 32px)); display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: end; gap: 8px; margin: 14px auto 0; padding: 10px 10px 7px; border: 1px solid var(--border-strong); border-radius: 22px; background: var(--bg-elevated); box-shadow: 0 10px 35px rgba(0, 0, 0, .1); }
 .composer label { min-width: 0; }

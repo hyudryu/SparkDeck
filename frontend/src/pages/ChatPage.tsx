@@ -31,7 +31,8 @@ interface ConversationMessage {
   failed?: boolean
   // Concurrent sends share a group id; runIndex (1-based) identifies which
   // parallel session an answer belongs to so follow-up turns replay only
-  // their own branch of the history.
+  // their own branch of the history and seed the engine differently per
+  // session (same prompt, different samples).
   groupId?: string
   runIndex?: number
   runTotal?: number
@@ -154,6 +155,37 @@ function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   return <p className="concurrency-summary">{parts.join(' · ')}</p>
 }
 
+function AssistantMessage({ message, className }: { message: ConversationMessage; className: string }) {
+  return (
+    <article className={className}>
+      <div className="message-avatar" aria-hidden="true"><Bot size={16} /></div>
+      <div className="assistant-message-body">
+        <p className="message-author">{message.model}{message.runTotal ? ` · Run ${message.runIndex} of ${message.runTotal}` : ''}</p>
+        {message.reasoning && (
+          <details className="reasoning-block" open={message.streaming && !message.content ? true : undefined}>
+            <summary>{message.streaming ? 'Thinking…' : 'Thinking'}</summary>
+            <div>{message.reasoning}</div>
+          </details>
+        )}
+        {message.content ? <div className={`message-content${message.streaming ? ' is-streaming' : ''}`}><Suspense fallback={<div className="markdown-fallback">{message.content}</div>}><MarkdownContent content={message.content} /></Suspense></div> : (
+          message.streaming && !message.reasoning ? <p className="thinking"><span className="thinking-dot" /> Thinking…</p> : null
+        )}
+        {message.stopped && <p className="generation-stopped">Response stopped</p>}
+        {message.failed && <p className="generation-failed">Response interrupted</p>}
+        <ResponseMetrics metrics={message.metrics} streaming={message.streaming} />
+      </div>
+    </article>
+  )
+}
+
+// Conversation is rendered as user / assistant singles plus one grid entry
+// per concurrent-send group, so its runs sit side by side in an array
+// instead of stacking as separate blocks. Runs of a group are always
+// appended together, so contiguously shared group ids mean one entry.
+type RenderEntry
+  = { kind: 'single'; message: ConversationMessage }
+  | { kind: 'runs'; groupId: string; runs: ConversationMessage[] }
+
 const toRequestMessage = ({ role, content, media }: ConversationMessage): ChatMessage => ({
   role,
   content: media?.length ? [
@@ -174,6 +206,11 @@ export function ChatPage() {
     // decision payload, but it is not a chat target.
     && item.runtime !== 'laya'
   )) ?? [], [deployments.data])
+  // The gateway routes /v1 requests by model name and picks an owning
+  // deployment itself, so deployments sharing an alias are one chat target:
+  // the dropdown lists each running model name once, not one option per
+  // deployment.
+  const modelNames = useMemo(() => Array.from(new Set(running.map((item) => item.alias))), [running])
   const [model, setModel] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])
@@ -193,7 +230,24 @@ export function ChatPage() {
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
-  const selectedModel = model || running[0]?.alias || ''
+  const selectedModel = model || modelNames[0] || ''
+
+  const renderEntries = useMemo(() => {
+    const entries: RenderEntry[] = []
+    for (const message of messages) {
+      if (message.role === 'assistant' && message.groupId) {
+        const last = entries[entries.length - 1]
+        if (last && last.kind === 'runs' && last.groupId === message.groupId) {
+          last.runs.push(message)
+          continue
+        }
+        entries.push({ kind: 'runs', groupId: message.groupId, runs: [message] })
+        continue
+      }
+      entries.push({ kind: 'single', message })
+    }
+    return entries
+  }, [messages])
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   useEffect(() => {
@@ -373,6 +427,10 @@ export function ChatPage() {
       try {
         const result = await api.chatStream(selectedModel, historyFor(message.runIndex), {
           signal: controller.signal,
+          // Parallel sessions get distinct seeds (their 1-based run number)
+          // so the engine samples the shared prompt differently per session;
+          // a single-session send leaves the seed to the engine default.
+          seed: message.runIndex,
           onUpdate: (update) => updateMessage(message.id, (current) => ({
             ...current,
             content: current.content + (update.content ?? ''),
@@ -428,7 +486,7 @@ export function ChatPage() {
       />
       {deployments.error && <ErrorState message={deployments.error} onRetry={deployments.reload} />}
       <div className="chat-toolbar">
-        <label className="field inline-field"><span>Model</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)} disabled={running.length === 0 || sending}><option value="">Select a running model</option>{running.map((item) => <option key={item.id} value={item.alias}>{item.alias} · {item.runtime}</option>)}</select></label>
+        <label className="field inline-field"><span>Model</span><select value={selectedModel} onChange={(event) => setModel(event.target.value)} disabled={running.length === 0 || sending}><option value="">Select a running model</option>{modelNames.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
         {selectedModel && running.find((item) => item.alias === selectedModel) && <RuntimeMark runtime={running.find((item) => item.alias === selectedModel)!.runtime} />}
         <label className="field inline-field"><span>Concurrency</span><select value={String(concurrency)} onChange={(event) => setConcurrency(Number(event.target.value))} disabled={running.length === 0 || sending}>{CONCURRENCY_OPTIONS.map((count) => <option key={count} value={String(count)}>{count} {count === 1 ? 'session' : 'sessions'}</option>)}</select></label>
         <span className="privacy-note"><Gauge size={14} /> Live metrics · content private</span>
@@ -440,37 +498,22 @@ export function ChatPage() {
       }}>
         {messages.length === 0 ? (
           <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
-        ) : messages.map((message) => message.role === 'user' ? (
-          <article className="message message-user" key={message.id}>
+        ) : renderEntries.map((entry) => entry.kind === 'runs' ? (
+          <div className="run-grid" key={entry.groupId} role="group" aria-label={`${entry.runs[0]?.model ?? 'Model'} · ${entry.runs.length} concurrent sessions`}>
+            {entry.runs.map((message) => <AssistantMessage key={message.id} className="run-cell" message={message} />)}
+            <ConcurrencySummary runs={entry.runs} />
+          </div>
+        ) : entry.message.role === 'user' ? (
+          <article className="message message-user" key={entry.message.id}>
             <div className="user-message-content">
-              {message.media?.length ? <div className="user-message-media">{message.media.map((item) => item.kind === 'video'
+              {entry.message.media?.length ? <div className="user-message-media">{entry.message.media.map((item) => item.kind === 'video'
                 ? <video key={item.id} src={item.dataUrl} controls preload="metadata" aria-label={`Attached ${item.name}`} />
                 : <img key={item.id} src={item.dataUrl} alt={`Attached ${item.name}`} />)}</div> : null}
-              {message.content && <div className="user-message-text">{message.content}</div>}
+              {entry.message.content && <div className="user-message-text">{entry.message.content}</div>}
             </div>
           </article>
         ) : (
-          <article className="message message-assistant" key={message.id}>
-            <div className="message-avatar" aria-hidden="true"><Bot size={16} /></div>
-            <div className="assistant-message-body">
-              <p className="message-author">{message.model}{message.runTotal ? ` · Run ${message.runIndex} of ${message.runTotal}` : ''}</p>
-              {message.reasoning && (
-                <details className="reasoning-block" open={message.streaming && !message.content ? true : undefined}>
-                  <summary>{message.streaming ? 'Thinking…' : 'Thinking'}</summary>
-                  <div>{message.reasoning}</div>
-                </details>
-              )}
-              {message.content ? <div className={`message-content${message.streaming ? ' is-streaming' : ''}`}><Suspense fallback={<div className="markdown-fallback">{message.content}</div>}><MarkdownContent content={message.content} /></Suspense></div> : (
-                message.streaming && !message.reasoning ? <p className="thinking"><span className="thinking-dot" /> Thinking…</p> : null
-              )}
-              {message.stopped && <p className="generation-stopped">Response stopped</p>}
-              {message.failed && <p className="generation-failed">Response interrupted</p>}
-              <ResponseMetrics metrics={message.metrics} streaming={message.streaming} />
-              {message.groupId && message.runIndex === message.runTotal
-                ? <ConcurrencySummary runs={messages.filter((entry) => entry.groupId === message.groupId)} />
-                : null}
-            </div>
-          </article>
+          <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} />
         ))}
         {error && <p className="inline-error chat-error" role="alert">{error}</p>}
       </section>

@@ -109,9 +109,9 @@ describe('ChatPage', () => {
       })
     })
     const user = userEvent.setup()
-    render(<ChatPage />)
+    const { container } = render(<ChatPage />)
 
-    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await screen.findByRole('option', { name: 'reasoner' })
     await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
     const composer = await screen.findByRole('textbox', { name: 'Message' })
     await user.type(composer, 'Load test')
@@ -134,6 +134,40 @@ describe('ChatPage', () => {
     // The combined rate divides total completion tokens by the shared
     // wall-clock window, so only its shape is asserted.
     expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
+
+    // The sessions sit side by side in one grid array with the combined
+    // summary spanning the row beneath them, and each session samples the
+    // shared prompt with its own seed.
+    expect(container.querySelectorAll('.run-grid')).toHaveLength(1)
+    expect(container.querySelectorAll('.run-grid .run-cell')).toHaveLength(2)
+    expect(container.querySelector('.run-grid > .concurrency-summary')).toBeInTheDocument()
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[2]?.seed).toBe(1)
+    expect(vi.mocked(api.chatStream).mock.calls[1]?.[2]?.seed).toBe(2)
+  })
+
+  it('lists each running model name once across deployments sharing it', async () => {
+    vi.mocked(api.deployments.list).mockResolvedValue([
+      { id: 'a', alias: 'shared', runtime: 'vllm', status: 'running' } as never,
+      { id: 'b', alias: 'shared', runtime: 'sglang', status: 'running' } as never,
+      { id: 'c', alias: 'solo', runtime: 'vllm', status: 'running' } as never,
+    ])
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Balanced' }, reasoning: '', metrics: {},
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    // The gateway load-balances requests by model name across the
+    // deployments serving it, so the dropdown is keyed by name only.
+    const select = await screen.findByLabelText('Model')
+    expect(within(select).getAllByRole('option').map((option) => option.textContent))
+      .toEqual(['Select a running model', 'shared', 'solo'])
+
+    await user.selectOptions(select, 'solo')
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Route by name')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('Balanced')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[0]).toBe('solo')
   })
 
   it('replays one representative answer per earlier group when concurrency returns to one', async () => {
@@ -147,7 +181,7 @@ describe('ChatPage', () => {
     const user = userEvent.setup()
     render(<ChatPage />)
 
-    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await screen.findByRole('option', { name: 'reasoner' })
     await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
     const composer = await screen.findByRole('textbox', { name: 'Message' })
     await user.type(composer, 'First')
@@ -180,7 +214,7 @@ describe('ChatPage', () => {
     const user = userEvent.setup()
     render(<ChatPage />)
 
-    await screen.findByRole('option', { name: 'reasoner · vllm' })
+    await screen.findByRole('option', { name: 'reasoner' })
     await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
     const composer = await screen.findByRole('textbox', { name: 'Message' })
     await user.type(composer, 'First')
@@ -225,6 +259,8 @@ describe('ChatPage', () => {
     expect(screen.getByText('TTFT')).toBeInTheDocument()
     expect(screen.getByText('300 ms')).toBeInTheDocument()
     expect(screen.getByText('40.0 tok/s')).toBeInTheDocument()
+    // A single session leaves the sampling seed to the engine default.
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[2]?.seed).toBeUndefined()
   })
 
   it('marks a partial failed response and excludes it from later prompts', async () => {

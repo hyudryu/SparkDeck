@@ -182,6 +182,9 @@ async function requestWithFallback<T>(
 export interface ChatStreamOptions {
   signal?: AbortSignal
   onUpdate?: (update: ChatStreamUpdate) => void
+  // Forwarded to the engine as `seed` so parallel sessions sample the same
+  // prompt differently. Omitted from the request when undefined.
+  seed?: number
 }
 
 function positiveNumber(value: unknown) {
@@ -195,7 +198,13 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
     credentials: 'same-origin',
     cache: 'no-store',
     headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true } }),
+    body: JSON.stringify({
+      model,
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+      ...(options.seed === undefined ? {} : { seed: options.seed }),
+    }),
     signal: options.signal,
   })
   if (!response.ok) {

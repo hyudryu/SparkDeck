@@ -4922,6 +4922,128 @@ async def v1_chat_completions(req: Request):
     return result
 
 
+CHAT_WS_MAX_STREAMS = 64
+CHAT_WS_MAX_ID_LENGTH = 64
+
+
+def _chat_ws_caller_ip(websocket: WebSocket) -> str:
+    value = websocket.client.host if websocket.client else "unknown"
+    if websocket.headers.get(FORWARD_CLIENT_HEADER):
+        valid, _ = onboarding.validate_forward_headers(websocket.headers)
+        if valid:
+            value = websocket.headers[FORWARD_CLIENT_HEADER]
+    return _normalized_caller_ip(value)
+
+
+@app.websocket("/api/v1/chat/ws")
+async def chat_stream_mux(websocket: WebSocket):
+    """Run many chat streams concurrently over one socket.
+
+    The browser caps HTTP/1.1 connections to an origin at six, so a chat
+    fan-out larger than that queues the surplus streams invisibly in the
+    socket pool. WebSocket connections are not in that pool, so the chat
+    page sends every session through this socket instead. Protocol: the
+    client sends {"op": "start", "id": ..., "body": <openai chat body>} and
+    {"op": "stop", "id": ...}; the server replies with {"id": ..., "chunk":
+    ...} per upstream SSE chunk followed by {"id": ..., "done": true}, or
+    with {"id": ..., "error": ...} / {"id": ..., "cancelled": true} instead.
+    """
+    # Same-origin rules as the dashboard socket: browsers do not apply
+    # same-origin policy to WebSockets, and header-less (non-browser)
+    # clients are allowed.
+    origin = websocket.headers.get("origin")
+    if origin:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.netloc.casefold()
+            != websocket.headers.get("host", "").casefold()
+        ):
+            await websocket.close(code=1008)
+            return
+    # Joined workers forward chat REST calls to the controller; refuse the
+    # socket so the UI keeps using that forwarded polling fallback.
+    if onboarding.assignment.load():
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    caller_ip = _chat_ws_caller_ip(websocket)
+    sends = asyncio.Lock()
+    active: dict[str, asyncio.Event] = {}
+    tasks: set[asyncio.Task] = set()
+
+    async def send_frame(payload: dict):
+        async with sends:
+            await websocket.send_json(payload)
+
+    async def run_stream(stream_id: str, body: dict):
+        cancel = active[stream_id]
+        try:
+            result = await sparkdeck.proxy(
+                body, "chat/completions", cancel, caller_ip=caller_ip)
+            if hasattr(result, "__aiter__"):
+                try:
+                    async for chunk in result:
+                        await send_frame({"id": stream_id, "chunk": chunk})
+                finally:
+                    await close_async_stream(result)
+                await send_frame({"id": stream_id, "done": True})
+            else:
+                # The chat page always requests streaming; a non-stream body
+                # still gets a terminal frame rather than silence.
+                await send_frame({"id": stream_id, "result": result})
+        except ClientAbort:
+            # Same contract as the HTTP route's 499: the client asked to
+            # stop (or the socket died) and the upstream was aborted too.
+            await send_frame({"id": stream_id, "cancelled": True})
+        except (SourceRoutingUnavailable, ClusterReplicaUnavailable,
+                LookupError, TimeoutError) as exc:
+            await send_frame({"id": stream_id, "error": str(exc)})
+        except httpx.HTTPStatusError as exc:
+            await send_frame({"id": stream_id, "error": exc.response.text[:500]})
+        except Exception as exc:
+            await send_frame({"id": stream_id, "error": str(exc)})
+        finally:
+            active.pop(stream_id, None)
+
+    def discard(task: asyncio.Task):
+        tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # retrieve so a closed socket is not reported
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            op = message.get("op") if isinstance(message, dict) else None
+            stream_id = message.get("id") if isinstance(message, dict) else None
+            if op == "start" and isinstance(stream_id, str) and stream_id:
+                body = message.get("body")
+                if (
+                    len(stream_id) > CHAT_WS_MAX_ID_LENGTH
+                    or not isinstance(body, dict)
+                    or not body.get("model")
+                    or stream_id in active
+                    or len(active) >= CHAT_WS_MAX_STREAMS
+                ):
+                    await send_frame({"id": stream_id, "error": "invalid start frame"})
+                    continue
+                active[stream_id] = asyncio.Event()
+                task = asyncio.create_task(run_stream(stream_id, body))
+                tasks.add(task)
+                task.add_done_callback(discard)
+            elif op == "stop" and isinstance(stream_id, str):
+                cancel = active.get(stream_id)
+                if cancel:
+                    cancel.set()
+    except (WebSocketDisconnect, RuntimeError, ValueError):
+        pass
+    finally:
+        for cancel in active.values():
+            cancel.set()
+        for task in tasks:
+            task.cancel()
+
+
 @app.post("/v1/responses")
 async def v1_responses(req: Request):
     body = await _inference_json(req)
@@ -5115,6 +5237,10 @@ async def _serve_application() -> None:
         port=7878,
         log_level="info",
         timeout_graceful_shutdown=10,
+        # uvicorn's default 64 KiB WebSocket frame limit is far below the
+        # chat mux's largest start frame (base64 image attachments), so
+        # oversized sessions would be refused instead of falling back.
+        ws_max_size=16 * 1024 * 1024,
     ))
 
     # Config applies Uvicorn logging and replaces its logger handlers.

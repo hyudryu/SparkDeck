@@ -191,40 +191,150 @@ function positiveNumber(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
+// ---------- multiplexed chat streaming ----------
+// Browsers cap HTTP/1.1 connections to an origin at six, so a chat fan-out
+// wider than that queues the surplus sessions invisibly in the socket pool
+// (background polling permanently occupies a socket or two of it). One
+// WebSocket is not part of that pool, so every chat session rides this
+// shared socket; the server tags each upstream SSE chunk with its stream
+// id. When the endpoint is unavailable (older controller, blocked socket)
+// callers fall back to the classic per-request HTTP streaming.
+const MUX_CONNECT_TIMEOUT_MS = 2500
+const MUX_MAX_BODY_CHARS = 512 * 1024
+
+class MuxUnavailable extends Error {}
+
+type MuxStreamHandlers = {
+  onChunk: (text: string) => void
+  onDone: () => void
+  onServerError: (message: string) => void
+  onTransportFailure: () => void
+}
+
+const muxStreams = new Map<string, MuxStreamHandlers>()
+let mux: { socket: WebSocket; ready: Promise<void> } | null = null
+
+function muxUrl(): string {
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${scheme}//${window.location.host}/api/v1/chat/ws`
+}
+
+function getMux(): { socket: WebSocket; ready: Promise<void> } {
+  if (mux) return mux
+  const socket = new WebSocket(muxUrl())
+  let settleReady!: { resolve: () => void; reject: (error: Error) => void }
+  const ready = new Promise<void>((resolve, reject) => { settleReady = { resolve, reject } })
+  const entry = { socket, ready }
+  mux = entry
+  socket.onopen = () => settleReady.resolve()
+  socket.onerror = () => settleReady.reject(new MuxUnavailable('The chat socket could not open'))
+  socket.onclose = () => {
+    if (mux === entry) mux = null
+    settleReady.reject(new MuxUnavailable('The chat socket closed'))
+    muxStreams.forEach((handlers) => handlers.onTransportFailure())
+    muxStreams.clear()
+  }
+  socket.onmessage = (event) => {
+    if (typeof event.data !== 'string') return
+    let frame: Record<string, unknown>
+    try {
+      frame = JSON.parse(event.data) as Record<string, unknown>
+    } catch {
+      return
+    }
+    const id = typeof frame.id === 'string' ? frame.id : undefined
+    const handlers = id === undefined ? undefined : muxStreams.get(id)
+    if (!handlers) return
+    if (typeof frame.chunk === 'string') handlers.onChunk(frame.chunk)
+    else if (frame.done === true) {
+      muxStreams.delete(id!)
+      handlers.onDone()
+    } else if (frame.error !== undefined) {
+      muxStreams.delete(id!)
+      handlers.onServerError(String(frame.error))
+    } else if (frame.cancelled === true) {
+      muxStreams.delete(id!)
+      handlers.onServerError('The stream was cancelled')
+    }
+  }
+  return entry
+}
+
+function streamChatOverMux(
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  onChunk: (text: string) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const id = `ws-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const entry = getMux()
+    let settled = false
+    let started = false
+    const onAbort = () => {
+      // Mirrors an HTTP client disconnect: the server aborts the upstream.
+      try { entry.socket.send(JSON.stringify({ op: 'stop', id })) } catch { /* already gone */ }
+      settle(() => {
+        const error = new Error('Aborted')
+        error.name = 'AbortError'
+        reject(error)
+      })
+    }
+    // Guards only the handshake: once the stream is running, upstream
+    // latency is the proxy's problem to time out.
+    const guard = setTimeout(() => {
+      settle(() => reject(new MuxUnavailable('The chat socket did not open')))
+    }, MUX_CONNECT_TIMEOUT_MS)
+    const cleanup = () => {
+      muxStreams.delete(id)
+      clearTimeout(guard)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const settle = (finish: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      finish()
+    }
+    if (signal) {
+      if (signal.aborted) { onAbort(); return }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    muxStreams.set(id, {
+      onChunk: (text) => { started = true; onChunk(text) },
+      onDone: () => settle(resolve),
+      onServerError: (message) => settle(() => reject(new Error(message))),
+      onTransportFailure: () => settle(() => reject(
+        started
+          ? new Error('The chat connection dropped mid-stream')
+          : new MuxUnavailable('The chat socket closed'),
+      )),
+    })
+    entry.ready.then(() => {
+      if (settled) return
+      try {
+        entry.socket.send(JSON.stringify({ op: 'start', id, body }))
+        clearTimeout(guard)
+      } catch {
+        settle(() => reject(new MuxUnavailable('The chat socket send failed')))
+      }
+    }, (error: unknown) => {
+      settle(() => reject(error instanceof MuxUnavailable
+        ? error
+        : new MuxUnavailable(String((error as Error)?.message ?? error))))
+    })
+  })
+}
+
 async function streamChat(model: string, messages: ChatMessage[], options: ChatStreamOptions = {}): Promise<ChatStreamResult> {
   const startedAt = performance.now()
-  const response = await fetch('/v1/chat/completions', {
-    method: 'POST',
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: true,
-      stream_options: { include_usage: true },
-      ...(options.seed === undefined ? {} : { seed: options.seed }),
-    }),
-    signal: options.signal,
-  })
-  if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`
-    try {
-      const body = await response.json() as { detail?: unknown; message?: string }
-      if (typeof body.detail === 'string') message = body.detail
-      else if (body.message) message = body.message
-    } catch {
-      // Keep the HTTP status for non-JSON failures.
-    }
-    throw new ApiError(message, response.status)
+  const requestBody: Record<string, unknown> = {
+    model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+    ...(options.seed === undefined ? {} : { seed: options.seed }),
   }
-  if (!response.headers.get('content-type')?.includes('text/event-stream')) {
-    throw new Error('The model returned a non-streaming response')
-  }
-  if (!response.body) throw new Error('The model returned an empty response stream')
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
   let buffer = ''
   let eventData: string[] = []
   let content = ''
@@ -312,38 +422,82 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
     }
   }
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read()
-      buffer += decoder.decode(value, { stream: !done })
-      let newline = buffer.indexOf('\n')
-      while (newline >= 0 && !doneReceived) {
-        consumeLine(buffer.slice(0, newline))
-        buffer = buffer.slice(newline + 1)
-        newline = buffer.indexOf('\n')
-      }
-      if (doneReceived) {
-        break
-      }
-      if (done) break
+  // SSE framing is transport-agnostic: the fetch path feeds decoded bytes,
+  // the mux path feeds whole upstream chunks, and both end in finalize().
+  const feedText = (text: string) => {
+    buffer += text
+    let newline = buffer.indexOf('\n')
+    while (newline >= 0 && !doneReceived) {
+      consumeLine(buffer.slice(0, newline))
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf('\n')
     }
+  }
+
+  const finalize = (): ChatStreamResult => {
     if (!doneReceived) {
       if (buffer) consumeLine(buffer)
       if (eventData.length) consumeData(eventData.join('\n'))
     }
     if (!terminalSeen) throw new Error('The model response stream ended unexpectedly')
+    return {
+      message: { role: 'assistant', content },
+      reasoning,
+      usage,
+      metrics: metricsAt(performance.now()),
+    }
+  }
+
+  if (typeof WebSocket !== 'undefined'
+    && JSON.stringify(requestBody).length <= MUX_MAX_BODY_CHARS) {
+    try {
+      await streamChatOverMux(requestBody, options.signal, feedText)
+      return finalize()
+    } catch (error) {
+      // Anything but a never-started transport failure is the caller's
+      // problem (AbortError, upstream errors, mid-stream drops).
+      if (!(error instanceof MuxUnavailable)) throw error
+    }
+  }
+
+  const response = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+    signal: options.signal,
+  })
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const body = await response.json() as { detail?: unknown; message?: string }
+      if (typeof body.detail === 'string') message = body.detail
+      else if (body.message) message = body.message
+    } catch {
+      // Keep the HTTP status for non-JSON failures.
+    }
+    throw new ApiError(message, response.status)
+  }
+  if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+    throw new Error('The model returned a non-streaming response')
+  }
+  if (!response.body) throw new Error('The model returned an empty response stream')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      feedText(decoder.decode(value, { stream: !done }))
+      if (doneReceived || done) break
+    }
+    return finalize()
   } catch (error) {
     await reader.cancel().catch(() => undefined)
     throw error
   } finally {
     reader.releaseLock()
-  }
-
-  return {
-    message: { role: 'assistant', content },
-    reasoning,
-    usage,
-    metrics: metricsAt(performance.now()),
   }
 }
 

@@ -206,6 +206,7 @@ class MuxUnavailable extends Error {}
 
 type MuxStreamHandlers = {
   onChunk: (text: string) => void
+  onChunkError: (error: unknown) => void
   onDone: () => void
   onServerError: (message: string) => void
   onTransportFailure: () => void
@@ -245,8 +246,21 @@ function getMux(): { socket: WebSocket; ready: Promise<void> } {
     const id = typeof frame.id === 'string' ? frame.id : undefined
     const handlers = id === undefined ? undefined : muxStreams.get(id)
     if (!handlers) return
-    if (typeof frame.chunk === 'string') handlers.onChunk(frame.chunk)
-    else if (frame.done === true) {
+    if (typeof frame.chunk === 'string') {
+      // The fetch loop used to own this try/catch. On a shared socket a throw
+      // from the reader's parser would escape into the WebSocket event
+      // handler instead, stranding the stream in the sending state and
+      // leaving the upstream (untimed out by the HTTP transport) running.
+      // A parse failure therefore ends only its own stream: the offending
+      // stream is stopped server-side and the socket stays open for peers.
+      try {
+        handlers.onChunk(frame.chunk)
+      } catch (error) {
+        muxStreams.delete(id!)
+        try { socket.send(JSON.stringify({ op: 'stop', id })) } catch { /* already gone */ }
+        handlers.onChunkError(error)
+      }
+    } else if (frame.done === true) {
       muxStreams.delete(id!)
       handlers.onDone()
     } else if (frame.error !== undefined) {
@@ -301,6 +315,11 @@ function streamChatOverMux(
     }
     muxStreams.set(id, {
       onChunk: (text) => { started = true; onChunk(text) },
+      // Data-plane failures reject outright: replaying them over fetch would
+      // issue a second completion for the same prompt.
+      onChunkError: (error) => settle(() => reject(
+        error instanceof Error ? error : new Error(String(error)),
+      )),
       onDone: () => settle(resolve),
       onServerError: (message) => settle(() => reject(new Error(message))),
       onTransportFailure: () => settle(() => reject(

@@ -898,6 +898,44 @@ describe('multiplexed chat streaming', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('stops only the broken stream when a chunk carries malformed stream data', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const broken = muxApi.chatStream('reasoner', [{ role: 'user', content: 'First' }])
+    const healthy = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Second' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(2))
+    const [first, second] = socket.starts()
+
+    socket.frame({ id: first?.id, chunk: 'data: {not json\n\n' })
+    await expect(broken).rejects.toThrow('The model returned malformed stream data')
+    // The offender is stopped upstream while the shared socket serves its peer.
+    expect(socket.stops()).toEqual([{ op: 'stop', id: first?.id }])
+    socket.frame({ id: second?.id, chunk: sse('Unaffected') })
+    socket.frame({ id: second?.id, chunk: 'data: [DONE]\n\n' })
+    socket.frame({ id: second?.id, done: true })
+    expect((await healthy).message.content).toBe('Unaffected')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects with the message of an SSE error payload without retrying over fetch', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    const [start] = socket.starts()
+    socket.frame({ id: start?.id, chunk: 'data: {"error":{"message":"GPU worker stopped"}}\n\n' })
+
+    await expect(pending).rejects.toThrow('GPU worker stopped')
+    expect(socket.stops()).toEqual([{ op: 'stop', id: start?.id }])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('surfaces a mid-stream socket drop instead of restarting the response', async () => {
     const fetchMock = vi.fn<typeof fetch>()
     vi.stubGlobal('fetch', fetchMock)

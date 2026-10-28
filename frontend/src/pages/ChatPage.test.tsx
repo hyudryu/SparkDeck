@@ -170,6 +170,32 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[0]).toBe('solo')
   })
 
+  it('lists the served model name once across deployments with different aliases', async () => {
+    vi.mocked(api.deployments.list).mockResolvedValue([
+      { id: 'a', alias: 'qwen on gx10', runtime: 'vllm', status: 'running', served_models: ['qwen3.8'] } as never,
+      { id: 'b', alias: 'qwen on ws1', runtime: 'vllm', status: 'running', served_model: 'qwen3.8' } as never,
+      { id: 'c', alias: 'solo', runtime: 'vllm', status: 'running' } as never,
+    ])
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Balanced' }, reasoning: '', metrics: {},
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    // Deployments carrying different UI aliases but the same runtime served
+    // name collapse into that one name, and the request carries it so the
+    // gateway can rotate the owning deployment across clusters.
+    const select = await screen.findByLabelText('Model')
+    expect(within(select).getAllByRole('option').map((option) => option.textContent))
+      .toEqual(['Select a running model', 'qwen3.8', 'solo'])
+
+    await user.selectOptions(select, 'qwen3.8')
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Balance me')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('Balanced')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[0]).toBe('qwen3.8')
+  })
+
   it('replays one representative answer per earlier group when concurrency returns to one', async () => {
     let call = 0
     const results: ChatStreamResult[] = [

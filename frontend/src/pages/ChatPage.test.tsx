@@ -196,6 +196,31 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[0]).toBe('qwen3.8')
   })
 
+  it('offers the alias of a deployment whose served name is another alias', async () => {
+    vi.mocked(api.deployments.list).mockResolvedValue([
+      { id: 'a', alias: 'alpha', runtime: 'vllm', status: 'running', served_models: ['model-two'] } as never,
+      { id: 'b', alias: 'model-two', runtime: 'sglang', status: 'running', served_models: ['other-model'] } as never,
+    ])
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Unambiguous' }, reasoning: '', metrics: {},
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    // The gateway resolves an exact alias match before other deployments'
+    // served names, so 'model-two' would route to deployment b. Deployment
+    // a stays reachable through its own alias as the unambiguous selector.
+    const select = await screen.findByLabelText('Model')
+    expect(within(select).getAllByRole('option').map((option) => option.textContent))
+      .toEqual(['Select a running model', 'model-two', 'alpha', 'other-model'])
+
+    await user.selectOptions(select, 'alpha')
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Reach alpha')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await screen.findByText('Unambiguous')
+    expect(vi.mocked(api.chatStream).mock.calls[0]?.[0]).toBe('alpha')
+  })
+
   it('replays one representative answer per earlier group when concurrency returns to one', async () => {
     let call = 0
     const results: ChatStreamResult[] = [

@@ -245,10 +245,22 @@ export function ChatPage() {
   // The gateway routes /v1 requests by the request's model id and rotates
   // the owning deployment when several share it, so the dropdown lists each
   // public serving name once — not one option per deployment — and sends
-  // that name so shared models keep load-balancing across clusters.
-  const modelNames = useMemo(() => Array.from(new Set(
-    running.flatMap((item) => deploymentPublicModelIds(item)),
-  )), [running])
+  // that name so shared models keep load-balancing across clusters. The
+  // gateway resolves an exact alias match before other deployments' served
+  // names (service._live_candidates_for_model_id), so when a deployment's
+  // serving name is shadowed by another deployment's alias, its own alias is
+  // also offered as the only unambiguous selector for it.
+  const modelNames = useMemo(() => {
+    const aliases = new Set(running.map((item) => item.alias.trim()).filter(Boolean))
+    const names: string[] = []
+    for (const item of running) {
+      const ids = deploymentPublicModelIds(item)
+      for (const id of ids) if (id && !names.includes(id)) names.push(id)
+      const own = item.alias.trim()
+      if (own && !names.includes(own) && ids.some((id) => id !== own && aliases.has(id))) names.push(own)
+    }
+    return names
+  }, [running])
   const [model, setModel] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])
@@ -269,10 +281,14 @@ export function ChatPage() {
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
   const selectedModel = model || modelNames[0] || ''
-  const selectedDeployment = useMemo(
-    () => running.find((item) => deploymentPublicModelIds(item).includes(selectedModel)),
-    [running, selectedModel],
-  )
+  // Mirrors the gateway's selector precedence: an exact alias match wins
+  // over other deployments' served names, so the runtime mark attributes the
+  // request to the same deployment the gateway would route it to.
+  const selectedDeployment = useMemo(() => selectedModel
+    ? running.find((item) => item.alias.trim() === selectedModel)
+      ?? running.find((item) => deploymentPublicModelIds(item).includes(selectedModel))
+    : undefined,
+  [running, selectedModel])
 
   const renderEntries = useMemo(() => {
     const entries: RenderEntry[] = []

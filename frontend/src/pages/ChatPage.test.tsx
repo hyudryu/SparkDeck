@@ -38,6 +38,12 @@ const dropOnComposer = (container: HTMLElement, files: File[]) => {
   })
 }
 
+// Stream chunks are coalesced into one render per animation frame, so tests
+// that push chunks must let a frame elapse before asserting their effect.
+const streamFrame = () => act(async () => {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+})
+
 describe('ChatPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -413,16 +419,19 @@ describe('ChatPage', () => {
 
       body.scrollTop = 0
       act(() => streamOptions?.onUpdate?.({ reasoning: ' Second thought.' }))
+      await streamFrame()
       expect(body.scrollTop).toBe(500)
 
       body.scrollTop = 0
       fireEvent.scroll(body)
       act(() => streamOptions?.onUpdate?.({ reasoning: ' Third thought.' }))
+      await streamFrame()
       expect(body.scrollTop).toBe(0)
 
       body.scrollTop = 450
       fireEvent.scroll(body)
       act(() => streamOptions?.onUpdate?.({ reasoning: ' Fourth thought.' }))
+      await streamFrame()
       expect(body.scrollTop).toBe(500)
 
       await act(async () => finishStream?.({
@@ -482,6 +491,7 @@ describe('ChatPage', () => {
 
       act(() => updates[0]?.({ content: 'First half of answer' }))
       act(() => updates[1]?.({ content: 'Second half of answer' }))
+      await streamFrame()
       expect(jumps.some((jump) => jump.pane === 0 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
       expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900 && jump.behavior === 'auto')).toBe(true)
       panes.forEach((pane) => expect(pane.style.scrollBehavior).toBe(''))
@@ -491,6 +501,7 @@ describe('ChatPage', () => {
       panes[0]!.scrollTop = 0
       fireEvent.scroll(panes[0]!)
       act(() => updates[0]?.({ content: ' more' }))
+      await streamFrame()
       expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before)
       expect(jumps.some((jump) => jump.pane === 1 && jump.to === 900)).toBe(true)
 
@@ -498,11 +509,83 @@ describe('ChatPage', () => {
       panes[0]!.scrollTop = 900
       fireEvent.scroll(panes[0]!)
       act(() => updates[0]?.({ content: ' tail' }))
+      await streamFrame()
       expect(jumps.filter((jump) => jump.pane === 0).length).toBe(before + 1)
 
       await act(async () => {
         finishers[0]?.({ message: { role: 'assistant', content: 'First half of answer more tail' }, reasoning: '', metrics: {} })
         finishers[1]?.({ message: { role: 'assistant', content: 'Second half of answer' }, reasoning: '', metrics: {} })
+      })
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
+
+  it('coalesces streamed chunks per frame and keeps the follow when a queued scroll event arrives after the pane grew', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        updates[index] = options?.onUpdate
+      })
+    })
+    let fakeScrollHeight = 700
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => fakeScrollHeight })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('option', { name: 'reasoner' })
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+      await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stream fast')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+      await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+      const panes = Array.from(container.querySelectorAll<HTMLElement>('.chat-pane'))
+      const jumps: Array<{ pane: number; to: number }> = []
+      panes.forEach((pane, index) => {
+        let stored = 0
+        Object.defineProperty(pane, 'scrollTop', {
+          configurable: true,
+          get: () => stored,
+          set: (value: number) => {
+            stored = value
+            if (pane.style.scrollBehavior === 'auto') jumps.push({ pane: index, to: value })
+          },
+        })
+      })
+
+      // Three chunks inside one frame window must land as at most two renders
+      // (one immediate lead plus one coalesced trailing flush), never three,
+      // with no delta lost — the render storm is what makes the follow lag
+      // and pulse when many sessions stream at once.
+      act(() => {
+        updates[0]?.({ content: 'Alpha ' })
+        updates[0]?.({ content: 'Beta ' })
+        updates[0]?.({ content: 'Gamma' })
+      })
+      await streamFrame()
+      expect(jumps.filter((jump) => jump.pane === 0)).toHaveLength(2)
+      expect(jumps.every((jump) => jump.to === 700)).toBe(true)
+      expect(await screen.findByText(/Alpha Beta Gamma/)).toBeInTheDocument()
+
+      // The race the pulse came from: the pane grows past the stick
+      // threshold before the follow jump's queued scroll event is delivered.
+      // The event still reports the pane at its last followed position — the
+      // reader never moved — so the follow must survive it and the next
+      // chunk must still snap to the bottom (keeping the newest line and the
+      // tok/s pill in view) instead of silently going un-stuck.
+      fakeScrollHeight = 900
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' tail' }))
+      await streamFrame()
+      const own = jumps.filter((jump) => jump.pane === 0)
+      expect(own).toHaveLength(3)
+      expect(own[2]).toEqual({ pane: 0, to: 900 })
+
+      await act(async () => {
+        finishers[0]?.({ message: { role: 'assistant', content: 'Alpha Beta Gamma tail' }, reasoning: '', metrics: {} })
+        finishers[1]?.({ message: { role: 'assistant', content: '' }, reasoning: '', metrics: {} })
       })
     } finally {
       delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
@@ -956,6 +1039,44 @@ describe('ChatPage', () => {
     expect(screen.getByText(/TTFT 300 ms – 300 ms/)).toBeInTheDocument()
   })
 
+  it('keeps buffered stream output when a concurrent run stops before the next frame', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const rejecters: Array<(reason: Error) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = rejecters.length
+      return new Promise<ChatStreamResult>((_resolve, reject) => {
+        rejecters.push(reject)
+        updates[index] = options?.onUpdate
+      })
+    })
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('option', { name: 'reasoner' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stop mid-stream')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+    await screen.findByRole('log', { name: 'Session 1' })
+
+    // Session 1's chunk renders on the frame's leading edge; session 2's
+    // lands inside the open frame window and is still buffered when both
+    // streams fail. Everything already published over SSE must survive the
+    // interruption, including the entire second answer.
+    act(() => updates[0]?.({ content: 'Visible chunk' }))
+    act(() => updates[1]?.({ content: 'Buffered chunk' }))
+    await act(async () => {
+      rejecters[0]?.(new Error('GPU worker stopped'))
+      rejecters[1]?.(new Error('GPU worker stopped'))
+    })
+
+    const grid = container.querySelector('.chat-panes') as HTMLElement
+    expect(within(grid).getByText('Visible chunk')).toBeInTheDocument()
+    expect(within(grid).getByText('Buffered chunk')).toBeInTheDocument()
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(2)
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop generating' })).not.toBeInTheDocument())
+  })
+
   it('keeps following panes whose queued scroll event lands after streaming grew past the stick threshold', async () => {
     const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
     const finishers: Array<(result: ChatStreamResult) => void> = []
@@ -991,6 +1112,7 @@ describe('ChatPage', () => {
         })
       })
       act(() => updates[0]?.({ content: 'First half of answer' }))
+      await streamFrame()
 
       // Streaming grew the pane beyond the stick threshold between the
       // follow assignment and its asynchronous scroll event. The follow

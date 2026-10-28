@@ -94,10 +94,14 @@ export function AppShell({
   useEffect(() => setDrawerOpen(false), [location.pathname])
 
   // Leaving the chat page always brings the sidebar back: ChatPage unmounts
-  // while the shell keeps this state, so reset it on any other route.
+  // while the shell keeps this state, so reset it on any other route. Also
+  // reset when the controller goes away, because App drops the routes (and
+  // with them the chat's exit toggle and Escape listener) while the pathname
+  // may still be /chat, which would strand the outage screen in full-window
+  // mode with no way back.
   useEffect(() => {
-    if (!location.pathname.startsWith('/chat')) setChatFullscreen(false)
-  }, [location.pathname])
+    if (!location.pathname.startsWith('/chat') || !controllerAvailable) setChatFullscreen(false)
+  }, [location.pathname, controllerAvailable])
 
   useEffect(() => {
     if (!controllerAvailable) return

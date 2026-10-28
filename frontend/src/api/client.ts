@@ -278,6 +278,7 @@ function streamChatOverMux(
   body: Record<string, unknown>,
   signal: AbortSignal | undefined,
   onChunk: (text: string) => void,
+  isComplete: () => boolean,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const id = `ws-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -314,7 +315,19 @@ function streamChatOverMux(
       signal.addEventListener('abort', onAbort, { once: true })
     }
     muxStreams.set(id, {
-      onChunk: (text) => { started = true; onChunk(text) },
+      onChunk: (text) => {
+        started = true
+        onChunk(text)
+        // The server only emits its terminal frame once the upstream
+        // generator ends, and llama.cpp keeps that generator reading after
+        // `[DONE]`, so completing on the SSE sentinel is the client's job —
+        // exactly as the fetch loop did when it broke out on `doneReceived`.
+        // Stop the upstream explicitly to keep its slot and budget free.
+        if (isComplete()) {
+          try { entry.socket.send(JSON.stringify({ op: 'stop', id })) } catch { /* already gone */ }
+          settle(resolve)
+        }
+      },
       // Data-plane failures reject outright: replaying them over fetch would
       // issue a second completion for the same prompt.
       onChunkError: (error) => settle(() => reject(
@@ -470,7 +483,7 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
   if (typeof WebSocket !== 'undefined'
     && JSON.stringify(requestBody).length <= MUX_MAX_BODY_CHARS) {
     try {
-      await streamChatOverMux(requestBody, options.signal, feedText)
+      await streamChatOverMux(requestBody, options.signal, feedText, () => doneReceived)
       return finalize()
     } catch (error) {
       // Anything but a never-started transport failure is the caller's

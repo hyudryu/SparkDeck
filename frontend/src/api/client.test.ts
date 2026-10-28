@@ -936,6 +936,34 @@ describe('multiplexed chat streaming', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('completes on the SSE sentinel while the upstream generator keeps streaming', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    // Mirrors the llama.cpp path: [DONE] arrives but the server never gets
+    // to emit its terminal frame because the upstream generator stays open.
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    const [start] = socket.starts()
+    socket.frame({ id: start?.id, chunk: sse('Answer') })
+    socket.frame({ id: start?.id, chunk: 'data: [DONE]\n\n' })
+
+    const result = await pending
+    expect(result.message.content).toBe('Answer')
+    // The stream stops its own upstream instead of idling for the done frame.
+    expect(socket.stops()).toEqual([{ op: 'stop', id: start?.id }])
+    // And the shared socket is intact for the next session.
+    const next = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Again' }])
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(2))
+    const [second] = socket.starts().slice(1)
+    socket.frame({ id: second?.id, chunk: sse('Done') })
+    socket.frame({ id: second?.id, chunk: 'data: [DONE]\n\n' })
+    expect((await next).message.content).toBe('Done')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('surfaces a mid-stream socket drop instead of restarting the response', async () => {
     const fetchMock = vi.fn<typeof fetch>()
     vi.stubGlobal('fetch', fetchMock)

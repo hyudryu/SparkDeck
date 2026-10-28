@@ -108,6 +108,26 @@ const readMedia = async (file: File, id: string): Promise<ChatMediaAttachment> =
   })
 }
 
+// Panes are laid out as an evenly divided grid: the column count must
+// divide the session count so every row is full (8 -> 4x2, 16 -> 4x4)
+// instead of leaving a ragged last row, and no pane may shrink below the
+// minimum readable width. The widest divisor that fits wins. Keep these in
+// sync with the gap/padding of `.chat-panes` in styles.css.
+const PANE_MIN_WIDTH_PX = 300
+const PANE_GAP_PX = 10
+const PANE_GRID_PADDING_PX = 10
+
+function gridColumnsFor(count: number, containerWidth: number): number {
+  if (count <= 1) return 1
+  const usable = containerWidth - PANE_GRID_PADDING_PX * 2 + PANE_GAP_PX
+  const maxByWidth = Math.max(1, Math.floor(usable / (PANE_MIN_WIDTH_PX + PANE_GAP_PX)))
+  let best = 1
+  for (let candidate = 2; candidate <= Math.min(count, maxByWidth); candidate += 1) {
+    if (count % candidate === 0) best = candidate
+  }
+  return best
+}
+
 function formatRate(value: number | undefined, streaming?: boolean) {
   return value === undefined ? (streaming ? 'Measuring…' : 'Unavailable') : `${value.toFixed(1)} tok/s`
 }
@@ -117,13 +137,17 @@ function formatTtft(value: number | undefined, streaming?: boolean) {
   return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`
 }
 
-function ResponseMetrics({ metrics, streaming }: { metrics?: ChatResponseMetrics; streaming?: boolean }) {
+// Concurrent stress panes stay narrow and dense, so they carry only the
+// decode rate: the TTFT and prompt-processing chips add noise there, while
+// the aggregate TTFT spread still lives in the footer summary. Single
+// sessions keep the full set.
+function ResponseMetrics({ metrics, streaming, condensed = false }: { metrics?: ChatResponseMetrics; streaming?: boolean; condensed?: boolean }) {
   if (!metrics && !streaming) return null
   const promptMeasured = streaming || metrics?.prompt_tokens_per_second !== undefined
   return (
     <dl className="response-metrics" role="group" aria-label="Response performance">
-      {promptMeasured && <div><dt>Prompt processing</dt><dd>{formatRate(metrics?.prompt_tokens_per_second, streaming)}</dd></div>}
-      <div><dt>TTFT</dt><dd>{formatTtft(metrics?.ttft_ms, streaming)}</dd></div>
+      {!condensed && promptMeasured && <div><dt>Prompt processing</dt><dd>{formatRate(metrics?.prompt_tokens_per_second, streaming)}</dd></div>}
+      {!condensed && <div><dt>TTFT</dt><dd>{formatTtft(metrics?.ttft_ms, streaming)}</dd></div>}
       <div><dt>Output speed</dt><dd>{formatRate(metrics?.output_tokens_per_second, streaming)}</dd></div>
     </dl>
   )
@@ -217,10 +241,11 @@ function UserBubble({ message }: { message: ConversationMessage }) {
 
 // runLabel is dropped inside a session pane, where the pane's own header
 // already identifies which concurrent session an answer belongs to.
-function AssistantMessage({ message, className, runLabel = true }: {
+function AssistantMessage({ message, className, runLabel = true, condensed = false }: {
   message: ConversationMessage
   className: string
   runLabel?: boolean
+  condensed?: boolean
 }) {
   return (
     <article className={className}>
@@ -238,7 +263,7 @@ function AssistantMessage({ message, className, runLabel = true }: {
         )}
         {message.stopped && <p className="generation-stopped">Response stopped</p>}
         {message.failed && <p className="generation-failed">Response interrupted</p>}
-        <ResponseMetrics metrics={message.metrics} streaming={message.streaming} />
+        <ResponseMetrics metrics={message.metrics} streaming={message.streaming} condensed={condensed} />
       </div>
     </article>
   )
@@ -364,6 +389,28 @@ export function ChatPage() {
     1,
   ), [renderEntries])
   const paneCount = Math.max(historyPaneCount, sending ? historyPaneCount : concurrency)
+  // The pane grid measures its own host so the column count can divide the
+  // sessions evenly at the real available width. ResizeObserver keeps the
+  // split correct after window/sidebar/full-window changes; a plain resize
+  // listener covers environments without it (and jsdom).
+  const panesHostRef = useRef<HTMLDivElement | null>(null)
+  const [panesWidth, setPanesWidth] = useState(0)
+  useEffect(() => {
+    if (paneCount <= 1) return
+    const measure = () => {
+      const width = panesHostRef.current?.clientWidth || window.innerWidth
+      setPanesWidth((current) => Math.abs(current - width) > 1 ? width : current)
+    }
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    if (panesHostRef.current && observer) observer.observe(panesHostRef.current)
+    window.addEventListener('resize', measure)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', measure)
+    }
+  }, [paneCount])
+  const gridColumns = gridColumnsFor(paneCount, panesWidth || window.innerWidth)
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   // Escape drops back out of full-window mode, mirroring the drawer's
@@ -381,12 +428,22 @@ export function ChatPage() {
     if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
   }, [messages])
   // Panes scroll on their own (the outer box stops scrolling), so each one
-  // follows its own newest content until its reader scrolls up.
+  // follows its own newest content until its reader scrolls up. A pane's
+  // stick flag is driven by position changes, not by "distance from bottom"
+  // at event time: a follow jump queues a scroll event that is delivered
+  // asynchronously, and if streaming grew the pane farther than the stick
+  // threshold in the meantime, a distance check would read that routine
+  // event as the reader scrolling away and silently kill the follow. A
+  // programmatic follow only ever increases scrollTop, so a *decrease*
+  // between two scroll events can only come from the reader (wheel, drag,
+  // keys) and is the sole unstick trigger; arriving at the bottom re-sticks.
   const paneRefs = useRef<Array<HTMLDivElement | null>>([])
   const paneStickToBottom = useRef<boolean[]>([])
+  const paneLastScrollTop = useRef<number[]>([])
   useEffect(() => {
     paneRefs.current.forEach((pane, index) => {
       if (pane && paneStickToBottom.current[index] !== false) followToBottom(pane)
+      if (pane) paneLastScrollTop.current[index] = pane.scrollTop
     })
   }, [messages, paneCount])
   // Keep file drops outside the composer from navigating the page away.
@@ -552,6 +609,7 @@ export function ChatPage() {
     abortRef.current = [...abortRef.current, ...controllers]
     shouldAutoScrollRef.current = true
     paneStickToBottom.current = []
+    paneLastScrollTop.current = []
     setMessages([...messages, userMessage, ...assistantMessages])
     setDraft('')
     replaceAttachments([])
@@ -607,6 +665,7 @@ export function ChatPage() {
     abortRef.current.forEach((controller) => controller.abort())
     abortRef.current = []
     paneStickToBottom.current = []
+    paneLastScrollTop.current = []
     setMessages([])
     replaceAttachments([])
     setAttachmentError(undefined)
@@ -647,7 +706,11 @@ export function ChatPage() {
       }}>
         {paneCount > 1 ? (
           <>
-            <div className={`chat-panes${paneCount >= 4 ? ' is-compact' : ''}`}>
+            <div
+              ref={panesHostRef}
+              className={`chat-panes${paneCount >= 4 ? ' is-compact' : ''}`}
+              style={{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))` }}
+            >
               {Array.from({ length: paneCount }, (_, paneIndex) => (
                 <div
                   key={paneIndex}
@@ -655,7 +718,12 @@ export function ChatPage() {
                   role="log"
                   aria-label={`Session ${paneIndex + 1}`}
                   ref={(element) => { paneRefs.current[paneIndex] = element }}
-                  onScroll={(event) => { paneStickToBottom.current[paneIndex] = stickToBottom(event.currentTarget) }}
+                  onScroll={(event) => {
+                    const pane = event.currentTarget
+                    if (stickToBottom(pane)) paneStickToBottom.current[paneIndex] = true
+                    else if ((paneLastScrollTop.current[paneIndex] ?? 0) - pane.scrollTop > 2) paneStickToBottom.current[paneIndex] = false
+                    paneLastScrollTop.current[paneIndex] = pane.scrollTop
+                  }}
                 >
                   <p className="chat-pane-label">Session {paneIndex + 1}</p>
                   {messages.length === 0 && paneIndex === 0 && (
@@ -668,11 +736,11 @@ export function ChatPage() {
                     // session so the panes keep showing the history that is
                     // actually replayed to the model.
                     const run = entry.runs.find((item) => item.runIndex === paneIndex + 1)
-                    return run ? <AssistantMessage key={run.id} className="message message-assistant" message={run} runLabel={false} /> : null
+                    return run ? <AssistantMessage key={run.id} className="message message-assistant" message={run} runLabel={false} condensed /> : null
                   })() : entry.message.role === 'user' ? (
                     <UserBubble key={entry.message.id} message={entry.message} />
                   ) : (
-                    <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} />
+                    <AssistantMessage key={entry.message.id} className="message message-assistant" message={entry.message} condensed />
                   ))}
                 </div>
               ))}

@@ -305,14 +305,16 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
    full-height chat panes: the box itself stops scrolling and each pane
    follows its own newest content, like separate chats side by side. */
 .conversation.has-panes { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-/* Grid rows must be height-bounded (minmax(0, 1fr) rather than the default
-   auto) or the longest answer sizes its row to content and every pane
-   expands instead of scrolling down on its own. auto-fit wraps sessions
-   into implicit rows when they exceed the columns that fit, so both the
-   explicit first row and every generated row need the bound. */
-.chat-panes { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); grid-template-rows: minmax(0, 1fr); grid-auto-rows: minmax(0, 1fr); }
-/* Four or more concurrent sessions squeeze each pane toward its 320px
-   floor, so tighten the type, spacing, and pane padding to fit more of
+/* The component sets grid-template-columns to a count that evenly divides
+   the sessions (8 -> 4x2, 16 -> 4x4), so every row stays full and every
+   pane is the same size. Rows must be height-bounded (minmax(0, 1fr)
+   rather than the default auto) or the longest answer sizes its row to
+   content and every pane expands instead of scrolling down on its own.
+   gap/padding must stay in sync with PANE_GAP_PX / PANE_GRID_PADDING_PX in
+   ChatPage.tsx, which factor them into the widest divisor that fits. */
+.chat-panes { flex: 1 1 auto; min-height: 0; display: grid; gap: 10px; padding: 10px; grid-auto-rows: minmax(0, 1fr); }
+/* Four or more concurrent sessions squeeze each pane toward the 300px
+   minimum, so tighten the type, spacing, and pane padding to fit more of
    each conversation on screen. */
 .chat-panes.is-compact .chat-pane { padding: 12px 10px 20px; }
 .chat-panes.is-compact .message + .message { margin-top: 14px; }
@@ -320,8 +322,8 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 .chat-panes.is-compact .message-content { font-size: 12.5px; line-height: 1.5; }
 .chat-panes.is-compact .message-content > * + * { margin-top: 8px; }
 .chat-panes.is-compact .reasoning-block > div { font-size: 11px; line-height: 1.5; }
-.chat-pane { min-width: 0; min-height: 0; padding: 18px 14px 28px; overflow-y: auto; border-left: 1px solid var(--border-subtle); scroll-behavior: smooth; }
-.chat-pane:first-child { border-left: 0; }
+/* Each session reads as its own card so the grid gap has visible edges. */
+.chat-pane { min-width: 0; min-height: 0; padding: 18px 14px 28px; overflow-y: auto; background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: 12px; scroll-behavior: smooth; }
 .chat-pane .message { width: 100%; margin-inline: 0; }
 .chat-pane-label { margin: 0 0 16px; color: var(--text-secondary); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
 .chat-pane-hint { color: var(--text-tertiary); font-size: 12px; }

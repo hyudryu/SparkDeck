@@ -1,10 +1,17 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api, deploymentFromWire } from './client'
 import type { ChatStreamUpdate } from './types'
+
+beforeEach(() => {
+  // Most of these tests assert the classic per-request fetch streaming.
+  // Without a WebSocket global the client skips the multiplexer entirely.
+  vi.stubGlobal('WebSocket', undefined)
+})
 
 afterEach(() => {
   vi.restoreAllMocks()
   vi.useRealTimers()
+  vi.unstubAllGlobals()
 })
 
 describe('API client adapters', () => {
@@ -699,5 +706,276 @@ describe('API client adapters', () => {
       '/api/token-stats/sync',
     ])
     expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({ method: 'POST' })
+  })
+})
+
+describe('multiplexed chat streaming', () => {
+  // jsdom ships a real WebSocket, which would try to open a genuine socket,
+  // so the whole mux path runs against this fake. The client module keeps the
+  // shared socket in module state, hence the per-test module reset.
+  class FakeWebSocket {
+    url: string
+    sent: string[] = []
+    onopen: (() => void) | null = null
+    onclose: (() => void) | null = null
+    onerror: (() => void) | null = null
+    onmessage: ((event: { data: string }) => void) | null = null
+
+    constructor(url: string) {
+      this.url = url
+      sockets.push(this)
+    }
+
+    send(data: string) {
+      this.sent.push(data)
+    }
+
+    open() {
+      this.onopen?.()
+    }
+
+    fail() {
+      this.onerror?.()
+    }
+
+    close() {
+      this.onclose?.()
+    }
+
+    frame(payload: Record<string, unknown>) {
+      this.onmessage?.({ data: JSON.stringify(payload) })
+    }
+
+    starts() {
+      return this.sent
+        .map((data) => JSON.parse(data) as { op: string; id?: string; body?: Record<string, unknown> })
+        .filter((frame) => frame.op === 'start')
+    }
+
+    stops() {
+      return this.sent
+        .map((data) => JSON.parse(data) as { op: string; id?: string })
+        .filter((frame) => frame.op === 'stop')
+    }
+  }
+
+  let sockets: FakeWebSocket[] = []
+  let muxApi: typeof api
+
+  beforeEach(async () => {
+    sockets = []
+    vi.resetModules()
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    muxApi = (await import('./client')).api
+  })
+
+  function sse(content: string) {
+    return `data: {"choices":[{"delta":{"content":${JSON.stringify(content)}}}]}\n\n`
+  }
+
+  it('streams a single response over the shared socket without touching fetch', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    const updates: ChatStreamUpdate[] = []
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }], {
+      onUpdate: (update) => updates.push(update),
+    })
+    const socket = sockets[0]
+    expect(socket.url).toContain('/api/v1/chat/ws')
+    socket.open()
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+
+    const [start] = socket.starts()
+    expect(start?.body).toEqual(expect.objectContaining({
+      model: 'reasoner',
+      messages: [{ role: 'user', content: 'Hello' }],
+      stream: true,
+      stream_options: { include_usage: true },
+    }))
+    socket.frame({ id: start?.id, chunk: sse('Hel') })
+    socket.frame({ id: start?.id, chunk: sse('lo') })
+    socket.frame({ id: start?.id, chunk: 'data: [DONE]\n\n' })
+    socket.frame({ id: start?.id, done: true })
+
+    const result = await pending
+    expect(result.message.content).toBe('Hello')
+    expect(updates.map((update) => update.content)).toEqual(['Hel', 'lo'])
+    expect(result.metrics.ttft_ms).toBeGreaterThanOrEqual(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('fans concurrent sessions over one socket and routes frames by stream id', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const first = muxApi.chatStream('reasoner', [{ role: 'user', content: 'First' }])
+    const second = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Second' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(2))
+    expect(sockets).toHaveLength(1)
+
+    const [a, b] = socket.starts()
+    expect(a?.id).not.toBe(b?.id)
+    socket.frame({ id: a?.id, chunk: sse('Answer ') })
+    socket.frame({ id: b?.id, chunk: sse('Second ') })
+    socket.frame({ id: a?.id, chunk: sse('A') })
+    socket.frame({ id: a?.id, chunk: 'data: [DONE]\n\n' })
+    socket.frame({ id: a?.id, done: true })
+    socket.frame({ id: b?.id, chunk: sse('B') })
+    socket.frame({ id: b?.id, chunk: 'data: [DONE]\n\n' })
+    socket.frame({ id: b?.id, done: true })
+
+    expect((await first).message.content).toBe('Answer A')
+    expect((await second).message.content).toBe('Second B')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to fetch when the socket fails before the stream starts', async () => {
+    const response = new Response('data: {"choices":[{"delta":{"content":"Fallback"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.fail()
+
+    const result = await pending
+    expect(result.message.content).toBe('Fallback')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(socket.sent).toHaveLength(0)
+  })
+
+  it('falls back to fetch when the socket never opens', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    const response = new Response('data: {"choices":[{"delta":{"content":"Fallback"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    await vi.advanceTimersByTimeAsync(3000)
+
+    const result = await pending
+    expect(result.message.content).toBe('Fallback')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(sockets[0]?.sent).toHaveLength(0)
+  })
+
+  it('tells the server to abort and rejects with AbortError when the caller aborts', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }], {
+      signal: controller.signal,
+    })
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(socket.stops()).toEqual([{ op: 'stop', id: socket.starts()[0]?.id }])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects with the server error frame without retrying over fetch', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    socket.frame({ id: socket.starts()[0]?.id, error: 'no serving replica for reasoner' })
+
+    await expect(pending).rejects.toThrow('no serving replica for reasoner')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('stops only the broken stream when a chunk carries malformed stream data', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const broken = muxApi.chatStream('reasoner', [{ role: 'user', content: 'First' }])
+    const healthy = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Second' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(2))
+    const [first, second] = socket.starts()
+
+    socket.frame({ id: first?.id, chunk: 'data: {not json\n\n' })
+    await expect(broken).rejects.toThrow('The model returned malformed stream data')
+    // The offender is stopped upstream while the shared socket serves its peer.
+    expect(socket.stops()).toEqual([{ op: 'stop', id: first?.id }])
+    socket.frame({ id: second?.id, chunk: sse('Unaffected') })
+    socket.frame({ id: second?.id, chunk: 'data: [DONE]\n\n' })
+    socket.frame({ id: second?.id, done: true })
+    expect((await healthy).message.content).toBe('Unaffected')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects with the message of an SSE error payload without retrying over fetch', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    const [start] = socket.starts()
+    socket.frame({ id: start?.id, chunk: 'data: {"error":{"message":"GPU worker stopped"}}\n\n' })
+
+    await expect(pending).rejects.toThrow('GPU worker stopped')
+    expect(socket.stops()).toEqual([{ op: 'stop', id: start?.id }])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('completes on the SSE sentinel while the upstream generator keeps streaming', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    // Mirrors the llama.cpp path: [DONE] arrives but the server never gets
+    // to emit its terminal frame because the upstream generator stays open.
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    const [start] = socket.starts()
+    socket.frame({ id: start?.id, chunk: sse('Answer') })
+    socket.frame({ id: start?.id, chunk: 'data: [DONE]\n\n' })
+
+    const result = await pending
+    expect(result.message.content).toBe('Answer')
+    // The stream stops its own upstream instead of idling for the done frame.
+    expect(socket.stops()).toEqual([{ op: 'stop', id: start?.id }])
+    // And the shared socket is intact for the next session.
+    const next = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Again' }])
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(2))
+    const [second] = socket.starts().slice(1)
+    socket.frame({ id: second?.id, chunk: sse('Done') })
+    socket.frame({ id: second?.id, chunk: 'data: [DONE]\n\n' })
+    expect((await next).message.content).toBe('Done')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a mid-stream socket drop instead of restarting the response', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = muxApi.chatStream('reasoner', [{ role: 'user', content: 'Hello' }])
+    const socket = sockets[0]
+    socket.open()
+    await vi.waitFor(() => expect(socket.starts()).toHaveLength(1))
+    socket.frame({ id: socket.starts()[0]?.id, chunk: sse('Partial') })
+    socket.close()
+
+    await expect(pending).rejects.toThrow('The chat connection dropped mid-stream')
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

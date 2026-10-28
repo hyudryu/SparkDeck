@@ -148,6 +148,28 @@ describe('ChatPage', () => {
     expect(vi.mocked(api.chatStream).mock.calls[1]?.[2]?.seed).toBe(2)
   })
 
+  it('splits the conversation into N panes as soon as N sessions are selected', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner' })
+    expect(screen.getByText('How can I help?')).toBeInTheDocument()
+
+    // Choosing a concurrency splits the box into that many session columns
+    // immediately, before any prompt is sent, previewing the fan-out.
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '4')
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(4)
+    expect(screen.getByRole('log', { name: 'Session 4' })).toBeInTheDocument()
+    expect(container.querySelector('.conversation.has-panes')).toBeInTheDocument()
+    expect(screen.queryByText('How can I help?')).not.toBeInTheDocument()
+
+    // Turning the selector back down on an empty conversation returns to the
+    // single empty state.
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '1')
+    expect(container.querySelectorAll('.chat-pane')).toHaveLength(0)
+    expect(screen.getByText('How can I help?')).toBeInTheDocument()
+  })
+
   it('keeps a surviving answer in its own pane when an earlier run fails before content', async () => {
     let call = 0
     vi.mocked(api.chatStream).mockImplementation(() => (++call === 1

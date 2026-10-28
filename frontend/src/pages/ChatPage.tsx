@@ -334,11 +334,14 @@ export function ChatPage() {
   // The count is the widest group in the history so earlier branches keep
   // their column even after the concurrency selector is turned back down.
   // runTotal (not the live runs length) keeps failed runs that were dropped
-  // before producing content from collapsing a session column.
-  const paneCount = useMemo(() => renderEntries.reduce(
+  // before producing content from collapsing a session column. The live
+  // selector is folded in so choosing N splits the box into N boxes right
+  // away, previewing the fan-out the next send will produce.
+  const historyPaneCount = useMemo(() => renderEntries.reduce(
     (max, entry) => entry.kind === 'runs' ? Math.max(max, entry.runs[0]?.runTotal ?? entry.runs.length) : max,
     1,
   ), [renderEntries])
+  const paneCount = Math.max(historyPaneCount, sending ? historyPaneCount : concurrency)
 
   useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
   useEffect(() => {
@@ -597,9 +600,7 @@ export function ChatPage() {
       <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
         shouldAutoScrollRef.current = stickToBottom(event.currentTarget)
       }}>
-        {messages.length === 0 ? (
-          <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
-        ) : paneCount > 1 ? (
+        {paneCount > 1 ? (
           <>
             <div className="chat-panes">
               {Array.from({ length: paneCount }, (_, paneIndex) => (
@@ -612,6 +613,9 @@ export function ChatPage() {
                   onScroll={(event) => { paneStickToBottom.current[paneIndex] = stickToBottom(event.currentTarget) }}
                 >
                   <p className="chat-pane-label">Session {paneIndex + 1}</p>
+                  {messages.length === 0 && paneIndex === 0 && (
+                    <p className="chat-pane-hint">Send a prompt and it fans out to {paneCount} independent sessions.</p>
+                  )}
                   {renderEntries.map((entry) => entry.kind === 'runs' ? (() => {
                     // Assign by the stable runIndex, never array position: a
                     // run that fails before producing content is removed from
@@ -634,6 +638,8 @@ export function ChatPage() {
                 : [])}
             </div>
           </>
+        ) : messages.length === 0 ? (
+          <div className="chat-empty"><span className="chat-empty-icon"><Bot size={22} /></span><h2>How can I help?</h2><p>Choose a running model and start a private, local conversation. Thinking and answer text stream as they are generated.</p></div>
         ) : renderEntries.map((entry) => entry.kind === 'runs' ? (
           entry.runs.map((run) => <AssistantMessage key={run.id} className="message message-assistant" message={run} />)
         ) : entry.message.role === 'user' ? (

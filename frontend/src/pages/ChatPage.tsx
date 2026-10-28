@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent } from 'react'
 import { ArrowUp, Bot, Gauge, Maximize2, Minimize2, Paperclip, Square, Trash2, X } from 'lucide-react'
 import { api } from '../api/client'
-import type { ChatMessage, ChatResponseMetrics, Deployment } from '../api/types'
+import type { ChatMessage, ChatResponseMetrics, ChatStreamUpdate, Deployment } from '../api/types'
 import { useChatFullscreen } from '../components/AppShell'
 import { Button, ErrorState, PageHeader, RuntimeMark } from '../components/ui'
 import { useResource } from '../hooks/useResource'
@@ -163,6 +163,20 @@ function stickToBottom(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_THRESHOLD_PX
 }
 
+// A scroll event is delivered asynchronously: between a follow jump and its
+// delivery, streaming can grow the box farther than the stick threshold from
+// the bottom, so a pure distance check at event time would read the follow's
+// own queued event as the reader leaving and silently kill the follow — most
+// often with many sessions streaming at once, where growth per frame easily
+// exceeds the threshold. Only a decrease of scrollTop can be the reader's
+// doing (a programmatic follow only ever moves down), so it is the sole
+// unstick trigger; holding or moving down keeps the follow, and arriving
+// within the threshold re-arms it.
+function nextStickState(el: HTMLElement, previousTop: number, wasStuck: boolean) {
+  if (stickToBottom(el)) return true
+  return wasStuck && previousTop - el.scrollTop <= 2
+}
+
 // The conversation and pane boxes set `scroll-behavior: smooth`, which would
 // turn each programmatic follow into an animation whose intermediate scroll
 // events land farther than the stick threshold from the bottom and flip the
@@ -178,13 +192,17 @@ function followToBottom(el: HTMLElement) {
 function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasoning: string }) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  const lastTopRef = useRef(0)
   useEffect(() => {
     const body = bodyRef.current
     if (body && streaming && stickToBottomRef.current) followToBottom(body)
+    if (body) lastTopRef.current = body.scrollTop
   }, [reasoning, streaming])
   return (
     <div ref={bodyRef} onScroll={(event) => {
-      stickToBottomRef.current = stickToBottom(event.currentTarget)
+      const body = event.currentTarget
+      stickToBottomRef.current = nextStickState(body, lastTopRef.current, stickToBottomRef.current)
+      lastTopRef.current = body.scrollTop
     }}>{reasoning}</div>
   )
 }
@@ -350,6 +368,7 @@ export function ChatPage() {
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const conversationRef = useRef<HTMLElement>(null)
   const shouldAutoScrollRef = useRef(true)
+  const conversationLastTopRef = useRef(0)
   const selectedModel = model || modelNames[0] || ''
   // Mirrors the gateway's selector precedence: an exact alias match wins
   // over other deployments' served names, so the runtime mark attributes the
@@ -412,7 +431,20 @@ export function ChatPage() {
   }, [paneCount])
   const gridColumns = gridColumnsFor(paneCount, panesWidth || window.innerWidth)
 
-  useEffect(() => () => abortRef.current.forEach((controller) => controller.abort()), [])
+  // SSE chunks from sixteen parallel streams arrive hundreds of times per
+  // second, and a render per chunk (each one re-parsing every pane's growing
+  // markdown) starves the main thread: the pane grows much farther than the
+  // follow can keep up between frames, the newest line and the tok/s pill
+  // slide out of view, and the follow then snaps — the pulse readers see.
+  // Coalesce chunks into one render per animation frame: the first chunk of
+  // a burst renders immediately so the first token is never delayed, chunks
+  // landing inside the open frame window accumulate and flush together.
+  const streamDeltasRef = useRef(new Map<string, { content: string; reasoning: string; metrics?: ChatResponseMetrics }>())
+  const streamFrameRef = useRef(0)
+  useEffect(() => () => {
+    abortRef.current.forEach((controller) => controller.abort())
+    if (streamFrameRef.current) cancelAnimationFrame(streamFrameRef.current)
+  }, [])
   // Escape drops back out of full-window mode, mirroring the drawer's
   // Escape-to-close behaviour.
   useEffect(() => {
@@ -426,17 +458,12 @@ export function ChatPage() {
   useEffect(() => {
     const conversation = conversationRef.current
     if (conversation && shouldAutoScrollRef.current) followToBottom(conversation)
+    if (conversation) conversationLastTopRef.current = conversation.scrollTop
   }, [messages])
   // Panes scroll on their own (the outer box stops scrolling), so each one
-  // follows its own newest content until its reader scrolls up. A pane's
-  // stick flag is driven by position changes, not by "distance from bottom"
-  // at event time: a follow jump queues a scroll event that is delivered
-  // asynchronously, and if streaming grew the pane farther than the stick
-  // threshold in the meantime, a distance check would read that routine
-  // event as the reader scrolling away and silently kill the follow. A
-  // programmatic follow only ever increases scrollTop, so a *decrease*
-  // between two scroll events can only come from the reader (wheel, drag,
-  // keys) and is the sole unstick trigger; arriving at the bottom re-sticks.
+  // follows its own newest content until its reader scrolls up, using the
+  // same position-change stick rule as the conversation and the thinking
+  // box (see nextStickState).
   const paneRefs = useRef<Array<HTMLDivElement | null>>([])
   const paneStickToBottom = useRef<boolean[]>([])
   const paneLastScrollTop = useRef<number[]>([])
@@ -461,6 +488,36 @@ export function ChatPage() {
 
   const updateMessage = (id: string, update: (message: ConversationMessage) => ConversationMessage) => {
     setMessages((current) => current.map((message) => message.id === id ? update(message) : message))
+  }
+
+  const applyStreamDeltas = () => {
+    const deltas = streamDeltasRef.current
+    if (deltas.size === 0) return
+    streamDeltasRef.current = new Map()
+    setMessages((current) => current.map((message) => {
+      const delta = deltas.get(message.id)
+      return delta ? {
+        ...message,
+        content: message.content + delta.content,
+        reasoning: (message.reasoning ?? '') + delta.reasoning,
+        metrics: delta.metrics ?? message.metrics,
+      } : message
+    }))
+  }
+
+  const bufferStreamUpdate = (id: string, update: ChatStreamUpdate) => {
+    const deltas = streamDeltasRef.current
+    const delta = deltas.get(id) ?? { content: '', reasoning: '' }
+    delta.content += update.content ?? ''
+    delta.reasoning += update.reasoning ?? ''
+    if (update.metrics) delta.metrics = update.metrics
+    deltas.set(id, delta)
+    if (streamFrameRef.current) return
+    applyStreamDeltas()
+    streamFrameRef.current = requestAnimationFrame(() => {
+      streamFrameRef.current = 0
+      applyStreamDeltas()
+    })
   }
 
   const replaceAttachments = (next: ChatMediaAttachment[], cancelPendingReads = true) => {
@@ -625,13 +682,11 @@ export function ChatPage() {
           // so the engine samples the shared prompt differently per session;
           // a single-session send leaves the seed to the engine default.
           seed: message.runIndex,
-          onUpdate: (update) => updateMessage(message.id, (current) => ({
-            ...current,
-            content: current.content + (update.content ?? ''),
-            reasoning: (current.reasoning ?? '') + (update.reasoning ?? ''),
-            metrics: update.metrics ?? current.metrics,
-          })),
+          onUpdate: (update) => bufferStreamUpdate(message.id, update),
         })
+        // Flush trailing chunks before the final replace so a queued delta
+        // cannot append on top of the complete result content.
+        applyStreamDeltas()
         updateMessage(message.id, (current) => ({
           ...current,
           content: result.message.content || current.content,
@@ -642,6 +697,7 @@ export function ChatPage() {
         }))
       } catch (reason) {
         const stopped = reason instanceof Error && reason.name === 'AbortError'
+        streamDeltasRef.current.delete(message.id)
         setMessages((current) => current.flatMap((entry) => {
           if (entry.id !== message.id) return [entry]
           if (!stopped && !entry.content && !entry.reasoning) return []
@@ -664,6 +720,7 @@ export function ChatPage() {
   const clear = () => {
     abortRef.current.forEach((controller) => controller.abort())
     abortRef.current = []
+    streamDeltasRef.current.clear()
     paneStickToBottom.current = []
     paneLastScrollTop.current = []
     setMessages([])
@@ -702,7 +759,9 @@ export function ChatPage() {
       </div>
       <p className="sr-only" role="status" aria-live="polite">{sending ? 'Generating response' : messages.length ? 'Response complete' : ''}</p>
       <section ref={conversationRef} className={`conversation${paneCount > 1 ? ' has-panes' : ''}`} aria-label="Conversation" onScroll={(event) => {
-        shouldAutoScrollRef.current = stickToBottom(event.currentTarget)
+        const box = event.currentTarget
+        shouldAutoScrollRef.current = nextStickState(box, conversationLastTopRef.current, shouldAutoScrollRef.current)
+        conversationLastTopRef.current = box.scrollTop
       }}>
         {paneCount > 1 ? (
           <>
@@ -720,8 +779,11 @@ export function ChatPage() {
                   ref={(element) => { paneRefs.current[paneIndex] = element }}
                   onScroll={(event) => {
                     const pane = event.currentTarget
-                    if (stickToBottom(pane)) paneStickToBottom.current[paneIndex] = true
-                    else if ((paneLastScrollTop.current[paneIndex] ?? 0) - pane.scrollTop > 2) paneStickToBottom.current[paneIndex] = false
+                    paneStickToBottom.current[paneIndex] = nextStickState(
+                      pane,
+                      paneLastScrollTop.current[paneIndex] ?? pane.scrollTop,
+                      paneStickToBottom.current[paneIndex] ?? true,
+                    )
                     paneLastScrollTop.current[paneIndex] = pane.scrollTop
                   }}
                 >

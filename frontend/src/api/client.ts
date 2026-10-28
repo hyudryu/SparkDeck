@@ -378,28 +378,65 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
   let doneReceived = false
   let terminalSeen = false
 
-  const metricsAt = (now: number): ChatResponseMetrics => {
+  // Both sources of the streamed Output speed pill are instantaneous
+  // numbers that bounce: engine timings are a per-token estimate that
+  // oscillates, and the usage-derived fallback divides a token count that
+  // only moves in bursts, so the rate sags between bursts and jumps at
+  // each one. Sampling either at chunk cadence makes the pill flicker up
+  // and down. Feed both through an exponential moving average with a
+  // ~750 ms time constant (time-weighted, so chunk cadence cannot bias it)
+  // and republish metrics at most four times a second — text still
+  // streams every chunk, but re-rendering the same instantaneous estimate
+  // sixty times a second is what readers see flicker. The terminal
+  // measurement skips the smoothing: the number shown after the stream
+  // closes is the unfiltered one.
+  const OUTPUT_RATE_EMA_TAU_MS = 750
+  const METRICS_PUBLISH_INTERVAL_MS = 250
+  let smoothedOutputRate: number | undefined
+  let lastRateSampleAt: number | undefined
+  let lastMetricsPublishedAt = Number.NEGATIVE_INFINITY
+
+  const metricsAt = (now: number, smooth: boolean): ChatResponseMetrics => {
     const ttftMs = firstTokenAt === undefined ? undefined : Math.max(0, firstTokenAt - startedAt)
     const promptTokens = positiveNumber(usage?.prompt_tokens)
     const completionTokens = positiveNumber(usage?.completion_tokens)
     const generationMs = firstTokenAt === undefined ? undefined : now - firstTokenAt
+    let outputRate = nativeOutputRate ?? (
+      completionTokens !== undefined && completionTokens >= 2 && generationMs !== undefined && generationMs >= 50
+        ? completionTokens / (generationMs / 1000)
+        : undefined
+    )
+    if (smooth) {
+      if (outputRate !== undefined) {
+        const sampleGap = lastRateSampleAt === undefined ? 0 : Math.max(0, now - lastRateSampleAt)
+        lastRateSampleAt = now
+        const weight = 1 - Math.exp(-sampleGap / OUTPUT_RATE_EMA_TAU_MS)
+        smoothedOutputRate = smoothedOutputRate === undefined
+          ? outputRate
+          : smoothedOutputRate + (outputRate - smoothedOutputRate) * weight
+      }
+      outputRate = smoothedOutputRate
+    }
     return {
       // Only the engine can measure prefill; deriving a rate from TTFT would
       // fold queue wait, proxy hops, and the first decode step into it.
       prompt_tokens_per_second: nativePromptRate,
       ttft_ms: ttftMs,
-      output_tokens_per_second: nativeOutputRate ?? (
-        completionTokens !== undefined && completionTokens >= 2 && generationMs !== undefined && generationMs >= 50
-          ? completionTokens / (generationMs / 1000)
-          : undefined
-      ),
+      output_tokens_per_second: outputRate,
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
     }
   }
 
   const publish = (update: Omit<ChatStreamUpdate, 'metrics'> = {}) => {
-    options.onUpdate?.({ ...update, metrics: metricsAt(performance.now()) })
+    const now = performance.now()
+    if (now - lastMetricsPublishedAt < METRICS_PUBLISH_INTERVAL_MS) {
+      // Hold the last published metrics; the deltas flow through untouched.
+      options.onUpdate?.({ ...update, metrics: undefined })
+      return
+    }
+    lastMetricsPublishedAt = now
+    options.onUpdate?.({ ...update, metrics: metricsAt(now, true) })
   }
 
   const consumeData = (data: string) => {
@@ -476,7 +513,7 @@ async function streamChat(model: string, messages: ChatMessage[], options: ChatS
       message: { role: 'assistant', content },
       reasoning,
       usage,
-      metrics: metricsAt(performance.now()),
+      metrics: metricsAt(performance.now(), false),
     }
   }
 

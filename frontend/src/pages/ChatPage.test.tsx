@@ -911,4 +911,105 @@ describe('ChatPage', () => {
     expect(compactGrid).toHaveClass('is-compact')
     expect(within(compactGrid as HTMLElement).getAllByRole('log')).toHaveLength(4)
   })
+
+  it('divides the pane grid evenly: 8 sessions become 4x2 and 16 become 4x4', async () => {
+    const originalWidth = window.innerWidth
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1300 })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('textbox', { name: 'Message' })
+
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '8')
+      const eightGrid = container.querySelector('.chat-panes') as HTMLElement
+      expect(within(eightGrid).getAllByRole('log')).toHaveLength(8)
+      expect(eightGrid.style.gridTemplateColumns).toBe('repeat(4, minmax(0, 1fr))')
+
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '16')
+      const sixteenGrid = container.querySelector('.chat-panes') as HTMLElement
+      expect(within(sixteenGrid).getAllByRole('log')).toHaveLength(16)
+      expect(sixteenGrid.style.gridTemplateColumns).toBe('repeat(4, minmax(0, 1fr))')
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth })
+    }
+  })
+
+  it('keeps only the decode rate chip inside concurrent panes', async () => {
+    vi.mocked(api.chatStream).mockResolvedValue({
+      message: { role: 'assistant', content: 'Stress answer' },
+      reasoning: '',
+      metrics: { ttft_ms: 300, prompt_tokens_per_second: 500, output_tokens_per_second: 40 },
+    })
+    const user = userEvent.setup()
+    const { container } = render(<ChatPage />)
+    await screen.findByRole('textbox', { name: 'Message' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    await user.type(screen.getByRole('textbox', { name: 'Message' }), 'Stress')
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+    const grid = container.querySelector('.chat-panes') as HTMLElement
+    await waitFor(() => expect(within(grid).getAllByText('Stress answer')).toHaveLength(2))
+    expect(within(grid).getAllByText('40.0 tok/s')).toHaveLength(2)
+    expect(within(grid).queryByText('TTFT')).not.toBeInTheDocument()
+    expect(within(grid).queryByText('Prompt processing')).not.toBeInTheDocument()
+    // The aggregate TTFT spread still lives in the footer summary.
+    expect(screen.getByText(/TTFT 300 ms – 300 ms/)).toBeInTheDocument()
+  })
+
+  it('keeps following panes whose queued scroll event lands after streaming grew past the stick threshold', async () => {
+    const updates: Array<NonNullable<ChatStreamOptions['onUpdate']> | undefined> = []
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        updates[index] = options?.onUpdate
+      })
+    })
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 900 })
+    try {
+      const user = userEvent.setup()
+      const { container } = render(<ChatPage />)
+      await screen.findByRole('option', { name: 'reasoner' })
+      await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+      await user.type(await screen.findByRole('textbox', { name: 'Message' }), 'Stream together')
+      await user.click(screen.getByRole('button', { name: 'Send message' }))
+
+      await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+      await screen.findByRole('log', { name: 'Session 1' })
+      const panes = Array.from(container.querySelectorAll<HTMLElement>('.chat-pane'))
+      const jumps: Array<{ pane: number; to: number }> = []
+      panes.forEach((pane, index) => {
+        let stored = 0
+        Object.defineProperty(pane, 'scrollTop', {
+          configurable: true,
+          get: () => stored,
+          set: (value: number) => {
+            stored = value
+            jumps.push({ pane: index, to: value })
+          },
+        })
+      })
+      act(() => updates[0]?.({ content: 'First half of answer' }))
+
+      // Streaming grew the pane beyond the stick threshold between the
+      // follow assignment and its asynchronous scroll event. The follow
+      // only ever raises scrollTop, so this event is not a reader scrolling
+      // away: it must not drop the stick, and the next chunk must still be
+      // followed to the new bottom.
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, value: 1200 })
+      fireEvent.scroll(panes[0]!)
+      act(() => updates[0]?.({ content: ' more' }))
+      expect(jumps.some((jump) => jump.pane === 0 && jump.to === 1200)).toBe(true)
+      expect(jumps.some((jump) => jump.pane === 1 && jump.to === 1200)).toBe(true)
+
+      await act(async () => {
+        finishers[0]?.({ message: { role: 'assistant', content: 'First half of answer more' }, reasoning: '', metrics: {} })
+        finishers[1]?.({ message: { role: 'assistant', content: 'second' }, reasoning: '', metrics: {} })
+      })
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight
+    }
+  })
 })

@@ -153,12 +153,13 @@ function ReasoningBlock({ streaming, reasoning }: { streaming: boolean; reasonin
 }
 
 // Shown once every run of a concurrent send has finished: aggregate serving
-// throughput over the shared wall-clock window (summing the per-run average
+// throughput over the shared decode window (summing the per-run average
 // rates would overstate it when runs finish at different times), the spread
 // in time-to-first-token, and whether the engine produced byte-identical
-// answers across the sessions. The window runs from request dispatch to
-// stream close, so unlike a session's own Output speed it includes queueing
-// and time-to-first-token; the label says so to keep the two apart.
+// answers across the sessions. The window spans the union of the runs'
+// decode intervals — from the earliest first token to the last stream close —
+// so queueing and prefill (time-to-first-token) never dilute the rate; this
+// matches how each session's own Output speed excludes TTFT.
 function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   if (runs.length < 2 || runs.some((run) => run.streaming)) return null
   const parts = [`${runs.length} concurrent runs`]
@@ -168,9 +169,16 @@ function ConcurrencySummary({ runs }: { runs: ConversationMessage[] }) {
   if (tokens.every((value): value is number => value !== undefined)
     && starts.every((value): value is number => value !== undefined)
     && ends.every((value): value is number => value !== undefined)) {
-    const windowMs = Math.max(1, Math.max(...ends) - Math.min(...starts))
+    // A run only emits tokens after its own first token, so its decode clock
+    // starts at startedAt + ttft_ms. A run without a reported ttft falls back
+    // to its dispatch time, which can only overstate the window.
+    const decodeStarts = runs.map((run, index) => {
+      const ttft = run.metrics?.ttft_ms
+      return ttft === undefined ? starts[index]! : starts[index]! + ttft
+    })
+    const windowMs = Math.max(1, Math.max(...ends) - Math.min(...decodeStarts))
     const totalTokens = tokens.reduce((sum, count) => sum + count, 0)
-    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s (TTFT included)`)
+    parts.push(`combined ${(totalTokens / (windowMs / 1000)).toFixed(1)} tok/s over ${(windowMs / 1000).toFixed(1)} s (decode only)`)
   }
   const ttfts = runs.map((run) => run.metrics?.ttft_ms).filter((value): value is number => value !== undefined)
   if (ttfts.length === runs.length) parts.push(`TTFT ${formatTtft(Math.min(...ttfts))} – ${formatTtft(Math.max(...ttfts))}`)

@@ -16,6 +16,7 @@ vi.mock('../api/client', () => ({
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 const pngFile = (name: string) => new File(
@@ -135,8 +136,9 @@ describe('ChatPage', () => {
     })
 
     // The combined rate divides total completion tokens by the shared
-    // wall-clock window, so only its shape is asserted.
-    expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s \(TTFT included\) · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
+    // decode-only window (earliest first token → last stream close), never
+    // the dispatch-to-close wall clock, so only its shape is asserted.
+    expect(await screen.findByText(/^2 concurrent runs · combined \d+(\.\d+)? tok\/s over \d+(\.\d+)? s \(decode only\) · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
 
     // The sessions sit in independent panes with the combined summary in a
     // footer beneath them, and each session samples the shared prompt with
@@ -146,6 +148,52 @@ describe('ChatPage', () => {
     expect(container.querySelector('.conversation-footer .concurrency-summary')).toBeInTheDocument()
     expect(vi.mocked(api.chatStream).mock.calls[0]?.[2]?.seed).toBe(1)
     expect(vi.mocked(api.chatStream).mock.calls[1]?.[2]?.seed).toBe(2)
+  })
+
+  it('measures the combined rate over the decode window only, excluding time-to-first-token', async () => {
+    const finishers: Array<(result: ChatStreamResult) => void> = []
+    vi.mocked(api.chatStream).mockImplementation((_model, _messages, options) => {
+      const index = finishers.length
+      return new Promise<ChatStreamResult>((resolve) => {
+        finishers.push(resolve)
+        options?.onUpdate?.({
+          content: 'Shared answer',
+          metrics: { ttft_ms: 200 + index * 100, output_tokens_per_second: 20 },
+        })
+      })
+    })
+    const user = userEvent.setup()
+    render(<ChatPage />)
+
+    await screen.findByRole('option', { name: 'reasoner' })
+    await user.selectOptions(screen.getByLabelText('Concurrency'), '2')
+    const composer = await screen.findByRole('textbox', { name: 'Message' })
+    await user.type(composer, 'Load test')
+
+    // Freeze the wall clock (Date only, so waitFor/userEvent keep working)
+    // so the summary arithmetic is asserted exactly: both runs dispatch at
+    // the same base instant and each starts emitting tokens only at its own
+    // first token (base + ttft_ms).
+    const base = 1_700_000_000_000
+    vi.setSystemTime(base)
+    await user.click(screen.getByRole('button', { name: 'Send message' }))
+    await waitFor(() => expect(api.chatStream).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      vi.setSystemTime(base + 12_000)
+      finishers[0]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 200, output_tokens_per_second: 20, completion_tokens: 100 } })
+    })
+    await act(async () => {
+      vi.setSystemTime(base + 10_300)
+      finishers[1]?.({ message: { role: 'assistant', content: 'Shared answer' }, reasoning: '', metrics: { ttft_ms: 300, output_tokens_per_second: 25, completion_tokens: 100 } })
+    })
+    vi.useRealTimers()
+
+    // The decode window spans the earliest first token (base + 200 ms) to the
+    // last stream close (base + 12 s): 200 tokens over 11.8 s = 16.9 tok/s.
+    // The dispatch-to-close wall clock (16.7 tok/s over 12.0 s) must not be
+    // used, or the rate would be diluted by prefill/queueing time.
+    expect(await screen.findByText(/^2 concurrent runs · combined 16\.9 tok\/s over 11\.8 s \(decode only\) · TTFT 200 ms – 300 ms · identical output$/)).toBeInTheDocument()
   })
 
   it('keeps a surviving answer in its own pane when an earlier run fails before content', async () => {

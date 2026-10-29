@@ -612,6 +612,7 @@ class NodeRegistry:
 
     async def probe(
         self, node: dict, *, force: bool = False, details: bool = True,
+        allow_stale_negative: bool = False,
     ) -> dict:
         node_id = node["id"]
         cached = self._status_cache.get(node_id)
@@ -629,15 +630,20 @@ class NodeRegistry:
                 not details or "docker_ready" in entry or negative
             ):
                 return entry
-            if details and negative and age < NODE_NEGATIVE_CACHE_SERVE_SECONDS:
+            if (
+                details and allow_stale_negative and negative
+                and age < NODE_NEGATIVE_CACHE_SERVE_SECONDS
+            ):
                 # Past the freshness window but still last-seen dead: hand
                 # back the stale negative snapshot and refresh it without
-                # making this caller wait on the dead node. Restricted to
-                # observational (details=True) consumers: liveness callers
-                # (details=False) decide agent broadcasts and update gates
-                # from ``online``, so they must not skip a recovered worker
-                # just because the background re-dial has not landed yet.
-                # They still join the in-flight refresh below.
+                # making this caller wait on the dead node. Opt-in, and only
+                # observational snapshot consumers (node dashboards, the
+                # routing fan-out) accept it: decision consumers — transfer
+                # endpoint selection, pre-download validation, liveness
+                # broadcasts — would act as if a recovered worker were still
+                # dead (management-routed giant transfers, wrongly skipped
+                # agents) for the length of the background re-dial, so they
+                # fall through and share or start the fresh probe instead.
                 self._ensure_probe(node, details=True)
                 return entry
         inflight = self._probe_inflight.get(node_id)
@@ -777,8 +783,15 @@ class NodeRegistry:
     async def public_nodes(self, local_status: dict) -> list[dict]:
         import asyncio
 
+        # Observational snapshot fan-out: a known-dead node may be served
+        # from the stale-negative window so per-request snapshot reads never
+        # re-dial a black-holed peer; the background refresh keeps it honest.
         remote = await asyncio.gather(
-            *[self.probe(n) for n in self.nodes], return_exceptions=True
+            *[
+                self.probe(n, allow_stale_negative=True)
+                for n in self.nodes
+            ],
+            return_exceptions=True,
         )
         result = [{
             "id": LOCAL_NODE_ID,

@@ -12061,8 +12061,15 @@ class Manager:
             "online": True,
             "stats": local_stats,
         }]
+        # Observational telemetry tick for the temperature view. A known-dead
+        # node may be served from the stale-negative window so the periodic
+        # fan-out never blocks on a black-holed peer; recovery is discovered
+        # by the background refresh this triggers.
         remote = await asyncio.gather(
-            *(self.node_registry.probe(node) for node in self.node_registry.nodes),
+            *(
+                self.node_registry.probe(node, allow_stale_negative=True)
+                for node in self.node_registry.nodes
+            ),
             return_exceptions=True,
         )
         nodes.extend(status for status in remote if isinstance(status, dict))

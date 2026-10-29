@@ -108,11 +108,14 @@ class NodeProbeCacheTests(unittest.IsolatedAsyncioTestCase):
                  "online": False, "status_message": "timed out"},
             )
 
-            # Expired negative snapshot: the caller gets it immediately even
-            # though the background refresh is stuck on the connect timeout.
+            # Expired negative snapshot: an observational caller gets it
+            # immediately even though the background refresh is stuck on the
+            # connect timeout.
             deadline = time.monotonic() + 2.0
             result = await asyncio.wait_for(
-                registry.probe(node, details=True), timeout=1.0,
+                registry.probe(
+                    node, details=True, allow_stale_negative=True,
+                ), timeout=1.0,
             )
             self.assertLess(time.monotonic(), deadline)
             self.assertEqual(result["status"], "unreachable")
@@ -159,6 +162,74 @@ class NodeProbeCacheTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(result["online"])
             self.assertEqual(requests.count("/api/agent/health"), 1)
+            await registry.http.aclose()
+
+    async def test_default_details_caller_redials_stale_negative(self) -> None:
+        requests = []
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            if path == "/api/agent/health":
+                return {"protocol_version": AGENT_PROTOCOL_VERSION}
+            return _healthy_status()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(directory)
+            registry.request = request
+            node = _node()
+            stale_at = time.monotonic() - (NODE_NEGATIVE_CACHE_SERVE_SECONDS - 5)
+            registry._status_cache["remote-1"] = (
+                stale_at,
+                {**registry.public_config(node), "status": "unreachable",
+                 "online": False},
+            )
+            # Stale-negative serving is opt-in: a details=True caller that
+            # did not opt in (a decision consumer) must not inherit the
+            # dead verdict for the background re-dial's duration.
+            result = await asyncio.wait_for(
+                registry.probe(node, details=True), timeout=2.0,
+            )
+            self.assertTrue(result["online"])
+            self.assertTrue(requests)
+            await registry.http.aclose()
+
+    async def test_transfer_resolver_selects_rdma_over_stale_negative(self) -> None:
+        requests = []
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            if path == "/api/agent/health":
+                return {"protocol_version": AGENT_PROTOCOL_VERSION}
+            return {
+                **_healthy_status(),
+                "interfaces": [{
+                    "name": "mlx5_0", "rdma": True, "up": True,
+                    "ipv4": ["10.0.0.9"],
+                }],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(directory)
+            registry.request = request
+            node = _node()
+            registry.nodes = [node]
+            stale_at = time.monotonic() - (NODE_NEGATIVE_CACHE_SERVE_SECONDS - 5)
+            registry._status_cache["remote-1"] = (
+                stale_at,
+                {**registry.public_config(node), "status": "unreachable",
+                 "online": False, "interfaces": []},
+            )
+
+            # The resolver decides the data plane for an entire archive
+            # transfer. Inheriting the stale negative (empty interfaces)
+            # would return None and silently route gigabytes over the
+            # management link instead of RDMA, so it must re-dial.
+            endpoint = await asyncio.wait_for(
+                registry.resolve_direct_transfer_source("remote-1"),
+                timeout=2.0,
+            )
+            self.assertEqual(endpoint, "http://10.0.0.9:7878")
+            self.assertTrue(requests)
             await registry.http.aclose()
 
     async def test_concurrent_probes_share_one_dial(self) -> None:
@@ -214,7 +285,9 @@ class NodeProbeCacheTests(unittest.IsolatedAsyncioTestCase):
 
             for _ in range(5):
                 result = await asyncio.wait_for(
-                    registry.probe(node, details=True), timeout=1.0,
+                    registry.probe(
+                        node, details=True, allow_stale_negative=True,
+                    ), timeout=1.0,
                 )
                 self.assertEqual(result["status"], "unreachable")
             await asyncio.sleep(0)  # let the single shared dial start

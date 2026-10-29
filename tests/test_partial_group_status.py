@@ -119,6 +119,47 @@ def test_public_inventory_reconciles_partial_health_from_active_group(tmp_path, 
     asyncio.run(run())
 
 
+def test_retired_replica_does_not_degrade_surviving_replica(tmp_path):
+    async def run():
+        manager = Manager(tmp_path)
+        deployment = {
+            "id": "replicated", "model": "org/model", "engine": "vllm",
+            "mode": "replicated", "status": "running", "desired_state": "running",
+            "node_ids": ["node-1"],
+            "launch_settings": {"model": "org/model", "engine": "vllm"},
+            "members": [
+                {"node_id": "node-1", "container_name": "rep-0", "rank": 0,
+                 "desired_state": "running", "status": "running"},
+                # Retired by node removal: the node is no longer registered,
+                # so this member can never report a container again.
+                {"node_id": "remote-1", "container_name": "rep-1", "rank": 1,
+                 "desired_state": "stopped", "status": "stopped"},
+            ],
+        }
+        manager.deployments = [deployment]
+        manager.list_containers = AsyncMock(return_value=[])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+        manager.cluster_nodes = AsyncMock(return_value=[
+            {"id": "node-1", "online": True, "status": "online",
+             "docker_ready": True, "containers": [{
+                 "name": "rep-0", "status": "running",
+                 "phase": {"phase": "ready"},
+             }]},
+        ])
+        try:
+            public = (await manager.get_state())["deployments"][0]
+            # Without excluding the retired member, its permanently "stopped"
+            # observation kept degrading the surviving replica forever.
+            assert public["status"] == "ready"
+            assert public["members"][0]["status"] == "running"
+            assert public["members"][1]["status"] == "stopped"
+            assert public["members"][1]["node_status"] == "offline"
+        finally:
+            await manager.http.aclose()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("all_stopped_intent", [False, True])
 @pytest.mark.parametrize("failed_rank_online", [False, True])
 def test_failed_group_stop_remains_degraded_during_reconciliation(tmp_path, all_stopped_intent, failed_rank_online):

@@ -226,6 +226,11 @@ _MEMBER_ABSENT_ERROR_MARKERS = (
     "cluster member not found",
     "managed container not found",
     "no such container",
+    # A member whose node was forgotten has nothing left to stop or remove;
+    # relaunching a saved deployment must treat the registry miss as the
+    # already-absent end state instead of aborting before creating the
+    # replacement ranks.
+    "remote node not found",
 )
 
 
@@ -428,6 +433,17 @@ _SUPPORTED_ENGINES = (
 # Strata do expose GET /health (Strata answers it before its API-key gate),
 # so they keep the strict readiness probe.
 _ENGINES_WITHOUT_HEALTH_ROUTE = frozenset({"laya", "tensorfold"})
+# Deployment/member statuses that prove nothing is running: anything else
+# is treated as a live workload until proven otherwise (a forced removal
+# covers nodes whose stale controller-side status cannot be trusted).
+_STOPPED_DEPLOYMENT_STATUSES = frozenset({"", "stopped", "error", "removed"})
+_LIVE_MEMBER_STATUSES = frozenset({
+    "queued", "creating", "created", "starting", "restarting",
+    "running", "ready",
+})
+_OFFLINE_MEMBER_NODE_STATUSES = frozenset({
+    "offline", "unreachable", "disconnected", "missing", "failed", "dead",
+})
 
 
 def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
@@ -4463,20 +4479,163 @@ class Manager:
         return await self.node_registry.probe(node, force=True)
 
     def remove_cluster_node(self, node_id: str) -> bool:
-        self._assert_cluster_node_removable(node_id)
-        return self.node_registry.remove(node_id)
+        """Forget a node whose worker already verified it owns no workloads.
 
-    def _assert_cluster_node_removable(self, node_id: str) -> None:
+        The worker-side leave flow runs its own authoritative workload check
+        before this is reached, so a stale controller-side deployment status
+        must not veto the removal. Deployment records that referenced the
+        node survive as stopped launch templates.
+        """
+        removed = self.node_registry.remove(node_id)
+        if removed:
+            self._retire_node_deployment_references(node_id)
+        return removed
+
+    async def _assert_cluster_node_removable(
+        self, node: dict, *, force: bool = False,
+    ) -> None:
+        """Refuse to forget a node that is actively serving a deployment.
+
+        A saved (stopped or errored) deployment record is a launch template,
+        not a node reservation: it can be started on any node that holds the
+        weights, so it must not pin a retired or offline node. Only workloads
+        that are live on this node right now block removal — and an
+        authoritative probe that cannot reach the node proves nothing can be
+        running there. A forced removal is controller-local recovery and
+        skips the check entirely.
+        """
+        if force:
+            return
+        node_id = str(node.get("id") or "")
+        try:
+            status = await self.node_registry.probe(node, force=True, details=False)
+        except Exception:
+            status = {"online": False}
+        if not status.get("online"):
+            return
         for deployment in self.deployments:
-            member_node_ids = {
-                member.get("node_id")
-                for member in deployment.get("members", [])
-            }
-            if node_id in set(deployment.get("node_ids", [])) | member_node_ids:
+            members = [
+                member for member in deployment.get("members") or []
+                if member.get("node_id") == node_id
+            ]
+            if not members and node_id not in (deployment.get("node_ids") or []):
+                continue
+            deployment_status = str(deployment.get("status") or "").casefold()
+            if deployment_status in _STOPPED_DEPLOYMENT_STATUSES:
+                continue
+            serving = (
+                not members
+                or any(
+                    str(member.get("status") or "").casefold() in _LIVE_MEMBER_STATUSES
+                    and str(member.get("node_status") or "").casefold()
+                    not in _OFFLINE_MEMBER_NODE_STATUSES
+                    for member in members
+                )
+            )
+            if serving:
                 name = deployment.get("name") or deployment.get("id") or "deployment"
                 raise ValueError(
-                    f"node is still used by {name}; remove that deployment first"
+                    f"node is still used by {name}; stop that deployment first"
                 )
+
+    def _retire_node_deployment_references(self, node_id: str) -> bool:
+        """Demote saved deployments that pointed at a removed node to stopped.
+
+        The record survives as a launch template so it can be started on
+        another node; clearing its run intent keeps the interrupted-launch
+        resume loop from trying to relaunch it onto the forgotten node. A
+        grouped-sharded or replicated deployment keeps its deployment-wide
+        running intent whenever a group or replica on a retained node still
+        expects to run: the guard already proved the removed node serves
+        nothing, so a deployment-wide stop would only take healthy serving
+        units down with it. A tensor-parallel group whose ranks spanned the
+        removed node is irrecoverable, so every rank of that group retires
+        together; groups wholly on retained nodes keep running.
+        """
+        changed = False
+        for deployment in self.deployments:
+            members = deployment.get("members") or []
+            if not (
+                node_id in (deployment.get("node_ids") or [])
+                or any(member.get("node_id") == node_id for member in members)
+            ):
+                continue
+            retired = [
+                member for member in members if member.get("node_id") == node_id
+            ]
+            if deployment.get("mode") == "grouped_sharded" and retired:
+                # Recovery of a partially retired group would keep trying to
+                # stop and restart the rank on the forgotten node, so the
+                # whole group loses its intent together. Group ids follow
+                # ``int(instance_id or 0)`` like the grouped helpers do.
+                affected = {
+                    int(member.get("instance_id") or 0) for member in retired
+                }
+                retired = [
+                    member for member in members
+                    if member.get("node_id") == node_id
+                    or int(member.get("instance_id") or 0) in affected
+                ]
+            for member in retired:
+                if member.get("desired_state") != "stopped":
+                    member["desired_state"] = "stopped"
+                    changed = True
+                if str(member.get("status") or "").casefold() in _LIVE_MEMBER_STATUSES:
+                    member["status"] = "stopped"
+                    changed = True
+                # A retired rank can never complete its recreation on the
+                # forgotten node; leaving the flag would keep its group in
+                # the derived expected-running set.
+                if member.pop("recreate_pending", None):
+                    changed = True
+            survivors = [
+                member for member in members
+                if member.get("node_id") != node_id
+                and str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if (
+                deployment.get("mode") in {"grouped_sharded", "replicated"}
+                and members
+                and survivors
+                # A legacy deployment-wide Stop may predate per-member
+                # intent; without this the member-level check would see
+                # stale members as survivors and revive the whole card.
+                and str(deployment.get("desired_state") or "running").casefold()
+                != "stopped"
+            ):
+                if deployment.get("mode") == "grouped_sharded":
+                    status = self._grouped_deployment_status(deployment)
+                else:
+                    statuses = [
+                        str(member.get("status") or "").casefold()
+                        for member in survivors
+                    ]
+                    offline = [
+                        member for member in survivors
+                        if str(member.get("node_status") or "").casefold()
+                        in _OFFLINE_MEMBER_NODE_STATUSES
+                    ]
+                    if offline:
+                        status = "degraded"
+                    elif all(s in {"running", "ready"} for s in statuses):
+                        status = "running"
+                    elif all(s in _LIVE_MEMBER_STATUSES for s in statuses):
+                        status = "starting"
+                    else:
+                        status = "degraded"
+                if deployment.get("status") != status:
+                    deployment["status"] = status
+                    changed = True
+                continue
+            if str(deployment.get("desired_state") or "running").casefold() != "stopped":
+                deployment["desired_state"] = "stopped"
+                changed = True
+            if str(deployment.get("status") or "").casefold() not in _STOPPED_DEPLOYMENT_STATUSES:
+                deployment["status"] = "stopped"
+                changed = True
+        if changed:
+            self._save_deployments()
+        return changed
 
     async def detach_cluster_node(self, node_id: str, *, force: bool = False) -> bool:
         """Disconnect one worker before forgetting its controller-side record.
@@ -4490,7 +4649,7 @@ class Manager:
         node = self.node_registry.get(node_id)
         if not node:
             return False
-        self._assert_cluster_node_removable(node_id)
+        await self._assert_cluster_node_removable(node, force=force)
         if not force:
             try:
                 await self.node_registry.request(
@@ -4509,7 +4668,10 @@ class Manager:
                 # advertised compatible version. Preserve the legacy removal
                 # behavior when that one capability is absent; a later local
                 # Leave cluster clears the worker's stale assignment.
-        return self.node_registry.remove(node_id)
+        removed = self.node_registry.remove(node_id)
+        if removed:
+            self._retire_node_deployment_references(node_id)
+        return removed
 
     # ---------- clustered deployments ----------
     def _load_deployments(self) -> list[dict]:
@@ -10875,6 +11037,15 @@ class Manager:
         node_by_id = {node.get("id"): node for node in nodes}
         if deployment.get("mode") == "grouped_sharded":
             return self._grouped_health_issue(deployment, node_by_id)
+        # A member retired by node removal (or a deliberate per-replica stop)
+        # is not part of the serving set: evaluating it would let its
+        # forgotten node blind the check to a real split among survivors.
+        members = [
+            member for member in members
+            if str(member.get("desired_state") or "running") != "stopped"
+        ]
+        if len(members) < 2:
+            return None
         member_containers = []
         for member in members:
             node = node_by_id.get(member.get("node_id"))
@@ -11046,6 +11217,15 @@ class Manager:
                 return
             if deployment.get("mode") == "grouped_sharded":
                 await self._recover_grouped_instances(deployment, issue)
+                return
+            # Recovery mirrors the health evaluation's member set: retired
+            # replicas stay untouched, and the whole-generation restart
+            # covers only the replicas that still expect to run.
+            members = [
+                member for member in members
+                if str(member.get("desired_state") or "running") != "stopped"
+            ]
+            if len(members) < 2:
                 return
 
             checked_at = time.time()
@@ -11405,6 +11585,38 @@ class Manager:
                 self._save_deployments()
                 return
 
+            # Members retired by node removal never take part in the rebuild:
+            # their forgotten nodes can never stop or start, and a raw failure
+            # there would put the deployment into error without restarting the
+            # healthy survivors. The replacement layout is the running-intent
+            # members, so validate their nodes before touching any serving
+            # container.
+            active_members = [
+                member for member in deployment.get("members") or []
+                if str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if not active_members:
+                return
+            node_by_id = {
+                node.get("id"): node for node in await self.cluster_nodes()
+            }
+            unavailable_nodes = []
+            for member in active_members:
+                node = node_by_id.get(member.get("node_id"))
+                if not node or not node.get("online") or not node.get("docker_ready"):
+                    unavailable_nodes.append(
+                        str(member.get("node_id") or member.get("rank"))
+                    )
+            if unavailable_nodes:
+                # A surviving rank whose node is offline could not be brought
+                # back after this rebuild tears it down; leave every serving
+                # container alone and retry on a later capacity tick.
+                print(
+                    f"[vllm-capacity] {deployment_id}: deferring concurrency "
+                    f"reduction; nodes not ready: {', '.join(unavailable_nodes)}"
+                )
+                return
+
             previous_limit = int(configured)
             controls["max_concurrency"] = safe_limit
             settings["extra_args"] = self._apply_deployment_launch_controls(
@@ -11458,12 +11670,16 @@ class Manager:
             guard.update(protected_models)
             try:
                 stopped = await asyncio.gather(*(
-                    self._member_action(member, "stop") for member in members
+                    self._member_action(member, "stop") for member in active_members
                 ), return_exceptions=True)
                 stop_errors = [
                     f"rank {member.get('rank')}: {result}"
-                    for member, result in zip(members, stopped)
+                    for member, result in zip(active_members, stopped)
                     if isinstance(result, Exception)
+                    # A node forgotten between the layout check and the stop
+                    # is the already-stopped end state, matching the tolerant
+                    # stop filters used by the deployment-wide action paths.
+                    and not self._member_action_already_absent(str(result))
                 ]
                 if stop_errors:
                     observation["status"] = "redeploy_failed"
@@ -24735,6 +24951,18 @@ class Manager:
                 member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
+            # Members retired by node removal (or a deliberate per-member
+            # stop) are not part of the expected serving set: their forgotten
+            # nodes can never report a container, so counting them would
+            # publish every surviving workload as degraded forever. When no
+            # member expects to run, fall back to the full states so a fully
+            # retired card cannot look silently live.
+            expected_states = [
+                member.get("status") for member in deployment["members"]
+                if str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if not expected_states:
+                expected_states = list(member_states)
             if saved.get("mode") in _SHARDED_MEMBER_MODES:
                 # Headless ranks have no readiness endpoint of their own;
                 # derive their phase from the group coordinator's readiness.
@@ -24805,23 +25033,29 @@ class Manager:
                             deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
                     s in {"stopped", "unreachable", "missing", "dead", "error"}
-                    for s in member_states
+                    for s in expected_states
                 ):
                     # Startup recovery owns this deployment and will retry when
                     # its selected nodes reconnect. Keep the public deployment
                     # active while its member phase carries the honest wait.
                     deployment["status"] = "recovering"
-                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in member_states):
+                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in expected_states):
                     deployment["status"] = "degraded"
-                elif member_states and all(s == "exited" for s in member_states):
+                elif expected_states and all(s == "exited" for s in expected_states):
                     deployment["status"] = "stopped"
                 elif saved.get("status") == "stopping":
                     # A stop is in flight but not every rank has exited yet.
                     # Keep the transition visible instead of flipping the card
                     # back to the pre-stop status.
                     deployment["status"] = "stopping"
-                elif member_states and all(s == "running" for s in member_states):
-                    primary = deployment["members"][0]
+                elif expected_states and all(s == "running" for s in expected_states):
+                    primary = next(
+                        (
+                            member for member in deployment["members"]
+                            if str(member.get("desired_state") or "").casefold() != "stopped"
+                        ),
+                        deployment["members"][0],
+                    )
                     phase = primary.get("phase") or {}
                     deployment["status"] = "ready" if phase.get("phase") == "ready" else "starting"
             if not deployment.get("launch_settings"):

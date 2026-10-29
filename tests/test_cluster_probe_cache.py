@@ -129,6 +129,38 @@ class NodeProbeCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(refreshed["online"])
             await registry.http.aclose()
 
+    async def test_liveness_caller_never_gets_stale_negative(self) -> None:
+        requests = []
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            if path == "/api/agent/health":
+                return {"protocol_version": AGENT_PROTOCOL_VERSION}
+            return _healthy_status()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(directory)
+            registry.request = request
+            node = _node()
+            stale_at = time.monotonic() - (NODE_NEGATIVE_CACHE_SERVE_SECONDS - 5)
+            registry._status_cache["remote-1"] = (
+                stale_at,
+                {**registry.public_config(node), "status": "unreachable",
+                 "online": False},
+            )
+
+            # Liveness consumers (bandwidth broadcasts, updater gates)
+            # decide from ``online``: a recovered worker must not be
+            # skipped because a stale negative snapshot is still inside
+            # the observational serve window. It must wait for the fresh
+            # verdict instead.
+            result = await asyncio.wait_for(
+                registry.probe(node, details=False), timeout=2.0,
+            )
+            self.assertTrue(result["online"])
+            self.assertEqual(requests.count("/api/agent/health"), 1)
+            await registry.http.aclose()
+
     async def test_concurrent_probes_share_one_dial(self) -> None:
         requests = []
         gate: asyncio.Event = asyncio.Event()
@@ -228,7 +260,10 @@ class CachedStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_snapshot_served_while_refreshing(self) -> None:
         manager = self._FakeManager()
         await manager.cached_state()  # seeds the cache with snapshot 1
-        manager._state_cache = (time.monotonic() - 5, {"snapshot": "cached"})
+        manager._state_cache = (
+            time.monotonic() - 5, {"snapshot": "cached"},
+            manager._state_fingerprint(),
+        )
         manager.gate = asyncio.Event()
 
         result = await asyncio.wait_for(manager.cached_state(), timeout=1.0)
@@ -246,7 +281,10 @@ class CachedStateTests(unittest.IsolatedAsyncioTestCase):
         manager = self._FakeManager()
         await manager.cached_state()
         self.assertEqual(manager.calls, 1)
-        manager._state_cache = (time.monotonic() - 30, {"snapshot": "stale"})
+        manager._state_cache = (
+            time.monotonic() - 30, {"snapshot": "stale"},
+            manager._state_fingerprint(),
+        )
         result = await manager.cached_state(ttl_seconds=1.5)
         self.assertEqual(result, {"snapshot": 2})
         self.assertEqual(manager.calls, 2)
@@ -261,6 +299,66 @@ class CachedStateTests(unittest.IsolatedAsyncioTestCase):
         manager.fail = False
         result = await manager.cached_state()
         self.assertEqual(result, {"snapshot": 2})
+        self.assertEqual(manager.calls, 2)
+
+    async def test_lifecycle_save_invalidates_fresh_snapshot(self) -> None:
+        manager = self._FakeManager()
+        manager.deployments = [
+            {"id": "d1", "desired_state": "running", "status": "running",
+             "members": []},
+        ]
+        manager._state_cache = (
+            time.monotonic(), {"snapshot": "seeded"},
+            manager._state_fingerprint(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manager.deployments_path = Path(directory) / "deployments.json"
+            # An explicit start/stop moves the durable intent.
+            manager.deployments[0]["desired_state"] = "stopped"
+            manager._save_deployments()
+        # A routing snapshot captured before the action must be gone even
+        # though it was still inside the freshness window.
+        self.assertIsNone(manager._state_cache)
+        result = await manager.cached_state()
+        self.assertEqual(result, {"snapshot": 1})
+        self.assertEqual(manager.calls, 1)
+
+    async def test_last_used_touch_does_not_invalidate(self) -> None:
+        # _mark_deployment_used saves (throttled) on inference activity.
+        # It only moves last_used_at, so invalidating on it would defeat
+        # the cache on the very hot path this PR is optimizing.
+        manager = self._FakeManager()
+        manager.deployments = [
+            {"id": "d1", "desired_state": "running", "status": "running",
+             "members": [{"node_id": "n1", "desired_state": "running",
+                          "status": "running"}]},
+        ]
+        await manager.cached_state()
+        self.assertEqual(manager.calls, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            manager.deployments_path = Path(directory) / "deployments.json"
+            manager._mark_deployment_used("d1")
+        self.assertIsNotNone(manager._state_cache)
+        result = await manager.cached_state()
+        self.assertEqual(result, {"snapshot": 1})
+        self.assertEqual(manager.calls, 1)
+
+    async def test_pre_action_inflight_refresh_is_not_published(self) -> None:
+        # An in-flight get_state started before a lifecycle action must be
+        # handed to its waiters but never published as the shared snapshot.
+        manager = self._FakeManager()
+        manager.gate = asyncio.Event()
+        pending = asyncio.create_task(manager.cached_state())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # collection is now blocked in get_state
+        manager.invalidate_state_cache()
+        manager.gate.set()
+        result = await asyncio.wait_for(pending, timeout=1.0)
+        self.assertEqual(result, {"snapshot": 1})
+        self.assertIsNone(manager._state_cache)
+        manager.gate = None
+        fresh = await manager.cached_state()
+        self.assertEqual(fresh, {"snapshot": 2})
         self.assertEqual(manager.calls, 2)
 
 

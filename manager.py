@@ -4531,6 +4531,11 @@ class Manager:
 
     def _save_deployments(self) -> None:
         _atomic_private_json_write(self.deployments_path, self.deployments)
+        # Every durable lifecycle transition saves. Invalidate the routing
+        # snapshot when (and only when) lifecycle-relevant fields moved, so
+        # a chat request can never be routed from a pre-action snapshot,
+        # while the throttled last_used_at touch leaves the cache alone.
+        self._invalidate_state_if_lifecycle_changed()
 
     # Source-IP inference routing is intentionally separate from usage aliases
     # and accounting rules.  These records affect request placement and are
@@ -24471,9 +24476,11 @@ class Manager:
 
     # ---------- aggregate state ----------
     # Snapshot cache fields for cached_state(). Declared at class level so
-    # lightweight test doubles that lack a full __init__ still work.
-    _state_cache: "tuple[float, dict] | None" = None
+    # lightweight test doubles that lack a full __init__ still work. The
+    # cache entry is ``(collected_at, snapshot, lifecycle_fingerprint)``.
+    _state_cache: "tuple[float, dict, tuple] | None" = None
     _state_inflight: "asyncio.Future | None" = None
+    _state_generation: int = 0
 
     async def cached_state(
         self, *, ttl_seconds: float = 1.5, stale_ttl_seconds: float = 10.0,
@@ -24490,7 +24497,8 @@ class Manager:
         share one in-flight snapshot, and failures are never cached.
         The snapshot dict is shared; treat it as read-only. Consumers that
         must observe the instant truth (lifecycle actions, dashboards) keep
-        calling ``get_state`` directly.
+        calling ``get_state`` directly, and ``_save_deployments`` drops any
+        snapshot (or in-flight collection) that a lifecycle action raced.
         """
         cached = self._state_cache
         if cached:
@@ -24505,19 +24513,79 @@ class Manager:
                 return cached[1]
         return await asyncio.shield(self._ensure_state_refresh())
 
+    def invalidate_state_cache(self) -> None:
+        """Drop the routing snapshot and disarm any in-flight collection.
+
+        A lifecycle action must never be answered from a snapshot captured
+        before it: a cached ``desired_state`` once let sticky-stop
+        reconciliation write a superseded stop back into the store after an
+        explicit start. The generation bump disowns the in-flight refresh
+        too — waiters still receive their result, but it is never published.
+        """
+        self._state_generation += 1
+        self._state_cache = None
+        self._state_inflight = None
+
+    def _state_fingerprint(self) -> tuple:
+        """Identity of the durable lifecycle state behind snapshot reads.
+
+        Covers fields ``get_state`` publishes as authoritative intent or
+        runtime state; activity bookkeeping such as ``last_used_at`` is
+        excluded so the per-request touch does not invalidate the cache.
+        """
+        fingerprint = []
+        for deployment in getattr(self, "deployments", None) or []:
+            if not isinstance(deployment, dict):
+                continue
+            fingerprint.append((
+                deployment.get("id"),
+                deployment.get("desired_state"),
+                deployment.get("status"),
+                tuple(
+                    (
+                        member.get("node_id"),
+                        member.get("desired_state"),
+                        member.get("status"),
+                    )
+                    for member in deployment.get("members") or []
+                    if isinstance(member, dict)
+                ),
+            ))
+        return tuple(fingerprint)
+
+    def _invalidate_state_if_lifecycle_changed(self) -> None:
+        cached = self._state_cache
+        if cached is None:
+            return
+        if self._state_fingerprint() != cached[2]:
+            self.invalidate_state_cache()
+
     def _ensure_state_refresh(self) -> "asyncio.Future":
         task = self._state_inflight
         if task is None or task.done():
-            task = asyncio.get_running_loop().create_task(self.get_state())
+            task = asyncio.get_running_loop().create_task(
+                self._collect_state(self._state_generation),
+            )
             self._state_inflight = task
-            task.add_done_callback(self._settle_state)
+            task.add_done_callback(self._forget_state)
         return task
 
-    def _settle_state(self, finished: "asyncio.Future") -> None:
+    async def _collect_state(self, generation: int) -> dict:
+        before = self._state_fingerprint()
+        state = await self.get_state()
+        if (
+            generation == self._state_generation
+            and self._state_fingerprint() == before
+        ):
+            # Nothing lifecycle-relevant moved while this snapshot was being
+            # collected. An invalidated or raced collection is handed to its
+            # waiters but never cached.
+            self._state_cache = (time.monotonic(), state, before)
+        return state
+
+    def _forget_state(self, finished: "asyncio.Future") -> None:
         if self._state_inflight is finished:
             self._state_inflight = None
-        if not finished.cancelled() and finished.exception() is None:
-            self._state_cache = (time.monotonic(), finished.result())
 
     async def get_state(self) -> dict:
         containers_result, images_result, stats_result = await asyncio.gather(

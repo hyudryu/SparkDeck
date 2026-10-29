@@ -629,10 +629,15 @@ class NodeRegistry:
                 not details or "docker_ready" in entry or negative
             ):
                 return entry
-            if negative and age < NODE_NEGATIVE_CACHE_SERVE_SECONDS:
+            if details and negative and age < NODE_NEGATIVE_CACHE_SERVE_SECONDS:
                 # Past the freshness window but still last-seen dead: hand
                 # back the stale negative snapshot and refresh it without
-                # making this caller wait on the dead node.
+                # making this caller wait on the dead node. Restricted to
+                # observational (details=True) consumers: liveness callers
+                # (details=False) decide agent broadcasts and update gates
+                # from ``online``, so they must not skip a recovered worker
+                # just because the background re-dial has not landed yet.
+                # They still join the in-flight refresh below.
                 self._ensure_probe(node, details=True)
                 return entry
         inflight = self._probe_inflight.get(node_id)

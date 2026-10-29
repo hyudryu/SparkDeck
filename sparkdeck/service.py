@@ -1233,7 +1233,15 @@ class SparkDeckService:
                 stored["settings"] = settings
                 stored["container_name"] = container_name
                 manager_id = cluster.get("id")
-            manager_desired = cluster.get("desired_state")
+            # The routing snapshot may lag a lifecycle action, and these
+            # branches persist their verdict into the store: read the
+            # Manager's durable intent (Start/Stop update it synchronously)
+            # instead of the cached observation, or a stale "stopped" would
+            # clobber the store after an explicit start. Same durable
+            # lookup the reconciliation branch below performs.
+            manager_desired = _live_manager_cluster(
+                raw_manager_deployments, cluster,
+            ).get("desired_state")
             stored_desired = stored.get("desired_state")
             # A persisted stop is sticky until an explicit SparkDeck start.
             # This also migrates legacy SQLite rows when the Manager record is

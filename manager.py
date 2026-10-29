@@ -226,6 +226,11 @@ _MEMBER_ABSENT_ERROR_MARKERS = (
     "cluster member not found",
     "managed container not found",
     "no such container",
+    # A member whose node was forgotten has nothing left to stop or remove;
+    # relaunching a saved deployment must treat the registry miss as the
+    # already-absent end state instead of aborting before creating the
+    # replacement ranks.
+    "remote node not found",
 )
 
 
@@ -4535,7 +4540,11 @@ class Manager:
 
         The record survives as a launch template so it can be started on
         another node; clearing its run intent keeps the interrupted-launch
-        resume loop from trying to relaunch it onto the forgotten node.
+        resume loop from trying to relaunch it onto the forgotten node. A
+        grouped-sharded deployment keeps its deployment-wide running intent
+        whenever a group on a retained node still expects to run: the guard
+        already proved the removed node serves nothing, so a deployment-wide
+        stop would only take healthy groups down with it.
         """
         changed = False
         for deployment in self.deployments:
@@ -4545,12 +4554,6 @@ class Manager:
                 or any(member.get("node_id") == node_id for member in members)
             ):
                 continue
-            if str(deployment.get("desired_state") or "running").casefold() != "stopped":
-                deployment["desired_state"] = "stopped"
-                changed = True
-            if str(deployment.get("status") or "").casefold() not in _STOPPED_DEPLOYMENT_STATUSES:
-                deployment["status"] = "stopped"
-                changed = True
             for member in members:
                 if member.get("node_id") != node_id:
                     continue
@@ -4560,6 +4563,37 @@ class Manager:
                 if str(member.get("status") or "").casefold() in _LIVE_MEMBER_STATUSES:
                     member["status"] = "stopped"
                     changed = True
+                # A retired rank can never complete its recreation on the
+                # forgotten node; leaving the flag would keep its group in
+                # the derived expected-running set.
+                if member.pop("recreate_pending", None):
+                    changed = True
+            survivors = [
+                member for member in members
+                if member.get("node_id") != node_id
+                and str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if (
+                deployment.get("mode") == "grouped_sharded"
+                and members
+                and survivors
+                # A legacy deployment-wide Stop may predate per-member
+                # intent; without this the member-level check would see
+                # stale members as survivors and revive the whole card.
+                and str(deployment.get("desired_state") or "running").casefold()
+                != "stopped"
+            ):
+                status = self._grouped_deployment_status(deployment)
+                if deployment.get("status") != status:
+                    deployment["status"] = status
+                    changed = True
+                continue
+            if str(deployment.get("desired_state") or "running").casefold() != "stopped":
+                deployment["desired_state"] = "stopped"
+                changed = True
+            if str(deployment.get("status") or "").casefold() not in _STOPPED_DEPLOYMENT_STATUSES:
+                deployment["status"] = "stopped"
+                changed = True
         if changed:
             self._save_deployments()
         return changed

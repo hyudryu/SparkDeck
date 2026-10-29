@@ -6796,6 +6796,78 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(member["desired_state"], "stopped")
         instance._save_deployments.assert_called_once()
 
+    def test_retirement_keeps_survivor_groups_running_on_removed_node(self) -> None:
+        instance = Manager.__new__(Manager)
+        survivor = {
+            "rank": 0, "instance_id": 0, "node_id": "local",
+            "status": "running", "desired_state": "running",
+        }
+        retired = {
+            "rank": 0, "instance_id": 1, "node_id": "remote-1",
+            "status": "stopped", "desired_state": "running",
+        }
+        deployment = {
+            "id": "deployment-1",
+            "name": "Replicated cluster",
+            "mode": "grouped_sharded",
+            "status": "running",
+            "desired_state": "running",
+            "node_ids": ["local", "remote-1"],
+            "members": [survivor, retired],
+            "launch_settings": {"tensor_parallel_size": 1},
+        }
+        instance.deployments = [deployment]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(instance.remove_cluster_node("remote-1"))
+        self.assertEqual(deployment["desired_state"], "running")
+        self.assertEqual(deployment["status"], "running")
+        self.assertEqual(survivor["desired_state"], "running")
+        self.assertEqual(survivor["status"], "running")
+        self.assertEqual(retired["desired_state"], "stopped")
+        self.assertEqual(retired["status"], "stopped")
+        instance._save_deployments.assert_called_once()
+
+    def test_retirement_stops_grouped_deployment_when_no_group_survives(self) -> None:
+        instance = Manager.__new__(Manager)
+        member = {
+            "rank": 0, "instance_id": 0, "node_id": "remote-1",
+            "status": "running", "desired_state": "running",
+            "recreate_pending": True,
+        }
+        deployment = {
+            "id": "deployment-1",
+            "name": "Replicated cluster",
+            "mode": "grouped_sharded",
+            "status": "running",
+            "desired_state": "running",
+            "node_ids": ["remote-1"],
+            "members": [member],
+            "launch_settings": {"tensor_parallel_size": 1},
+        }
+        instance.deployments = [deployment]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(instance.remove_cluster_node("remote-1"))
+        self.assertEqual(deployment["desired_state"], "stopped")
+        self.assertEqual(deployment["status"], "stopped")
+        self.assertEqual(member["desired_state"], "stopped")
+        self.assertNotIn("recreate_pending", member)
+
+    def test_member_errors_treat_forgotten_node_as_absent(self) -> None:
+        error = ValueError("remote node not found")
+        self.assertEqual(Manager._member_action_errors([error], "remove"), [])
+        self.assertEqual(Manager._member_action_errors([error], "stop"), [])
+        # A start can never reach a forgotten node, so the failure is real.
+        self.assertEqual(
+            Manager._member_action_errors([error], "start"),
+            ["remote node not found"],
+        )
+
     async def test_force_forget_skips_the_live_workload_guard(self) -> None:
         instance = Manager.__new__(Manager)
         instance.deployments = [{

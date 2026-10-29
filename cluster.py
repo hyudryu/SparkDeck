@@ -780,15 +780,19 @@ class NodeRegistry:
         self._status_cache[node_id] = (time.monotonic(), result)
         return result
 
-    async def public_nodes(self, local_status: dict) -> list[dict]:
+    async def public_nodes(
+        self, local_status: dict, *, allow_stale_negative: bool = False,
+    ) -> list[dict]:
         import asyncio
 
-        # Observational snapshot fan-out: a known-dead node may be served
-        # from the stale-negative window so per-request snapshot reads never
-        # re-dial a black-holed peer; the background refresh keeps it honest.
+        # Decision consumers (launch validation, node selection) probe fresh
+        # by default, so a recovered worker is never rejected as offline from
+        # a stale snapshot. Only the read-only state snapshot passes the
+        # opt-in to serve a known-dead node from the stale-negative window
+        # while the background refresh runs.
         remote = await asyncio.gather(
             *[
-                self.probe(n, allow_stale_negative=True)
+                self.probe(n, allow_stale_negative=allow_stale_negative)
                 for n in self.nodes
             ],
             return_exceptions=True,

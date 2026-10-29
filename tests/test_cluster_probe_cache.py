@@ -232,6 +232,73 @@ class NodeProbeCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(requests)
             await registry.http.aclose()
 
+    def _seed_stale_negative(self, registry: NodeRegistry, node: dict) -> None:
+        stale_at = time.monotonic() - (NODE_NEGATIVE_CACHE_SERVE_SECONDS - 5)
+        registry._status_cache["remote-1"] = (
+            stale_at,
+            {**registry.public_config(node), "status": "unreachable",
+             "online": False, "interfaces": []},
+        )
+
+    async def test_public_nodes_redials_stale_negative_by_default(self) -> None:
+        requests = []
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            if path == "/api/agent/health":
+                return {"protocol_version": AGENT_PROTOCOL_VERSION}
+            return _healthy_status()
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(directory)
+            registry.request = request
+            node = _node()
+            registry.nodes = [node]
+            self._seed_stale_negative(registry, node)
+
+            # The fan-out feeds launch validation and node selection, so
+            # without the explicit opt-in a recovered worker must come back
+            # online instead of being rejected as offline from the stale
+            # snapshot.
+            nodes = await asyncio.wait_for(
+                registry.public_nodes({"name": "Local"}), timeout=2.0,
+            )
+            remote_node = next(n for n in nodes if n["id"] == "remote-1")
+            self.assertTrue(remote_node["online"], remote_node)
+            self.assertTrue(requests)
+            await registry.http.aclose()
+
+    async def test_public_nodes_serves_stale_negative_when_opted_in(self) -> None:
+        requests = []
+        block: asyncio.Event = asyncio.Event()
+
+        async def request(node_id, method, path, **_kwargs):
+            requests.append(path)
+            await block.wait()
+            raise httpx.ConnectTimeout("timed out")
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(directory)
+            registry.request = request
+            node = _node()
+            registry.nodes = [node]
+            self._seed_stale_negative(registry, node)
+
+            nodes = await asyncio.wait_for(
+                registry.public_nodes(
+                    {"name": "Local"}, allow_stale_negative=True,
+                ), timeout=1.0,
+            )
+            remote_node = next(n for n in nodes if n["id"] == "remote-1")
+            self.assertFalse(remote_node["online"])
+            await asyncio.sleep(0)  # let the background dial start
+            self.assertEqual(len(requests), 1)
+
+            pending = registry._probe_inflight["remote-1"]["task"]
+            block.set()
+            await asyncio.wait_for(pending, timeout=2.0)
+            await registry.http.aclose()
+
     async def test_concurrent_probes_share_one_dial(self) -> None:
         requests = []
         gate: asyncio.Event = asyncio.Event()

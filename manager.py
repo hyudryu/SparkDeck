@@ -1656,6 +1656,7 @@ class Manager:
     async def cluster_nodes(
         self, local_stats: dict | None = None,
         local_containers: list[dict] | None = None,
+        *, allow_stale_negative: bool = False,
     ) -> list[dict]:
         local = await self.agent_status(local_stats, local_containers)
         local["hidden_from_dashboard"] = self.settings.get(
@@ -1666,7 +1667,9 @@ class Manager:
             self.settings.get("cluster_fabric_ip"),
             self.settings.get("cluster_fabric_interface"),
         )
-        nodes = await self.node_registry.public_nodes(local)
+        nodes = await self.node_registry.public_nodes(
+            local, allow_stale_negative=allow_stale_negative,
+        )
 
         async def add_legacy_disk(node: dict) -> None:
             # Agents from before disk telemetry was added still expose the
@@ -24618,7 +24621,12 @@ class Manager:
         # Reuse the local inventory gathered above. Calling agent_status without
         # it would perform the same Docker container scan a second time for
         # every deployment snapshot.
-        nodes = await self.cluster_nodes(stats, containers)
+        # get_state() backs cached_state(), the read-only routing snapshot
+        # polled on every proxied request. Opt in to stale-negative serving
+        # so the fan-out never re-dials a known-dead node; action validation
+        # and launch use selected_cluster_nodes()/cluster_nodes() with the
+        # fresh default instead.
+        nodes = await self.cluster_nodes(stats, containers, allow_stale_negative=True)
         if containers_unavailable:
             for node in nodes:
                 if node.get("local") or node.get("id") == LOCAL_NODE_ID:

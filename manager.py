@@ -4541,10 +4541,11 @@ class Manager:
         The record survives as a launch template so it can be started on
         another node; clearing its run intent keeps the interrupted-launch
         resume loop from trying to relaunch it onto the forgotten node. A
-        grouped-sharded deployment keeps its deployment-wide running intent
-        whenever a group on a retained node still expects to run: the guard
-        already proved the removed node serves nothing, so a deployment-wide
-        stop would only take healthy groups down with it.
+        grouped-sharded or replicated deployment keeps its deployment-wide
+        running intent whenever a group or replica on a retained node still
+        expects to run: the guard already proved the removed node serves
+        nothing, so a deployment-wide stop would only take healthy serving
+        units down with it.
         """
         changed = False
         for deployment in self.deployments:
@@ -4574,7 +4575,7 @@ class Manager:
                 and str(member.get("desired_state") or "").casefold() != "stopped"
             ]
             if (
-                deployment.get("mode") == "grouped_sharded"
+                deployment.get("mode") in {"grouped_sharded", "replicated"}
                 and members
                 and survivors
                 # A legacy deployment-wide Stop may predate per-member
@@ -4583,7 +4584,26 @@ class Manager:
                 and str(deployment.get("desired_state") or "running").casefold()
                 != "stopped"
             ):
-                status = self._grouped_deployment_status(deployment)
+                if deployment.get("mode") == "grouped_sharded":
+                    status = self._grouped_deployment_status(deployment)
+                else:
+                    statuses = [
+                        str(member.get("status") or "").casefold()
+                        for member in survivors
+                    ]
+                    offline = [
+                        member for member in survivors
+                        if str(member.get("node_status") or "").casefold()
+                        in _OFFLINE_MEMBER_NODE_STATUSES
+                    ]
+                    if offline:
+                        status = "degraded"
+                    elif all(s in {"running", "ready"} for s in statuses):
+                        status = "running"
+                    elif all(s in _LIVE_MEMBER_STATUSES for s in statuses):
+                        status = "starting"
+                    else:
+                        status = "degraded"
                 if deployment.get("status") != status:
                     deployment["status"] = status
                     changed = True

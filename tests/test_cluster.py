@@ -6682,23 +6682,150 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             timeout=120,
         )
 
-    def test_node_in_use_by_deployment_cannot_be_removed(self) -> None:
+    def test_saved_deployment_does_not_block_forgetting_its_node(self) -> None:
+        instance = Manager.__new__(Manager)
+        member = {
+            "rank": 0, "node_id": "remote-1", "status": "exited",
+            "desired_state": "stopped",
+        }
+        deployment = {
+            "id": "deployment-1",
+            "name": "Qwen cluster",
+            "status": "stopped",
+            "desired_state": "running",
+            "node_ids": ["local", "remote-1"],
+            "members": [member],
+        }
+        instance.deployments = [deployment]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(instance.remove_cluster_node("remote-1"))
+        self.assertEqual(deployment["desired_state"], "stopped")
+        instance._save_deployments.assert_called_once()
+
+    def test_unreferenced_deployments_are_untouched_by_retirement(self) -> None:
+        instance = Manager.__new__(Manager)
+        kept = {
+            "id": "deployment-1", "name": "Other cluster",
+            "status": "running", "desired_state": "running",
+            "node_ids": ["local"], "members": [{"rank": 0, "node_id": "local"}],
+        }
+        instance.deployments = [kept]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(instance.remove_cluster_node("remote-1"))
+        self.assertEqual(kept["desired_state"], "running")
+        instance._save_deployments.assert_not_called()
+
+    async def test_live_deployment_on_online_node_blocks_node_removal(self) -> None:
         instance = Manager.__new__(Manager)
         instance.deployments = [{
             "id": "deployment-1",
-            "name": "DeepSeek cluster",
+            "name": "Qwen cluster",
+            "status": "running",
+            "desired_state": "running",
             "node_ids": ["local", "remote-1"],
+            "members": [
+                {"rank": 0, "node_id": "remote-1", "status": "running"},
+                {"rank": 1, "node_id": "local", "status": "running"},
+            ],
+        }]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.get.return_value = {"id": "remote-1", "name": "Worker"}
+        instance.node_registry.probe = mock.AsyncMock(
+            return_value={"online": True, "status": "online"},
+        )
+        instance.node_registry.request = mock.AsyncMock()
+        instance._save_deployments = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "stop that deployment first"):
+            await instance.detach_cluster_node("remote-1")
+        instance.node_registry.remove.assert_not_called()
+
+    async def test_launch_in_flight_blocks_removal_of_its_selected_node(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1",
+            "name": "Qwen cluster",
+            "status": "launching",
+            "desired_state": "running",
+            "node_ids": ["remote-1"],
             "members": [],
         }]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.get.return_value = {"id": "remote-1", "name": "Worker"}
+        instance.node_registry.probe = mock.AsyncMock(
+            return_value={"online": True, "status": "online"},
+        )
 
-        with self.assertRaisesRegex(ValueError, "remove that deployment first"):
-            instance.remove_cluster_node("remote-1")
+        with self.assertRaisesRegex(ValueError, "stop that deployment first"):
+            await instance.detach_cluster_node("remote-1")
+
+    async def test_offline_node_removal_normalizes_stale_live_deployment(self) -> None:
+        instance = Manager.__new__(Manager)
+        member = {
+            "rank": 0, "node_id": "remote-1", "status": "running",
+            "desired_state": "running",
+        }
+        deployment = {
+            "id": "deployment-1",
+            "name": "Qwen cluster",
+            "status": "running",
+            "desired_state": "running",
+            "node_ids": ["remote-1"],
+            "members": [member],
+        }
+        instance.deployments = [deployment]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.get.return_value = {"id": "remote-1", "name": "Worker"}
+        instance.node_registry.probe = mock.AsyncMock(
+            return_value={"online": False, "status": "unreachable"},
+        )
+        instance.node_registry.request = mock.AsyncMock(return_value={"ok": True})
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(await instance.detach_cluster_node("remote-1"))
+        self.assertEqual(deployment["status"], "stopped")
+        self.assertEqual(deployment["desired_state"], "stopped")
+        self.assertEqual(member["status"], "stopped")
+        self.assertEqual(member["desired_state"], "stopped")
+        instance._save_deployments.assert_called_once()
+
+    async def test_force_forget_skips_the_live_workload_guard(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.deployments = [{
+            "id": "deployment-1",
+            "name": "Qwen cluster",
+            "status": "running",
+            "desired_state": "running",
+            "node_ids": ["remote-1"],
+            "members": [{"rank": 0, "node_id": "remote-1", "status": "running"}],
+        }]
+        instance.node_registry = mock.Mock()
+        instance.node_registry.get.return_value = {"id": "remote-1", "name": "Worker"}
+        instance.node_registry.probe = mock.AsyncMock()
+        instance.node_registry.request = mock.AsyncMock()
+        instance.node_registry.remove.return_value = True
+        instance._save_deployments = mock.Mock()
+
+        self.assertTrue(await instance.detach_cluster_node("remote-1", force=True))
+        instance.node_registry.probe.assert_not_awaited()
+        instance.node_registry.request.assert_not_awaited()
+        self.assertEqual(instance.deployments[0]["status"], "stopped")
 
     async def test_controller_detaches_worker_before_removing_registry_record(self) -> None:
         instance = Manager.__new__(Manager)
         instance.deployments = []
         instance.node_registry = mock.Mock()
         instance.node_registry.get.return_value = {"id": "remote-1", "name": "Worker"}
+        instance.node_registry.probe = mock.AsyncMock(
+            return_value={"online": True, "status": "online"},
+        )
         instance.node_registry.request = mock.AsyncMock(return_value={"ok": True})
         instance.node_registry.remove.return_value = True
 
@@ -6740,6 +6867,9 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             "name": "Worker",
             "protocol_version": AGENT_PROTOCOL_VERSION,
         }
+        instance.node_registry.probe = mock.AsyncMock(
+            return_value={"online": True, "status": "online"},
+        )
         instance.node_registry.request = mock.AsyncMock(side_effect=agent_error)
         instance.node_registry.remove.return_value = True
 

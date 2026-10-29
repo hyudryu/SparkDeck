@@ -428,6 +428,17 @@ _SUPPORTED_ENGINES = (
 # Strata do expose GET /health (Strata answers it before its API-key gate),
 # so they keep the strict readiness probe.
 _ENGINES_WITHOUT_HEALTH_ROUTE = frozenset({"laya", "tensorfold"})
+# Deployment/member statuses that prove nothing is running: anything else
+# is treated as a live workload until proven otherwise (a forced removal
+# covers nodes whose stale controller-side status cannot be trusted).
+_STOPPED_DEPLOYMENT_STATUSES = frozenset({"", "stopped", "error", "removed"})
+_LIVE_MEMBER_STATUSES = frozenset({
+    "queued", "creating", "created", "starting", "restarting",
+    "running", "ready",
+})
+_OFFLINE_MEMBER_NODE_STATUSES = frozenset({
+    "offline", "unreachable", "disconnected", "missing", "failed", "dead",
+})
 
 
 def _laya_gpu_preference(extra_args: list[str] | None) -> bool | None:
@@ -4460,20 +4471,98 @@ class Manager:
         return await self.node_registry.probe(node, force=True)
 
     def remove_cluster_node(self, node_id: str) -> bool:
-        self._assert_cluster_node_removable(node_id)
-        return self.node_registry.remove(node_id)
+        """Forget a node whose worker already verified it owns no workloads.
 
-    def _assert_cluster_node_removable(self, node_id: str) -> None:
+        The worker-side leave flow runs its own authoritative workload check
+        before this is reached, so a stale controller-side deployment status
+        must not veto the removal. Deployment records that referenced the
+        node survive as stopped launch templates.
+        """
+        removed = self.node_registry.remove(node_id)
+        if removed:
+            self._retire_node_deployment_references(node_id)
+        return removed
+
+    async def _assert_cluster_node_removable(
+        self, node: dict, *, force: bool = False,
+    ) -> None:
+        """Refuse to forget a node that is actively serving a deployment.
+
+        A saved (stopped or errored) deployment record is a launch template,
+        not a node reservation: it can be started on any node that holds the
+        weights, so it must not pin a retired or offline node. Only workloads
+        that are live on this node right now block removal — and an
+        authoritative probe that cannot reach the node proves nothing can be
+        running there. A forced removal is controller-local recovery and
+        skips the check entirely.
+        """
+        if force:
+            return
+        node_id = str(node.get("id") or "")
+        try:
+            status = await self.node_registry.probe(node, force=True, details=False)
+        except Exception:
+            status = {"online": False}
+        if not status.get("online"):
+            return
         for deployment in self.deployments:
-            member_node_ids = {
-                member.get("node_id")
-                for member in deployment.get("members", [])
-            }
-            if node_id in set(deployment.get("node_ids", [])) | member_node_ids:
+            members = [
+                member for member in deployment.get("members") or []
+                if member.get("node_id") == node_id
+            ]
+            if not members and node_id not in (deployment.get("node_ids") or []):
+                continue
+            deployment_status = str(deployment.get("status") or "").casefold()
+            if deployment_status in _STOPPED_DEPLOYMENT_STATUSES:
+                continue
+            serving = (
+                not members
+                or any(
+                    str(member.get("status") or "").casefold() in _LIVE_MEMBER_STATUSES
+                    and str(member.get("node_status") or "").casefold()
+                    not in _OFFLINE_MEMBER_NODE_STATUSES
+                    for member in members
+                )
+            )
+            if serving:
                 name = deployment.get("name") or deployment.get("id") or "deployment"
                 raise ValueError(
-                    f"node is still used by {name}; remove that deployment first"
+                    f"node is still used by {name}; stop that deployment first"
                 )
+
+    def _retire_node_deployment_references(self, node_id: str) -> bool:
+        """Demote saved deployments that pointed at a removed node to stopped.
+
+        The record survives as a launch template so it can be started on
+        another node; clearing its run intent keeps the interrupted-launch
+        resume loop from trying to relaunch it onto the forgotten node.
+        """
+        changed = False
+        for deployment in self.deployments:
+            members = deployment.get("members") or []
+            if not (
+                node_id in (deployment.get("node_ids") or [])
+                or any(member.get("node_id") == node_id for member in members)
+            ):
+                continue
+            if str(deployment.get("desired_state") or "running").casefold() != "stopped":
+                deployment["desired_state"] = "stopped"
+                changed = True
+            if str(deployment.get("status") or "").casefold() not in _STOPPED_DEPLOYMENT_STATUSES:
+                deployment["status"] = "stopped"
+                changed = True
+            for member in members:
+                if member.get("node_id") != node_id:
+                    continue
+                if member.get("desired_state") != "stopped":
+                    member["desired_state"] = "stopped"
+                    changed = True
+                if str(member.get("status") or "").casefold() in _LIVE_MEMBER_STATUSES:
+                    member["status"] = "stopped"
+                    changed = True
+        if changed:
+            self._save_deployments()
+        return changed
 
     async def detach_cluster_node(self, node_id: str, *, force: bool = False) -> bool:
         """Disconnect one worker before forgetting its controller-side record.
@@ -4487,7 +4576,7 @@ class Manager:
         node = self.node_registry.get(node_id)
         if not node:
             return False
-        self._assert_cluster_node_removable(node_id)
+        await self._assert_cluster_node_removable(node, force=force)
         if not force:
             try:
                 await self.node_registry.request(
@@ -4506,7 +4595,10 @@ class Manager:
                 # advertised compatible version. Preserve the legacy removal
                 # behavior when that one capability is absent; a later local
                 # Leave cluster clears the worker's stale assignment.
-        return self.node_registry.remove(node_id)
+        removed = self.node_registry.remove(node_id)
+        if removed:
+            self._retire_node_deployment_references(node_id)
+        return removed
 
     # ---------- clustered deployments ----------
     def _load_deployments(self) -> list[dict]:

@@ -24470,6 +24470,55 @@ class Manager:
                             pass
 
     # ---------- aggregate state ----------
+    # Snapshot cache fields for cached_state(). Declared at class level so
+    # lightweight test doubles that lack a full __init__ still work.
+    _state_cache: "tuple[float, dict] | None" = None
+    _state_inflight: "asyncio.Future | None" = None
+
+    async def cached_state(
+        self, *, ttl_seconds: float = 1.5, stale_ttl_seconds: float = 10.0,
+    ) -> dict:
+        """Return a recent ``get_state()`` snapshot for read-only consumers.
+
+        ``get_state`` performs a full Docker inventory and a fan-out to every
+        registered node. Calling it once per proxied inference request added
+        seconds to every chat completion even though the answer barely moves
+        between requests. Fresh snapshots are reused for ``ttl_seconds``;
+        between that and ``stale_ttl_seconds`` the last snapshot is handed
+        back while a single background refresh runs, so a steady request
+        stream never blocks on inventory collection. Concurrent callers
+        share one in-flight snapshot, and failures are never cached.
+        The snapshot dict is shared; treat it as read-only. Consumers that
+        must observe the instant truth (lifecycle actions, dashboards) keep
+        calling ``get_state`` directly.
+        """
+        cached = self._state_cache
+        if cached:
+            age = time.monotonic() - cached[0]
+            if age < ttl_seconds:
+                return cached[1]
+            if age < stale_ttl_seconds:
+                # Stale-while-revalidate: the routing snapshot is safe to
+                # reuse briefly, so never make a chat request pay for the
+                # refresh it triggers.
+                self._ensure_state_refresh()
+                return cached[1]
+        return await asyncio.shield(self._ensure_state_refresh())
+
+    def _ensure_state_refresh(self) -> "asyncio.Future":
+        task = self._state_inflight
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(self.get_state())
+            self._state_inflight = task
+            task.add_done_callback(self._settle_state)
+        return task
+
+    def _settle_state(self, finished: "asyncio.Future") -> None:
+        if self._state_inflight is finished:
+            self._state_inflight = None
+        if not finished.cancelled() and finished.exception() is None:
+            self._state_cache = (time.monotonic(), finished.result())
+
     async def get_state(self) -> dict:
         containers_result, images_result, stats_result = await asyncio.gather(
             self.list_containers(),

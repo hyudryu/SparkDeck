@@ -1121,7 +1121,18 @@ class SparkDeckService:
         cluster_state: dict[str, Any] = {}
         if any(item.get("settings", {}).get("manager_deployment_id") for item in registered):
             try:
-                cluster_state = await self.manager.get_state()
+                # This runs on the hot path for every proxied inference
+                # request (via _live_candidates_for_model_id). The routing
+                # snapshot is safe to reuse briefly, so prefer the Manager's
+                # short-lived cache with single-flight de-duplication instead
+                # of paying for a full Docker inventory plus cluster fan-out
+                # on each chat completion. Lighter test doubles that predate
+                # cached_state keep working through the get_state fallback.
+                cached_state = getattr(self.manager, "cached_state", None)
+                cluster_state = (
+                    await cached_state() if callable(cached_state)
+                    else await self.manager.get_state()
+                )
             except Exception:
                 cluster_state = {}
         manager_deployments = (

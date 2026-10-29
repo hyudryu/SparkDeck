@@ -5,6 +5,7 @@ tokens server-side and exposes sanitized node state for the UI.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -22,6 +23,12 @@ from sparkdeck.private_json import atomic_private_json_write as _atomic_json_wri
 
 LOCAL_NODE_ID = "local"
 AGENT_PROTOCOL_VERSION = 2
+# Fresh window for a cached node snapshot, and the longer window during which
+# a known-negative snapshot may be served while it is refreshed in the
+# background.  Without the negative window, every request that fans out to
+# the cluster re-dials an offline node and waits out its full connect timeout.
+NODE_STATUS_CACHE_TTL_SECONDS = 4.0
+NODE_NEGATIVE_CACHE_SERVE_SECONDS = 60.0
 COORDINATOR_ID_HEADER = "X-SparkDeck-Coordinator-ID"
 AGENT_FABRIC_PORT = 7878
 # Advertised by agents whose Manager can launch the TensorFold engine. Older
@@ -220,6 +227,9 @@ class NodeRegistry:
         self.nodes = self._load()
         self._status_cache: dict[str, tuple[float, dict]] = {}
         self._status_generations: dict[str, int] = {}
+        # node_id -> {"task": asyncio.Task, "details": bool} for the probe
+        # currently in flight, so concurrent callers share one dial.
+        self._probe_inflight: dict[str, dict] = {}
 
     async def _connection_targets(
         self, agent_url: str, path: str,
@@ -260,7 +270,7 @@ class NodeRegistry:
     def cached_status(self, node_id: str) -> dict | None:
         """Read a recent connectivity observation without probing the node."""
         cached = self._status_cache.get(node_id)
-        if cached and time.monotonic() - cached[0] < 4.0:
+        if cached and time.monotonic() - cached[0] < NODE_STATUS_CACHE_TTL_SECONDS:
             return cached[1]
         return None
 
@@ -604,14 +614,77 @@ class NodeRegistry:
         self, node: dict, *, force: bool = False, details: bool = True,
     ) -> dict:
         node_id = node["id"]
+        cached = self._status_cache.get(node_id)
+        if not force and cached:
+            age = time.monotonic() - cached[0]
+            entry = cached[1]
+            # A negative snapshot (unreachable or disabled) is a complete
+            # observation: its probe ran and already waited out the failure.
+            # It carries no ``docker_ready``, so the old details check refused
+            # to reuse it and every request re-dialed a black-holed offline
+            # node for its full connect timeout. Reuse the negative snapshot
+            # within the normal freshness window instead.
+            negative = entry.get("online") is False
+            if age < NODE_STATUS_CACHE_TTL_SECONDS and (
+                not details or "docker_ready" in entry or negative
+            ):
+                return entry
+            if negative and age < NODE_NEGATIVE_CACHE_SERVE_SECONDS:
+                # Past the freshness window but still last-seen dead: hand
+                # back the stale negative snapshot and refresh it without
+                # making this caller wait on the dead node.
+                self._ensure_probe(node, details=True)
+                return entry
+        inflight = self._probe_inflight.get(node_id)
+        if not force and self._reusable_probe(inflight, details=details):
+            # Shield so one cancelled caller cannot tear down the shared dial.
+            return await asyncio.shield(inflight["task"])
+        task = self._start_probe(node, details=details)
+        return await asyncio.shield(task)
+
+    @staticmethod
+    def _reusable_probe(inflight: dict | None, *, details: bool) -> bool:
+        """True when the in-flight probe already satisfies the request."""
+        return bool(
+            inflight
+            and not inflight["task"].done()
+            # A details probe supersedes a liveness-only probe, not the
+            # other way around: results must always be rich enough for the
+            # caller that awaits them.
+            and (inflight["details"] or not details)
+        )
+
+    def _start_probe(self, node: dict, *, details: bool) -> asyncio.Task:
+        task = asyncio.get_running_loop().create_task(
+            self._probe_now(node, details=details),
+        )
+        self._probe_inflight[node["id"]] = {"task": task, "details": details}
+        task.add_done_callback(
+            lambda finished, key=node["id"]: self._forget_probe(key, finished)
+        )
+        return task
+
+    def _ensure_probe(self, node: dict, *, details: bool) -> None:
+        """Schedule a background refresh, deduplicated per node."""
+        if self._reusable_probe(
+            self._probe_inflight.get(node["id"]), details=details,
+        ):
+            return
+        self._start_probe(node, details=details)
+
+    def _forget_probe(self, node_id: str, finished: asyncio.Task) -> None:
+        current = self._probe_inflight.get(node_id)
+        if current is not None and current["task"] is finished:
+            self._probe_inflight.pop(node_id, None)
+        if not finished.cancelled():
+            # Background refreshes have no awaiting caller; retrieve the
+            # result so asyncio does not warn about an unretrieved exception.
+            finished.exception()
+
+    async def _probe_now(self, node: dict, *, details: bool) -> dict:
+        node_id = node["id"]
         generation = self._status_generations.get(node_id, 0)
         cached = self._status_cache.get(node_id)
-        cached_has_details = bool(cached and "docker_ready" in cached[1])
-        if (
-            not force and cached and time.monotonic() - cached[0] < 4.0
-            and (not details or cached_has_details)
-        ):
-            return cached[1]
         started = time.monotonic()
         public = self.public_config(node)
         if not node.get("enabled", True):
@@ -692,7 +765,7 @@ class NodeRegistry:
         if generation != self._status_generations.get(node_id, 0):
             # A lifecycle action settled while this snapshot was being read.
             # Do not publish or cache pre-action readiness for that node.
-            return await self.probe(node, force=True, details=details)
+            return await self._probe_now(node, details=details)
         self._status_cache[node_id] = (time.monotonic(), result)
         return result
 

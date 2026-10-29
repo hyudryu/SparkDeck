@@ -4545,7 +4545,9 @@ class Manager:
         running intent whenever a group or replica on a retained node still
         expects to run: the guard already proved the removed node serves
         nothing, so a deployment-wide stop would only take healthy serving
-        units down with it.
+        units down with it. A tensor-parallel group whose ranks spanned the
+        removed node is irrecoverable, so every rank of that group retires
+        together; groups wholly on retained nodes keep running.
         """
         changed = False
         for deployment in self.deployments:
@@ -4555,9 +4557,23 @@ class Manager:
                 or any(member.get("node_id") == node_id for member in members)
             ):
                 continue
-            for member in members:
-                if member.get("node_id") != node_id:
-                    continue
+            retired = [
+                member for member in members if member.get("node_id") == node_id
+            ]
+            if deployment.get("mode") == "grouped_sharded" and retired:
+                # Recovery of a partially retired group would keep trying to
+                # stop and restart the rank on the forgotten node, so the
+                # whole group loses its intent together. Group ids follow
+                # ``int(instance_id or 0)`` like the grouped helpers do.
+                affected = {
+                    int(member.get("instance_id") or 0) for member in retired
+                }
+                retired = [
+                    member for member in members
+                    if member.get("node_id") == node_id
+                    or int(member.get("instance_id") or 0) in affected
+                ]
+            for member in retired:
                 if member.get("desired_state") != "stopped":
                     member["desired_state"] = "stopped"
                     changed = True
@@ -11561,6 +11577,38 @@ class Manager:
                 self._save_deployments()
                 return
 
+            # Members retired by node removal never take part in the rebuild:
+            # their forgotten nodes can never stop or start, and a raw failure
+            # there would put the deployment into error without restarting the
+            # healthy survivors. The replacement layout is the running-intent
+            # members, so validate their nodes before touching any serving
+            # container.
+            active_members = [
+                member for member in deployment.get("members") or []
+                if str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if not active_members:
+                return
+            node_by_id = {
+                node.get("id"): node for node in await self.cluster_nodes()
+            }
+            unavailable_nodes = []
+            for member in active_members:
+                node = node_by_id.get(member.get("node_id"))
+                if not node or not node.get("online") or not node.get("docker_ready"):
+                    unavailable_nodes.append(
+                        str(member.get("node_id") or member.get("rank"))
+                    )
+            if unavailable_nodes:
+                # A surviving rank whose node is offline could not be brought
+                # back after this rebuild tears it down; leave every serving
+                # container alone and retry on a later capacity tick.
+                print(
+                    f"[vllm-capacity] {deployment_id}: deferring concurrency "
+                    f"reduction; nodes not ready: {', '.join(unavailable_nodes)}"
+                )
+                return
+
             previous_limit = int(configured)
             controls["max_concurrency"] = safe_limit
             settings["extra_args"] = self._apply_deployment_launch_controls(
@@ -11614,12 +11662,16 @@ class Manager:
             guard.update(protected_models)
             try:
                 stopped = await asyncio.gather(*(
-                    self._member_action(member, "stop") for member in members
+                    self._member_action(member, "stop") for member in active_members
                 ), return_exceptions=True)
                 stop_errors = [
                     f"rank {member.get('rank')}: {result}"
-                    for member, result in zip(members, stopped)
+                    for member, result in zip(active_members, stopped)
                     if isinstance(result, Exception)
+                    # A node forgotten between the layout check and the stop
+                    # is the already-stopped end state, matching the tolerant
+                    # stop filters used by the deployment-wide action paths.
+                    and not self._member_action_already_absent(str(result))
                 ]
                 if stop_errors:
                     observation["status"] = "redeploy_failed"
@@ -24767,6 +24819,18 @@ class Manager:
                 member["node_docker_ready"] = node.get("docker_ready")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
+            # Members retired by node removal (or a deliberate per-member
+            # stop) are not part of the expected serving set: their forgotten
+            # nodes can never report a container, so counting them would
+            # publish every surviving workload as degraded forever. When no
+            # member expects to run, fall back to the full states so a fully
+            # retired card cannot look silently live.
+            expected_states = [
+                member.get("status") for member in deployment["members"]
+                if str(member.get("desired_state") or "").casefold() != "stopped"
+            ]
+            if not expected_states:
+                expected_states = list(member_states)
             if saved.get("mode") in _SHARDED_MEMBER_MODES:
                 # Headless ranks have no readiness endpoint of their own;
                 # derive their phase from the group coordinator's readiness.
@@ -24837,23 +24901,29 @@ class Manager:
                             deployment["status"] = "recovering"
                 elif saved.get("status") == "recovering" and any(
                     s in {"stopped", "unreachable", "missing", "dead", "error"}
-                    for s in member_states
+                    for s in expected_states
                 ):
                     # Startup recovery owns this deployment and will retry when
                     # its selected nodes reconnect. Keep the public deployment
                     # active while its member phase carries the honest wait.
                     deployment["status"] = "recovering"
-                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in member_states):
+                elif any(s in {"stopped", "unreachable", "missing", "dead", "error"} for s in expected_states):
                     deployment["status"] = "degraded"
-                elif member_states and all(s == "exited" for s in member_states):
+                elif expected_states and all(s == "exited" for s in expected_states):
                     deployment["status"] = "stopped"
                 elif saved.get("status") == "stopping":
                     # A stop is in flight but not every rank has exited yet.
                     # Keep the transition visible instead of flipping the card
                     # back to the pre-stop status.
                     deployment["status"] = "stopping"
-                elif member_states and all(s == "running" for s in member_states):
-                    primary = deployment["members"][0]
+                elif expected_states and all(s == "running" for s in expected_states):
+                    primary = next(
+                        (
+                            member for member in deployment["members"]
+                            if str(member.get("desired_state") or "").casefold() != "stopped"
+                        ),
+                        deployment["members"][0],
+                    )
                     phase = primary.get("phase") or {}
                     deployment["status"] = "ready" if phase.get("phase") == "ready" else "starting"
             if not deployment.get("launch_settings"):

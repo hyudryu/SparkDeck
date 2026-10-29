@@ -11013,6 +11013,15 @@ class Manager:
         node_by_id = {node.get("id"): node for node in nodes}
         if deployment.get("mode") == "grouped_sharded":
             return self._grouped_health_issue(deployment, node_by_id)
+        # A member retired by node removal (or a deliberate per-replica stop)
+        # is not part of the serving set: evaluating it would let its
+        # forgotten node blind the check to a real split among survivors.
+        members = [
+            member for member in members
+            if str(member.get("desired_state") or "running") != "stopped"
+        ]
+        if len(members) < 2:
+            return None
         member_containers = []
         for member in members:
             node = node_by_id.get(member.get("node_id"))
@@ -11184,6 +11193,15 @@ class Manager:
                 return
             if deployment.get("mode") == "grouped_sharded":
                 await self._recover_grouped_instances(deployment, issue)
+                return
+            # Recovery mirrors the health evaluation's member set: retired
+            # replicas stay untouched, and the whole-generation restart
+            # covers only the replicas that still expect to run.
+            members = [
+                member for member in members
+                if str(member.get("desired_state") or "running") != "stopped"
+            ]
+            if len(members) < 2:
                 return
 
             checked_at = time.time()

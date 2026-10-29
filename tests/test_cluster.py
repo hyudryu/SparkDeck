@@ -6918,6 +6918,66 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment["desired_state"], "running")
         self.assertEqual(deployment["status"], "degraded")
 
+    def _retired_replicated_deployment(self) -> tuple[dict, list[dict]]:
+        members = [
+            {"rank": 0, "node_id": "node-a", "container_name": "rep-0",
+             "status": "running", "desired_state": "running",
+             "node_status": "online"},
+            {"rank": 1, "node_id": "node-b", "container_name": "rep-1",
+             "status": "exited", "desired_state": "running",
+             "node_status": "online"},
+            # Retired by node removal: its node is no longer registered.
+            {"rank": 2, "node_id": "remote-1", "container_name": "rep-2",
+             "status": "stopped", "desired_state": "stopped"},
+        ]
+        deployment = {
+            "id": "deployment-1", "name": "Shared replicas",
+            "mode": "replicated", "status": "running",
+            "desired_state": "running", "members": members,
+        }
+        return deployment, members
+
+    def test_health_issue_ignores_retired_replica_and_detects_survivor_split(self) -> None:
+        instance = Manager.__new__(Manager)
+        deployment, _ = self._retired_replicated_deployment()
+        nodes = [
+            {"id": "node-a", "online": True, "docker_ready": True,
+             "containers": [{"name": "rep-0", "status": "running",
+                             "restart_count": 0}]},
+            {"id": "node-b", "online": True, "docker_ready": True,
+             "containers": [{"name": "rep-1", "status": "exited",
+                             "restart_count": 0}]},
+        ]
+
+        issue = instance._cluster_health_issue(deployment, nodes)
+
+        # Without the retired-member exclusion the forgotten node returned
+        # None here, permanently disabling monitoring for the survivors.
+        self.assertIsNotNone(issue)
+        self.assertIn("rank 1: exited", issue)
+
+    async def test_recovery_skips_retired_replicas(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance._save_deployments = mock.Mock()
+        deployment, _ = self._retired_replicated_deployment()
+        instance._deployment = mock.Mock(return_value=deployment)
+        actions: list[tuple[str, str]] = []
+
+        async def fake_action(member, action, **kwargs):
+            actions.append((member["container_name"], action))
+            return {"ok": True}
+
+        instance._member_action = fake_action
+        await instance._recover_cluster_deployment(
+            "deployment-1", "cluster ranks are split (rank 1: exited)",
+        )
+
+        self.assertEqual(actions, [
+            ("rep-0", "stop"), ("rep-1", "stop"),
+            ("rep-0", "start"), ("rep-1", "start"),
+        ])
+        self.assertEqual(deployment["status"], "starting")
+
     def test_member_errors_treat_forgotten_node_as_absent(self) -> None:
         error = ValueError("remote node not found")
         self.assertEqual(Manager._member_action_errors([error], "remove"), [])

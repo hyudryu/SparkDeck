@@ -462,7 +462,7 @@ class NodeDashboardVisibilityTests(unittest.IsolatedAsyncioTestCase):
         manager._inferred_fabric = Mock(return_value=(None, None))
         manager.node_registry = Mock()
         manager.node_registry.public_nodes = AsyncMock(
-            side_effect=lambda local: [local],
+            side_effect=lambda local, **_kwargs: [local],
         )
 
         nodes = await manager.cluster_nodes()

@@ -1656,6 +1656,7 @@ class Manager:
     async def cluster_nodes(
         self, local_stats: dict | None = None,
         local_containers: list[dict] | None = None,
+        *, allow_stale_negative: bool = False,
     ) -> list[dict]:
         local = await self.agent_status(local_stats, local_containers)
         local["hidden_from_dashboard"] = self.settings.get(
@@ -1666,7 +1667,9 @@ class Manager:
             self.settings.get("cluster_fabric_ip"),
             self.settings.get("cluster_fabric_interface"),
         )
-        nodes = await self.node_registry.public_nodes(local)
+        nodes = await self.node_registry.public_nodes(
+            local, allow_stale_negative=allow_stale_negative,
+        )
 
         async def add_legacy_disk(node: dict) -> None:
             # Agents from before disk telemetry was added still expose the
@@ -4531,6 +4534,11 @@ class Manager:
 
     def _save_deployments(self) -> None:
         _atomic_private_json_write(self.deployments_path, self.deployments)
+        # Every durable lifecycle transition saves. Invalidate the routing
+        # snapshot when (and only when) lifecycle-relevant fields moved, so
+        # a chat request can never be routed from a pre-action snapshot,
+        # while the throttled last_used_at touch leaves the cache alone.
+        self._invalidate_state_if_lifecycle_changed()
 
     # Source-IP inference routing is intentionally separate from usage aliases
     # and accounting rules.  These records affect request placement and are
@@ -12056,8 +12064,15 @@ class Manager:
             "online": True,
             "stats": local_stats,
         }]
+        # Observational telemetry tick for the temperature view. A known-dead
+        # node may be served from the stale-negative window so the periodic
+        # fan-out never blocks on a black-holed peer; recovery is discovered
+        # by the background refresh this triggers.
         remote = await asyncio.gather(
-            *(self.node_registry.probe(node) for node in self.node_registry.nodes),
+            *(
+                self.node_registry.probe(node, allow_stale_negative=True)
+                for node in self.node_registry.nodes
+            ),
             return_exceptions=True,
         )
         nodes.extend(status for status in remote if isinstance(status, dict))
@@ -24470,6 +24485,118 @@ class Manager:
                             pass
 
     # ---------- aggregate state ----------
+    # Snapshot cache fields for cached_state(). Declared at class level so
+    # lightweight test doubles that lack a full __init__ still work. The
+    # cache entry is ``(collected_at, snapshot, lifecycle_fingerprint)``.
+    _state_cache: "tuple[float, dict, tuple] | None" = None
+    _state_inflight: "asyncio.Future | None" = None
+    _state_generation: int = 0
+
+    async def cached_state(
+        self, *, ttl_seconds: float = 1.5, stale_ttl_seconds: float = 10.0,
+    ) -> dict:
+        """Return a recent ``get_state()`` snapshot for read-only consumers.
+
+        ``get_state`` performs a full Docker inventory and a fan-out to every
+        registered node. Calling it once per proxied inference request added
+        seconds to every chat completion even though the answer barely moves
+        between requests. Fresh snapshots are reused for ``ttl_seconds``;
+        between that and ``stale_ttl_seconds`` the last snapshot is handed
+        back while a single background refresh runs, so a steady request
+        stream never blocks on inventory collection. Concurrent callers
+        share one in-flight snapshot, and failures are never cached.
+        The snapshot dict is shared; treat it as read-only. Consumers that
+        must observe the instant truth (lifecycle actions, dashboards) keep
+        calling ``get_state`` directly, and ``_save_deployments`` drops any
+        snapshot (or in-flight collection) that a lifecycle action raced.
+        """
+        cached = self._state_cache
+        if cached:
+            age = time.monotonic() - cached[0]
+            if age < ttl_seconds:
+                return cached[1]
+            if age < stale_ttl_seconds:
+                # Stale-while-revalidate: the routing snapshot is safe to
+                # reuse briefly, so never make a chat request pay for the
+                # refresh it triggers.
+                self._ensure_state_refresh()
+                return cached[1]
+        return await asyncio.shield(self._ensure_state_refresh())
+
+    def invalidate_state_cache(self) -> None:
+        """Drop the routing snapshot and disarm any in-flight collection.
+
+        A lifecycle action must never be answered from a snapshot captured
+        before it: a cached ``desired_state`` once let sticky-stop
+        reconciliation write a superseded stop back into the store after an
+        explicit start. The generation bump disowns the in-flight refresh
+        too — waiters still receive their result, but it is never published.
+        """
+        self._state_generation += 1
+        self._state_cache = None
+        self._state_inflight = None
+
+    def _state_fingerprint(self) -> tuple:
+        """Identity of the durable lifecycle state behind snapshot reads.
+
+        Covers fields ``get_state`` publishes as authoritative intent or
+        runtime state; activity bookkeeping such as ``last_used_at`` is
+        excluded so the per-request touch does not invalidate the cache.
+        """
+        fingerprint = []
+        for deployment in getattr(self, "deployments", None) or []:
+            if not isinstance(deployment, dict):
+                continue
+            fingerprint.append((
+                deployment.get("id"),
+                deployment.get("desired_state"),
+                deployment.get("status"),
+                tuple(
+                    (
+                        member.get("node_id"),
+                        member.get("desired_state"),
+                        member.get("status"),
+                    )
+                    for member in deployment.get("members") or []
+                    if isinstance(member, dict)
+                ),
+            ))
+        return tuple(fingerprint)
+
+    def _invalidate_state_if_lifecycle_changed(self) -> None:
+        cached = self._state_cache
+        if cached is None:
+            return
+        if self._state_fingerprint() != cached[2]:
+            self.invalidate_state_cache()
+
+    def _ensure_state_refresh(self) -> "asyncio.Future":
+        task = self._state_inflight
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                self._collect_state(self._state_generation),
+            )
+            self._state_inflight = task
+            task.add_done_callback(self._forget_state)
+        return task
+
+    async def _collect_state(self, generation: int) -> dict:
+        before = self._state_fingerprint()
+        state = await self.get_state()
+        if (
+            generation == self._state_generation
+            and self._state_fingerprint() == before
+        ):
+            # Nothing lifecycle-relevant moved while this snapshot was being
+            # collected. An invalidated or raced collection is handed to its
+            # waiters but never cached.
+            self._state_cache = (time.monotonic(), state, before)
+        return state
+
+    def _forget_state(self, finished: "asyncio.Future") -> None:
+        if self._state_inflight is finished:
+            self._state_inflight = None
+
     async def get_state(self) -> dict:
         containers_result, images_result, stats_result = await asyncio.gather(
             self.list_containers(),
@@ -24494,7 +24621,12 @@ class Manager:
         # Reuse the local inventory gathered above. Calling agent_status without
         # it would perform the same Docker container scan a second time for
         # every deployment snapshot.
-        nodes = await self.cluster_nodes(stats, containers)
+        # get_state() backs cached_state(), the read-only routing snapshot
+        # polled on every proxied request. Opt in to stale-negative serving
+        # so the fan-out never re-dials a known-dead node; action validation
+        # and launch use selected_cluster_nodes()/cluster_nodes() with the
+        # fresh default instead.
+        nodes = await self.cluster_nodes(stats, containers, allow_stale_negative=True)
         if containers_unavailable:
             for node in nodes:
                 if node.get("local") or node.get("id") == LOCAL_NODE_ID:

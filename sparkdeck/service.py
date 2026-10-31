@@ -10363,10 +10363,9 @@ def _live_manager_cluster(
 def _member_occupies_no_node(member: dict[str, Any]) -> bool:
     """Whether a rank provably holds no container on its node.
 
-    A node is only released when every rank on it satisfies this, and only for a
-    record whose intent is already stopped, so absence is never inferred from
-    stopped intent alone. This predicate answers only "is this rank itself
-    holding a node?".
+    A node is only released when every rank on it satisfies this and the caller
+    confirms stopped intent or a failed launch with healthy, empty inventory.
+    This predicate answers only "is this rank itself holding a node?".
 
     ``error`` counts as absent because Manager records a launch that failed
     before any container existed that way, and a cluster whose launches never
@@ -10446,7 +10445,18 @@ def _observed_occupied_node_ids(cluster: dict[str, Any]) -> list[str] | None:
             (rank.get("desired_state") or "running") == "stopped"
             for rank in ranks
         )
-        idle = (cluster_stopped or ranks_stopped) and all(
+        # A failed launch can retain running intent even though it never
+        # created a container. Error deployments are not automatically recovered;
+        # their saved intent must not reserve hardware indefinitely. Require
+        # explicit, healthy inventory for every rank before releasing that node.
+        failed_launch_absent = cluster.get("status") == "error" and all(
+            rank.get("has_live_container") is False
+            and rank.get("node_status") == "online"
+            and rank.get("node_docker_ready") is True
+            and rank.get("node_inventory_available") is True
+            for rank in ranks
+        )
+        idle = (cluster_stopped or ranks_stopped or failed_launch_absent) and all(
             not rank.get("recreate_pending")
             and _member_occupies_no_node(rank)
             for rank in ranks

@@ -1,6 +1,7 @@
 """Stopped Docker members must not retain synthetic launch reservations."""
 
 import unittest
+from copy import deepcopy
 from unittest.mock import AsyncMock, Mock, patch
 
 import docker
@@ -8,6 +9,104 @@ from fastapi import HTTPException
 
 from manager import Manager
 from sparkdeck.service import _observed_occupied_node_ids
+
+
+class FailedLaunchReservationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.controller = Manager.__new__(Manager)
+        self.controller.list_containers = AsyncMock(return_value=[])
+        self.controller.list_images = AsyncMock(return_value=[])
+        self.controller.get_stats = AsyncMock(return_value={})
+        self.controller.settings = {}
+        for field in (
+            "_token_usage_sync_status", "token_stats", "usage_aliases",
+            "usage_merge_groups", "usage_routing_rules", "usage_cache_estimates",
+            "session_token_stats", "jobs",
+        ):
+            setattr(self.controller, field, {})
+        for method in (
+            "public_settings", "active_requests", "active_request_groups",
+            "inference_admission",
+        ):
+            setattr(self.controller, method, Mock(return_value={}))
+        self.controller.usage_rows = Mock(return_value=[])
+        self.cluster = {
+            "id": "failed-qwen", "model": "org/qwen", "status": "error",
+            "desired_state": "running", "mode": "single", "node_ids": ["worker"],
+            "launch_settings": {"engine": "vllm"},
+            "members": [{
+                "node_id": "worker", "container_name": "qwen-0", "rank": 0,
+                "status": "error", "desired_state": "running",
+            }],
+        }
+        self.node = {
+            "id": "worker", "name": "Worker", "online": True, "status": "online",
+            "docker_ready": True, "inventory_available": True, "containers": [],
+        }
+
+    async def snapshot(self, cluster=None, nodes=None):
+        self.controller.deployments = [cluster if cluster is not None else self.cluster]
+        self.controller.cluster_nodes = AsyncMock(
+            return_value=nodes if nodes is not None else [self.node],
+        )
+        state = await self.controller.get_state()
+        return state["deployments"][0]
+
+    async def test_failed_launch_with_confirmed_empty_inventory_releases_running_intent(self):
+        observed = await self.snapshot()
+
+        self.assertEqual(observed["status"], "error")
+        self.assertEqual(observed["desired_state"], "running")
+        self.assertEqual(observed["members"][0]["status"], "error")
+        self.assertIs(observed["members"][0]["has_live_container"], False)
+        self.assertIs(observed["members"][0]["node_inventory_available"], True)
+        self.assertEqual(_observed_occupied_node_ids(observed), [])
+
+    async def test_failed_launch_only_releases_nodes_without_live_ranks(self):
+        cluster = deepcopy(self.cluster)
+        cluster["node_ids"].append("live-worker")
+        cluster["members"].append({
+            "node_id": "live-worker", "container_name": "qwen-1", "rank": 1,
+            "status": "error", "desired_state": "running",
+        })
+        live_node = {
+            **self.node, "id": "live-worker",
+            "containers": [{"name": "qwen-1", "status": "running"}],
+        }
+        observed = await self.snapshot(cluster, [self.node, live_node])
+        self.assertEqual(_observed_occupied_node_ids(observed), ["live-worker"])
+
+        # An absent rank must not release another live rank on the same host.
+        cluster["node_ids"] = ["worker"]
+        cluster["members"][1]["node_id"] = "worker"
+        observed = await self.snapshot(cluster, [{**self.node, "containers": live_node["containers"]}])
+        self.assertEqual(_observed_occupied_node_ids(observed), ["worker"])
+
+    async def test_uncertain_inventory_or_docker_keeps_failed_launch_reserved(self):
+        for field in ("inventory_available", "docker_ready"):
+            for value in (False, None):
+                with self.subTest(field=field, value=value):
+                    observed = await self.snapshot(nodes=[{**self.node, field: value}])
+                    self.assertEqual(_observed_occupied_node_ids(observed), ["worker"])
+
+    async def test_failed_launch_pending_recreation_or_failed_stop_keeps_reservation(self):
+        for update in (
+            {"recreate_pending": True},
+            {"failed_stop_error": "Docker stop timed out"},
+        ):
+            with self.subTest(update=update):
+                cluster = deepcopy(self.cluster)
+                cluster["members"][0].update(update)
+                observed = await self.snapshot(cluster)
+                self.assertEqual(_observed_occupied_node_ids(observed), ["worker"])
+
+    async def test_inflight_launch_states_keep_empty_nodes_reserved(self):
+        for status in ("launching", "starting", "stopping", "recovering"):
+            with self.subTest(status=status):
+                cluster = deepcopy(self.cluster)
+                cluster["status"] = status
+                observed = await self.snapshot(cluster)
+                self.assertEqual(_observed_occupied_node_ids(observed), ["worker"])
 
 
 class StopLaunchTrackingTests(unittest.IsolatedAsyncioTestCase):
@@ -79,7 +178,7 @@ class StopLaunchTrackingTests(unittest.IsolatedAsyncioTestCase):
                          "status": "running", "desired_state": "running"}],
         }]
 
-        async def cluster_nodes(*_args):
+        async def cluster_nodes(*_args, **_kwargs):
             return [{"id": "node-3", "name": "Node 3", **await agent.agent_status(stats={})}, {
                 "id": "node-2", "name": "Node 2", "online": True, "status": "online",
                 "docker_ready": True, "inventory_available": True,

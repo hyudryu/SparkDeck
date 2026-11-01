@@ -152,9 +152,11 @@ _COMFYUI_MODEL_BUNDLES = (
     ),
 )
 # Conventional ComfyUI model-store sections scanned by the generic fallback
-# inventory. The scan stays bounded to these directories only.
+# inventory. The scan stays bounded to these directories only. ``loras`` is
+# deliberately excluded: LoRAs are workflow add-ons the user manages in
+# ComfyUI, not node weights SparkDeck accounts or deletes.
 _COMFYUI_SECTION_DIRS = (
-    "checkpoints", "diffusion_models", "unet", "loras", "vae",
+    "checkpoints", "diffusion_models", "unet", "vae",
     "text_encoders", "clip", "clip_vision", "controlnet", "upscale_models",
     "embeddings", "latent_upscale_models", "style_models", "hypernetworks",
 )
@@ -187,17 +189,21 @@ _enable_hf_xet_high_performance()
 
 
 def _default_comfyui_model_roots() -> list[Path]:
-    """Return bounded, conventional ComfyUI model stores without exposing paths."""
+    """Return the ComfyUI model stores configured for scanning, if any.
+
+    The generic ComfyUI fallback inventory is opt-in: SparkDeck scans only
+    the roots listed in ``SPARKDECK_COMFYUI_MODELS_ROOTS`` (``os.pathsep``
+    separated). Unset means no ComfyUI scanning at all — ComfyUI manages its
+    own weights and they do not belong in SparkDeck storage accounting.
+    """
     configured = str(os.environ.get("SPARKDECK_COMFYUI_MODELS_ROOTS") or "")
-    candidates = [
-        *(Path(value.strip()) for value in configured.split(os.pathsep) if value.strip()),
-        Path("/bridge-mcp/ComfyUI/models"),
-        Path.home() / "ComfyUI" / "models",
-    ]
     roots = []
     seen = set()
-    for candidate in candidates:
-        expanded = candidate.expanduser()
+    for value in configured.split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        expanded = Path(value).expanduser()
         key = os.path.normcase(str(expanded))
         if key not in seen:
             seen.add(key)

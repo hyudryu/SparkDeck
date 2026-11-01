@@ -1810,6 +1810,23 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(nas.inventory()[0]["partial"])
 
+    async def test_default_comfyui_roots_opt_in(self):
+        # Unset: no implicit ComfyUI scanning — ComfyUI weights stay out of
+        # SparkDeck storage accounting unless the operator opts in.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SPARKDECK_COMFYUI_MODELS_ROOTS", None)
+            self.assertEqual(virtual_nas._default_comfyui_model_roots(), [])
+        # Set: only the configured roots are scanned, deduped, order kept.
+        roots = os.pathsep.join(
+            ["/tmp/cv-a/models", "/tmp/cv-b/models", "/tmp/cv-a/models"]
+        )
+        with patch.dict(os.environ, {"SPARKDECK_COMFYUI_MODELS_ROOTS": roots}):
+            resolved = virtual_nas._default_comfyui_model_roots()
+            self.assertEqual(
+                [str(path) for path in resolved],
+                [str(Path("/tmp/cv-a/models")), str(Path("/tmp/cv-b/models"))],
+            )
+
     async def test_inventory_reports_unrecognized_comfyui_weights(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "ComfyUI" / "models"
@@ -1819,7 +1836,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 "vae/minimax_music3_dav.safetensors",
             )
             extra_files = (
-                "checkpoints/Minimax Video/minimax_video.safetensors",
+                "checkpoints/bundle/bundle_model.safetensors",
                 "loras/foo.safetensors",
             )
             for relative in (*bundle_files, *extra_files):
@@ -1840,7 +1857,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
             self.assertEqual(by_id["Comfy-Org/MiniMax-Music-3"]["file_count"], 3)
-            for name in ("checkpoints/Minimax Video", "loras/foo"):
+            for name in ("checkpoints/bundle",):
                 entry = by_id[name]
                 self.assertEqual(entry["size_bytes"], 7)
                 self.assertEqual(entry["file_count"], 1)
@@ -1850,6 +1867,12 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(entry["externally_managed"])
                 self.assertFalse(entry["transferable"])
                 self.assertNotEqual(entry.get("deletable"), False)
+            # LoRAs are deliberately not inventoried: the file is left alone.
+            self.assertNotIn("loras/foo", by_id)
+            self.assertFalse(
+                any(m["model_id"].startswith("loras/") for m in models),
+            )
+            self.assertTrue((root / "loras" / "foo.safetensors").is_file())
 
     async def test_delete_unrecognized_comfyui_groups_re_resolves_listed_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1858,8 +1881,8 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 Path(directory) / "second" / "models",
             ]
             deleted_relatives = (
-                "checkpoints/Minimax Video/model.safetensors",
-                "checkpoints/Minimax Video/nested/refiner.gguf",
+                "checkpoints/bundle/model.safetensors",
+                "checkpoints/bundle/nested/refiner.gguf",
             )
             for root in roots:
                 for relative in deleted_relatives:
@@ -1869,7 +1892,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                 sibling = root / "checkpoints" / "Other" / "keep.safetensors"
                 sibling.parent.mkdir(parents=True, exist_ok=True)
                 sibling.write_bytes(b"keep")
-            loose = roots[0] / "loras" / "foo.safetensors"
+            loose = roots[0] / "upscale_models" / "foo.safetensors"
             loose.parent.mkdir(parents=True, exist_ok=True)
             loose.write_bytes(b"loose")
             nas = VirtualNAS(
@@ -1879,9 +1902,9 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
             )
 
             listed = {item["model_id"] for item in nas.inventory()}
-            self.assertIn("checkpoints/Minimax Video", listed)
-            self.assertIn("loras/foo", listed)
-            self.assertTrue(nas.delete_model("checkpoints/Minimax Video")["ok"])
+            self.assertIn("checkpoints/bundle", listed)
+            self.assertIn("upscale_models/foo", listed)
+            self.assertTrue(nas.delete_model("checkpoints/bundle")["ok"])
 
             for root in roots:
                 for relative in deleted_relatives:
@@ -1891,7 +1914,7 @@ class InventoryAndArchiveTests(unittest.IsolatedAsyncioTestCase):
                     b"keep",
                 )
             self.assertTrue(loose.is_file())
-            self.assertTrue(nas.delete_model("loras/foo")["ok"])
+            self.assertTrue(nas.delete_model("upscale_models/foo")["ok"])
             self.assertFalse(loose.exists())
 
     async def test_guessed_fallback_identity_cannot_delete_known_bundle_component(self):
@@ -5158,7 +5181,7 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager.virtual_nas = Mock()
         manager.virtual_nas.model_in_transfer.return_value = False
         manager.virtual_nas.delete_model.return_value = {
-            "ok": True, "model_id": "checkpoints/Minimax Video",
+            "ok": True, "model_id": "checkpoints/bundle",
         }
         manager.list_containers = AsyncMock(return_value=[])
         manager._unsloth_loaded_model = AsyncMock(return_value=None)
@@ -5166,12 +5189,12 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         manager._invalidate_virtual_nas_nodes = Mock()
 
         result = await manager.delete_virtual_nas_model(
-            "local", "checkpoints/Minimax Video",
+            "local", "checkpoints/bundle",
         )
 
         self.assertTrue(result["ok"])
         manager.virtual_nas.delete_model.assert_called_once_with(
-            "checkpoints/Minimax Video",
+            "checkpoints/bundle",
         )
         manager._invalidate_virtual_nas_nodes.assert_called_once_with()
 

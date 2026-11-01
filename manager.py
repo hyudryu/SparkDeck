@@ -24949,6 +24949,7 @@ class Manager:
                 # advertises no container summary, so an absent container there
                 # means the inventory is unreliable rather than a confirmed loss.
                 member["node_docker_ready"] = node.get("docker_ready")
+                member["node_inventory_available"] = node.get("inventory_available")
                 deployment["members"].append(member)
                 member_states.append(member.get("status"))
             # Members retired by node removal (or a deliberate per-member

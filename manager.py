@@ -572,6 +572,18 @@ CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
 INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 
+# A deployment that crashed while its desired state is still "running" (all
+# ranks exited, or the launch action failed outright) has no other recovery
+# owner: the split-rank health monitor only handles the degraded in-between
+# state. Restart such a deployment automatically up to this many times,
+# waiting this long between attempts, so a transient network hiccup does not
+# leave the model down until someone notices. The per-episode counter resets
+# only after the deployment serves again; a launch that cannot stick
+# exhausts its attempts and stays down until a manual start.
+DEPLOYMENT_CRASH_RETRY_LIMIT = 3
+DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS = 5.0
+DEPLOYMENT_CRASH_POLL_SECONDS = 1.0
+
 # vLLM prints its allocated KV capacity after engine initialization. Poll only
 # deployments that have not produced a usable capacity report yet; once found,
 # the result is persisted with the deployment.
@@ -1212,6 +1224,7 @@ class Manager:
             ("idle_task", self._idle_monitor_loop),
             ("admission_reaper_task", self._admission_reaper_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
+            ("deployment_crash_retry_task", self._deployment_crash_retry_loop),
             ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
             ("fan_cluster_task", self._fan_cluster_monitor_loop),
             ("token_usage_sync_task", self._token_usage_sync_loop),
@@ -1226,7 +1239,7 @@ class Manager:
         await self.virtual_nas.stop()
         for field in (
             "worker_task", "idle_task", "admission_reaper_task",
-            "cluster_health_task",
+            "cluster_health_task", "deployment_crash_retry_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
             "deployment_stop_resume_task",
@@ -1275,6 +1288,7 @@ class Manager:
             self.idle_task,
             self.admission_reaper_task,
             self.cluster_health_task,
+            self.deployment_crash_retry_task,
             self.deployment_capacity_task,
             self.fan_cluster_task,
             self.temperature_history_task,
@@ -1290,6 +1304,14 @@ class Manager:
                     await t
                 except asyncio.CancelledError:
                     pass
+        # The crash-retry loop spawns restart attempts that outlive it; cancel
+        # any still pending so shutdown cannot race a late automatic start.
+        for t in list(self._crash_retry_state()["tasks"]):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         active_run_id = getattr(self, "_active_temperature_run_id", None)
         active_run = getattr(self, "temperature_runs", {}).get(active_run_id)
         if active_run and active_run.get("status") in {"armed", "recording"}:
@@ -11808,6 +11830,176 @@ class Manager:
                 await self._cluster_health_tick()
             except Exception as exc:
                 print(f"[cluster-health] check failed: {exc}")
+
+    def _crash_retry_state(self) -> dict[str, Any]:
+        """Lazily create the crash-retry bookkeeping, including on test
+        instances built without ``__init__``."""
+        state = getattr(self, "_deployment_crash_retry_state", None)
+        if state is None:
+            state = self._deployment_crash_retry_state = {
+                "attempts": {},
+                "stamps": {},
+                "healthy_seen": set(),
+                "inflight": set(),
+                "tasks": set(),
+                "runtime": {},
+            }
+        return state
+
+    @staticmethod
+    def _crash_retry_instances(deployment: dict) -> list[int] | None:
+        """Engine groups the automatic restart may wake.
+
+        Returns ``[]`` for a deployment-wide restart. Per-instance stop
+        intent lives on the members for grouped_sharded: a deployment whose
+        every group is deliberately stopped is not a crash, and only the
+        intended-running groups may be restarted, because a whole-deployment
+        start would clear the stopped groups' intent (``None``).
+        """
+        if deployment.get("mode") != "grouped_sharded":
+            return []
+        groups: dict[int, list[dict]] = {}
+        for member in deployment.get("members") or []:
+            groups.setdefault(int(member.get("instance_id") or 0), []).append(member)
+        intended = sorted(
+            instance for instance, group in groups.items()
+            if not any(member.get("desired_state") == "stopped" for member in group)
+        )
+        return intended or None
+
+    async def _deployment_crash_retry_loop(self) -> None:
+        while True:
+            await asyncio.sleep(DEPLOYMENT_CRASH_POLL_SECONDS)
+            try:
+                await self._deployment_crash_retry_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("deployment crash retry tick failed")
+
+    async def _deployment_crash_retry_tick(self) -> None:
+        state = self._crash_retry_state()
+        attempts: dict[str, int] = state["attempts"]
+        stamps: dict[str, float] = state["stamps"]
+        healthy_seen: set[str] = state["healthy_seen"]
+        inflight: set[str] = state["inflight"]
+        runtime: dict[str, dict[str, Any]] = state["runtime"]
+        live_ids: set[str] = set()
+        for deployment in list(self.deployments):
+            deployment_id = str(deployment.get("id") or "")
+            if not deployment_id:
+                continue
+            live_ids.add(deployment_id)
+            if deployment.get("desired_state") == "stopped":
+                attempts.pop(deployment_id, None)
+                stamps.pop(deployment_id, None)
+                healthy_seen.discard(deployment_id)
+                continue
+            # get_state() publishes the fold's runtime verdict into the side
+            # table; before the first observation, fall back to the saved
+            # launch status.
+            observed = runtime.get(deployment_id) or {}
+            status = str(
+                observed.get("status") or deployment.get("status") or ""
+            )
+            if status in {"running", "ready"}:
+                # Serving again: the next crash starts a fresh retry episode.
+                healthy_seen.add(deployment_id)
+                attempts.pop(deployment_id, None)
+                stamps.pop(deployment_id, None)
+                continue
+            eligible = {"stopped", "error"}
+            if len(deployment.get("members") or []) < 2:
+                # Single-rank deployments have no health-monitor owner, so a
+                # failed automatic start (which lands in "degraded") must
+                # stay eligible for the episode's remaining retries.
+                eligible.add("degraded")
+            if status not in eligible or deployment_id not in healthy_seen:
+                # Degraded multi-rank layouts are owned by the cluster health
+                # monitor; a launch that never served is not a crash and must
+                # not be replayed automatically.
+                continue
+            if not observed.get("definite", True):
+                # Offline nodes and unavailable Docker fold dead-looking
+                # member states; restarting then would burn the episode on
+                # an unreachable fleet.
+                continue
+            if deployment.get("launch_settings_error"):
+                continue
+            if deployment_id in inflight:
+                continue
+            instances = self._crash_retry_instances(deployment)
+            if instances is None:
+                continue
+            tried = attempts.get(deployment_id, 0)
+            if tried >= DEPLOYMENT_CRASH_RETRY_LIMIT:
+                continue
+            last = stamps.get(deployment_id, 0.0)
+            if last and (time.monotonic() - last) < DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS:
+                continue
+            attempt = tried + 1
+            attempts[deployment_id] = attempt
+            stamps[deployment_id] = time.monotonic()
+            inflight.add(deployment_id)
+            restart = asyncio.create_task(
+                self._restart_crashed_deployment(deployment_id, attempt, instances)
+            )
+
+            def _release(task: asyncio.Task, key: str = deployment_id) -> None:
+                state["tasks"].discard(task)
+                inflight.discard(key)
+
+            restart.add_done_callback(_release)
+            state["tasks"].add(restart)
+        for key in list(attempts.keys() | stamps.keys() | runtime.keys()):
+            if key not in live_ids:
+                attempts.pop(key, None)
+                stamps.pop(key, None)
+                runtime.pop(key, None)
+                inflight.discard(key)
+                healthy_seen.discard(key)
+
+    async def _restart_crashed_deployment(
+        self, deployment_id: str, attempt: int, instances: list[int],
+    ) -> None:
+        deployment = self._deployment(deployment_id)
+        label = (
+            str(deployment.get("name") or deployment_id)
+            if deployment else deployment_id
+        )
+        print(
+            f"[crash-retry] {label}: automatic restart attempt "
+            f"{attempt}/{DEPLOYMENT_CRASH_RETRY_LIMIT}"
+        )
+        try:
+            if instances:
+                for instance in instances:
+                    result = await self.deployment_action(
+                        deployment_id, "start", instance=instance,
+                    )
+                    if not (isinstance(result, dict) and result.get("ok")):
+                        raise RuntimeError(
+                            f"instance {instance} did not start: "
+                            + str(
+                                result.get("error")
+                                if isinstance(result, dict) else result
+                            )
+                        )
+            else:
+                result = await self.deployment_action(deployment_id, "start")
+                if not (isinstance(result, dict) and result.get("ok")):
+                    raise RuntimeError(
+                        str(
+                            result.get("error")
+                            if isinstance(result, dict) else result
+                        )
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[crash-retry] {label}: attempt {attempt} failed: {exc}")
+            return
+        print(f"[crash-retry] {label}: attempt {attempt} relaunched")
 
     async def deployment_logs(self, deployment_id: str) -> dict:
         deployment = self._deployment(deployment_id)
@@ -25109,6 +25301,24 @@ class Manager:
                 )
                 if prior_last_used > 0:
                     deployment["last_used_at"] = prior_last_used
+            # Publish the observed runtime state into the crash-retry side
+            # table. Launch and action paths leave "starting" behind on the
+            # saved records, and only this fold derives readiness and crashes
+            # from live containers. "definite" marks an observation where
+            # every node answered and Docker inventory was available: offline
+            # nodes fold their members to stopped-looking states, and acting
+            # on that would burn restart attempts against an unreachable
+            # fleet.
+            self._crash_retry_state()["runtime"][str(saved.get("id") or "")] = {
+                "status": deployment.get("status"),
+                "definite": bool(
+                    not member_inventory_unknown
+                    and all(
+                        member.get("node_status") != "offline"
+                        for member in deployment["members"]
+                    )
+                ),
+            }
             public_deployments.append(deployment)
         running_models = [c for c in containers if c["status"] == "running"]
         # Token-stats key of the model currently holding the GPU, so the UI

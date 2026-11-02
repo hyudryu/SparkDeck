@@ -6753,19 +6753,44 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
 class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
     """A deployment that crashed while desired running is restarted
-    automatically, up to three attempts five seconds apart."""
+    automatically, up to three attempts five seconds apart. The loop acts on
+    the runtime snapshot get_state() publishes into its side table, not the
+    launch-time status the action paths leave behind."""
 
     @staticmethod
-    def _crashed_deployment(status="stopped", desired="running"):
+    def _crashed_deployment(status="stopped", desired="running", members=2):
         return {
             "id": "deployment-1",
             "name": "sharded-tp2",
             "status": status,
             "desired_state": desired,
             "members": [
-                {"node_id": "local", "rank": 0, "container_name": "rank-0"},
-                {"node_id": "remote-1", "rank": 1, "container_name": "rank-1"},
+                {
+                    "node_id": f"node-{index}", "rank": index,
+                    "container_name": f"rank-{index}",
+                }
+                for index in range(members)
             ],
+        }
+
+    @staticmethod
+    def _grouped_deployment(instances=2, ranks_per_instance=2):
+        members = []
+        for instance in range(instances):
+            for rank in range(ranks_per_instance):
+                members.append({
+                    "node_id": f"node-{instance}-{rank}",
+                    "rank": rank,
+                    "instance_id": instance,
+                    "container_name": f"i{instance}-r{rank}",
+                })
+        return {
+            "id": "deployment-1",
+            "name": "grouped-model",
+            "status": "stopped",
+            "desired_state": "running",
+            "mode": "grouped_sharded",
+            "members": members,
         }
 
     @staticmethod
@@ -6778,9 +6803,27 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
         # Restart attempts run as fire-and-forget tasks; drain them so each
         # test observes deterministic state.
         await instance._deployment_crash_retry_tick()
-        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        tasks = [
+            task for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+        ]
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def _observe(self, instance, deployment, status, definite=True):
+        """Feed the loop the runtime snapshot get_state() would publish."""
+        instance._crash_retry_state()["runtime"][deployment["id"]] = {
+            "status": status,
+            "definite": definite,
+        }
+        await self._tick(instance)
+
+    @staticmethod
+    def _backdate(instance):
+        state = instance._crash_retry_state()
+        state["stamps"]["deployment-1"] -= (
+            DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
+        )
 
     async def test_crashed_deployment_is_restarted_once_per_tick(self) -> None:
         deployment = self._crashed_deployment()
@@ -6788,16 +6831,14 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
         starts = []
 
         async def action(deployment_id, action, *args, **kwargs):
-            starts.append((deployment_id, action))
+            starts.append((deployment_id, action, kwargs.get("instance")))
             return {"ok": True}
 
         instance.deployment_action = action
-        deployment["status"] = "running"
-        await self._tick(instance)
-        deployment["status"] = "stopped"
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
 
-        self.assertEqual(starts, [("deployment-1", "start")])
+        self.assertEqual(starts, [("deployment-1", "start", None)])
 
     async def test_retry_waits_five_seconds_between_attempts(self) -> None:
         deployment = self._crashed_deployment()
@@ -6810,17 +6851,12 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
 
         instance.deployment_action = action
 
-        deployment["status"] = "running"
-        await self._tick(instance)
-        deployment["status"] = "stopped"
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
         await self._tick(instance)
         self.assertEqual(len(starts), 1)
 
-        state = instance._crash_retry_state()
-        state["stamps"]["deployment-1"] -= (
-            DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
-        )
+        self._backdate(instance)
         await self._tick(instance)
         self.assertEqual(len(starts), 2)
 
@@ -6834,23 +6870,17 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": False, "error": "still failing"}
 
         instance.deployment_action = action
-        state = instance._crash_retry_state()
 
-        deployment["status"] = "running"
-        await self._tick(instance)
-        deployment["status"] = "stopped"
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
 
         for _ in range(DEPLOYMENT_CRASH_RETRY_LIMIT):
             await self._tick(instance)
-            state["stamps"]["deployment-1"] -= (
-                DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
-            )
+            self._backdate(instance)
 
         self.assertEqual(len(starts), DEPLOYMENT_CRASH_RETRY_LIMIT)
         await self._tick(instance)
-        state["stamps"]["deployment-1"] -= (
-            DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
-        )
+        self._backdate(instance)
         await self._tick(instance)
         self.assertEqual(len(starts), DEPLOYMENT_CRASH_RETRY_LIMIT)
 
@@ -6859,19 +6889,23 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
         instance = self._instance(deployment)
 
         async def action(deployment_id, action, *args, **kwargs):
-            deployment["status"] = "starting"
+            # The real start action persists "starting" before the ranks
+            # come up; get_state's fold later reports the serving state.
+            instance._crash_retry_state()["runtime"][deployment_id] = {
+                "status": "starting",
+                "definite": True,
+            }
             return {"ok": True}
 
         instance.deployment_action = action
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
 
-        deployment["status"] = "running"
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
         state = instance._crash_retry_state()
         self.assertEqual(state["attempts"].get("deployment-1"), None)
 
-        deployment["status"] = "stopped"
-        await self._tick(instance)
+        await self._observe(instance, deployment, "stopped")
         self.assertEqual(state["attempts"].get("deployment-1"), 1)
 
     async def test_deployment_that_never_served_is_not_retried(self) -> None:
@@ -6885,7 +6919,7 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
 
         instance.deployment_action = action
 
-        await self._tick(instance)
+        await self._observe(instance, deployment, "stopped")
 
         self.assertEqual(starts, [])
 
@@ -6899,7 +6933,8 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True}
 
         instance.deployment_action = action
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
 
         self.assertEqual(starts, [])
         state = instance._crash_retry_state()
@@ -6914,13 +6949,114 @@ class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
 
         instance.deployment_action = action
 
-        deployment["status"] = "running"
-        await self._tick(instance)
-        deployment["status"] = "stopped"
-        await self._tick(instance)
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
 
         state = instance._crash_retry_state()
         self.assertEqual(state["attempts"].get("deployment-1"), 1)
+
+    async def test_failed_single_rank_restart_stays_eligible(self) -> None:
+        deployment = self._crashed_deployment(members=1)
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            # The real start action folds a member-action failure into the
+            # "degraded" runtime status; the remaining retries must still
+            # fire even though the health monitor ignores single ranks.
+            instance._crash_retry_state()["runtime"][deployment_id] = {
+                "status": "degraded",
+                "definite": True,
+            }
+            return {"ok": False, "error": "rank 0 did not start"}
+
+        instance.deployment_action = action
+
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
+        await self._tick(instance)
+        self.assertEqual(len(starts), 1)
+
+        self._backdate(instance)
+        await self._tick(instance)
+        self.assertEqual(len(starts), 2)
+
+    async def test_degraded_multi_rank_is_left_to_the_health_monitor(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": True}
+
+        instance.deployment_action = action
+
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "degraded")
+
+        self.assertEqual(starts, [])
+
+    async def test_offline_observation_does_not_burn_attempts(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": True}
+
+        instance.deployment_action = action
+
+        await self._observe(instance, deployment, "running")
+        # Offline nodes fold their members to stopped-looking states.
+        await self._observe(instance, deployment, "stopped", definite=False)
+        self.assertEqual(starts, [])
+
+        await self._observe(instance, deployment, "stopped")
+        self.assertEqual(starts, ["deployment-1"])
+
+    async def test_grouped_deployment_with_all_groups_stopped_is_not_restarted(self) -> None:
+        deployment = self._grouped_deployment()
+        for member in deployment["members"]:
+            member["desired_state"] = "stopped"
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append((deployment_id, kwargs.get("instance")))
+            return {"ok": True}
+
+        instance.deployment_action = action
+
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
+
+        self.assertEqual(starts, [])
+
+    async def test_grouped_restart_preserves_stopped_group_intent(self) -> None:
+        deployment = self._grouped_deployment()
+        for member in deployment["members"]:
+            if member["instance_id"] == 0:
+                member["desired_state"] = "stopped"
+            else:
+                member["desired_state"] = "running"
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append((deployment_id, action, kwargs.get("instance")))
+            return {"ok": True}
+
+        instance.deployment_action = action
+
+        await self._observe(instance, deployment, "running")
+        await self._observe(instance, deployment, "stopped")
+
+        self.assertEqual(
+            starts, [("deployment-1", "start", 1)],
+        )
 
 
 class MemberActionIdempotencyTests(unittest.TestCase):

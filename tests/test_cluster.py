@@ -20,6 +20,8 @@ from cluster import (
     normalize_agent_url,
 )
 from manager import (
+    DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS,
+    DEPLOYMENT_CRASH_RETRY_LIMIT,
     DEPLOYMENT_LABEL,
     MODE_LABEL,
     SERVICE_PORT_LABEL,
@@ -6747,6 +6749,178 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(removed)
         instance.node_registry.remove.assert_called_once_with("remote-1")
+
+
+class DeploymentCrashRetryTests(unittest.IsolatedAsyncioTestCase):
+    """A deployment that crashed while desired running is restarted
+    automatically, up to three attempts five seconds apart."""
+
+    @staticmethod
+    def _crashed_deployment(status="stopped", desired="running"):
+        return {
+            "id": "deployment-1",
+            "name": "sharded-tp2",
+            "status": status,
+            "desired_state": desired,
+            "members": [
+                {"node_id": "local", "rank": 0, "container_name": "rank-0"},
+                {"node_id": "remote-1", "rank": 1, "container_name": "rank-1"},
+            ],
+        }
+
+    @staticmethod
+    def _instance(deployment):
+        instance = Manager.__new__(Manager)
+        instance.deployments = [deployment]
+        return instance
+
+    async def _tick(self, instance):
+        # Restart attempts run as fire-and-forget tasks; drain them so each
+        # test observes deterministic state.
+        await instance._deployment_crash_retry_tick()
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def test_crashed_deployment_is_restarted_once_per_tick(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append((deployment_id, action))
+            return {"ok": True}
+
+        instance.deployment_action = action
+        deployment["status"] = "running"
+        await self._tick(instance)
+        deployment["status"] = "stopped"
+        await self._tick(instance)
+
+        self.assertEqual(starts, [("deployment-1", "start")])
+
+    async def test_retry_waits_five_seconds_between_attempts(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": False, "error": "rank 1 did not start"}
+
+        instance.deployment_action = action
+
+        deployment["status"] = "running"
+        await self._tick(instance)
+        deployment["status"] = "stopped"
+        await self._tick(instance)
+        await self._tick(instance)
+        self.assertEqual(len(starts), 1)
+
+        state = instance._crash_retry_state()
+        state["stamps"]["deployment-1"] -= (
+            DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
+        )
+        await self._tick(instance)
+        self.assertEqual(len(starts), 2)
+
+    async def test_retry_stops_after_three_attempts(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": False, "error": "still failing"}
+
+        instance.deployment_action = action
+        state = instance._crash_retry_state()
+
+        deployment["status"] = "running"
+        await self._tick(instance)
+        deployment["status"] = "stopped"
+
+        for _ in range(DEPLOYMENT_CRASH_RETRY_LIMIT):
+            await self._tick(instance)
+            state["stamps"]["deployment-1"] -= (
+                DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
+            )
+
+        self.assertEqual(len(starts), DEPLOYMENT_CRASH_RETRY_LIMIT)
+        await self._tick(instance)
+        state["stamps"]["deployment-1"] -= (
+            DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS + 0.01
+        )
+        await self._tick(instance)
+        self.assertEqual(len(starts), DEPLOYMENT_CRASH_RETRY_LIMIT)
+
+    async def test_successful_restart_resets_the_episode(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+
+        async def action(deployment_id, action, *args, **kwargs):
+            deployment["status"] = "starting"
+            return {"ok": True}
+
+        instance.deployment_action = action
+        await self._tick(instance)
+
+        deployment["status"] = "running"
+        await self._tick(instance)
+        state = instance._crash_retry_state()
+        self.assertEqual(state["attempts"].get("deployment-1"), None)
+
+        deployment["status"] = "stopped"
+        await self._tick(instance)
+        self.assertEqual(state["attempts"].get("deployment-1"), 1)
+
+    async def test_deployment_that_never_served_is_not_retried(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": True}
+
+        instance.deployment_action = action
+
+        await self._tick(instance)
+
+        self.assertEqual(starts, [])
+
+    async def test_explicit_stops_are_never_restarted(self) -> None:
+        deployment = self._crashed_deployment(desired="stopped")
+        instance = self._instance(deployment)
+        starts = []
+
+        async def action(deployment_id, action, *args, **kwargs):
+            starts.append(deployment_id)
+            return {"ok": True}
+
+        instance.deployment_action = action
+        await self._tick(instance)
+
+        self.assertEqual(starts, [])
+        state = instance._crash_retry_state()
+        self.assertNotIn("deployment-1", state["healthy_seen"])
+
+    async def test_restarting_failure_does_not_raise_out_of_the_tick(self) -> None:
+        deployment = self._crashed_deployment()
+        instance = self._instance(deployment)
+
+        async def action(deployment_id, action, *args, **kwargs):
+            raise ValueError("saved launch arguments are invalid")
+
+        instance.deployment_action = action
+
+        deployment["status"] = "running"
+        await self._tick(instance)
+        deployment["status"] = "stopped"
+        await self._tick(instance)
+
+        state = instance._crash_retry_state()
+        self.assertEqual(state["attempts"].get("deployment-1"), 1)
 
 
 class MemberActionIdempotencyTests(unittest.TestCase):

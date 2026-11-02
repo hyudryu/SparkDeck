@@ -556,6 +556,18 @@ CLUSTER_START_SKEW_SECONDS = 660.0
 CLUSTER_RECOVERY_ALIGNMENT_SECONDS = CLUSTER_HEALTH_INTERVAL_SECONDS
 INTERRUPTED_LAUNCH_RETRY_SECONDS = 5.0
 
+# A deployment that crashed while its desired state is still "running" (all
+# ranks exited, or the launch action failed outright) has no other recovery
+# owner: the split-rank health monitor only handles the degraded in-between
+# state. Restart such a deployment automatically up to this many times,
+# waiting this long between attempts, so a transient network hiccup does not
+# leave the model down until someone notices. The per-episode counter resets
+# only after the deployment serves again; a launch that cannot stick
+# exhausts its attempts and stays down until a manual start.
+DEPLOYMENT_CRASH_RETRY_LIMIT = 3
+DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS = 5.0
+DEPLOYMENT_CRASH_POLL_SECONDS = 1.0
+
 # vLLM prints its allocated KV capacity after engine initialization. Poll only
 # deployments that have not produced a usable capacity report yet; once found,
 # the result is persisted with the deployment.
@@ -1196,6 +1208,7 @@ class Manager:
             ("idle_task", self._idle_monitor_loop),
             ("admission_reaper_task", self._admission_reaper_loop),
             ("cluster_health_task", self._cluster_health_monitor_loop),
+            ("deployment_crash_retry_task", self._deployment_crash_retry_loop),
             ("deployment_capacity_task", self._deployment_capacity_monitor_loop),
             ("fan_cluster_task", self._fan_cluster_monitor_loop),
             ("token_usage_sync_task", self._token_usage_sync_loop),
@@ -1210,7 +1223,7 @@ class Manager:
         await self.virtual_nas.stop()
         for field in (
             "worker_task", "idle_task", "admission_reaper_task",
-            "cluster_health_task",
+            "cluster_health_task", "deployment_crash_retry_task",
             "deployment_capacity_task", "fan_cluster_task",
             "token_usage_sync_task", "deployment_resume_task",
             "deployment_stop_resume_task",
@@ -11592,6 +11605,114 @@ class Manager:
                 await self._cluster_health_tick()
             except Exception as exc:
                 print(f"[cluster-health] check failed: {exc}")
+
+    def _crash_retry_state(self) -> dict[str, Any]:
+        """Lazily create the crash-retry bookkeeping, including on test
+        instances built without ``__init__``."""
+        state = getattr(self, "_deployment_crash_retry_state", None)
+        if state is None:
+            state = self._deployment_crash_retry_state = {
+                "attempts": {},
+                "stamps": {},
+                "healthy_seen": set(),
+                "inflight": set(),
+            }
+        return state
+
+    async def _deployment_crash_retry_loop(self) -> None:
+        while True:
+            await asyncio.sleep(DEPLOYMENT_CRASH_POLL_SECONDS)
+            try:
+                await self._deployment_crash_retry_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("deployment crash retry tick failed")
+
+    async def _deployment_crash_retry_tick(self) -> None:
+        state = self._crash_retry_state()
+        attempts: dict[str, int] = state["attempts"]
+        stamps: dict[str, float] = state["stamps"]
+        healthy_seen: set[str] = state["healthy_seen"]
+        inflight: set[str] = state["inflight"]
+        live_ids: set[str] = set()
+        for deployment in list(self.deployments):
+            deployment_id = str(deployment.get("id") or "")
+            if not deployment_id:
+                continue
+            live_ids.add(deployment_id)
+            if deployment.get("desired_state") == "stopped":
+                attempts.pop(deployment_id, None)
+                stamps.pop(deployment_id, None)
+                healthy_seen.discard(deployment_id)
+                continue
+            status = str(deployment.get("status") or "")
+            if status in {"running", "ready"}:
+                # Serving again: the next crash starts a fresh retry episode.
+                healthy_seen.add(deployment_id)
+                attempts.pop(deployment_id, None)
+                stamps.pop(deployment_id, None)
+                continue
+            if status not in {"stopped", "error"} or deployment_id not in healthy_seen:
+                # Degraded/recovering/launching layouts are owned by the
+                # cluster health monitor; a launch that never served is not a
+                # crash and must not be replayed automatically.
+                continue
+            if deployment.get("launch_settings_error"):
+                continue
+            if deployment_id in inflight:
+                continue
+            tried = attempts.get(deployment_id, 0)
+            if tried >= DEPLOYMENT_CRASH_RETRY_LIMIT:
+                continue
+            last = stamps.get(deployment_id, 0.0)
+            if last and (time.monotonic() - last) < DEPLOYMENT_CRASH_RETRY_DELAY_SECONDS:
+                continue
+            attempt = tried + 1
+            attempts[deployment_id] = attempt
+            stamps[deployment_id] = time.monotonic()
+            inflight.add(deployment_id)
+            restart = asyncio.create_task(
+                self._restart_crashed_deployment(deployment_id, attempt)
+            )
+            restart.add_done_callback(
+                lambda _task, key=deployment_id: (
+                    self._crash_retry_state()["inflight"].discard(key)
+                )
+            )
+        for key in list(attempts.keys() | stamps.keys()):
+            if key not in live_ids:
+                attempts.pop(key, None)
+                stamps.pop(key, None)
+                inflight.discard(key)
+                healthy_seen.discard(key)
+
+    async def _restart_crashed_deployment(
+        self, deployment_id: str, attempt: int,
+    ) -> None:
+        deployment = self._deployment(deployment_id)
+        label = (
+            str(deployment.get("name") or deployment_id)
+            if deployment else deployment_id
+        )
+        print(
+            f"[crash-retry] {label}: automatic restart attempt "
+            f"{attempt}/{DEPLOYMENT_CRASH_RETRY_LIMIT}"
+        )
+        try:
+            result = await self.deployment_action(deployment_id, "start")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[crash-retry] {label}: attempt {attempt} failed: {exc}")
+            return
+        if isinstance(result, dict) and result.get("ok"):
+            print(f"[crash-retry] {label}: attempt {attempt} relaunched")
+        else:
+            detail = (
+                result.get("error") if isinstance(result, dict) else result
+            )
+            print(f"[crash-retry] {label}: attempt {attempt} failed: {detail}")
 
     async def deployment_logs(self, deployment_id: str) -> dict:
         deployment = self._deployment(deployment_id)

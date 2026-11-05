@@ -25188,6 +25188,17 @@ class Manager:
                     member_states
                     and all(state in {"stopped", "exited"} for state in member_states)
                     and saved.get("status") not in {"recovering", "stopping", "launching"}
+                    # When every node is unreachable, each member's
+                    # assumed-stopped state is a connectivity loss rather
+                    # than an observed exit: publish degraded and wait for
+                    # the fleet to answer instead of reporting a crash (and
+                    # relaunching) on every reconnect blip. Observed exits on
+                    # live nodes still prove the stop, even alongside
+                    # unreachable peers.
+                    and not all(
+                        member.get("node_status") == "offline"
+                        for member in deployment["members"]
+                    )
                     and not any(
                         member.get("failed_stop_error") or member.get("recreate_pending")
                         for member in deployment["members"]

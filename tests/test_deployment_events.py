@@ -257,6 +257,33 @@ def test_readiness_outage_and_intentional_stop_do_not_invent_crashes(caplog, rea
     assert all(record.deployment_event != "crashed" for record in events(caplog))
 
 
+def test_offline_node_blip_is_silent_until_connectivity_returns(caplog):
+    from sparkdeck.service import _deployment_status
+
+    caplog.set_level(logging.INFO)
+    service = observer()
+    for fold_status in ["ready", "degraded", "degraded", "ready"]:
+        offline = fold_status == "degraded"
+        runtime = {
+            "status": fold_status,
+            "desired_state": "running",
+            "members": [
+                {
+                    "instance_id": 0, "rank": rank, "desired_state": "running",
+                    "node_status": "offline" if offline else "online",
+                    "status": "stopped" if offline else "running",
+                    "phase": {"phase": "stopped" if offline else "ready"},
+                }
+                for rank in (0, 1)
+            ],
+        }
+        service._observe_deployment_events(
+            [deployment(_deployment_status(fold_status))],
+            runtime_deployments={"model-1": runtime},
+        )
+    assert [record.deployment_event for record in events(caplog)] == ["launched"]
+
+
 def test_inventory_passes_raw_recovery_evidence_to_observer(caplog):
     from unittest.mock import AsyncMock
 

@@ -260,7 +260,9 @@ def test_other_group_action_preserves_failed_stop_marker(tmp_path):
     ("observed_running", "degraded"),
     ("observed_unknown", "degraded"),
     ("remote_docker_unavailable", "unknown"),
-    ("all_offline", "stopped"),
+    # Every node unreachable means no rank's state was observed: a
+    # connectivity loss waits in degraded instead of claiming a stop.
+    ("all_offline", "degraded"),
     ("failed_stop", "error"),
 ])
 def test_offline_peers_are_assumed_stopped_without_hiding_online_activity(tmp_path, mode, scenario, expected):

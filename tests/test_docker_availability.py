@@ -310,6 +310,87 @@ class DockerAvailabilityTests(unittest.IsolatedAsyncioTestCase):
             recovering["members"][1]["phase"]["phase"], "recovering",
         )
 
+    async def test_offline_node_blip_waits_in_degraded_instead_of_crashed(self):
+        manager = self.manager_without_docker()
+        manager.deployments = [{
+            "id": "deployment-1", "name": "Blipping", "model": "org/model",
+            "engine": "vllm", "mode": "single", "status": "running",
+            "desired_state": "running", "node_ids": ["remote-1", "remote-2"],
+            "members": [
+                {
+                    "node_id": "remote-1", "node_name": "Worker One", "rank": 0,
+                    "container_name": "rank-0", "status": "running",
+                },
+                {
+                    "node_id": "remote-2", "node_name": "Worker Two", "rank": 1,
+                    "container_name": "rank-1", "status": "running",
+                },
+            ],
+            "launch_settings": {
+                "model": "org/model", "engine": "vllm", "extra_args": [],
+            },
+        }]
+        manager.list_containers = AsyncMock(return_value=[])
+        manager.list_images = AsyncMock(return_value=[])
+        manager.get_stats = AsyncMock(return_value={})
+
+        def nodes(online: bool) -> list[dict]:
+            containers = [
+                {
+                    "name": name, "status": "running",
+                    "phase": {"phase": "ready", "message": "Ready"},
+                }
+                for name in ("rank-0", "rank-1")
+            ]
+            return [
+                {
+                    "id": "remote-1", "name": "Worker One", "online": online,
+                    "docker_ready": online,
+                    "containers": containers if online else [],
+                },
+                {
+                    "id": "remote-2", "name": "Worker Two", "online": online,
+                    "docker_ready": online,
+                    "containers": containers if online else [],
+                },
+            ]
+
+        # Both nodes drop (an access-network blip): the members fold to
+        # assumed-stopped, which must not publish a stopped deployment.
+        manager.cluster_nodes = AsyncMock(return_value=nodes(False))
+        blip = (await manager.get_state())["deployments"][0]
+        self.assertEqual(blip["status"], "degraded")
+        self.assertTrue(all(
+            member["status"] == "stopped" and member["node_status"] == "offline"
+            for member in blip["members"]
+        ))
+        self.assertTrue(all(
+            "assumed stopped" in member["phase"]["message"]
+            for member in blip["members"]
+        ))
+        self.assertFalse(
+            manager._crash_retry_state()["runtime"]["deployment-1"]["definite"]
+        )
+
+        # Connectivity returns with the containers untouched: the same
+        # generation is serving again, not a relaunch.
+        manager.cluster_nodes = AsyncMock(return_value=nodes(True))
+        recovered = (await manager.get_state())["deployments"][0]
+        self.assertEqual(recovered["status"], "ready")
+        self.assertTrue(
+            manager._crash_retry_state()["runtime"]["deployment-1"]["definite"]
+        )
+
+        # A real exit observed on answered nodes still reports stopped.
+        answered = nodes(True)
+        for node in answered:
+            for container in node["containers"]:
+                container["status"] = "exited"
+                container["phase"] = None
+        manager.cluster_nodes = AsyncMock(return_value=answered)
+        exited = (await manager.get_state())["deployments"][0]
+        self.assertEqual(exited["status"], "stopped")
+
     async def test_state_keeps_stopping_until_every_member_exits(self):
         manager = self.manager_without_docker()
         manager.deployments = [{

@@ -8299,6 +8299,47 @@ class Manager:
 
         return relay()
 
+    # How long one cluster request waits out a deployment whose members are
+    # all momentarily unable to serve, before failing with the retryable
+    # error. Class-level so test doubles built without __init__ inherit it.
+    _cluster_ride_through_seconds: float = 30.0
+    _CLUSTER_RIDE_THROUGH_FIRST_PAUSE = 0.5
+    _CLUSTER_RIDE_THROUGH_MAX_PAUSE = 2.0
+
+    @staticmethod
+    def _cluster_ride_through_retryable(exc: BaseException) -> bool:
+        """True only when a failure proves no engine received the prompt.
+
+        A readiness probe that went unanswered, a refused or timed-out
+        connect, and an agent reporting its member container missing all
+        fail before the prompt is sent, so replaying the request cannot
+        generate it twice. Anything after dispatch (read timeouts, upstream
+        5xx) is left to the existing per-request failover.
+        """
+        if isinstance(exc, ClusterReplicaUnavailable):
+            return True
+        connect_errors = (httpx.ConnectError, httpx.ConnectTimeout)
+        if isinstance(exc, connect_errors) or isinstance(exc.__cause__, connect_errors):
+            return True
+        return (
+            isinstance(exc, NodeAgentResponseError)
+            and exc.status_code == 404
+            and "replica_unavailable" in exc.detail
+        )
+
+    async def _cluster_ride_through_pause(
+        self, seconds: float, cancel: asyncio.Event | None,
+    ) -> None:
+        """Sleep between ride-through passes; a client disconnect ends it."""
+        if cancel is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+        raise ClientAbort("client disconnected while the deployment was unavailable")
+
     async def proxy_cluster_inference(
         self,
         deployment_id: str,
@@ -8310,7 +8351,65 @@ class Manager:
         caller_ip: str | None = None,
         source_route: dict | None = None,
     ):
-        """Proxy to a cluster member, balancing replicas and failing over."""
+        """Proxy to a cluster member, balancing replicas and failing over.
+
+        A deployment whose every member is momentarily unable to serve (its
+        node missed the readiness probe during a network blip, or refused the
+        connection while it re-associated) is ridden through: the whole route
+        is retried with a short backoff until a member serves, the
+        ``_cluster_ride_through_seconds`` window closes, or the client
+        disconnects. Only failures that prove the prompt never reached an
+        engine are retried. Source-IP routes keep failing fast: their pinned
+        target reports unavailability to the caller by contract.
+        """
+        window = max(0.0, float(self._cluster_ride_through_seconds or 0.0))
+        deadline = time.monotonic() + window
+        pause = self._CLUSTER_RIDE_THROUGH_FIRST_PAUSE
+        announced = False
+        while True:
+            try:
+                # Retry passes stay quiet: the outage is announced once below
+                # rather than once per replica on every pass.
+                return await self._proxy_cluster_inference_once(
+                    deployment_id, model, body, endpoint, cancel,
+                    route_observation=route_observation,
+                    caller_ip=caller_ip, source_route=source_route,
+                    log_failover=not announced,
+                )
+            except Exception as exc:
+                remaining = deadline - time.monotonic()
+                if (
+                    source_route is not None
+                    or remaining <= 0
+                    or (cancel is not None and cancel.is_set())
+                    or not self._cluster_ride_through_retryable(exc)
+                ):
+                    raise
+                if not announced:
+                    announced = True
+                    print(
+                        f"[cluster-lb] {deployment_id}: no member can serve "
+                        f"right now ({exc}); retrying for up to "
+                        f"{remaining:.0f}s"
+                    )
+                await self._cluster_ride_through_pause(
+                    min(pause, remaining), cancel,
+                )
+                pause = min(pause * 2, self._CLUSTER_RIDE_THROUGH_MAX_PAUSE)
+
+    async def _proxy_cluster_inference_once(
+        self,
+        deployment_id: str,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None = None,
+        route_observation: dict | None = None,
+        caller_ip: str | None = None,
+        source_route: dict | None = None,
+        log_failover: bool = True,
+    ):
+        """One balanced pass over the route order, failing over in turn."""
         deployment = self._deployment(deployment_id)
         if not deployment:
             if source_route is not None:
@@ -8368,11 +8467,12 @@ class Manager:
                     or not self._cluster_failover_retryable(exc)
                 ):
                     raise
-                print(
-                    f"[cluster-lb] {deployment_id}: replica on "
-                    f"{member.get('node_name') or member.get('node_id')} failed "
-                    f"({exc}); trying the next replica"
-                )
+                if log_failover:
+                    print(
+                        f"[cluster-lb] {deployment_id}: replica on "
+                        f"{member.get('node_name') or member.get('node_id')} failed "
+                        f"({exc}); trying the next replica"
+                    )
         raise LookupError("cluster deployment has no inference member")
 
     async def _proxy_cluster_member(

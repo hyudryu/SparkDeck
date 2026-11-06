@@ -247,7 +247,7 @@ def connect_failure(message: str = "could not contact threadripper") -> RuntimeE
 
 
 class ClusterRideThroughTests(unittest.IsolatedAsyncioTestCase):
-    def manager(self, *, window: float = 30.0, pause: bool = False) -> Manager:
+    def manager(self, *, window: float = 15.0, pause: bool = False) -> Manager:
         manager = build_manager(single_remote_deployment())
         manager._cluster_ride_through_seconds = window
         if not pause:

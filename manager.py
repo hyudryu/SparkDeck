@@ -8302,7 +8302,7 @@ class Manager:
     # How long one cluster request waits out a deployment whose members are
     # all momentarily unable to serve, before failing with the retryable
     # error. Class-level so test doubles built without __init__ inherit it.
-    _cluster_ride_through_seconds: float = 30.0
+    _cluster_ride_through_seconds: float = 15.0
     _CLUSTER_RIDE_THROUGH_FIRST_PAUSE = 0.5
     _CLUSTER_RIDE_THROUGH_MAX_PAUSE = 2.0
 

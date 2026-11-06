@@ -8253,6 +8253,50 @@ class SparkDeckService:
         self._note_shared_selector_owner(model_id, chosen)
         return chosen
 
+    # Observed states that a deployment meant to be serving passes through
+    # when its node misses one routing fan-out: an unreachable member folds to
+    # "degraded", unavailable Docker inventory to "unknown", and a primary
+    # whose phase was not read as ready (or a recovery) to "starting".
+    _TRANSIENTLY_UNOBSERVED_STATUSES = frozenset({"degraded", "unknown", "starting"})
+
+    async def _transiently_unobserved_owners(
+        self, model_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the stored owners of a request id that cannot be seen now.
+
+        Liveness comes from a routing snapshot, so a node that misses one
+        fan-out (a Wi-Fi blip, a Tailscale re-key) publishes its deployment
+        as degraded, unknown, or starting until the next one. Without an
+        owner, a served-name request fell through to the legacy
+        local-container lookup and failed with a terminal HTTP 404 ("No
+        managed container found") although the deployment was still meant
+        to serve. The stored owner keeps the request instead, so Manager's
+        live member health check decides and real unavailability surfaces
+        as a retryable 503. The caller applies the same selection the live
+        path uses (configured priority and caps, then least-in-flight
+        balancing) because these owners never reached the live selectors.
+        Consulted only when no live owner exists; an explicit stop, a
+        confirmed stop, and a launch error keep the previous behavior.
+        """
+        stored_by_id = {
+            deployment["id"]: deployment
+            for deployment in self.store.deployments(include_private=True)
+        }
+        owners: list[dict[str, Any]] = []
+        for deployment in await self.deployments():
+            stored = stored_by_id.get(deployment["id"])
+            if stored is None:
+                continue
+            if (deployment.get("kind") or stored.get("kind")) != DeploymentKind.MANAGED.value:
+                continue
+            if "stopped" in (stored.get("desired_state"), deployment.get("desired_state")):
+                continue
+            if deployment.get("status") not in self._TRANSIENTLY_UNOBSERVED_STATUSES:
+                continue
+            if model_id in self._deployment_public_model_ids(deployment):
+                owners.append({**stored, **deployment})
+        return owners
+
     # ---- Model routing policies: priority + concurrency overflow ----
 
     MAX_MODEL_ROUTING_MEMBERS = 16
@@ -9106,6 +9150,28 @@ class SparkDeckService:
                     )
             if deployment is None:
                 deployment = stored_deployment
+                if deployment is None:
+                    owners = await self._transiently_unobserved_owners(
+                        requested_model,
+                    )
+                    if owners:
+                        # The blipped owners never reached the live
+                        # selectors above, so run the same selection on
+                        # them: configured priority and caps first, then
+                        # the no-policy least-in-flight balancer.
+                        deployment = self._select_routed_member(
+                            requested_model, owners,
+                        )
+                        if deployment is not None:
+                            routing_slot = str(deployment.get("id") or "")
+                        elif len(owners) == 1:
+                            deployment = owners[0]
+                        else:
+                            deployment, routing_slot = (
+                                self._select_balanced_shared_owner(
+                                    requested_model, owners,
+                                )
+                            )
         if routing_slot is None and deployment is not None:
             # Alias and source-IP traffic bypasses the policy selector but
             # still consumes a policy member's concurrency budget.

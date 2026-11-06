@@ -399,8 +399,10 @@ class ReplicaFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_exhausted_replicas_raise_not_ready(self):
         # A replica whose readiness probe cannot be answered is out of
         # rotation, so exhausting every candidate reports no ready replica
-        # instead of the last transport error.
+        # instead of the last transport error. This pins one balancing pass;
+        # the outage ride-through around it is covered separately.
         manager = build_manager(replicated_deployment())
+        manager._cluster_ride_through_seconds = 0
         manager.node_registry.request = AsyncMock(side_effect=[
             RuntimeError("could not contact Node 0"),
             RuntimeError("could not contact Node 1"),
@@ -555,6 +557,8 @@ class ReadinessGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deployment_without_any_ready_replica_is_rejected(self):
         manager = build_manager(replicated_deployment())
+        # One balancing pass; the outage ride-through is covered separately.
+        manager._cluster_ride_through_seconds = 0
         manager.node_registry.request = AsyncMock(return_value={"ready": False})
 
         with self.assertRaisesRegex(ClusterReplicaUnavailable, "not ready"):

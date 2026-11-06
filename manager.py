@@ -8299,6 +8299,78 @@ class Manager:
 
         return relay()
 
+    # How long one cluster request waits out a deployment whose members are
+    # all momentarily unable to serve, before failing with the retryable
+    # error. Class-level so test doubles built without __init__ inherit it.
+    _cluster_ride_through_seconds: float = 15.0
+    _CLUSTER_RIDE_THROUGH_FIRST_PAUSE = 0.5
+    _CLUSTER_RIDE_THROUGH_MAX_PAUSE = 2.0
+
+    @staticmethod
+    def _cluster_ride_through_retryable(exc: BaseException) -> bool:
+        """True only when a failure proves no engine received the prompt.
+
+        A readiness probe that went unanswered, a refused or timed-out
+        connect, and an agent reporting its member container missing all
+        fail before the prompt is sent, so replaying the request cannot
+        generate it twice. Anything after dispatch (read timeouts, upstream
+        5xx) is left to the existing per-request failover.
+        """
+        if isinstance(exc, ClusterReplicaUnavailable):
+            # A readiness probe the agent answered with a deterministic
+            # client error is carried in __cause__; it will not clear by
+            # waiting, so the window is not ridden through on it.
+            return not Manager._cluster_probe_failure_deterministic(
+                exc.__cause__,
+            )
+        connect_errors = (httpx.ConnectError, httpx.ConnectTimeout)
+        if isinstance(exc, connect_errors) or isinstance(exc.__cause__, connect_errors):
+            return True
+        return (
+            isinstance(exc, NodeAgentResponseError)
+            and exc.status_code == 404
+            and "replica_unavailable" in exc.detail
+        )
+
+    @staticmethod
+    def _cluster_probe_failure_deterministic(exc: BaseException) -> bool:
+        """True when a readiness probe failure will not clear by waiting.
+
+        The agent rejecting the probe with a client error (rejected
+        credentials, an unknown route) answers the same way on every
+        attempt, so riding the outage window out cannot help and the cause
+        must surface instead of becoming a not-ready replica. So does a
+        node the operator disabled or removed: the registry refuses the
+        request before dialing and waiting cannot bring it back. The
+        agent's typed missing-container 404 and saturated or timed-out
+        answers stay transient: the container may be restarting and the
+        agent briefly overloaded.
+        """
+        if isinstance(exc, (ValueError, LookupError)) and any(
+            marker in str(exc)
+            for marker in ("is disabled", "remote node not found")
+        ):
+            return True
+        return (
+            isinstance(exc, NodeAgentResponseError)
+            and exc.status_code < 500
+            and exc.status_code not in (408, 429)
+            and not (exc.status_code == 404 and "replica_unavailable" in exc.detail)
+        )
+
+    async def _cluster_ride_through_pause(
+        self, seconds: float, cancel: asyncio.Event | None,
+    ) -> None:
+        """Sleep between ride-through passes; a client disconnect ends it."""
+        if cancel is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+        raise ClientAbort("client disconnected while the deployment was unavailable")
+
     async def proxy_cluster_inference(
         self,
         deployment_id: str,
@@ -8310,7 +8382,82 @@ class Manager:
         caller_ip: str | None = None,
         source_route: dict | None = None,
     ):
-        """Proxy to a cluster member, balancing replicas and failing over."""
+        """Proxy to a cluster member, balancing replicas and failing over.
+
+        A deployment whose every member is momentarily unable to serve (its
+        node missed the readiness probe during a network blip, or refused the
+        connection while it re-associated) is ridden through: the whole route
+        is retried with a short backoff until a member serves, the
+        ``_cluster_ride_through_seconds`` window closes, or the client
+        disconnects. Only failures that prove the prompt never reached an
+        engine are retried. Source-IP routes keep failing fast: their pinned
+        target reports unavailability to the caller by contract.
+        """
+        window = max(0.0, float(self._cluster_ride_through_seconds or 0.0))
+        deadline = time.monotonic() + window
+        pause = self._CLUSTER_RIDE_THROUGH_FIRST_PAUSE
+        announced = False
+        pass_state: dict = {}
+        while True:
+            try:
+                # Retry passes stay quiet: the outage is announced once below
+                # rather than once per replica on every pass. A zero window
+                # keeps the legacy single unbounded pass.
+                return await self._proxy_cluster_inference_once(
+                    deployment_id, model, body, endpoint, cancel,
+                    route_observation=route_observation,
+                    caller_ip=caller_ip, source_route=source_route,
+                    log_failover=not announced,
+                    deadline=deadline if window > 0 else None,
+                    pass_state=pass_state,
+                )
+            except Exception as exc:
+                remaining = deadline - time.monotonic()
+                if (
+                    source_route is not None
+                    or remaining <= 0
+                    or (cancel is not None and cancel.is_set())
+                    or not self._cluster_ride_through_retryable(exc)
+                    or pass_state.get("unsafe_to_replay")
+                ):
+                    raise
+                if not announced:
+                    announced = True
+                    print(
+                        f"[cluster-lb] {deployment_id}: no member can serve "
+                        f"right now ({exc}); retrying for up to "
+                        f"{remaining:.0f}s"
+                    )
+                await self._cluster_ride_through_pause(
+                    min(pause, remaining), cancel,
+                )
+                pause = min(pause * 2, self._CLUSTER_RIDE_THROUGH_MAX_PAUSE)
+
+    async def _proxy_cluster_inference_once(
+        self,
+        deployment_id: str,
+        model: str,
+        body: dict,
+        endpoint: str,
+        cancel: asyncio.Event | None = None,
+        route_observation: dict | None = None,
+        caller_ip: str | None = None,
+        source_route: dict | None = None,
+        log_failover: bool = True,
+        deadline: float | None = None,
+        pass_state: dict | None = None,
+    ):
+        """One balanced pass over the route order, failing over in turn.
+
+        ``deadline`` is the ride-through window's absolute monotonic end,
+        or ``None`` when there is none. It bounds the pass itself: once it
+        has passed, remaining members are not probed, because each probe
+        can wait out its full transport timeout and the configured wait
+        must hold. ``pass_state`` records what the pass saw for the
+        ride-through loop: a replica failing after dispatch marks the whole
+        pass unsafe to replay, even when a later replica's probe failure is
+        what ends it.
+        """
         deployment = self._deployment(deployment_id)
         if not deployment:
             if source_route is not None:
@@ -8337,10 +8484,23 @@ class Manager:
         if not candidates:
             raise LookupError("cluster deployment has no inference member")
         for index, member in enumerate(candidates):
+            if cancel is not None and cancel.is_set():
+                # The client is gone; holding reservations and dialing more
+                # replicas serves nobody.
+                raise ClientAbort(
+                    "client disconnected while the deployment was unavailable"
+                )
+            if deadline is not None and index and time.monotonic() >= deadline:
+                # The window closed mid-pass: probing further members would
+                # wait out their transport timeouts and overrun the
+                # configured wait, so report the outage now.
+                raise ClusterReplicaUnavailable(
+                    "no member became ready within the ride-through window"
+                )
             try:
                 result = await self._proxy_cluster_member(
                     deployment, member, model, body, endpoint, cancel,
-                    caller_ip=caller_ip,
+                    caller_ip=caller_ip, deadline=deadline,
                 )
                 if body.get("stream"):
                     return self._cluster_stream_with_failover(
@@ -8359,6 +8519,14 @@ class Manager:
             except ClientAbort:
                 raise
             except Exception as exc:
+                if pass_state is not None and not self._cluster_ride_through_retryable(
+                    exc,
+                ):
+                    # This replica failed after dispatch (read timeout,
+                    # upstream 5xx): the prompt may already be generating,
+                    # so the ride-through must not replay the route even
+                    # when a later replica's probe failure ends this pass.
+                    pass_state["unsafe_to_replay"] = True
                 if source_route is not None and self._cluster_failover_retryable(exc):
                     raise SourceRoutingUnavailable(
                         f"source-IP routing target is unavailable: {exc}"
@@ -8368,17 +8536,19 @@ class Manager:
                     or not self._cluster_failover_retryable(exc)
                 ):
                     raise
-                print(
-                    f"[cluster-lb] {deployment_id}: replica on "
-                    f"{member.get('node_name') or member.get('node_id')} failed "
-                    f"({exc}); trying the next replica"
-                )
+                if log_failover:
+                    print(
+                        f"[cluster-lb] {deployment_id}: replica on "
+                        f"{member.get('node_name') or member.get('node_id')} failed "
+                        f"({exc}); trying the next replica"
+                    )
         raise LookupError("cluster deployment has no inference member")
 
     async def _proxy_cluster_member(
         self, deployment: dict, member: dict, model: str, body: dict,
         endpoint: str, cancel: asyncio.Event | None, *,
         caller_ip: str | None = None, startup_benchmark: bool = False,
+        deadline: float | None = None,
     ):
         from sparkdeck.prompt_gate import PromptGates
 
@@ -8387,6 +8557,7 @@ class Manager:
             return await self._proxy_cluster_member_unlimited(
                 deployment, member, model, body, endpoint, cancel,
                 caller_ip=caller_ip, startup_benchmark=startup_benchmark,
+                deadline=deadline,
             )
         member = dict(member)
         deployment_id = str(deployment.get("id") or "")
@@ -8434,7 +8605,7 @@ class Manager:
             return await self._proxy_cluster_member_unlimited(
                 current, selected, model, body, endpoint, cancel,
                 caller_ip=caller_ip, startup_benchmark=startup_benchmark,
-                member_reserved=True,
+                member_reserved=True, deadline=deadline,
             )
 
         try:
@@ -8446,6 +8617,7 @@ class Manager:
 
     async def _cluster_member_serving(
         self, deployment: dict, member: dict, model: str,
+        timeout: float = 10, cancel: asyncio.Event | None = None,
     ) -> bool:
         """True only when this member's engine answers its health check now.
 
@@ -8463,13 +8635,13 @@ class Manager:
         strict_health = str(
             deployment.get("engine") or ""
         ) not in _ENGINES_WITHOUT_HEALTH_ROUTE
-        try:
+        async def probe():
             if member.get("node_id") == LOCAL_NODE_ID:
-                return await self.inference_target_health(
+                return bool(await self.inference_target_health(
                     model, container_name=member.get("container_name"),
                     deployment_id=deployment_id, single_target=True,
                     **({"strict_health": True} if strict_health else {}),
-                )
+                ))
             result = await self.node_registry.request(
                 member.get("node_id"), "POST", "/api/agent/inference/health",
                 json_body={
@@ -8478,13 +8650,44 @@ class Manager:
                     "_sparkdeck_deployment_id": deployment_id,
                     "single_target": True,
                     **({"strict_health": True} if strict_health else {}),
-                }, timeout=10,
+                }, timeout=timeout,
             )
+            return bool((result or {}).get("ready"))
+
+        try:
+            if cancel is None:
+                return await probe()
+            else:
+                # A disconnect must end the wait immediately, not at the
+                # probe's full timeout: race the probe against the event
+                # and stop dialing the agent once the client is gone.
+                probe_task = asyncio.ensure_future(probe())
+                cancel_task = asyncio.ensure_future(cancel.wait())
+                try:
+                    await asyncio.wait(
+                        {probe_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not probe_task.done():
+                        probe_task.cancel()
+                    cancel_task.cancel()
+                if cancel.is_set():
+                    raise ClientAbort(
+                        "client disconnected while the deployment was unavailable"
+                    )
+                return probe_task.result()
         except ClientAbort:
             raise
-        except Exception:
+        except Exception as exc:
+            if self._cluster_probe_failure_deterministic(exc):
+                # The agent will answer the same way on every retry; the
+                # outage window cannot help, so surface the cause. Wrapped
+                # so the remaining members are still tried in this pass.
+                raise ClusterReplicaUnavailable(
+                    f"engine readiness check failed: {exc}"
+                ) from exc
             return False
-        return bool((result or {}).get("ready"))
 
     async def _proxy_cluster_member_unlimited(
         self,
@@ -8498,6 +8701,7 @@ class Manager:
         caller_ip: str | None = None,
         startup_benchmark: bool = False,
         member_reserved: bool = False,
+        deadline: float | None = None,
     ):
         """Send one request to a specific member without failover.
 
@@ -8527,8 +8731,16 @@ class Manager:
                 raise ClusterReplicaUnavailable(
                     "engine group is stopped; start it or route to a running group"
                 )
+            probe_timeout = 10.0
+            if deadline is not None:
+                # The ride-through window bounds each probe: a member that
+                # cannot answer within the remaining time is out for this
+                # request anyway.
+                probe_timeout = min(
+                    10.0, max(deadline - time.monotonic(), 0.05),
+                )
             if not startup_benchmark and not await self._cluster_member_serving(
-                deployment, member, model,
+                deployment, member, model, timeout=probe_timeout, cancel=cancel,
             ):
                 # A container can be up for minutes while its weights are still
                 # loading, so Docker status alone proves nothing. Only a member

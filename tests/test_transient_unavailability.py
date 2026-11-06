@@ -229,6 +229,17 @@ def triple_remote_deployment() -> dict:
     }
 
 
+def dual_remote_deployment() -> dict:
+    return {
+        "id": "glm", "model": "/models/glm", "mode": "replicated",
+        "launch_settings": {},
+        "members": [
+            member(0, "node-a", "glm-r0"),
+            member(1, "node-b", "glm-r1"),
+        ],
+    }
+
+
 def connect_failure(message: str = "could not contact threadripper") -> RuntimeError:
     error = RuntimeError(message)
     error.__cause__ = httpx.ConnectTimeout("connect timed out")
@@ -461,6 +472,58 @@ class ClusterRideThroughTests(unittest.IsolatedAsyncioTestCase):
             await self.proxy(manager)
 
         self.assertEqual(manager.node_registry.request.await_count, 3)
+        self.assert_no_reservation_leaked(manager)
+
+    async def test_a_disabled_node_fails_fast(self):
+        # The registry refuses a disabled node's request before dialing;
+        # waiting out the window cannot bring it back, so the cause must
+        # surface immediately.
+        manager = self.manager()
+        manager.node_registry.request = AsyncMock(side_effect=[
+            ValueError("node threadripper is disabled"),
+        ])
+
+        with self.assertRaisesRegex(ClusterReplicaUnavailable, "disabled"):
+            await self.proxy(manager)
+
+        manager._cluster_ride_through_pause.assert_not_awaited()
+        self.assertEqual(manager.node_registry.request.await_count, 1)
+        self.assert_no_reservation_leaked(manager)
+
+    async def test_a_removed_node_fails_fast(self):
+        manager = self.manager()
+        manager.node_registry.request = AsyncMock(side_effect=[
+            ValueError("remote node not found"),
+        ])
+
+        with self.assertRaisesRegex(
+            ClusterReplicaUnavailable, "remote node not found",
+        ):
+            await self.proxy(manager)
+
+        manager._cluster_ride_through_pause.assert_not_awaited()
+        self.assertEqual(manager.node_registry.request.await_count, 1)
+
+    async def test_a_post_dispatch_failure_is_not_replayed_on_a_later_probe(self):
+        # Replica 0's dispatch fails after the prompt was sent (read
+        # timeout), then replica 1's probe failure ends the pass: the
+        # ride-through must not replay the route, because the first engine
+        # may still be generating the prompt.
+        manager = build_manager(dual_remote_deployment())
+        manager._cluster_ride_through_pause = AsyncMock()
+        dispatched = RuntimeError("could not contact node-a: read timed out")
+        dispatched.__cause__ = httpx.ReadTimeout("read timed out")
+        manager.node_registry.request = AsyncMock(side_effect=[
+            {"ready": True},
+            dispatched,
+            {"ready": False},
+        ])
+
+        with self.assertRaisesRegex(ClusterReplicaUnavailable, "not ready"):
+            await self.proxy(manager)
+
+        manager._cluster_ride_through_pause.assert_not_awaited()
+        self.assertEqual(self.forwarded(manager), 1)
         self.assert_no_reservation_leaked(manager)
 
 

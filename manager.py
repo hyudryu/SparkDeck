@@ -8339,11 +8339,18 @@ class Manager:
         The agent rejecting the probe with a client error (rejected
         credentials, an unknown route) answers the same way on every
         attempt, so riding the outage window out cannot help and the cause
-        must surface instead of becoming a not-ready replica. Its typed
-        missing-container 404 and saturated or timed-out answers stay
-        transient: the container may be restarting and the agent briefly
-        overloaded.
+        must surface instead of becoming a not-ready replica. So does a
+        node the operator disabled or removed: the registry refuses the
+        request before dialing and waiting cannot bring it back. The
+        agent's typed missing-container 404 and saturated or timed-out
+        answers stay transient: the container may be restarting and the
+        agent briefly overloaded.
         """
+        if isinstance(exc, (ValueError, LookupError)) and any(
+            marker in str(exc)
+            for marker in ("is disabled", "remote node not found")
+        ):
+            return True
         return (
             isinstance(exc, NodeAgentResponseError)
             and exc.status_code < 500
@@ -8390,6 +8397,7 @@ class Manager:
         deadline = time.monotonic() + window
         pause = self._CLUSTER_RIDE_THROUGH_FIRST_PAUSE
         announced = False
+        pass_state: dict = {}
         while True:
             try:
                 # Retry passes stay quiet: the outage is announced once below
@@ -8401,6 +8409,7 @@ class Manager:
                     caller_ip=caller_ip, source_route=source_route,
                     log_failover=not announced,
                     deadline=deadline if window > 0 else None,
+                    pass_state=pass_state,
                 )
             except Exception as exc:
                 remaining = deadline - time.monotonic()
@@ -8409,6 +8418,7 @@ class Manager:
                     or remaining <= 0
                     or (cancel is not None and cancel.is_set())
                     or not self._cluster_ride_through_retryable(exc)
+                    or pass_state.get("unsafe_to_replay")
                 ):
                     raise
                 if not announced:
@@ -8435,6 +8445,7 @@ class Manager:
         source_route: dict | None = None,
         log_failover: bool = True,
         deadline: float | None = None,
+        pass_state: dict | None = None,
     ):
         """One balanced pass over the route order, failing over in turn.
 
@@ -8442,7 +8453,10 @@ class Manager:
         or ``None`` when there is none. It bounds the pass itself: once it
         has passed, remaining members are not probed, because each probe
         can wait out its full transport timeout and the configured wait
-        must hold.
+        must hold. ``pass_state`` records what the pass saw for the
+        ride-through loop: a replica failing after dispatch marks the whole
+        pass unsafe to replay, even when a later replica's probe failure is
+        what ends it.
         """
         deployment = self._deployment(deployment_id)
         if not deployment:
@@ -8499,6 +8513,14 @@ class Manager:
             except ClientAbort:
                 raise
             except Exception as exc:
+                if pass_state is not None and not self._cluster_ride_through_retryable(
+                    exc,
+                ):
+                    # This replica failed after dispatch (read timeout,
+                    # upstream 5xx): the prompt may already be generating,
+                    # so the ride-through must not replay the route even
+                    # when a later replica's probe failure ends this pass.
+                    pass_state["unsafe_to_replay"] = True
                 if source_route is not None and self._cluster_failover_retryable(exc):
                     raise SourceRoutingUnavailable(
                         f"source-IP routing target is unavailable: {exc}"

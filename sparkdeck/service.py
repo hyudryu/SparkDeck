@@ -8259,10 +8259,10 @@ class SparkDeckService:
     # whose phase was not read as ready (or a recovery) to "starting".
     _TRANSIENTLY_UNOBSERVED_STATUSES = frozenset({"degraded", "unknown", "starting"})
 
-    async def _transiently_unobserved_owner(
+    async def _transiently_unobserved_owners(
         self, model_id: str,
-    ) -> dict[str, Any] | None:
-        """Return the stored owner of a request id that just cannot be seen now.
+    ) -> list[dict[str, Any]]:
+        """Return the stored owners of a request id that cannot be seen now.
 
         Liveness comes from a routing snapshot, so a node that misses one
         fan-out (a Wi-Fi blip, a Tailscale re-key) publishes its deployment
@@ -8272,9 +8272,11 @@ class SparkDeckService:
         managed container found") although the deployment was still meant
         to serve. The stored owner keeps the request instead, so Manager's
         live member health check decides and real unavailability surfaces
-        as a retryable 503. Consulted only when no live owner exists; an
-        explicit stop, a confirmed stop, and a launch error keep the
-        previous behavior.
+        as a retryable 503. The caller applies the same selection the live
+        path uses (configured priority and caps, then least-in-flight
+        balancing) because these owners never reached the live selectors.
+        Consulted only when no live owner exists; an explicit stop, a
+        confirmed stop, and a launch error keep the previous behavior.
         """
         stored_by_id = {
             deployment["id"]: deployment
@@ -8293,9 +8295,7 @@ class SparkDeckService:
                 continue
             if model_id in self._deployment_public_model_ids(deployment):
                 owners.append({**stored, **deployment})
-        if not owners:
-            return None
-        return max(owners, key=self._selector_owner_sort_key)
+        return owners
 
     # ---- Model routing policies: priority + concurrency overflow ----
 
@@ -9149,10 +9149,29 @@ class SparkDeckService:
                         requested_model, candidates,
                     )
             if deployment is None:
-                deployment = (
-                    stored_deployment
-                    or await self._transiently_unobserved_owner(requested_model)
-                )
+                deployment = stored_deployment
+                if deployment is None:
+                    owners = await self._transiently_unobserved_owners(
+                        requested_model,
+                    )
+                    if owners:
+                        # The blipped owners never reached the live
+                        # selectors above, so run the same selection on
+                        # them: configured priority and caps first, then
+                        # the no-policy least-in-flight balancer.
+                        deployment = self._select_routed_member(
+                            requested_model, owners,
+                        )
+                        if deployment is not None:
+                            routing_slot = str(deployment.get("id") or "")
+                        elif len(owners) == 1:
+                            deployment = owners[0]
+                        else:
+                            deployment, routing_slot = (
+                                self._select_balanced_shared_owner(
+                                    requested_model, owners,
+                                )
+                            )
         if routing_slot is None and deployment is not None:
             # Alias and source-IP traffic bypasses the policy selector but
             # still consumes a policy member's concurrency budget.

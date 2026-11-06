@@ -8484,6 +8484,12 @@ class Manager:
         if not candidates:
             raise LookupError("cluster deployment has no inference member")
         for index, member in enumerate(candidates):
+            if cancel is not None and cancel.is_set():
+                # The client is gone; holding reservations and dialing more
+                # replicas serves nobody.
+                raise ClientAbort(
+                    "client disconnected while the deployment was unavailable"
+                )
             if deadline is not None and index and time.monotonic() >= deadline:
                 # The window closed mid-pass: probing further members would
                 # wait out their transport timeouts and overrun the
@@ -8611,7 +8617,7 @@ class Manager:
 
     async def _cluster_member_serving(
         self, deployment: dict, member: dict, model: str,
-        timeout: float = 10,
+        timeout: float = 10, cancel: asyncio.Event | None = None,
     ) -> bool:
         """True only when this member's engine answers its health check now.
 
@@ -8629,13 +8635,13 @@ class Manager:
         strict_health = str(
             deployment.get("engine") or ""
         ) not in _ENGINES_WITHOUT_HEALTH_ROUTE
-        try:
+        async def probe():
             if member.get("node_id") == LOCAL_NODE_ID:
-                return await self.inference_target_health(
+                return bool(await self.inference_target_health(
                     model, container_name=member.get("container_name"),
                     deployment_id=deployment_id, single_target=True,
                     **({"strict_health": True} if strict_health else {}),
-                )
+                ))
             result = await self.node_registry.request(
                 member.get("node_id"), "POST", "/api/agent/inference/health",
                 json_body={
@@ -8646,6 +8652,31 @@ class Manager:
                     **({"strict_health": True} if strict_health else {}),
                 }, timeout=timeout,
             )
+            return bool((result or {}).get("ready"))
+
+        try:
+            if cancel is None:
+                return await probe()
+            else:
+                # A disconnect must end the wait immediately, not at the
+                # probe's full timeout: race the probe against the event
+                # and stop dialing the agent once the client is gone.
+                probe_task = asyncio.ensure_future(probe())
+                cancel_task = asyncio.ensure_future(cancel.wait())
+                try:
+                    await asyncio.wait(
+                        {probe_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not probe_task.done():
+                        probe_task.cancel()
+                    cancel_task.cancel()
+                if cancel.is_set():
+                    raise ClientAbort(
+                        "client disconnected while the deployment was unavailable"
+                    )
+                return probe_task.result()
         except ClientAbort:
             raise
         except Exception as exc:
@@ -8657,7 +8688,6 @@ class Manager:
                     f"engine readiness check failed: {exc}"
                 ) from exc
             return False
-        return bool((result or {}).get("ready"))
 
     async def _proxy_cluster_member_unlimited(
         self,
@@ -8710,7 +8740,7 @@ class Manager:
                     10.0, max(deadline - time.monotonic(), 0.05),
                 )
             if not startup_benchmark and not await self._cluster_member_serving(
-                deployment, member, model, timeout=probe_timeout,
+                deployment, member, model, timeout=probe_timeout, cancel=cancel,
             ):
                 # A container can be up for minutes while its weights are still
                 # loading, so Docker status alone proves nothing. Only a member

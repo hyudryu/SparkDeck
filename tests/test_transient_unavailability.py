@@ -526,6 +526,46 @@ class ClusterRideThroughTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.forwarded(manager), 1)
         self.assert_no_reservation_leaked(manager)
 
+    async def test_a_client_disconnect_ends_a_pending_probe(self):
+        # The client leaves while the readiness probe is still pending: the
+        # wait must end immediately instead of at the probe's full timeout,
+        # and no further members may be probed.
+        manager = build_manager(dual_remote_deployment())
+        manager._cluster_ride_through_pause = AsyncMock()
+        cancel = asyncio.Event()
+        started = time.monotonic()
+
+        async def slow_probe(node_id, method, path, *, json_body=None, timeout=30):
+            await asyncio.sleep(30)
+            return {"ready": False}
+
+        manager.node_registry.request = AsyncMock(side_effect=slow_probe)
+
+        async def leave_soon():
+            await asyncio.sleep(0.1)
+            cancel.set()
+
+        asyncio.ensure_future(leave_soon())
+
+        with self.assertRaises(ClientAbort):
+            await self.proxy(manager, cancel=cancel)
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(manager.node_registry.request.await_count, 1)
+        self.assert_no_reservation_leaked(manager)
+
+    async def test_a_disconnect_before_the_pass_probes_no_member(self):
+        manager = build_manager(dual_remote_deployment())
+        manager._cluster_ride_through_pause = AsyncMock()
+        cancel = asyncio.Event()
+        cancel.set()
+        manager.node_registry.request = AsyncMock(return_value={"ready": False})
+
+        with self.assertRaises(ClientAbort):
+            await self.proxy(manager, cancel=cancel)
+
+        manager.node_registry.request.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1143,12 +1143,18 @@ def build_server(
         ``max_running_requests``, ``mem_fraction_static``, and
         ``tensor_parallel_size``; vLLM accepts ``max_model_len``,
         ``max_running_requests``, ``gpu_memory_utilization``, and
-        ``environment``. Put environment at the recipe top level or inside
+        ``environment``. TensorFold accepts ``launch_settings`` with
+        ``context_length`` (mapped to its ``--context`` flag; use
+        ``launch_controls`` ``thinking_mode`` for ``--no-thinking``) and
+        ``environment``; it launches one server per selected node, so only
+        ``single`` and ``replicated`` deployment modes and no sg_*/GPU-memory
+        fields are supported, and pinned revisions are not forwarded. Put
+        environment at the recipe top level or inside
         launch_settings. It must be an object of non-secret string NAME/value
         pairs, for example ``{"NCCL_DEBUG": "WARN"}``, and is applied to every
-        vLLM rank. Values outside these fields are ignored. Recipes cover the
-        vLLM and SGLang engines; other runtimes (llama.cpp, Laya, TensorFold,
-        NInfer, Strata) are deployed through the deployments API instead.
+        engine rank. Values outside these fields are ignored. Recipes cover
+        the vLLM, SGLang, and TensorFold engines; other runtimes (llama.cpp,
+        Laya, NInfer, Strata) are deployed through the deployments API instead.
         """
         return await client.create_recipe(recipe)
 
@@ -1156,7 +1162,7 @@ def build_server(
     async def update_cluster_recipe(
         recipe_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
-        """Modify a recipe. Changes may include launch_controls, extra_args, and vLLM environment."""
+        """Modify a recipe. Changes may include launch_controls, extra_args, and the engine environment. TensorFold recipes accept the ``context_window`` and ``thinking_mode`` launch controls; sg_* and GPU-memory fields stay vLLM/SGLang-only."""
         return await client.update_recipe(recipe_id, changes)
 
     @server.tool()
@@ -1165,7 +1171,7 @@ def build_server(
         name: str,
         overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Clone a recipe and apply overrides, including a vLLM environment object."""
+        """Clone a recipe and apply overrides, including a vLLM or TensorFold environment object."""
         return await client.clone_recipe(recipe_id, name, overrides)
 
     @server.tool()
@@ -1175,7 +1181,7 @@ def build_server(
         deployment_name: str | None = None,
         automation_run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Launch a recipe with overrides such as vLLM environment and add MCP ownership metadata."""
+        """Launch a recipe with overrides such as a vLLM or TensorFold environment and add MCP ownership metadata."""
         return await client.deploy_recipe(
             recipe_id,
             overrides=overrides,

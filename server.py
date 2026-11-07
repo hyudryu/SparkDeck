@@ -2671,8 +2671,8 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
 
     payload = {key: value for key, value in body.items() if key != "launch_settings"}
     engine = payload.get("engine") or "vllm"
-    if engine not in {"vllm", "sglang"}:
-        raise HTTPException(400, "engine must be vllm or sglang")
+    if engine not in {"vllm", "sglang", "tensorfold"}:
+        raise HTTPException(400, "engine must be vllm, sglang, or tensorfold")
     raw_controls = payload.get("launch_controls")
     if raw_controls is not None and not isinstance(raw_controls, dict):
         raise HTTPException(400, "launch_controls must be an object")
@@ -2707,14 +2707,32 @@ def _merge_recipe_launch_settings(body: dict) -> dict:
         if payload.get("sg_cpu_affinity") is None and settings.get("sg_cpu_affinity") is not None:
             payload["sg_cpu_affinity"] = settings["sg_cpu_affinity"]
     else:
-        if payload.get("gpu_memory_utilization") is None and settings.get("gpu_memory_utilization") is not None:
-            payload["gpu_memory_utilization"] = settings["gpu_memory_utilization"]
         context_length = settings.get("max_model_len") or settings.get("context_length")
         if context_length is not None and controls.get("context_window") is None:
             controls["context_window"] = context_length
         max_running = settings.get("max_running_requests")
         if max_running is not None and controls.get("max_concurrency") is None:
             controls["max_concurrency"] = max_running
+        if engine == "tensorfold":
+            # TensorFold's launch contract is a plain `serve MODEL` argv: only
+            # the context window maps to a flag, so refuse the memory and
+            # concurrency knobs instead of dropping them silently.
+            unsupported = sorted(
+                label for label, value in (
+                    ("gpu_memory_utilization", settings.get("gpu_memory_utilization")),
+                    ("max_running_requests", max_running),
+                ) if value is not None
+            )
+            if unsupported:
+                raise HTTPException(
+                    400,
+                    f"{', '.join(unsupported)} not supported for tensorfold recipes",
+                )
+        elif (
+            payload.get("gpu_memory_utilization") is None
+            and settings.get("gpu_memory_utilization") is not None
+        ):
+            payload["gpu_memory_utilization"] = settings["gpu_memory_utilization"]
     if payload.get("environment") is None and settings.get("environment") is not None:
         payload["environment"] = settings["environment"]
 

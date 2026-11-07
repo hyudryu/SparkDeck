@@ -428,6 +428,11 @@ _STRATA_SERVE_PORT = 8080
 _SUPPORTED_ENGINES = (
     "vllm", "sglang", "llama.cpp", "laya", "tensorfold", "ninfer", "strata",
 )
+# Engines a persisted launch recipe may target. TensorFold joins the recipe
+# flow with the same launch contract the deployments API already uses (a
+# `serve MODEL` argv, single or replicated layouts only); the remaining
+# runtimes still launch exclusively through the deployments API.
+_RECIPE_ENGINES = frozenset({"vllm", "sglang", "tensorfold"})
 # The Laya decision server and TensorFold expose no /health route; their
 # readiness signal is the OpenAI surface itself answering 200. NInfer and
 # Strata do expose GET /health (Strata answers it before its API-key gate),
@@ -16078,6 +16083,12 @@ class Manager:
             if tensor_parallel is None:
                 tensor_parallel = self._cli_option(args, {"--tp-size"}, int)
             pipeline_parallel = 1
+        elif engine == "tensorfold":
+            # TensorFold's CLI has no tensor/pipeline-parallel flags and its
+            # launcher rejects sharded members, so a recipe always describes
+            # one single-GPU server per selected node.
+            tensor_parallel = 1
+            pipeline_parallel = 1
         else:
             tensor_parallel = self._cli_option(
                 args, {"--tensor-parallel-size", "-tp"}, int
@@ -16160,6 +16171,14 @@ class Manager:
             required_nodes = 1
             invalid_mode = f"unsupported persisted deployment mode: {mode}"
             mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
+        if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
+            # Launch preflight rejects sharded TensorFold members; surface the
+            # same constraint at the recipe contract so the UI and the MCP
+            # flow refuse to save an unlaunchable layout.
+            invalid_mode = (
+                "tensorfold recipes support single or replicated deployment modes"
+            )
+            mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
         model_revision = self._cli_option(args, {"--revision"})
         contract = {
             "required_node_count": required_nodes,
@@ -16182,7 +16201,7 @@ class Manager:
                     return []
                 for recipe in value:
                     engine = str(recipe.get("engine") or "vllm")
-                    if engine not in {"vllm", "sglang"}:
+                    if engine not in _RECIPE_ENGINES:
                         recipe["supported"] = False
                         recipe["error"] = f"unsupported persisted runtime: {engine}"
                 return value
@@ -16279,8 +16298,8 @@ class Manager:
         self._reject_hf_cli_credentials(extra_args)
         if not model:
             raise ValueError("model is required")
-        if engine not in {"vllm", "sglang"}:
-            raise ValueError("engine must be vllm or sglang")
+        if engine not in _RECIPE_ENGINES:
+            raise ValueError("engine must be vllm, sglang, or tensorfold")
         normalized_environment = normalize_runtime_environment(environment, engine)
         sg_tp_size = self._validated_sg_scalar("sg_tp_size", sg_tp_size)
         sg_context_length = self._validated_sg_scalar("sg_context_length", sg_context_length)
@@ -16291,11 +16310,36 @@ class Manager:
         sg_cpu_affinity = self._normalized_sg_cpu_affinity(sg_cpu_affinity)
         if sg_cpu_affinity and engine != "sglang":
             raise ValueError("sg_cpu_affinity is only supported for SGLang")
+        if engine == "tensorfold":
+            # TensorFold launches carry a plain `serve MODEL` argv: the typed
+            # SGLang scalars and the vLLM/SGLang GPU-memory knobs have no
+            # flags there, so refuse them instead of silently dropping them.
+            if any(
+                value is not None
+                for value in (
+                    sg_tp_size, sg_context_length, sg_max_running_requests,
+                    sg_mem_fraction, sg_image, sg_cpu_affinity,
+                )
+            ):
+                raise ValueError(
+                    "sg_* fields are only supported for SGLang recipes"
+                )
+            if gpu_memory_utilization is not None or gpu_memory_gb is not None:
+                raise ValueError(
+                    "gpu_memory_utilization and gpu_memory_gb are only "
+                    "supported for vLLM and SGLang recipes"
+                )
         deployment_mode = deployment_mode or "single"
         if deployment_mode not in _MODE_ALLOWLIST:
             raise ValueError(
                 "deployment_mode must be single, sharded, replicated, "
                 "or grouped_sharded"
+            )
+        if engine == "tensorfold" and deployment_mode in {
+            "sharded", "grouped_sharded",
+        }:
+            raise ValueError(
+                "tensorfold recipes support single or replicated deployment modes"
             )
         node_ids = self._normalize_recipe_node_ids(node_ids)
         if deployment_mode == "single":
@@ -16455,8 +16499,28 @@ class Manager:
             if not str(merged.get("model") or "").strip():
                 raise ValueError("model is required")
             engine = merged.get("engine") or "vllm"
-            if engine not in {"vllm", "sglang"}:
-                raise ValueError("engine must be vllm or sglang")
+            if engine not in _RECIPE_ENGINES:
+                raise ValueError("engine must be vllm, sglang, or tensorfold")
+            if engine == "tensorfold":
+                if any(
+                    merged.get(key) is not None
+                    for key in (
+                        "sg_tp_size", "sg_context_length",
+                        "sg_max_running_requests", "sg_mem_fraction",
+                        "sg_image", "sg_cpu_affinity",
+                    )
+                ):
+                    raise ValueError(
+                        "sg_* fields are only supported for SGLang recipes"
+                    )
+                if (
+                    merged.get("gpu_memory_utilization") is not None
+                    or merged.get("gpu_memory_gb") is not None
+                ):
+                    raise ValueError(
+                        "gpu_memory_utilization and gpu_memory_gb are only "
+                        "supported for vLLM and SGLang recipes"
+                    )
             merged["environment"] = normalize_runtime_environment(
                 merged.get("environment"), engine,
             )
@@ -16468,6 +16532,10 @@ class Manager:
                 raise ValueError(
                     "deployment_mode must be single, sharded, replicated, "
                     "or grouped_sharded"
+                )
+            if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
+                raise ValueError(
+                    "tensorfold recipes support single or replicated deployment modes"
                 )
             nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":

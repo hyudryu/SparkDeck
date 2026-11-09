@@ -54,6 +54,7 @@ from sparkdeck.runtimes import (
     validate_strata_model,
     validate_strata_served_model_name,
 )
+from sparkdeck.http_transport import cancellation_safe_client
 from sparkdeck.stream_cleanup import close_async_stream
 from sparkdeck.prefix_affinity import PrefixAffinity
 from sparkdeck.private_json import atomic_private_json_write as _atomic_private_json_write
@@ -1043,8 +1044,10 @@ class Manager:
         # lightweight polling while new engines are still initializing.
         self._capacity_deep_scan_attempted: set[str] = set()
         self._capacity_redeploying_models: set[str] = set()
-        self.http = httpx.AsyncClient(timeout=600)
-        self.fabric_http = httpx.AsyncClient(timeout=600, trust_env=False)
+        # Agent traffic is cancelled routinely (client disconnects, probes
+        # racing a cancel event); these clients must not strand pool slots.
+        self.http = cancellation_safe_client(timeout=600)
+        self.fabric_http = cancellation_safe_client(timeout=600, trust_env=False)
         self.agent_credentials = AgentCredentials(self.data_dir)
         self.node_registry = NodeRegistry(
             self.data_dir, self.http, self.agent_credentials.node_id,

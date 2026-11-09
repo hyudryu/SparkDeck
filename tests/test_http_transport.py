@@ -1,8 +1,11 @@
 """Cancelled requests must not strand httpx connection-pool slots."""
 
 import asyncio
+import os
 import unittest
+from unittest import mock
 
+import httpcore
 import httpx
 
 from sparkdeck.http_transport import (
@@ -124,8 +127,6 @@ class StrandedConnectionTests(unittest.IsolatedAsyncioTestCase):
                 # Simulate the queued-request race: the pool created a
                 # connection for a request that was cancelled before dialing.
                 origin = httpx.URL(server.url)
-                import httpcore
-
                 stranded = httpcore.AsyncHTTPConnection(
                     origin=httpcore.Origin(b"http", origin.host.encode(), origin.port),
                 )
@@ -148,6 +149,33 @@ class StrandedConnectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.timeout, httpx.Timeout(600))
         finally:
             await client.aclose()
+
+    async def test_transport_options_reach_the_pool(self):
+        client = cancellation_safe_client(limits=httpx.Limits(max_connections=3))
+        try:
+            self.assertEqual(_pool(client)._max_connections, 3)
+        finally:
+            await client.aclose()
+
+    async def test_environment_proxies_are_still_honoured(self):
+        proxy_env = {
+            "HTTP_PROXY": "http://proxy.invalid:3128",
+            "HTTPS_PROXY": "http://proxy.invalid:3128",
+            "NO_PROXY": "",
+        }
+        with mock.patch.dict(os.environ, proxy_env):
+            client = cancellation_safe_client(timeout=5)
+            no_env = cancellation_safe_client(timeout=5, trust_env=False)
+        try:
+            for url in ("http://example.com/", "https://example.com/"):
+                transport = client._transport_for_url(httpx.URL(url))
+                self.assertIsNot(transport, client._transport)
+                self.assertIsInstance(transport, CancellationSafeTransport)
+                self.assertIsInstance(transport._pool, httpcore.AsyncHTTPProxy)
+                self.assertIs(no_env._transport_for_url(httpx.URL(url)), no_env._transport)
+        finally:
+            await client.aclose()
+            await no_env.aclose()
 
 
 if __name__ == "__main__":

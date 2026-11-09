@@ -112,7 +112,25 @@ class CancellationSafeTransport(httpx.AsyncHTTPTransport):
             raise
 
 
-def cancellation_safe_client(*, trust_env: bool = True, **kwargs) -> httpx.AsyncClient:
-    """Build an ``AsyncClient`` whose default transport survives cancellation."""
-    transport = CancellationSafeTransport(trust_env=trust_env)
-    return httpx.AsyncClient(transport=transport, trust_env=trust_env, **kwargs)
+class CancellationSafeAsyncClient(httpx.AsyncClient):
+    """``AsyncClient`` whose default and proxy transports survive cancellation.
+
+    Overriding httpx's transport factories, rather than passing ``transport=``,
+    keeps every client option working: httpx still builds environment proxy
+    mounts (it disables them when a transport is supplied) and still applies
+    ``limits``, ``verify``, ``cert``, ``http1`` and ``http2`` to the transports
+    it creates. An explicit ``transport=`` is used as-is.
+    """
+
+    def _init_transport(self, *args, transport=None, **kwargs):
+        if transport is not None:
+            return transport
+        return CancellationSafeTransport(*args, **kwargs)
+
+    def _init_proxy_transport(self, proxy, *args, **kwargs):
+        return CancellationSafeTransport(*args, proxy=proxy, **kwargs)
+
+
+def cancellation_safe_client(**kwargs) -> httpx.AsyncClient:
+    """Build an ``AsyncClient`` whose transports survive request cancellation."""
+    return CancellationSafeAsyncClient(**kwargs)

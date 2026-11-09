@@ -40,6 +40,7 @@ from mcp_server import ControllerClient, build_server
 from sparkdeck import SparkDeckService
 from sparkdeck.benchmark_runner import BenchmarkRunnerError, BenchmarkRunnerService
 from sparkdeck.download_throttle import parse_bandwidth_mbps
+from sparkdeck.http_transport import cancellation_safe_client
 from sparkdeck.service import (
     _COMMUNITY_MAX_RESPONSE_BYTES,
     _public_community_aggregates,
@@ -4617,7 +4618,7 @@ def _community_aggregates_unavailable() -> dict:
 # ---------- Community telemetry uploader ----------
 # Shared client for the community API and Cognito token minting. Tests swap in
 # a MockTransport-backed client.
-_community_http = httpx.AsyncClient(timeout=5)
+_community_http = cancellation_safe_client(timeout=5)
 
 COMMUNITY_UPLOAD_BATCH_SIZE = 50
 COMMUNITY_UPLOAD_INTERVAL_SECONDS = 60

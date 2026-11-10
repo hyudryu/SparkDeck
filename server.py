@@ -21,6 +21,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
 import httpx
 import jwt
 import docker
@@ -436,52 +437,86 @@ _COMMUNITY_SESSION_LIMIT = 256
 _community_browser_sessions: dict[str, tuple[str, float]] = {}
 
 
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
-    forgotten_unregister = (
-        forwarded
-        and request.method == "POST"
-        and request.url.path == "/api/v1/onboarding/unregister"
-        and onboarding.is_already_unregistered_worker(request.headers)
-    )
-    if forgotten_unregister:
-        # The route turns this exact already-absent state into the 404 that a
-        # force-forgotten worker recognizes as a successful local recovery.
-        response = await call_next(request)
-    elif is_forwardable_path(request.url.path):
+class _SecurityHeadersMiddleware:
+    """Route worker-forwarded requests and add security headers.
+
+    This is deliberately a pure ASGI middleware, not ``@app.middleware("http")``.
+    Starlette's BaseHTTPMiddleware answers ``Request.is_disconnected()`` with
+    False for as long as a route is running, so ``_watch_disconnect`` never
+    set the inference cancel event. The admission reaper and the prompt gate
+    treat that event as the only proof a client left, so an abandoned stream
+    kept its admission slot and live-session record forever (shown on the
+    dashboard as an ever-growing "Prefilling" age).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        response = await self._management_response(request)
+        host = request.headers.get("host", "")
+        # Some browsers do not match ws:/wss: against 'self'; permit the
+        # dashboard socket on the same host the page was served from.
+        websocket_sources = f" ws://{host} wss://{host}" if host else ""
+        defaults = (
+            (
+                "Content-Security-Policy",
+                f"default-src 'self'; connect-src 'self' {COGNITO_IDP_ORIGIN}{websocket_sources}; img-src 'self' data:; "
+                "style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; "
+                "base-uri 'self'; frame-ancestors 'none'",
+            ),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+        )
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in defaults:
+                    headers.setdefault(name, value)
+            await send(message)
+
+        if response is None:
+            await self.app(scope, receive, send_with_headers)
+        else:
+            await response(scope, receive, send_with_headers)
+
+    @staticmethod
+    async def _management_response(request: Request) -> Response | None:
+        """Return the forwarded or rejected response, or None to route locally."""
+        forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
+        forgotten_unregister = (
+            forwarded
+            and request.method == "POST"
+            and request.url.path == "/api/v1/onboarding/unregister"
+            and onboarding.is_already_unregistered_worker(request.headers)
+        )
+        if forgotten_unregister:
+            # The route turns this exact already-absent state into the 404
+            # that a force-forgotten worker recognizes as a successful local
+            # recovery.
+            return None
+        if not is_forwardable_path(request.url.path):
+            return None
         assignment = onboarding.assignment.load()
         if assignment:
-            response = await forward_management_request(request, manager, assignment)
-        elif forwarded:
+            return await forward_management_request(request, manager, assignment)
+        if forwarded:
             valid, detail = onboarding.validate_forward_headers(request.headers)
             if not valid:
-                response = Response(
+                return Response(
                     json.dumps({"detail": detail}), status_code=401,
                     media_type="application/json",
                 )
-            else:
-                response = await call_next(request)
-        else:
-            response = await call_next(request)
-    else:
-        response = await call_next(request)
-    host = request.headers.get("host", "")
-    # Some browsers do not match ws:/wss: against 'self'; permit the dashboard
-    # socket on the same host the page was served from.
-    websocket_sources = f" ws://{host} wss://{host}" if host else ""
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        f"default-src 'self'; connect-src 'self' {COGNITO_IDP_ORIGIN}{websocket_sources}; img-src 'self' data:; "
-        "style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; "
-        "base-uri 'self'; frame-ancestors 'none'",
-    )
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    return response
+        return None
 
 
+app.add_middleware(_SecurityHeadersMiddleware)
 # Wrap forwarding and security middleware so their errors are captured too.
 app.add_middleware(_ErrorResponseLogMiddleware)
 

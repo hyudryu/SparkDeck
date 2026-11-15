@@ -98,6 +98,14 @@ controller_transfer = TransferService(
 # Automatic cluster actors (interrupted-launch resume, crash retry) hold off
 # while a promoted controller waits for the cluster to re-bind to it.
 manager._controller_transfer_gate = controller_transfer.defers_cluster_actions
+# The staged bundle is a point-in-time capture; in-flight deployment launches
+# could still commit to the live store after it. Wait for them to settle.
+controller_transfer.set_launch_drain_hook(
+    lambda: (
+        not getattr(sparkdeck, "_deployment_launches", None)
+        and not getattr(sparkdeck, "_deployment_launch_tasks", None)
+    )
+)
 image_patch_jobs = ImagePatchJobs(manager, ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
@@ -399,7 +407,7 @@ async def _deployment_log_loop():
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
-        controller_transfer.start()
+        controller_transfer.reconcile()
         uploader = asyncio.create_task(community_upload_loop())
         deployment_logs = asyncio.create_task(_deployment_log_loop())
         startup_benchmark_monitor = StartupBenchmarkMonitor(sparkdeck)
@@ -499,11 +507,28 @@ class _SecurityHeadersMiddleware:
     @staticmethod
     async def _management_response(request: Request) -> Response | None:
         """Return the forwarded or rejected response, or None to route locally."""
+        path = request.url.path
+        # A running controller transfer freezes controller-owned state from
+        # the bundle snapshot onward: acknowledged writes would live only on
+        # the outgoing machine and silently vanish when it archives its
+        # store. Inference (/v1), agent traffic, and the transfer's own
+        # endpoints keep working.
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and path.startswith("/api/")
+            and not path.startswith("/api/agent/")
+            and not path.startswith("/api/v1/controller-transfer")
+            and controller_transfer.blocks_management_writes()
+        ):
+            return JSONResponse(
+                {"detail": "cluster management is read-only during a controller transfer"},
+                status_code=503,
+            )
         forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
         forgotten_unregister = (
             forwarded
             and request.method == "POST"
-            and request.url.path == "/api/v1/onboarding/unregister"
+            and path == "/api/v1/onboarding/unregister"
             and onboarding.is_already_unregistered_worker(request.headers)
         )
         if forgotten_unregister:
@@ -511,7 +536,7 @@ class _SecurityHeadersMiddleware:
             # that a force-forgotten worker recognizes as a successful local
             # recovery.
             return None
-        if not is_forwardable_path(request.url.path):
+        if not is_forwardable_path(path):
             return None
         assignment = onboarding.assignment.load()
         if assignment:

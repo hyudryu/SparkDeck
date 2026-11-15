@@ -220,6 +220,39 @@ def promote(root: Path, state_path: Path) -> None:
                 )
                 raise
             raise
+        # Pre-commit: the assignment was never deleted, but the backup loop
+        # already moved the worker's originals aside. Put everything back so
+        # this node stays exactly the worker it was.
+        try:
+            for name in replaced:
+                source = backup / name
+                if source.exists():
+                    shutil.move(str(source), str(data_dir / name))
+            for name in json_files:
+                if not (backup / name).exists():
+                    (data_dir / name).unlink(missing_ok=True)
+            settings_backup = backup / "settings.json"
+            if settings_backup.exists():
+                shutil.copy2(str(settings_backup), str(data_dir / "settings.json"))
+            else:
+                (data_dir / "settings.json").unlink(missing_ok=True)
+            if "sparkdeck.sqlite3" not in replaced:
+                # A store was installed where none existed before; remove the
+                # fresh copy and any sidecar files it may have produced.
+                (data_dir / "sparkdeck.sqlite3").unlink(missing_ok=True)
+                (data_dir / "sparkdeck.sqlite3-wal").unlink(missing_ok=True)
+                (data_dir / "sparkdeck.sqlite3-shm").unlink(missing_ok=True)
+        except Exception as restore_exc:
+            write_state(
+                state_path,
+                phase="recovery_required",
+                error=(
+                    f"Promotion failed: {str(exc)[:220]}; restore failed:"
+                    f" {str(restore_exc)[:220]}"
+                ),
+                message="Automatic recovery failed; manual recovery is required",
+            )
+            raise
         write_state(
             state_path,
             phase="failed",

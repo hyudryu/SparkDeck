@@ -26,7 +26,7 @@ import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -45,6 +45,7 @@ MAX_STORE_BYTES = 256 * 1024 * 1024
 NEW_CONTROLLER_BOOT_TIMEOUT_SECONDS = 300.0
 REBIND_ATTEMPTS = 3
 COMPLETION_POLL_SECONDS = 5.0
+LAUNCH_DRAIN_TIMEOUT_SECONDS = 180.0
 
 # Settings that describe this machine rather than the cluster stay with the
 # node; every other controller setting transfers with the role.
@@ -75,6 +76,16 @@ TRANSFERRED_JSON_FILENAMES = (
     "token_usage_sync.json",
 )
 
+# Usage files describe this machine's own accounting origin. The outgoing
+# controller keeps them live after the demotion so its usage revisions and
+# counters survive as worker state; the promoted controller received its own
+# copies inside the bundle.
+NODE_LOCAL_USAGE_FILENAMES = {
+    "token_usage_sync.json",
+    "token_stats.json",
+    "hourly_token_stats.json",
+}
+
 # JSON keys whose values are cluster node ids. ``node_ids`` covers saved
 # deployment settings, replicas, and recipes; the scalars cover deployment
 # members and the RouterOS gateway pin. ``selected_nodes`` entries carry the
@@ -85,30 +96,36 @@ _NODE_REF_SCALAR_KEYS = {"node_id", "routeros_gateway_node_id"}
 _TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 
 
-def remap_node_refs(value: Any, replacement: str) -> Any:
-    """Deep-copy ``value`` with ``local`` node references moved to a node id."""
+def remap_node_refs(value: Any, replacements: dict[str, str]) -> Any:
+    """Deep-copy ``value`` with cluster node references rewritten.
+
+    A controller transfer moves two identities at once: the outgoing
+    controller's ``local`` sentinel becomes its real node id, and the
+    promoted worker's node id becomes the new ``local`` sentinel (its
+    registry entry is dropped because the promoted controller represents
+    itself as ``local``).
+    """
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
             if key in _NODE_REF_LIST_KEYS and isinstance(item, list):
                 result[key] = [
-                    replacement if entry == LOCAL_NODE_ID else entry
-                    for entry in item
+                    replacements.get(entry, entry) for entry in item
                 ]
-            elif key in _NODE_REF_SCALAR_KEYS and item == LOCAL_NODE_ID:
-                result[key] = replacement
+            elif key in _NODE_REF_SCALAR_KEYS and item in replacements:
+                result[key] = replacements[item]
             elif key == "selected_nodes" and isinstance(item, list):
                 result[key] = [
-                    {**entry, "id": replacement}
-                    if isinstance(entry, dict) and entry.get("id") == LOCAL_NODE_ID
+                    {**entry, "id": replacements[entry["id"]]}
+                    if isinstance(entry, dict) and entry.get("id") in replacements
                     else entry
                     for entry in item
                 ]
             else:
-                result[key] = remap_node_refs(item, replacement)
+                result[key] = remap_node_refs(item, replacements)
         return result
     if isinstance(value, list):
-        return [remap_node_refs(entry, replacement) for entry in value]
+        return [remap_node_refs(entry, replacements) for entry in value]
     return value
 
 
@@ -170,7 +187,9 @@ def _read_store_setting(data_dir: Path, key: str) -> Any:
         return None
 
 
-def snapshot_store(store_path: Path, destination: Path, replacement: str) -> None:
+def snapshot_store(
+    store_path: Path, destination: Path, replacements: dict[str, str]
+) -> None:
     """Write a standalone, node-remapped copy of the deployment store."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -196,7 +215,7 @@ def snapshot_store(store_path: Path, destination: Path, replacement: str) -> Non
                 settings = json.loads(settings_json)
             except ValueError:
                 continue
-            remapped = remap_node_refs(settings, replacement)
+            remapped = remap_node_refs(settings, replacements)
             if remapped != settings:
                 output.execute(
                     "UPDATE deployments SET settings_json = ? WHERE id = ?",
@@ -223,6 +242,29 @@ class TransferService:
         self._task: asyncio.Task | None = None
         self._completion_task: asyncio.Task | None = None
         self._closing = False
+        # Serializes admission (preflight + job reservation) so two requests
+        # cannot both observe an idle job and start competing orchestrations.
+        self._admission_lock = asyncio.Lock()
+        # Wired by server.py to SparkDeckService's launch bookkeeping so the
+        # bundle is captured only after in-flight launches settled.
+        self._launch_drain_hook: Callable[[], bool] | None = None
+
+    def set_launch_drain_hook(self, hook: Callable[[], bool]) -> None:
+        self._launch_drain_hook = hook
+
+    async def _drain_in_flight_launches(self) -> None:
+        """Wait until no deployment launch can still write the live store."""
+        hook = self._launch_drain_hook
+        if hook is None:
+            return
+        deadline = time.monotonic() + LAUNCH_DRAIN_TIMEOUT_SECONDS
+        while not hook():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "in-flight deployment launches did not settle in time;"
+                    " retry the transfer once they finish"
+                )
+            await asyncio.sleep(2)
 
     # ---------- durable state ----------
 
@@ -404,82 +446,99 @@ class TransferService:
             raise ValueError("Explicit controller transfer confirmation is required")
         if self.manager.is_joined_worker():
             raise RuntimeError("only the controller can transfer the controller role")
-        preflight = await self.preflight(target_node_id)
-        if not preflight["ok"]:
-            raise RuntimeError("; ".join(preflight["blockers"]))
-        target = self.manager.node_registry.get(str(target_node_id))
-        if not target:
-            raise RuntimeError("target is not a joined worker node")
-        target_url = str(target.get("agent_url") or "").rstrip("/")
-        own_urls = {url.rstrip("/") for url in self._controller_agent_urls()}
-        if not target_url or target_url in own_urls:
-            raise RuntimeError("target does not advertise a distinct cluster URL")
-        state = {
-            "id": uuid.uuid4().hex,
-            "active": True,
-            "committed": False,
-            "incoming": False,
-            "phase": "preflight",
-            "message": "Preparing the controller transfer",
-            "error": None,
-            "target_node_id": str(target_node_id),
-            "target_name": target.get("name"),
-            "target_url": target_url,
-            "old_controller_node_id": self.manager.agent_credentials.node_id,
-            "old_controller_name": self.manager.settings.get("cluster_node_name"),
-            "controller_url": target_url,
-            "nodes": [
-                {
-                    "id": node.get("id"),
-                    "name": node.get("name"),
-                    "status": "pending",
-                }
-                for node in self.manager.node_registry.nodes
-                if node.get("id") != str(target_node_id)
-            ],
-            "warnings": list(preflight["warnings"]),
-            "started_at": time.time(),
-            "completed_at": None,
-        }
-        self._write(state)
-        self._task = asyncio.create_task(self._run_transfer(state))
-        return self.status()
+        async with self._admission_lock:
+            preflight = await self.preflight(target_node_id)
+            if not preflight["ok"]:
+                raise RuntimeError("; ".join(preflight["blockers"]))
+            target = self.manager.node_registry.get(str(target_node_id))
+            if not target:
+                raise RuntimeError("target is not a joined worker node")
+            target_url = str(target.get("agent_url") or "").rstrip("/")
+            own_urls = {url.rstrip("/") for url in self._controller_agent_urls()}
+            if not target_url or target_url in own_urls:
+                raise RuntimeError("target does not advertise a distinct cluster URL")
+            state = {
+                "id": uuid.uuid4().hex,
+                "active": True,
+                "committed": False,
+                "promote_requested": False,
+                "incoming": False,
+                "phase": "preflight",
+                "message": "Preparing the controller transfer",
+                "error": None,
+                "target_node_id": str(target_node_id),
+                "target_name": target.get("name"),
+                "target_url": target_url,
+                "old_controller_node_id": self.manager.agent_credentials.node_id,
+                "old_controller_name": self.manager.settings.get("cluster_node_name"),
+                "controller_url": target_url,
+                "nodes": [
+                    {
+                        "id": node.get("id"),
+                        "name": node.get("name"),
+                        "status": "pending",
+                    }
+                    for node in self.manager.node_registry.nodes
+                    if node.get("id") != str(target_node_id)
+                ],
+                "warnings": list(preflight["warnings"]),
+                "started_at": time.time(),
+                "completed_at": None,
+            }
+            self._write(state)
+            self._task = asyncio.create_task(self._run_transfer(state))
+            return self.status()
+
+    def _cancellation_locked(self, state: dict) -> bool:
+        """Whether the promote commit may already be in flight.
+
+        Once the promote request was sent, the detached helper can commit at
+        any moment, so a cancel could strand a promoted controller next to an
+        outgoing controller that believes it cancelled.
+        """
+        return bool(state.get("committed") or state.get("promote_requested"))
 
     async def cancel(self) -> dict:
         state = self._read()
         if not state.get("active"):
             raise RuntimeError("no active controller transfer")
-        if state.get("committed"):
+        if self._cancellation_locked(state):
             raise RuntimeError(
-                "the target is already the controller; the transfer can only"
-                " be resumed, not cancelled"
+                "the target may already be the controller; the transfer can"
+                " only be resumed, not cancelled"
             )
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self._task
-        if not self.manager.is_joined_worker():
-            try:
-                await self.manager.node_registry.request(
-                    state["target_node_id"],
-                    "POST",
-                    "/api/agent/controller-transfer/discard",
-                    json_body={},
-                    timeout=15,
+        async with self._admission_lock:
+            state = self._read()
+            if not state.get("active") or self._cancellation_locked(state):
+                raise RuntimeError(
+                    "the transfer already progressed past cancellation"
                 )
-            except Exception:
-                pass
-        state.update(
-            active=False,
-            phase="cancelled",
-            message="Transfer cancelled before the target was promoted",
-        )
-        self._write(state)
-        return self.status()
+            if self._task is not None and not self._task.done():
+                self._task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await self._task
+            if not self.manager.is_joined_worker():
+                try:
+                    await self.manager.node_registry.request(
+                        state["target_node_id"],
+                        "POST",
+                        "/api/agent/controller-transfer/discard",
+                        json_body={},
+                        timeout=15,
+                    )
+                except Exception:
+                    pass
+            state.update(
+                active=False,
+                phase="cancelled",
+                message="Transfer cancelled before the target was promoted",
+            )
+            self._write(state)
+            return self.status()
 
     async def resume(self) -> dict:
         state = self._read()
-        if not state.get("active") or not state.get("committed"):
+        if not state.get("active") or not self._cancellation_locked(state):
             raise RuntimeError("no committed controller transfer to resume")
         if self._task is not None and not self._task.done():
             raise RuntimeError("the transfer is already running")
@@ -492,6 +551,7 @@ class TransferService:
 
     async def _run_transfer(self, state: dict) -> None:
         try:
+            await self._drain_in_flight_launches()
             state.update(
                 phase="bundling",
                 message="Capturing controller state",
@@ -531,7 +591,20 @@ class TransferService:
                 json_body={"job_id": state["id"]},
                 timeout=60,
             )
-            await self._wait_for_new_controller(state)
+            # The promote request was accepted: from here the detached helper
+            # may commit at any moment, so cancellation is no longer safe.
+            state["promote_requested"] = True
+            self._write(state)
+            try:
+                await self._wait_for_new_controller(state)
+            except RuntimeError:
+                if not await self._target_still_worker(state):
+                    raise
+                # The helper never promoted the target (it answered as a
+                # worker under this controller's credentials), so the flow is
+                # still reversible and a retry or cancel remains available.
+                state["promote_requested"] = False
+                raise
 
             # Commit point: the promoted controller is live. Quiesce this
             # process's cluster actors so only the new controller acts.
@@ -549,10 +622,11 @@ class TransferService:
                 node.get("status") == "failed" for node in state.get("nodes", [])
             ):
                 state.update(
+                    phase="rebinding",
                     message=(
                         "Some workers could not be re-bound; bring them back"
                         " online and resume the transfer"
-                    )
+                    ),
                 )
                 self._write(state)
                 return
@@ -560,21 +634,37 @@ class TransferService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            irreversible = self._cancellation_locked(state)
             state.update(
                 phase="failed",
-                active=not state.get("committed"),
+                # A committed (or possibly-committed) failure must stay
+                # resumable; only pre-promote failures release the job.
+                active=irreversible,
                 error=str(exc)[:500],
                 message=(
                     "Transfer failed"
                     + (
                         " after the target was promoted; resolve the issue and"
                         " resume it from the Cluster page"
-                        if state.get("committed")
+                        if irreversible
                         else ""
                     )
                 ),
             )
             self._write(state)
+
+    async def _target_still_worker(self, state: dict) -> bool:
+        """Check the target still answers as this controller's worker."""
+        try:
+            await self.manager.node_registry.request(
+                state["target_node_id"],
+                "GET",
+                "/api/agent/info",
+                timeout=10,
+            )
+            return True
+        except Exception:
+            return False
 
     def _controller_agent_urls(self) -> list[str]:
         port = getattr(self.onboarding, "port", 7878)
@@ -598,6 +688,15 @@ class TransferService:
         if not old_urls:
             raise RuntimeError("controller has no cluster-reachable URL")
         old_forward_token = secrets.token_urlsafe(32)
+        # The promoted worker's registry entry disappears (it becomes the
+        # ``local`` sentinel on the new controller), so every saved reference
+        # to it must become ``local``; the outgoing controller's ``local``
+        # references become its real node id, which the transferred registry
+        # re-introduces as a worker.
+        replacements = {
+            LOCAL_NODE_ID: old_node_id,
+            str(state["target_node_id"]): LOCAL_NODE_ID,
+        }
 
         entries = [
             {
@@ -637,7 +736,7 @@ class TransferService:
         with tempfile.TemporaryDirectory() as temporary:
             store_copy = Path(temporary) / "store.sqlite3"
             snapshot_store(
-                self.data_dir / "sparkdeck.sqlite3", store_copy, old_node_id
+                self.data_dir / "sparkdeck.sqlite3", store_copy, replacements
             )
             store_bytes = store_copy.read_bytes()
 
@@ -650,7 +749,7 @@ class TransferService:
                 value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            json_files[name] = remap_node_refs(value, old_node_id)
+            json_files[name] = remap_node_refs(value, replacements)
 
         overlay = {
             key: value
@@ -784,7 +883,15 @@ class TransferService:
                 "sparkdeck.sqlite3-wal",
                 "sparkdeck.sqlite3-shm",
                 "nodes.json",
-                *TRANSFERRED_JSON_FILENAMES,
+                *[
+                    filename
+                    for filename in TRANSFERRED_JSON_FILENAMES
+                    # Usage files describe this machine's own accounting
+                    # origin and stay live so the re-joined worker's usage
+                    # revisions survive; the new controller holds the
+                    # transferred copies from the bundle.
+                    if filename not in NODE_LOCAL_USAGE_FILENAMES
+                ],
             ):
                 source = self.data_dir / name
                 if source.exists():
@@ -837,7 +944,24 @@ class TransferService:
 
     async def _resume_committed(self, state: dict) -> None:
         try:
-            await self._wait_for_new_controller(state)
+            try:
+                await self._wait_for_new_controller(state)
+            except RuntimeError:
+                if not await self._target_still_worker(state):
+                    raise
+                # The target never promoted and still obeys this controller:
+                # release the job so the operator can retry or cancel.
+                state["promote_requested"] = False
+                state.update(
+                    active=False,
+                    phase="failed",
+                    message=(
+                        "The target stayed a worker; discard its staged state"
+                        " by cancelling, then start the transfer again"
+                    ),
+                )
+                self._write(state)
+                return
             adopt_worker = getattr(self.manager, "adopt_worker_role", None)
             if adopt_worker is not None:
                 await adopt_worker()
@@ -848,10 +972,11 @@ class TransferService:
                 node.get("status") == "failed" for node in state.get("nodes", [])
             ):
                 state.update(
+                    phase="rebinding",
                     message=(
                         "Some workers could not be re-bound; bring them back"
                         " online and resume the transfer"
-                    )
+                    ),
                 )
                 self._write(state)
                 return
@@ -919,6 +1044,26 @@ class TransferService:
             and state.get("incoming")
             and state.get("phase") in {"promoting", "promoted", "completing"}
         )
+
+    def blocks_management_writes(self) -> bool:
+        """Whether controller state is frozen for a running transfer.
+
+        From the bundle snapshot onward, acknowledged controller-state writes
+        would exist only on the outgoing machine and be silently lost when it
+        archives its store, so management mutations are rejected until the
+        flow finishes or is cancelled. Inference (/v1) and agent traffic are
+        not affected.
+        """
+        state = self._read()
+        if not state.get("active"):
+            return False
+        if state.get("incoming"):
+            # The promoted controller serves reads fine, but its writers do
+            # not know which workers accept their credentials yet.
+            return state.get("phase") in {"promoting", "promoted", "completing"}
+        return state.get("phase") in {
+            "bundling", "staging", "promoting", "rebinding", "demoting",
+        }
 
     # ---------- target-side (agent) surface ----------
 
@@ -1065,7 +1210,7 @@ class TransferService:
 
     # ---------- lifecycle ----------
 
-    def start(self) -> None:
+    def reconcile(self) -> None:
         """Reconcile durable transfer state with this process's role."""
         state = self._read()
         if not state.get("active"):
@@ -1104,7 +1249,7 @@ class TransferService:
             )
             self._write(state)
             return
-        if state.get("committed"):
+        if self._cancellation_locked(state):
             state.update(
                 phase="rebinding",
                 message="Resuming the committed controller transfer",

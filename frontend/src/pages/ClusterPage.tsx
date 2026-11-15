@@ -407,7 +407,7 @@ export function ClusterPage() {
           {transfer.data.message && <p>{transfer.data.message}</p>}
           {transfer.data.error && <p className="inline-error" role="alert">{transfer.data.error}</p>}
           {transferError && <p className="inline-error" role="alert">{transferError}</p>}
-          {transfer.data.phase === 'failed' && transfer.data.committed && <Button type="button" disabled={transferBusy} onClick={() => void resumeTransfer()}>{transferBusy ? 'Resuming…' : 'Resume transfer'}</Button>}
+          {(transfer.data.phase === 'failed' || transfer.data.phase === 'rebinding') && transfer.data.committed && <Button type="button" disabled={transferBusy} onClick={() => void resumeTransfer()}>{transferBusy ? 'Resuming…' : 'Resume transfer'}</Button>}
           {Boolean(transfer.data.nodes?.length) && <ul className="node-management-list transfer-node-list">
             {transfer.data.nodes?.map((node) => <li key={node.id} className="node-management-row">
               <div className="node-management-icon" aria-hidden="true"><Server size={17} /></div>

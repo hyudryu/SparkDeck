@@ -104,42 +104,51 @@ def write_store(path: Path, rows: list[tuple[str, str]]) -> None:
 class RemapNodeRefsTests(unittest.TestCase):
     def test_remaps_known_keys_and_leaves_other_values_alone(self):
         value = {
-            "node_ids": [LOCAL_NODE_ID, "worker-b"],
+            "node_ids": [LOCAL_NODE_ID, "worker-b", "target-id"],
             "routeros_gateway_node_id": LOCAL_NODE_ID,
             "members": [{"node_id": LOCAL_NODE_ID, "rank": 0}],
             "selected_nodes": [
                 {"id": LOCAL_NODE_ID, "name": "This device"},
+                {"id": "target-id", "name": "Target"},
                 {"id": "worker-b", "name": "B"},
             ],
-            "instances": [{"node_ids": [LOCAL_NODE_ID]}],
+            "instances": [{"node_ids": ["target-id"]}],
             "alias": LOCAL_NODE_ID,
             "count": 2,
         }
-        result = remap_node_refs(value, "old-controller")
-        self.assertEqual(result["node_ids"], ["old-controller", "worker-b"])
+        result = remap_node_refs(value, {
+            LOCAL_NODE_ID: "old-controller",
+            "target-id": LOCAL_NODE_ID,
+        })
+        self.assertEqual(result["node_ids"], ["old-controller", "worker-b", LOCAL_NODE_ID])
         self.assertEqual(result["routeros_gateway_node_id"], "old-controller")
         self.assertEqual(result["members"][0]["node_id"], "old-controller")
         self.assertEqual(result["selected_nodes"][0]["id"], "old-controller")
-        self.assertEqual(result["selected_nodes"][1]["id"], "worker-b")
-        self.assertEqual(result["instances"][0]["node_ids"], ["old-controller"])
+        self.assertEqual(result["selected_nodes"][1]["id"], LOCAL_NODE_ID)
+        self.assertEqual(result["selected_nodes"][2]["id"], "worker-b")
+        self.assertEqual(result["instances"][0]["node_ids"], [LOCAL_NODE_ID])
         # Unknown keys never move, even when they hold the sentinel text.
         self.assertEqual(result["alias"], LOCAL_NODE_ID)
         self.assertEqual(result["count"], 2)
         # The input is deep-copied.
-        self.assertEqual(value["node_ids"], [LOCAL_NODE_ID, "worker-b"])
+        self.assertEqual(value["node_ids"], [LOCAL_NODE_ID, "worker-b", "target-id"])
 
 
 class SnapshotStoreTests(unittest.TestCase):
-    def test_snapshot_remaps_local_references_into_a_standalone_copy(self):
+    def test_snapshot_remaps_node_references_into_a_standalone_copy(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sparkdeck.sqlite3"
             write_store(source, [
                 ("dep-1", json.dumps({"node_ids": [LOCAL_NODE_ID, "worker-b"]})),
-                ("dep-2", json.dumps({"tensor_parallel_size": 2})),
+                ("dep-2", json.dumps({"node_ids": ["target-id"]})),
+                ("dep-3", json.dumps({"tensor_parallel_size": 2})),
             ])
             destination = root / "copy.sqlite3"
-            snapshot_store(source, destination, "old-controller")
+            snapshot_store(source, destination, {
+                LOCAL_NODE_ID: "old-controller",
+                "target-id": LOCAL_NODE_ID,
+            })
             connection = sqlite3.connect(str(destination))
             try:
                 rows = dict(
@@ -151,7 +160,8 @@ class SnapshotStoreTests(unittest.TestCase):
                 json.loads(rows["dep-1"])["node_ids"],
                 ["old-controller", "worker-b"],
             )
-            self.assertEqual(json.loads(rows["dep-2"]), {"tensor_parallel_size": 2})
+            self.assertEqual(json.loads(rows["dep-2"])["node_ids"], [LOCAL_NODE_ID])
+            self.assertEqual(json.loads(rows["dep-3"]), {"tensor_parallel_size": 2})
             # The live store is untouched.
             original = sqlite3.connect(str(source))
             try:
@@ -310,6 +320,7 @@ class BuildBundleTests(unittest.TestCase):
         onboarding.assignment = ControllerAssignment(self.root)
         write_store(self.root / "sparkdeck.sqlite3", [
             ("dep-1", json.dumps({"node_ids": [LOCAL_NODE_ID]})),
+            ("dep-2", json.dumps({"node_ids": ["target-id"]})),
         ])
         (self.root / "recipes.json").write_text(json.dumps({
             "recipes": [{"id": "r1", "node_ids": [LOCAL_NODE_ID]}],
@@ -373,10 +384,19 @@ class BuildBundleTests(unittest.TestCase):
         settings_json = probe.execute(
             "SELECT settings_json FROM deployments WHERE id = 'dep-1'"
         ).fetchone()[0]
+        target_json = probe.execute(
+            "SELECT settings_json FROM deployments WHERE id = 'dep-2'"
+        ).fetchone()[0]
         probe.close()
         self.assertEqual(
             json.loads(settings_json)["node_ids"],
             [manager.agent_credentials.node_id],
+        )
+        # References to the promoted worker become the local sentinel on the
+        # new controller.
+        self.assertEqual(
+            json.loads(target_json)["node_ids"],
+            [LOCAL_NODE_ID],
         )
 
         self.assertTrue(bundle["transfer_state"]["incoming"])
@@ -443,7 +463,7 @@ class BootReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "nodes": [{"id": "worker-b", "name": "Bravo", "status": "pending"}],
         })
         with patch.object(transfer_module, "COMPLETION_POLL_SECONDS", 0.01):
-            service.start()
+            service.reconcile()
             for _ in range(200):
                 state = service._read()
                 if not state.get("active"):
@@ -467,11 +487,129 @@ class BootReconciliationTests(unittest.IsolatedAsyncioTestCase):
             "phase": "staging",
         })
         with patch.object(transfer_module, "COMPLETION_POLL_SECONDS", 0.01):
-            service.start()
+            service.reconcile()
         state = service._read()
         self.assertEqual(state["phase"], "failed")
         self.assertFalse(state["active"])
         await service.close()
+
+
+class StartTransferFlowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _service(self) -> tuple[TransferService, FakeManager]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "role": "controller",
+                "node": {
+                    "id": "target-id",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                },
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        manager.node_registry = FakeRegistry([
+            make_worker("target-id", "Target", "http://127.0.0.1:7000"),
+            make_worker("worker-b", "Bravo", "http://127.0.0.1:7001"),
+        ])
+
+        async def registry_request(node_id, method, path, json_body=None, timeout=30, allow_disabled=False):
+            if path == "/api/agent/controller-transfer/receive":
+                return {"ok": True, "job_id": (json_body or {}).get("job_id")}
+            if path == "/api/agent/controller-transfer/promote":
+                return {"ok": True, "helper_pid": 99}
+            if path == "/api/agent/onboarding/rebind":
+                return {"ok": True}
+            if path == "/api/agent/info":
+                return {"node_id": node_id, "capabilities": [CONTROLLER_TRANSFER_CAPABILITY]}
+            return {"ok": True}
+
+        manager.node_registry.request = AsyncMock(side_effect=registry_request)
+        manager.node_registry.probe = AsyncMock(return_value={"online": True})
+        onboarding = Mock()
+        onboarding.port = 7878
+        onboarding.assignment = ControllerAssignment(self.root)
+        write_store(self.root / "sparkdeck.sqlite3", [])
+        (self.root / "recipes.json").write_text("{}", encoding="utf-8")
+        (self.root / "token_stats.json").write_text("{}", encoding="utf-8")
+        return TransferService(manager, onboarding, self.root, self.root), manager
+
+    async def test_start_runs_through_staging_promotion_rebind_and_demotion(self):
+        service, manager = self._service()
+        service.set_launch_drain_hook(lambda: True)
+        with patch.object(service, "_spawn_helper", return_value=7) as spawn:
+            status = await service.start("target-id", TRANSFER_CONFIRMATION)
+            self.assertTrue(status["active"])
+            task = service._task
+            await task
+
+        spawn.assert_called_once_with("demote")
+        self.assertNotIn("Transfer failed", (task.exception() or "") if task.exception() else "")
+        # The old controller rejoined as a worker under the new controller.
+        assignment = ControllerAssignment(self.root).load()
+        self.assertEqual(assignment["controller_node_id"], "target-id")
+        self.assertEqual(
+            manager.agent_credentials.data["paired_controller_id"], "target-id"
+        )
+        self.assertTrue(assignment["forward_token"])
+        # The controller state is archived; the machine's own usage counters
+        # stay live as worker state.
+        archives = list(self.root.glob("controller-transfer-archive-*"))
+        self.assertEqual(len(archives), 1)
+        self.assertTrue((archives[0] / "recipes.json").exists())
+        self.assertFalse((self.root / "recipes.json").exists())
+        self.assertFalse((self.root / "sparkdeck.sqlite3").exists())
+        self.assertTrue((self.root / "token_stats.json").exists())
+        await manager.http.aclose()
+
+    async def test_cancel_is_locked_once_promotion_may_have_committed(self):
+        service, _manager = self._service()
+        service._write({
+            "id": "job-1",
+            "active": True,
+            "committed": False,
+            "promote_requested": True,
+            "phase": "promoting",
+            "target_node_id": "target-id",
+        })
+        with self.assertRaisesRegex(RuntimeError, "can only be resumed"):
+            await service.cancel()
+        self.assertTrue(service.blocks_management_writes())
+
+    async def test_resume_releases_the_job_when_the_target_stayed_a_worker(self):
+        service, _manager = self._service()
+        service._write({
+            "id": "job-1",
+            "active": True,
+            "committed": False,
+            "promote_requested": True,
+            "phase": "promoting",
+            "target_node_id": "target-id",
+            "target_name": "Target",
+            "target_url": "http://127.0.0.1:7000",
+            "nodes": [],
+            "old_controller_forward_token": "raw",
+        })
+        with patch.object(
+            service, "_wait_for_new_controller",
+            AsyncMock(side_effect=RuntimeError("controller never came up")),
+        ):
+            await service.resume()
+            await service._task
+        state = service._read()
+        # The target still answered as this controller's worker, so the flow
+        # released the job for a clean retry or cancel.
+        self.assertFalse(state["active"])
+        self.assertFalse(state["promote_requested"])
+        self.assertFalse(service.blocks_management_writes())
+        await service.close()
+        await service.manager.http.aclose()
 
 
 class AgentReceiveTests(unittest.IsolatedAsyncioTestCase):

@@ -517,6 +517,59 @@ export interface JoinClusterInput {
   name: string
 }
 
+export type ControllerTransferPhase =
+  | 'idle'
+  | 'preflight'
+  | 'bundling'
+  | 'staging'
+  | 'promoting'
+  | 'rebinding'
+  | 'demoting'
+  | 'promoted'
+  | 'completing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'recovery_required'
+
+export interface ControllerTransferNodeState {
+  id: string
+  name?: string | null
+  status?: 'pending' | 'rebound' | 'failed' | 'skipped' | 'online'
+  online?: boolean
+  message?: string | null
+  error?: string | null
+}
+
+export interface ControllerTransferStatus {
+  active: boolean
+  phase: ControllerTransferPhase
+  incoming?: boolean
+  committed?: boolean
+  message?: string | null
+  error?: string | null
+  target_node_id?: string | null
+  target_name?: string | null
+  target_url?: string | null
+  controller_url?: string | null
+  old_controller_name?: string | null
+  nodes?: ControllerTransferNodeState[]
+  warnings?: string[]
+  confirmation?: string
+  capability?: string
+  started_at?: number | null
+  completed_at?: number | null
+}
+
+export interface ControllerTransferPreflight {
+  ok: boolean
+  blockers: string[]
+  warnings: string[]
+  target_node_id: string
+  target_name?: string | null
+  estimated_bytes?: number
+}
+
 export interface BenchmarkSample extends BenchmarkHardwareIdentity {
   id: string
   deployment_id?: string

@@ -160,6 +160,28 @@ class ControllerClient:
     async def state(self) -> dict[str, Any]:
         return await self._request("GET", "/api/state")
 
+    async def controller_transfer(self) -> dict[str, Any]:
+        return await self._request("GET", "/api/v1/controller-transfer")
+
+    async def controller_transfer_preflight(self, target_node_id: str) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/controller-transfer/preflight",
+            json_body={"target_node_id": target_node_id},
+        )
+
+    async def start_controller_transfer(
+        self, target_node_id: str, confirm: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/controller-transfer",
+            json_body={"target_node_id": target_node_id, "confirm": confirm},
+        )
+
+    async def resume_controller_transfer(self) -> dict[str, Any]:
+        return await self._request("POST", "/api/v1/controller-transfer/resume")
+
     async def recipe(self, recipe_id: str) -> dict[str, Any]:
         state = await self.state()
         recipe = next(
@@ -942,6 +964,44 @@ def build_server(
     async def get_cluster_state() -> dict[str, Any]:
         """Return nodes, recipes, deployments, and controller summary state."""
         return await client.state()
+
+    @server.tool()
+    async def get_controller_transfer() -> dict[str, Any]:
+        """Return the durable controller-transfer status of this cluster."""
+        return await client.controller_transfer()
+
+    @server.tool()
+    async def preflight_controller_transfer(
+        target_node_id: str,
+    ) -> dict[str, Any]:
+        """Check whether the controller role can move to one joined node.
+
+        Returns blockers (must be empty before starting) and warnings (moves
+        that need follow-up, such as API keys stored in the old machine's
+        credential manager).
+        """
+        return await client.controller_transfer_preflight(target_node_id)
+
+    @server.tool()
+    async def transfer_cluster_controller(
+        target_node_id: str,
+        confirm: str,
+    ) -> dict[str, Any]:
+        """Move the controller role to a joined worker node.
+
+        The outgoing controller orchestrates everything: it uploads its state
+        bundle, promotes the target (which restarts it as the controller),
+        re-binds every worker, then rejoins itself as a worker. Expect about a
+        minute of control-plane unavailability; running deployments keep
+        serving. Pass confirm="transfer-controller" after reviewing the
+        preflight result. Poll get_controller_transfer for progress.
+        """
+        return await client.start_controller_transfer(target_node_id, confirm)
+
+    @server.tool()
+    async def resume_controller_transfer() -> dict[str, Any]:
+        """Retry re-binding workers of a committed but stalled transfer."""
+        return await client.resume_controller_transfer()
 
     @server.tool()
     async def list_storage_weights(

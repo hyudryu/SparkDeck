@@ -862,11 +862,46 @@ class TransferService:
                     raise
                 except Exception as exc:
                     error = str(exc)[:300]
+                    if await self._rebound_under_new_controller(state, entry):
+                        # The worker already accepted the promoted controller
+                        # (its reply was lost, or this process restarted
+                        # before persisting the status). The old controller's
+                        # credentials are rejected for good, and that is the
+                        # success state.
+                        entry["status"] = "rebound"
+                        entry.pop("error", None)
+                        entry.pop("message", None)
+                        error = None
+                        break
                     await asyncio.sleep(2)
             if error is not None:
                 entry["status"] = "failed"
                 entry["error"] = error
             self._write(state)
+
+    async def _rebound_under_new_controller(self, state: dict, entry: dict) -> bool:
+        """Check whether the promoted controller already sees this node online.
+
+        A rebind whose reply was lost leaves the worker paired to the new
+        controller, so every retry through the old credentials fails with
+        401. The promoted controller's inventory is the reconciliation
+        source: only a re-bound worker probes as online under it.
+        """
+        try:
+            response = await self.manager.http.get(
+                f"{str(state['target_url']).rstrip('/')}/api/v1/nodes",
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return False
+            for node in response.json().get("items", []):
+                if str(node.get("id")) == str(entry["id"]) and bool(
+                    node.get("online")
+                ):
+                    return True
+        except (httpx.HTTPError, ValueError):
+            pass
+        return False
 
     async def _demote_self(self, state: dict) -> None:
         state.update(

@@ -139,6 +139,12 @@ def promote(root: Path, state_path: Path) -> None:
     replaced: list[str] = []
     committed = False
     try:
+        # Copy settings.json before any install step can fail: it is merged
+        # in place, so the backup is the only way to restore the machine's
+        # original content.
+        settings_path = data_dir / "settings.json"
+        if settings_path.exists():
+            shutil.copy2(str(settings_path), str(backup / "settings.json"))
         # Move aside everything the bundle replaces so a failed apply can put
         # this worker back exactly as it was.
         for name in (
@@ -161,10 +167,8 @@ def promote(root: Path, state_path: Path) -> None:
             atomic_private_json_write(data_dir / name, value)
         # settings.json is merged in place, not replaced: the node keeps its
         # machine-local values and receives every cluster-wide setting.
-        settings_path = data_dir / "settings.json"
         settings: dict = {}
         if settings_path.exists():
-            shutil.copy2(str(settings_path), str(backup / "settings.json"))
             try:
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -221,15 +225,18 @@ def promote(root: Path, state_path: Path) -> None:
                 raise
             raise
         # Pre-commit: the assignment was never deleted, but the backup loop
-        # already moved the worker's originals aside. Put everything back so
-        # this node stays exactly the worker it was.
+        # already moved the worker's originals aside. Restore every original,
+        # remove only files the bundle created where the worker had none
+        # (existence is tracked through ``replaced``, not the backup dir,
+        # because restoring moves the backup copy away), and put settings.json
+        # back from its copy.
         try:
             for name in replaced:
                 source = backup / name
                 if source.exists():
                     shutil.move(str(source), str(data_dir / name))
             for name in json_files:
-                if not (backup / name).exists():
+                if name not in replaced:
                     (data_dir / name).unlink(missing_ok=True)
             settings_backup = backup / "settings.json"
             if settings_backup.exists():

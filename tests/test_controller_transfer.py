@@ -612,6 +612,74 @@ class StartTransferFlowTests(unittest.IsolatedAsyncioTestCase):
         await service.manager.http.aclose()
 
 
+class RebindReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _service(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/nodes":
+                return httpx.Response(200, json={"items": [
+                    {"id": "worker-b", "online": True},
+                    {"id": "worker-c", "online": False},
+                ]})
+            return httpx.Response(200, json={})
+
+        manager = FakeManager(self.root, httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ))
+        manager.node_registry = FakeRegistry([
+            make_worker("worker-b", "Bravo", "http://127.0.0.1:7001"),
+            make_worker("worker-c", "Charlie", "http://127.0.0.1:7002"),
+        ])
+        onboarding = Mock()
+        onboarding.assignment = ControllerAssignment(self.root)
+        return TransferService(manager, onboarding, self.root, self.root), manager
+
+    async def test_lost_rebind_reply_is_reconciled_through_the_new_controller(self):
+        from cluster import NodeAgentResponseError
+
+        service, _manager = self._service()
+        # The worker already re-bound; the old controller's credentials now
+        # draw a 401 on every retry.
+        async def reject(node_id, method, path, json_body=None, timeout=30, allow_disabled=False):
+            raise NodeAgentResponseError("Bravo", 401, "invalid node-agent token")
+
+        service.manager.node_registry.request = AsyncMock(side_effect=reject)
+        state = {
+            "id": "job-1",
+            "target_node_id": "target-id",
+            "target_url": "http://127.0.0.1:7000",
+            "nodes": [{"id": "worker-b", "name": "Bravo", "status": "pending"}],
+        }
+        await service._rebind_nodes(state)
+        self.assertEqual(state["nodes"][0]["status"], "rebound")
+        self.assertNotIn("error", state["nodes"][0])
+        await service.manager.http.aclose()
+
+    async def test_offline_under_new_controller_stays_failed(self):
+        from cluster import NodeAgentResponseError
+
+        service, _manager = self._service()
+        async def reject(node_id, method, path, json_body=None, timeout=30, allow_disabled=False):
+            raise NodeAgentResponseError("Bravo", 401, "invalid node-agent token")
+
+        service.manager.node_registry.request = AsyncMock(side_effect=reject)
+        state = {
+            "id": "job-1",
+            "target_node_id": "target-id",
+            "target_url": "http://127.0.0.1:7000",
+            "nodes": [{"id": "worker-c", "name": "Charlie", "status": "pending"}],
+        }
+        await service._rebind_nodes(state)
+        self.assertEqual(state["nodes"][0]["status"], "failed")
+        await service.manager.http.aclose()
+
+
 class AgentReceiveTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -811,3 +879,29 @@ class TransferHelperTests(unittest.TestCase):
         self.assertNotIn("hf_token", settings)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "recovery_required")
+
+    def test_promote_restores_everything_on_an_early_install_failure(self):
+        self._stage()
+        (self.data / "recipes.json").write_text(
+            json.dumps({"recipes": ["original"]}), encoding="utf-8"
+        )
+        state_path = self.data / "controller-transfer.json"
+        with patch.object(
+            transfer_helper, "_install_private_bytes", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                transfer_helper.promote(self.root, state_path)
+
+        # Nothing about the worker changed, including machine-local settings
+        # that were never backed up when the failure happened mid-install.
+        self.assertTrue((self.data / "controller.json").exists())
+        self.assertEqual((self.data / "sparkdeck.sqlite3").read_bytes(), b"old store")
+        self.assertEqual(
+            json.loads((self.data / "recipes.json").read_text(encoding="utf-8")),
+            {"recipes": ["original"]},
+        )
+        settings = json.loads((self.data / "settings.json").read_text(encoding="utf-8"))
+        self.assertNotIn("hf_token", settings)
+        self.assertEqual(settings["cluster_node_name"], "Target")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "failed")

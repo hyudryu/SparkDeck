@@ -493,6 +493,33 @@ describe('ClusterPage', () => {
     expect(screen.queryByRole('button', { name: 'Transfer controller role' })).not.toBeInTheDocument()
   })
 
+  it('lets the operator dismiss a completed transfer and start another one', async () => {
+    const completed = {
+      active: false,
+      phase: 'completed',
+      committed: true,
+      incoming: true,
+      target_name: 'Studio Spark',
+      target_url: 'http://100.64.0.11:7878',
+      nodes: [],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/controller-transfer')) return new Response(JSON.stringify(completed), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await screen.findByRole('heading', { name: 'Controller transfer' })
+    expect(screen.queryByRole('heading', { name: 'Transfer the controller role' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+    expect(await screen.findByRole('heading', { name: 'Transfer the controller role' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Controller transfer' })).not.toBeInTheDocument()
+  })
+
   it('never shows the transfer panel on a worker entry', async () => {
     const workerStatus = {
       role: 'worker',

@@ -105,6 +105,7 @@ export function ClusterPage() {
   const [transferConfirm, setTransferConfirm] = useState('')
   const [transferBusy, setTransferBusy] = useState(false)
   const [transferError, setTransferError] = useState<string>()
+  const [transferResultDismissed, setTransferResultDismissed] = useState(false)
 
   useEffect(() => {
     if (!resource.data) return
@@ -121,6 +122,7 @@ export function ClusterPage() {
     resource.data?.role === 'controller',
   )
   const transferActive = transfer.data?.active === true
+  const transferCompleted = transfer.data?.phase === 'completed' && !transferResultDismissed
   const reloadTransfer = transfer.reload
 
   useEffect(() => {
@@ -398,10 +400,11 @@ export function ClusterPage() {
           </ul>}
         </section>
 
-        {controller && transfer.data && (transferActive || transfer.data.phase === 'completed') && <Panel className="transfer-progress-panel" aria-live="polite">
+        {controller && transfer.data && (transferActive || transferCompleted) && <Panel className="transfer-progress-panel" aria-live="polite">
           <div className="section-heading">
             <div><h2>Controller transfer</h2><p>Moving the controller role{transfer.data.target_name ? ` to ${transfer.data.target_name}` : ''}.</p></div>
             {transferActive && !transfer.data.committed && <Button type="button" variant="danger" disabled={transferBusy} onClick={() => void cancelTransfer()}>Cancel transfer</Button>}
+            {transferCompleted && <Button type="button" variant="tertiary" onClick={() => setTransferResultDismissed(true)}>Dismiss</Button>}
           </div>
           <Status status={transfer.data.phase === 'failed' || transfer.data.phase === 'recovery_required' ? 'error' : transfer.data.phase === 'completed' ? 'running' : 'pending'}>{transferPhaseLabel(transfer.data)}</Status>
           {transfer.data.message && <p>{transfer.data.message}</p>}
@@ -426,7 +429,7 @@ export function ClusterPage() {
           </p>}
         </Panel>}
 
-        {controller && transfer.data && !transferActive && transfer.data.phase !== 'completed' && !joining && <Panel className="transfer-panel">
+        {controller && transfer.data && !transferActive && !transferCompleted && !joining && <Panel className="transfer-panel">
           <div className="section-heading">
             <div><h2>Transfer the controller role</h2><p>Move cluster management to one joined node, for example before retiring or selling this machine. Running deployments keep serving; expect about a minute of management downtime. Every node must be online and on the latest build.</p></div>
           </div>

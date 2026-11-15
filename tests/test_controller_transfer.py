@@ -305,6 +305,71 @@ class OnboardingRebindTests(unittest.IsolatedAsyncioTestCase):
             })
         await manager.http.aclose()
 
+    async def test_rebind_adopts_an_unassigned_but_paired_node(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "role": "controller",
+                    "join_code": "JOIN123",
+                    "node": {
+                        "id": "new-controller",
+                        "protocol_version": AGENT_PROTOCOL_VERSION,
+                    },
+                })
+            return httpx.Response(200, json={
+                "ok": True,
+                "role": "controller",
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+                "forward_token": "adopted-forward",
+                "node": {"id": "new-controller", "name": "New"},
+                "cluster": {"nodes": []},
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        # The lost-assignment state: the credential claim still names the old
+        # controller, but controller.json is gone, so this node runs as a
+        # standalone controller.
+        manager.agent_credentials.rebind_controller("old-controller")
+        service = OnboardingService(manager, self.root)
+
+        result = await service.rebind(
+            {
+                "controller_url": "http://127.0.0.1:9100",
+                "controller_node_id": "new-controller",
+            },
+            current_controller_id="old-controller",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["adopted"])
+        assignment = ControllerAssignment(self.root).load()
+        self.assertEqual(assignment["controller_url"], "http://127.0.0.1:9100")
+        self.assertEqual(assignment["controller_node_id"], "new-controller")
+        self.assertEqual(assignment["forward_token"], "adopted-forward")
+        self.assertIsNotNone(assignment.get("adopted_at"))
+        manager.adopt_worker_role.assert_awaited_once()
+        await http.aclose()
+
+    async def test_rebind_adopts_requires_the_calling_controller_claim(self):
+        manager = FakeManager(self.root)
+        manager.agent_credentials.rebind_controller("old-controller")
+        service = OnboardingService(manager, self.root)
+        with self.assertRaisesRegex(ValueError, "only a joined worker"):
+            await service.rebind(
+                {
+                    "controller_url": "http://127.0.0.1:9100",
+                    "controller_node_id": "new-controller",
+                },
+                current_controller_id="someone-else",
+            )
+        with self.assertRaisesRegex(ValueError, "only a joined worker"):
+            await service.rebind({
+                "controller_url": "http://127.0.0.1:9100",
+                "controller_node_id": "new-controller",
+            })
+        await manager.http.aclose()
+
     async def test_rebind_finishes_a_partial_credential_write(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={

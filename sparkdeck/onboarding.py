@@ -745,19 +745,36 @@ class OnboardingService:
             adopt_controller()
         return {"ok": True, "role": "controller", "revoked": True}
 
-    async def rebind(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def rebind(
+        self, body: dict[str, Any], current_controller_id: str = "",
+    ) -> dict[str, Any]:
         """Re-point this worker at a promoted controller during a transfer.
 
         Only the currently paired controller can reach the authenticated
         route that calls this, which is exactly the authority a transfer
         needs: the old controller stays the sole writer until every worker
-        has moved. The worker keeps its forward token and agent bearer; both
+        moved. The worker keeps its forward token and agent bearer; both
         already exist in the promoted controller's transferred registry.
+
+        A worker whose durable assignment was lost but whose credential
+        claim still points at the caller is adopted through a guided join
+        instead of failing the whole transfer.
         """
         async with self._membership_lock:
             assignment = self.assignment.load()
             if not assignment:
-                raise ValueError("only a joined worker can be re-bound")
+                paired = str(
+                    self.manager.agent_credentials.data.get(
+                        "paired_controller_id"
+                    ) or ""
+                )
+                if not (
+                    current_controller_id
+                    and paired
+                    and secrets.compare_digest(current_controller_id, paired)
+                ):
+                    raise ValueError("only a joined worker can be re-bound")
+                return await self._adopt_into_transfer(body)
             if set(body) != {"controller_url", "controller_node_id"}:
                 raise ValueError(
                     "request must contain only controller_url and controller_node_id"
@@ -821,6 +838,97 @@ class OnboardingService:
                 "controller_url": controller_url,
                 "controller_node_id": controller_node_id,
             }
+
+    async def _adopt_into_transfer(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Join this un-assigned but still-paired node into the promoted cluster.
+
+        The node answers the old controller's credentials but has no durable
+        assignment, so a plain re-bind cannot help it. Reuse the standard
+        join flow against the promoted controller: it re-pairs (fresh bearer
+        and forward token, replacing the transferred registry entry) and
+        switches this process to worker mode.
+        """
+        if set(body) != {"controller_url", "controller_node_id"}:
+            raise ValueError(
+                "request must contain only controller_url and controller_node_id"
+            )
+        controller_url = await validate_control_url(body.get("controller_url"))
+        controller_node_id = str(body.get("controller_node_id") or "").strip()
+        if not controller_node_id:
+            raise ValueError("controller_node_id is required")
+        connection = await resolve_control_connection(controller_url)
+        try:
+            response = await _send_pinned_control_request(
+                self.manager.http,
+                connection,
+                "GET",
+                "/api/v1/onboarding",
+                timeout=5,
+            )
+            response.raise_for_status()
+            identity = response.json()
+        except httpx.HTTPError as exc:
+            raise ValueError(f"promoted controller is unreachable: {exc}") from exc
+        remote_node_id = str(identity.get("node", {}).get("id") or "")
+        join_code = str(identity.get("join_code") or "")
+        if (
+            identity.get("role") != "controller"
+            or int(identity.get("node", {}).get("protocol_version") or 0)
+            != AGENT_PROTOCOL_VERSION
+            or not secrets.compare_digest(remote_node_id, controller_node_id)
+            or not join_code
+        ):
+            raise ValueError("the promoted controller did not confirm its identity")
+        access_urls = self._access_urls(controller_url)
+        if not access_urls:
+            raise ValueError(
+                "this node has no cluster-reachable (Tailscale) URL to advertise"
+            )
+        register = await _send_pinned_control_request(
+            self.manager.http,
+            connection,
+            "POST",
+            "/api/v1/onboarding/register",
+            json_body={
+                "join_code": join_code,
+                "advertise_url": access_urls[0],
+                "name": str(
+                    self.manager.settings.get("cluster_node_name") or "Worker"
+                ).strip(),
+                "pairing_code": self.manager.agent_credentials.data["pairing_code"],
+            },
+            timeout=30,
+        )
+        if register.status_code >= 400:
+            raise ValueError(
+                f"promoted controller rejected the join: {register.text[:300]}"
+            )
+        joined = register.json()
+        if (
+            joined.get("role") != "controller"
+            or int(joined.get("protocol_version") or 0) != AGENT_PROTOCOL_VERSION
+            or not joined.get("forward_token")
+        ):
+            raise ValueError("promoted controller returned an invalid join response")
+        self.assignment.save({
+            "controller_url": controller_url,
+            "forward_token": str(joined["forward_token"]),
+            "node_id": self.manager.agent_credentials.node_id,
+            "controller_node_id": controller_node_id,
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+            "joined_at": time.time(),
+            "rebound_at": time.time(),
+            "adopted_at": time.time(),
+        })
+        adopt_worker = getattr(self.manager, "adopt_worker_role", None)
+        if adopt_worker is not None:
+            await adopt_worker()
+        return {
+            "ok": True,
+            "controller_url": controller_url,
+            "controller_node_id": controller_node_id,
+            "adopted": True,
+        }
 
     def unregister(self, headers: Any) -> dict[str, Any]:
         """Revoke a leaving worker's one-hop grant and inventory record."""

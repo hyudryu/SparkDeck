@@ -511,13 +511,18 @@ class _SecurityHeadersMiddleware:
         # A running controller transfer freezes controller-owned state from
         # the bundle snapshot onward: acknowledged writes would live only on
         # the outgoing machine and silently vanish when it archives its
-        # store. Inference (/v1), agent traffic, and the transfer's own
-        # endpoints keep working.
+        # store. Inference (/v1), agent traffic, the transfer's own
+        # endpoints, and onboarding recovery keep working. Onboarding must
+        # stay open: a promoted controller waiting for a lost node to
+        # re-bind adopts it through the standard join flow
+        # (/api/v1/onboarding/register), so the freeze would otherwise
+        # deadlock the transfer.
         if (
             request.method in {"POST", "PUT", "PATCH", "DELETE"}
             and path.startswith("/api/")
             and not path.startswith("/api/agent/")
             and not path.startswith("/api/v1/controller-transfer")
+            and not path.startswith("/api/v1/onboarding/")
             and controller_transfer.blocks_management_writes()
         ):
             return JSONResponse(

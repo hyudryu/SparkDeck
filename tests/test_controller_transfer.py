@@ -1076,3 +1076,47 @@ class TransferHelperTests(unittest.TestCase):
         self.assertEqual(settings["cluster_node_name"], "Target")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "failed")
+
+
+class TransferWriteGateTests(unittest.IsolatedAsyncioTestCase):
+    """The transfer freeze must not block the transfer's own recovery flow.
+
+    A promoted controller waiting on a lost worker adopts it through the
+    standard join flow, which writes via /api/v1/onboarding/register. If the
+    freeze covered onboarding, the controller would wait forever for a node
+    it refuses to admit.
+    """
+
+    async def _gated(self, method: str, path: str):
+        from types import SimpleNamespace
+
+        import server
+        from server import _SecurityHeadersMiddleware
+
+        request = Mock()
+        request.method = method
+        request.url = SimpleNamespace(path=path)
+        request.headers = {}
+        with patch.object(
+            server.controller_transfer, "blocks_management_writes", return_value=True
+        ):
+            return await _SecurityHeadersMiddleware._management_response(request)
+
+    async def test_frozen_management_writes_return_503(self):
+        response = await self._gated("POST", "/api/v1/deployments")
+        self.assertEqual(response.status_code, 503)
+
+    async def test_reads_agent_and_transfer_traffic_stay_open(self):
+        for method, path in (
+            ("GET", "/api/v1/deployments"),
+            ("POST", "/api/agent/command"),
+            ("POST", "/api/v1/controller-transfer/resume"),
+        ):
+            self.assertIsNone(await self._gated(method, path), f"{method} {path}")
+
+    async def test_onboarding_writes_stay_open_during_freeze(self):
+        for method, path in (
+            ("POST", "/api/v1/onboarding/register"),
+            ("POST", "/api/v1/onboarding/unregister"),
+        ):
+            self.assertIsNone(await self._gated(method, path), f"{method} {path}")

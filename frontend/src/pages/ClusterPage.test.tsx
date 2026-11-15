@@ -408,4 +408,133 @@ describe('ClusterPage', () => {
 
     expect(screen.queryByRole('button', { name: /Remove node|Forget node/ })).not.toBeInTheDocument()
   })
+
+  it('runs preflight and starts a controller transfer after typed confirmation', async () => {
+    const onlineNodes = {
+      items: [
+        { id: 'local', name: 'Studio controller', local: true, online: true, docker_ready: true, selectable: true },
+        { id: 'spark-2', name: 'Studio Spark', online: true, docker_ready: true, selectable: true },
+      ],
+    }
+    const idleTransfer = { active: false, phase: 'idle', confirmation: 'transfer-controller' }
+    const activeTransfer = {
+      active: true,
+      phase: 'promoting',
+      committed: false,
+      target_name: 'Studio Spark',
+      target_url: 'http://100.64.0.11:7878',
+      message: 'Promoting the target node to controller',
+      nodes: [{ id: 'spark-3', name: 'Render Spark', status: 'pending' }],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/controller-transfer/preflight')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          blockers: [],
+          warnings: ['1 saved deployment(s) use API keys stored in this machine\'s credential manager; re-enter them on the new controller after the transfer'],
+          target_node_id: 'spark-2',
+          target_name: 'Studio Spark',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/controller-transfer') && init?.method === 'POST') {
+        return new Response(JSON.stringify(activeTransfer), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/controller-transfer')) return new Response(JSON.stringify(idleTransfer), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(onlineNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await screen.findByRole('heading', { name: 'Transfer the controller role' })
+    await user.selectOptions(screen.getByRole('combobox', { name: 'New controller node' }), 'spark-2')
+    await user.click(screen.getByRole('button', { name: 'Check readiness' }))
+    expect(await screen.findByText(/use API keys stored in this machine/i)).toBeInTheDocument()
+    expect(JSON.parse(String(fetchMock.mock.calls.find(([url, options]) => String(url).endsWith('/preflight') && options?.method === 'POST')?.[1]?.body))).toEqual({ target_node_id: 'spark-2' })
+
+    const startButton = screen.getByRole('button', { name: 'Transfer controller role' })
+    expect(startButton).toBeDisabled()
+    await user.type(screen.getByRole('textbox', { name: /Type transfer-controller to confirm/i }), 'transfer-controller')
+    expect(startButton).toBeEnabled()
+    await user.click(startButton)
+
+    expect(await screen.findByRole('heading', { name: 'Controller transfer' })).toBeInTheDocument()
+    expect(screen.getByText('Promoting the target node')).toBeInTheDocument()
+    expect(screen.getByText('Render Spark')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cancel transfer' })).toBeInTheDocument()
+    expect(JSON.parse(String(fetchMock.mock.calls.find(([url, options]) => String(url) === '/api/v1/controller-transfer' && options?.method === 'POST')?.[1]?.body))).toEqual({
+      target_node_id: 'spark-2',
+      confirm: 'transfer-controller',
+    })
+  })
+
+  it('shows preflight blockers and keeps the transfer start disabled', async () => {
+    const idleTransfer = { active: false, phase: 'idle' }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/controller-transfer/preflight')) {
+        return new Response(JSON.stringify({
+          ok: false,
+          blockers: ['Studio Spark needs the latest SparkDeck build before a controller transfer'],
+          warnings: [],
+          target_node_id: 'spark-2',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (path.endsWith('/api/v1/controller-transfer')) return new Response(JSON.stringify(idleTransfer), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<ClusterPage />)
+
+    await screen.findByRole('heading', { name: 'Transfer the controller role' })
+    expect(screen.queryByRole('textbox', { name: /to confirm/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Transfer controller role' })).not.toBeInTheDocument()
+  })
+
+  it('lets the operator dismiss a completed transfer and start another one', async () => {
+    const completed = {
+      active: false,
+      phase: 'completed',
+      committed: true,
+      incoming: true,
+      target_name: 'Studio Spark',
+      target_url: 'http://100.64.0.11:7878',
+      nodes: [],
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = String(input)
+      if (path.endsWith('/api/v1/controller-transfer')) return new Response(JSON.stringify(completed), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (path.endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(controllerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const user = userEvent.setup()
+    render(<ClusterPage />)
+
+    await screen.findByRole('heading', { name: 'Controller transfer' })
+    expect(screen.queryByRole('heading', { name: 'Transfer the controller role' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }))
+
+    expect(await screen.findByRole('heading', { name: 'Transfer the controller role' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Controller transfer' })).not.toBeInTheDocument()
+  })
+
+  it('never shows the transfer panel on a worker entry', async () => {
+    const workerStatus = {
+      role: 'worker',
+      node: { id: 'spark-2', name: 'Studio Spark', port: 7878, access_urls: ['https://spark-2.tailnet.ts.net'] },
+      controller_url: 'https://controller.tailnet.ts.net',
+      controller_reachable: true,
+    }
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      if (String(input).endsWith('/api/v1/nodes')) return new Response(JSON.stringify(clusterNodes), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify(workerStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<ClusterPage />)
+
+    await screen.findByRole('heading', { name: 'Connected to controller' })
+    expect(screen.queryByRole('heading', { name: 'Transfer the controller role' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Controller transfer' })).not.toBeInTheDocument()
+  })
 })

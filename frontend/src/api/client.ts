@@ -38,6 +38,8 @@ import type {
   ImagePullResult,
   OnboardingStatus,
   JoinClusterInput,
+  ControllerTransferPreflight,
+  ControllerTransferStatus,
   CreateStorageTransferInput,
   StorageState,
   StorageTransferJob,
@@ -994,6 +996,28 @@ export const api = {
       body: JSON.stringify(input),
     }),
     leave: () => request<OnboardingStatus>('/api/v1/onboarding/leave', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  },
+  controllerTransfer: {
+    get: (signal?: AbortSignal) => request<ControllerTransferStatus>(
+      '/api/v1/controller-transfer', { signal },
+    ),
+    preflight: (targetNodeId: string) => request<ControllerTransferPreflight>(
+      '/api/v1/controller-transfer/preflight',
+      { method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId }) },
+    ),
+    start: (targetNodeId: string, confirm: string) => request<ControllerTransferStatus>(
+      '/api/v1/controller-transfer',
+      { method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId, confirm }) },
+      NO_REQUEST_TIMEOUT,
+    ),
+    cancel: () => request<ControllerTransferStatus>('/api/v1/controller-transfer/cancel', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+    resume: () => request<ControllerTransferStatus>('/api/v1/controller-transfer/resume', {
       method: 'POST',
       body: JSON.stringify({}),
     }),

@@ -33,6 +33,7 @@ from manager import (
 )
 from cluster import (
     AGENT_PROTOCOL_VERSION,
+    CONTROLLER_TRANSFER_CAPABILITY,
     COORDINATOR_ID_HEADER,
     LOCAL_NODE_ID,
     normalize_agent_url,
@@ -76,6 +77,7 @@ from sparkdeck.onboarding import (
     is_forwardable_path,
 )
 from sparkdeck.updater import CONFIRMATION, UpdateService
+from sparkdeck.controller_transfer import TransferService
 from sparkdeck.image_patch_jobs import ImagePatchJobs
 from sparkdeck.image_patches import valid_base_image_identity
 from sparkdeck.web import configure_static_asset_mime_types, register_spa_routes
@@ -90,6 +92,20 @@ onboarding = OnboardingService(
     revoke_community_consent=sparkdeck.revoke_community_membership,
 )
 updater = UpdateService(manager, root=ROOT, data_dir=ROOT / "data")
+controller_transfer = TransferService(
+    manager, onboarding, root=ROOT, data_dir=ROOT / "data"
+)
+# Automatic cluster actors (interrupted-launch resume, crash retry) hold off
+# while a promoted controller waits for the cluster to re-bind to it.
+manager._controller_transfer_gate = controller_transfer.defers_cluster_actions
+# The staged bundle is a point-in-time capture; in-flight deployment launches
+# could still commit to the live store after it. Wait for them to settle.
+controller_transfer.set_launch_drain_hook(
+    lambda: (
+        not getattr(sparkdeck, "_deployment_launches", None)
+        and not getattr(sparkdeck, "_deployment_launch_tasks", None)
+    )
+)
 image_patch_jobs = ImagePatchJobs(manager, ROOT / "data")
 disk_scan_jobs = DiskScanJobs()
 mcp_control = build_server(
@@ -391,6 +407,7 @@ async def _deployment_log_loop():
 async def lifespan(app: FastAPI):
     async with mcp_control.session_manager.run():
         await manager.start()
+        controller_transfer.reconcile()
         uploader = asyncio.create_task(community_upload_loop())
         deployment_logs = asyncio.create_task(_deployment_log_loop())
         startup_benchmark_monitor = StartupBenchmarkMonitor(sparkdeck)
@@ -405,6 +422,7 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(startup_benchmarks, return_exceptions=True)
             await manager.virtual_nas.stop_dispatcher()
             await updater.close()
+            await controller_transfer.close()
             await asyncio.gather(deployment_logs, return_exceptions=True)
             await sparkdeck.close()
             await manager.stop()
@@ -489,11 +507,28 @@ class _SecurityHeadersMiddleware:
     @staticmethod
     async def _management_response(request: Request) -> Response | None:
         """Return the forwarded or rejected response, or None to route locally."""
+        path = request.url.path
+        # A running controller transfer freezes controller-owned state from
+        # the bundle snapshot onward: acknowledged writes would live only on
+        # the outgoing machine and silently vanish when it archives its
+        # store. Inference (/v1), agent traffic, and the transfer's own
+        # endpoints keep working.
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and path.startswith("/api/")
+            and not path.startswith("/api/agent/")
+            and not path.startswith("/api/v1/controller-transfer")
+            and controller_transfer.blocks_management_writes()
+        ):
+            return JSONResponse(
+                {"detail": "cluster management is read-only during a controller transfer"},
+                status_code=503,
+            )
         forwarded = any(request.headers.get(name) for name in FORWARD_HEADERS)
         forgotten_unregister = (
             forwarded
             and request.method == "POST"
-            and request.url.path == "/api/v1/onboarding/unregister"
+            and path == "/api/v1/onboarding/unregister"
             and onboarding.is_already_unregistered_worker(request.headers)
         )
         if forgotten_unregister:
@@ -501,7 +536,7 @@ class _SecurityHeadersMiddleware:
             # that a force-forgotten worker recognizes as a successful local
             # recovery.
             return None
-        if not is_forwardable_path(request.url.path):
+        if not is_forwardable_path(path):
             return None
         assignment = onboarding.assignment.load()
         if assignment:
@@ -910,6 +945,9 @@ async def agent_info():
         "protocol_version": AGENT_PROTOCOL_VERSION,
         "pairing_required": True,
         "app_revision": updater.runtime_revision,
+        # Feature gates the controller checks before orchestrating a
+        # controller-role transfer across the cluster.
+        "capabilities": [CONTROLLER_TRANSFER_CAPABILITY],
     }
 
 
@@ -974,6 +1012,66 @@ async def agent_preflight_system_update(req: Request):
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+# ---------- controller transfer (agent side; never forwarded) ----------
+
+@app.get("/api/agent/controller-transfer")
+async def agent_controller_transfer(req: Request):
+    _require_agent(req)
+    return controller_transfer.agent_status()
+
+
+@app.post("/api/agent/controller-transfer/preflight")
+async def agent_controller_transfer_preflight(req: Request):
+    _require_agent(req)
+    return controller_transfer.agent_preflight()
+
+
+@app.post("/api/agent/controller-transfer/receive")
+async def agent_controller_transfer_receive(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return await controller_transfer.agent_receive(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/agent/controller-transfer/promote", status_code=202)
+async def agent_controller_transfer_promote(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return await controller_transfer.agent_promote(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/agent/controller-transfer/discard")
+async def agent_controller_transfer_discard(req: Request):
+    _require_agent(req)
+    return controller_transfer.agent_discard()
+
+
+@app.post("/api/agent/onboarding/rebind")
+async def agent_onboarding_rebind(req: Request):
+    _require_agent(req)
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return await onboarding.rebind(body)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.patch("/api/agent/node")
@@ -2606,6 +2704,58 @@ async def v1_remove_node(node_id: str, force: bool = False):
     if not removed:
         raise HTTPException(404, "node not found")
     return {"ok": True, "node_id": node_id, "forced": force}
+
+
+# ---------- controller transfer (management side) ----------
+
+@app.get("/api/v1/controller-transfer")
+async def v1_controller_transfer():
+    return controller_transfer.status()
+
+
+@app.post("/api/v1/controller-transfer/preflight")
+async def v1_controller_transfer_preflight(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict) or set(body) != {"target_node_id"}:
+            raise ValueError("request body must contain only target_node_id")
+        return await controller_transfer.preflight(str(body.get("target_node_id")))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/controller-transfer")
+async def v1_controller_transfer_start(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        return await controller_transfer.start(
+            str(body.get("target_node_id") or ""),
+            str(body.get("confirm") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/v1/controller-transfer/cancel")
+async def v1_controller_transfer_cancel():
+    try:
+        return await controller_transfer.cancel()
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/v1/controller-transfer/resume")
+async def v1_controller_transfer_resume():
+    try:
+        return await controller_transfer.resume()
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/v1/images/pull", status_code=201)

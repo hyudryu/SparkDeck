@@ -268,6 +268,10 @@ Membership is per machine. On that machine's own local SparkDeck page, use **Lea
 
 Joined nodes are alternate entry points, not automatic controller failover. Restore Spark 1 for cluster management. Local onboarding remains available on each machine for recovery.
 
+### Moving the controller to another node
+
+To retire or sell the controller machine, move the controller role instead of rebuilding the cluster. On the controller, open **Cluster Management → Transfer the controller role**, pick an online joined node, review the readiness check, type `transfer-controller`, and start. SparkDeck uploads the controller's state to the target, restarts it as the new controller, re-points every worker, then rejoins the old controller as an ordinary worker. Running deployments keep serving; expect about a minute of management downtime. Every node must be online and on the latest build (run a cluster update first). The same flow is available over MCP with `preflight_controller_transfer` and `transfer_cluster_controller`. This is an operator-driven move, not automatic failover: if the old controller dies mid-transfer, the workers that had not re-bound yet must use **Leave cluster** and join the new controller.
+
 ## Next steps
 
 - Read the [product manual](docs/PRODUCT_MANUAL.md).

@@ -1,13 +1,41 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Check, Clipboard, Edit3, Eye, EyeOff, Link2, Network, RefreshCw, Server, ShieldCheck, Trash2, Unlink } from 'lucide-react'
 import { api } from '../api/client'
-import type { JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
+import type { ControllerTransferPreflight, ControllerTransferStatus, JoinClusterInput, NodeInventoryItem, OnboardingStatus } from '../api/types'
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
 
 const emptyJoin: JoinClusterInput = { controller_url: '', join_code: '', advertise_url: '', name: '' }
 const maximumNodeNameLength = 80
+const transferConfirmationPhrase = 'transfer-controller'
+
+const transferPhaseLabels: Record<string, string> = {
+  preflight: 'Checking readiness',
+  bundling: 'Capturing controller state',
+  staging: 'Uploading state to the target',
+  promoting: 'Promoting the target node',
+  rebinding: 'Re-pointing workers',
+  demoting: 'Rejoining the old controller as a worker',
+  promoted: 'Restarting the new controller',
+  completing: 'Waiting for every node to re-bind',
+}
+
+const transferNodeStatusLabels: Record<string, string> = {
+  pending: 'Waiting',
+  rebound: 'Re-bound to the new controller',
+  online: 'Online under the new controller',
+  failed: 'Failed',
+  skipped: 'Skipped',
+}
+
+function transferPhaseLabel(status: ControllerTransferStatus): string {
+  if (status.phase === 'completed') return 'Completed'
+  if (status.phase === 'failed') return 'Failed'
+  if (status.phase === 'cancelled') return 'Cancelled'
+  if (status.phase === 'recovery_required') return 'Recovery required'
+  return transferPhaseLabels[status.phase] ?? status.phase
+}
 
 function isCurrentEntryNode(node: NodeInventoryItem, onboarding: OnboardingStatus) {
   return onboarding.role === 'controller' ? node.local === true : node.id === onboarding.node.id
@@ -72,6 +100,12 @@ export function ClusterPage() {
   const [removingNodeId, setRemovingNodeId] = useState<string>()
   const [visibilityNodeId, setVisibilityNodeId] = useState<string>()
   const [nodeError, setNodeError] = useState<{ id: string; message: string }>()
+  const [transferTargetId, setTransferTargetId] = useState('')
+  const [transferPreflight, setTransferPreflight] = useState<ControllerTransferPreflight>()
+  const [transferConfirm, setTransferConfirm] = useState('')
+  const [transferBusy, setTransferBusy] = useState(false)
+  const [transferError, setTransferError] = useState<string>()
+  const [transferResultDismissed, setTransferResultDismissed] = useState(false)
 
   useEffect(() => {
     if (!resource.data) return
@@ -81,6 +115,76 @@ export function ClusterPage() {
       advertise_url: current.advertise_url || resource.data?.node.access_urls[0] || '',
     }))
   }, [resource.data])
+
+  const transfer = useResource(
+    (signal) => api.controllerTransfer.get(signal),
+    [resource.data?.role],
+    resource.data?.role === 'controller',
+  )
+  const transferActive = transfer.data?.active === true
+  const transferCompleted = transfer.data?.phase === 'completed' && !transferResultDismissed
+  const reloadTransfer = transfer.reload
+
+  useEffect(() => {
+    if (!transferActive) return
+    const timer = window.setInterval(() => reloadTransfer(), 3000)
+    return () => window.clearInterval(timer)
+  }, [transferActive, reloadTransfer])
+
+  const runTransferPreflight = async () => {
+    if (!transferTargetId) return
+    setTransferBusy(true)
+    setTransferError(undefined)
+    try {
+      setTransferPreflight(await api.controllerTransfer.preflight(transferTargetId))
+    } catch (reason) {
+      setTransferError(reason instanceof Error ? reason.message : 'Could not check transfer readiness')
+    } finally {
+      setTransferBusy(false)
+    }
+  }
+
+  const startTransfer = async () => {
+    setTransferBusy(true)
+    setTransferError(undefined)
+    try {
+      transfer.apply(await api.controllerTransfer.start(transferTargetId, transferConfirmationPhrase))
+    } catch (reason) {
+      setTransferError(reason instanceof Error ? reason.message : 'Could not start the controller transfer')
+    } finally {
+      setTransferBusy(false)
+    }
+  }
+
+  const cancelTransfer = async () => {
+    if (!await confirm({
+      title: 'Cancel the controller transfer?',
+      message: 'This only works before the target node was promoted. Cancel now?',
+      confirmLabel: 'Cancel transfer',
+      danger: true,
+    })) return
+    setTransferBusy(true)
+    setTransferError(undefined)
+    try {
+      transfer.apply(await api.controllerTransfer.cancel())
+    } catch (reason) {
+      setTransferError(reason instanceof Error ? reason.message : 'Could not cancel the transfer')
+    } finally {
+      setTransferBusy(false)
+    }
+  }
+
+  const resumeTransfer = async () => {
+    setTransferBusy(true)
+    setTransferError(undefined)
+    try {
+      transfer.apply(await api.controllerTransfer.resume())
+    } catch (reason) {
+      setTransferError(reason instanceof Error ? reason.message : 'Could not resume the transfer')
+    } finally {
+      setTransferBusy(false)
+    }
+  }
 
   const copy = async (value: string, label: string) => {
     try {
@@ -295,6 +399,67 @@ export function ClusterPage() {
             })}
           </ul>}
         </section>
+
+        {controller && transfer.data && (transferActive || transferCompleted) && <Panel className="transfer-progress-panel" aria-live="polite">
+          <div className="section-heading">
+            <div><h2>Controller transfer</h2><p>Moving the controller role{transfer.data.target_name ? ` to ${transfer.data.target_name}` : ''}.</p></div>
+            {transferActive && !transfer.data.committed && <Button type="button" variant="danger" disabled={transferBusy} onClick={() => void cancelTransfer()}>Cancel transfer</Button>}
+            {transferCompleted && <Button type="button" variant="tertiary" onClick={() => setTransferResultDismissed(true)}>Dismiss</Button>}
+          </div>
+          <Status status={transfer.data.phase === 'failed' || transfer.data.phase === 'recovery_required' ? 'error' : transfer.data.phase === 'completed' ? 'running' : 'pending'}>{transferPhaseLabel(transfer.data)}</Status>
+          {transfer.data.message && <p>{transfer.data.message}</p>}
+          {transfer.data.error && <p className="inline-error" role="alert">{transfer.data.error}</p>}
+          {transferError && <p className="inline-error" role="alert">{transferError}</p>}
+          {(transfer.data.phase === 'failed' || transfer.data.phase === 'rebinding') && transfer.data.committed && <Button type="button" disabled={transferBusy} onClick={() => void resumeTransfer()}>{transferBusy ? 'Resuming…' : 'Resume transfer'}</Button>}
+          {Boolean(transfer.data.nodes?.length) && <ul className="node-management-list transfer-node-list">
+            {transfer.data.nodes?.map((node) => <li key={node.id} className="node-management-row">
+              <div className="node-management-icon" aria-hidden="true"><Server size={17} /></div>
+              <div className="node-management-identity">
+                <strong>{node.name ?? node.id}</strong>
+                <span>{transferNodeStatusLabels[node.status ?? 'pending'] ?? node.status}</span>
+              </div>
+              <div className="node-management-state">
+                <Status status={node.status === 'failed' ? 'error' : node.status === 'rebound' || node.status === 'online' ? 'running' : 'pending'}>{transferNodeStatusLabels[node.status ?? 'pending'] ?? node.status ?? 'Waiting'}</Status>
+              </div>
+              {node.error && <p className="inline-error node-management-error" role="alert">{node.error}</p>}
+            </li>)}
+          </ul>}
+          {transfer.data.phase === 'completed' && <p className="inline-success" role="status">
+            The controller role moved to <strong>{transfer.data.target_name}</strong>{transfer.data.target_url ? <> at <code>{transfer.data.target_url}</code></> : null}. Update bookmarks to the new URL; the old URL keeps working through worker forwarding.
+          </p>}
+        </Panel>}
+
+        {controller && transfer.data && !transferActive && !transferCompleted && !joining && <Panel className="transfer-panel">
+          <div className="section-heading">
+            <div><h2>Transfer the controller role</h2><p>Move cluster management to one joined node, for example before retiring or selling this machine. Running deployments keep serving; expect about a minute of management downtime. Every node must be online and on the latest build.</p></div>
+          </div>
+          <div className="field">
+            <label htmlFor="transfer-target">New controller node</label>
+            <select id="transfer-target" value={transferTargetId} onChange={(event) => { setTransferTargetId(event.target.value); setTransferPreflight(undefined); setTransferConfirm('') }}>
+              <option value="">Select a joined node…</option>
+              {nodes.data?.filter((node) => !node.local && node.id !== 'local' && node.online !== false).map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
+            </select>
+          </div>
+          <div className="modal-actions">
+            <Button type="button" disabled={!transferTargetId || transferBusy} onClick={() => void runTransferPreflight()}>{transferBusy ? 'Checking…' : 'Check readiness'}</Button>
+          </div>
+          {transferPreflight && <>
+            {transferPreflight.blockers.length > 0 && <ul className="inline-error" role="alert">
+              {transferPreflight.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
+            </ul>}
+            {transferPreflight.blockers.length === 0 && transferPreflight.warnings.length > 0 && <ul className="transfer-warnings">
+              {transferPreflight.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>}
+            {transferPreflight.ok && <div className="field">
+              <label htmlFor="transfer-confirm">Type <code>{transferConfirmationPhrase}</code> to confirm</label>
+              <input id="transfer-confirm" value={transferConfirm} autoComplete="off" onChange={(event) => setTransferConfirm(event.target.value)} />
+            </div>}
+            <div className="modal-actions">
+              <Button type="button" variant="danger" disabled={!transferPreflight.ok || transferConfirm !== transferConfirmationPhrase || transferBusy} onClick={() => void startTransfer()}>{transferBusy ? 'Starting…' : 'Transfer controller role'}</Button>
+            </div>
+          </>}
+          {transferError && <p className="form-error" role="alert">{transferError}</p>}
+        </Panel>}
 
         <Panel className="tailnet-note">
           <ShieldCheck size={20} aria-hidden="true" />

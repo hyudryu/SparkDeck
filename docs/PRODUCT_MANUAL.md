@@ -39,6 +39,7 @@ For a first installation, start with the [two-node QuickStart](../QUICKSTART.md)
 - **Joined node:** a worker that runs assigned work and forwards management requests to the controller.
 - **Per-machine membership:** pairing one machine does not import other machines that it previously controlled. Join every physical machine separately.
 - **Alternate entry, not failover:** an online worker URL opens the same controller-managed cluster, but workers do not automatically become controllers if the controller goes offline.
+- **Controller transfer, not failover:** the controller role can be moved to a joined node on demand (for example before retiring or selling the controller machine) from Cluster Management or over MCP. The move is operator-driven: it requires every node online and on the latest build, brief management downtime, and it finishes by rejoining the old controller as an ordinary worker.
 - **Node-targeted work:** downloads, image pulls, deployments, and model-weight transfers are assigned to explicit nodes.
 - **Local-first data:** operational state, settings, credentials, prompts, responses, and detailed benchmark history stay on the systems you control. Community sharing is optional and separately disclosed.
 

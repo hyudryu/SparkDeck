@@ -1209,6 +1209,11 @@ class Manager:
             "count": None, "names": [], "sessions": 0,
         }
         self._online_users_ts = 0.0
+        # Set by server.py to the controller-transfer service's gate. While a
+        # promoted controller waits for the cluster to re-bind to it,
+        # automatic actors must not try to relaunch or stop members through
+        # node credentials that have not moved yet.
+        self._controller_transfer_gate: Any = None
 
     # ---------- lifecycle ----------
     def is_joined_worker(self) -> bool:
@@ -1222,6 +1227,16 @@ class Manager:
                 and value.get("node_id")
             )
         except (OSError, json.JSONDecodeError, AttributeError):
+            return False
+
+    def _cluster_actions_deferred(self) -> bool:
+        """Whether a controller transfer is holding off cluster actors."""
+        # Tests build partial Managers via __new__; a missing gate simply
+        # means no transfer is in flight.
+        gate = getattr(self, "_controller_transfer_gate", None)
+        try:
+            return bool(gate is not None and gate())
+        except Exception:
             return False
 
     def _start_controller_tasks(self) -> None:
@@ -11039,6 +11054,12 @@ class Manager:
             and deployment.get("id")
         }
         while pending:
+            if self._cluster_actions_deferred():
+                # A controller transfer is mid-flight: worker credentials may
+                # be re-binding, so hold off instead of issuing stops through
+                # them.
+                await asyncio.sleep(5)
+                continue
             retry_later = set()
             for deployment_id in pending:
                 deployment = self._deployment(deployment_id)
@@ -11073,6 +11094,11 @@ class Manager:
     async def _resume_interrupted_deployments(self) -> None:
         """Relaunch accepted work whose request died before containers existed."""
         while True:
+            if self._cluster_actions_deferred():
+                # A controller transfer is mid-flight: relaunching through
+                # not-yet-rebound workers would race the re-bind.
+                await asyncio.sleep(5)
+                continue
             candidates = [
                 deployment for deployment in list(self.deployments)
                 if isinstance(deployment, dict)
@@ -12090,6 +12116,10 @@ class Manager:
     async def _deployment_crash_retry_loop(self) -> None:
         while True:
             await asyncio.sleep(DEPLOYMENT_CRASH_POLL_SECONDS)
+            if self._cluster_actions_deferred():
+                # A controller transfer is mid-flight; automatic restarts
+                # resume once the cluster re-bound to the new controller.
+                continue
             try:
                 await self._deployment_crash_retry_tick()
             except asyncio.CancelledError:

@@ -50,6 +50,12 @@ STRATA_SERVED_NAME_CAPABILITY = "strata-served-name-v1"
 # about a too-old driver from the node-side launcher, i.e. after a
 # relocation already removed the serving ranks.
 STRATA_DRIVER_CAPABILITY_PREFIX = "strata-nvidia-driver:"
+# Advertised by agents that support the orchestrated controller-role
+# transfer: staging a state bundle, promoting to controller, and re-binding
+# to a promoted controller. A mixed-version cluster must be caught in
+# preflight because a mid-transfer failure between old and new agents has
+# no automatic unwind.
+CONTROLLER_TRANSFER_CAPABILITY = "controller-transfer-v1"
 
 
 class NodeAgentResponseError(RuntimeError):
@@ -176,6 +182,24 @@ class AgentCredentials:
         value.pop("paired_at", None)
         value.pop("paired_controller_id", None)
         value.pop("controller_claimed_at", None)
+        _atomic_json_write(self.path, value)
+        self.data = value
+
+    def rebind_controller(self, controller_id: str) -> None:
+        """Durably claim a new coordinator during a controller transfer.
+
+        Unlike :meth:`pair`, the agent bearer stays unchanged: the promoted
+        controller already holds it from the transferred node registry, and
+        rotating it would leave the new controller unable to reach this node.
+        """
+        controller_id = str(controller_id or "").strip()
+        if not controller_id:
+            raise ValueError("controller id is required")
+        value = {
+            **self.data,
+            "paired_controller_id": controller_id,
+            "paired_at": time.time(),
+        }
         _atomic_json_write(self.path, value)
         self.data = value
 

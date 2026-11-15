@@ -654,17 +654,29 @@ class TransferService:
             self._write(state)
 
     async def _target_still_worker(self, state: dict) -> bool:
-        """Check the target still answers as this controller's worker."""
+        """Check the target still reports itself as this controller's worker.
+
+        ``/api/v1/onboarding`` is role-bearing: a still-worker answers
+        ``role: worker`` under this controller's credentials, while an
+        already-promoted target answers ``role: controller``. Reachability
+        alone would release an ambiguous promotion to a controller.
+        """
         try:
-            await self.manager.node_registry.request(
+            identity = await self.manager.node_registry.request(
                 state["target_node_id"],
                 "GET",
-                "/api/agent/info",
+                "/api/v1/onboarding",
                 timeout=10,
             )
-            return True
         except Exception:
+            # Unreachable is not proof of reversibility; the job stays
+            # committed until the target is positively identified.
             return False
+        return (
+            identity.get("role") == "worker"
+            and str((identity.get("node") or {}).get("id") or "")
+            == str(state["target_node_id"])
+        )
 
     def _controller_agent_urls(self) -> list[str]:
         port = getattr(self.onboarding, "port", 7878)
@@ -751,11 +763,11 @@ class TransferService:
                 continue
             json_files[name] = remap_node_refs(value, replacements)
 
-        overlay = {
+        overlay = remap_node_refs({
             key: value
             for key, value in self.manager.settings.items()
             if key not in NODE_LOCAL_SETTING_KEYS
-        }
+        }, replacements)
 
         transfer_state = {
             "id": state["id"],

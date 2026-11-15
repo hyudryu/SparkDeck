@@ -53,6 +53,7 @@ class FakeManager:
             "cluster_fabric_ip": "10.0.0.9",
             "cluster_node_hidden_from_dashboard": False,
             "flagship_pricing": {"Fable 5": {"input": 1.0, "output": 2.0}},
+            "routeros_gateway_node_id": LOCAL_NODE_ID,
         }
         self.deployments = []
         self.is_joined_worker = Mock(return_value=False)
@@ -293,12 +294,58 @@ class OnboardingRebindTests(unittest.IsolatedAsyncioTestCase):
             "protocol_version": AGENT_PROTOCOL_VERSION,
             "joined_at": time.time(),
         })
+        # Claim the credential the way a completed rebind would; an unclaimed
+        # agent with a matching assignment is the partial-write recovery case
+        # instead (covered by its own test).
+        manager.agent_credentials.rebind_controller("old-controller")
         with self.assertRaisesRegex(ValueError, "already bound"):
             await service.rebind({
                 "controller_url": "http://127.0.0.1:9100",
                 "controller_node_id": "old-controller",
             })
         await manager.http.aclose()
+
+    async def test_rebind_finishes_a_partial_credential_write(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "role": "controller",
+                "node": {
+                    "id": "new-controller",
+                    "protocol_version": AGENT_PROTOCOL_VERSION,
+                },
+            })
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = FakeManager(self.root, http)
+        service = OnboardingService(manager, self.root)
+        ControllerAssignment(self.root).save({
+            "controller_url": "http://127.0.0.1:9100",
+            "forward_token": "forward-secret",
+            "node_id": manager.agent_credentials.node_id,
+            # The previous attempt saved the assignment but the credential
+            # write failed, so the agent still answers for the old owner.
+            "controller_node_id": "new-controller",
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+            "joined_at": time.time(),
+        })
+
+        result = await service.rebind({
+            "controller_url": "http://127.0.0.1:9100",
+            "controller_node_id": "new-controller",
+        })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            manager.agent_credentials.data["paired_controller_id"],
+            "new-controller",
+        )
+        # A further identical rebind is now genuinely a duplicate.
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            await service.rebind({
+                "controller_url": "http://127.0.0.1:9100",
+                "controller_node_id": "new-controller",
+            })
+        await http.aclose()
 
 
 class BuildBundleTests(unittest.TestCase):
@@ -374,6 +421,11 @@ class BuildBundleTests(unittest.TestCase):
         self.assertNotIn("hf_cache", overlay)
         self.assertNotIn("cluster_node_name", overlay)
         self.assertNotIn("cluster_fabric_ip", overlay)
+        # Cluster-wide settings that pin nodes move with the remap too.
+        self.assertEqual(
+            overlay["routeros_gateway_node_id"],
+            manager.agent_credentials.node_id,
+        )
 
         store_bytes = base64.b64decode(bundle["store_b64"])
         self.assertEqual(
@@ -526,6 +578,8 @@ class StartTransferFlowTests(unittest.IsolatedAsyncioTestCase):
                 return {"ok": True, "helper_pid": 99}
             if path == "/api/agent/onboarding/rebind":
                 return {"ok": True}
+            if path == "/api/v1/onboarding":
+                return {"role": "worker", "node": {"id": "target-id"}}
             if path == "/api/agent/info":
                 return {"node_id": node_id, "capabilities": [CONTROLLER_TRANSFER_CAPABILITY]}
             return {"ok": True}
@@ -677,6 +731,58 @@ class RebindReconciliationTests(unittest.IsolatedAsyncioTestCase):
         }
         await service._rebind_nodes(state)
         self.assertEqual(state["nodes"][0]["status"], "failed")
+        await service.manager.http.aclose()
+
+
+class AmbiguityReleaseTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _service(self, responses: list[dict]) -> tuple[TransferService, FakeManager]:
+        manager = FakeManager(self.root)
+        manager.node_registry = FakeRegistry([])
+        seen: list[str] = []
+
+        async def registry_request(node_id, method, path, json_body=None, timeout=30, allow_disabled=False):
+            seen.append(path)
+            return responses[min(len(seen) - 1, len(responses) - 1)]
+
+        manager.node_registry.request = AsyncMock(side_effect=registry_request)
+        onboarding = Mock()
+        onboarding.assignment = ControllerAssignment(self.root)
+        return (
+            TransferService(manager, onboarding, self.root, self.root),
+            manager,
+        )
+
+    async def test_target_still_worker_requires_a_worker_role(self):
+        service, _manager = self._service([
+            {"role": "worker", "node": {"id": "target-id"}},
+        ])
+        state = {"id": "job-1", "target_node_id": "target-id"}
+        self.assertTrue(await service._target_still_worker(state))
+        await service.manager.http.aclose()
+
+    async def test_promoted_target_is_not_reversible(self):
+        service, _manager = self._service([
+            {"role": "controller", "node": {"id": "target-id"}},
+        ])
+        state = {"id": "job-1", "target_node_id": "target-id"}
+        self.assertFalse(await service._target_still_worker(state))
+        await service.manager.http.aclose()
+
+    async def test_unreachable_target_is_not_reversible(self):
+        service, _manager = self._service([])
+        async def unreachable(node_id, method, path, json_body=None, timeout=30, allow_disabled=False):
+            raise RuntimeError("target is offline")
+
+        service.manager.node_registry.request = AsyncMock(side_effect=unreachable)
+        state = {"id": "job-1", "target_node_id": "target-id"}
+        self.assertFalse(await service._target_still_worker(state))
         await service.manager.http.aclose()
 
 

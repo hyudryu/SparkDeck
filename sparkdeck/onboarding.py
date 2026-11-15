@@ -767,8 +767,22 @@ class OnboardingService:
             if not controller_node_id:
                 raise ValueError("controller_node_id is required")
             current_controller_id = str(assignment.get("controller_node_id") or "")
+            paired_controller_id = str(
+                self.manager.agent_credentials.data.get("paired_controller_id") or ""
+            )
             if secrets.compare_digest(controller_node_id, current_controller_id):
-                raise ValueError("worker is already bound to this controller")
+                if secrets.compare_digest(controller_node_id, paired_controller_id):
+                    raise ValueError("worker is already bound to this controller")
+                # A previous attempt saved the assignment but failed the
+                # credential write. Finish the transition instead of refusing
+                # forever: the assignment is already correct, so only the
+                # durable credential claim remains.
+                self.manager.agent_credentials.rebind_controller(controller_node_id)
+                return {
+                    "ok": True,
+                    "controller_url": controller_url,
+                    "controller_node_id": controller_node_id,
+                }
             if controller_node_id == self.manager.agent_credentials.node_id:
                 raise ValueError("controller id cannot reference this worker")
             connection = await resolve_control_connection(controller_url)

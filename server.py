@@ -1069,7 +1069,11 @@ async def agent_onboarding_rebind(req: Request):
         body = await req.json()
         if not isinstance(body, dict):
             raise ValueError("request body must be an object")
-        return await onboarding.rebind(body)
+        # _require_agent just verified this id against the durable pairing;
+        # rebind uses it to recognize (and adopt) an un-assigned worker.
+        return await onboarding.rebind(
+            body, req.headers.get(COORDINATOR_ID_HEADER, ""),
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 

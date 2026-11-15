@@ -730,6 +730,16 @@ class StartTransferFlowTests(unittest.IsolatedAsyncioTestCase):
         await service.close()
         await service.manager.http.aclose()
 
+    async def test_onboarding_writes_open_tracks_incoming_role(self):
+        service, _manager = self._service()
+        self.assertTrue(service.onboarding_writes_open())
+        service._write({"id": "job-1", "active": True, "incoming": False})
+        self.assertFalse(service.onboarding_writes_open())
+        service._write({"id": "job-1", "active": True, "incoming": True})
+        self.assertTrue(service.onboarding_writes_open())
+        await service.close()
+        await service.manager.http.aclose()
+
 
 class RebindReconciliationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1087,7 +1097,7 @@ class TransferWriteGateTests(unittest.IsolatedAsyncioTestCase):
     it refuses to admit.
     """
 
-    async def _gated(self, method: str, path: str):
+    async def _gated(self, method: str, path: str, onboarding_open: bool = True):
         from types import SimpleNamespace
 
         import server
@@ -1099,24 +1109,40 @@ class TransferWriteGateTests(unittest.IsolatedAsyncioTestCase):
         request.headers = {}
         with patch.object(
             server.controller_transfer, "blocks_management_writes", return_value=True
+        ), patch.object(
+            server.controller_transfer,
+            "onboarding_writes_open",
+            return_value=onboarding_open,
         ):
             return await _SecurityHeadersMiddleware._management_response(request)
 
+    async def _gated_incoming(self, method: str, path: str):
+        return await self._gated(method, path, onboarding_open=True)
+
+    async def _gated_outgoing(self, method: str, path: str):
+        return await self._gated(method, path, onboarding_open=False)
+
     async def test_frozen_management_writes_return_503(self):
-        response = await self._gated("POST", "/api/v1/deployments")
-        self.assertEqual(response.status_code, 503)
+        for gated in (self._gated_incoming, self._gated_outgoing):
+            response = await gated("POST", "/api/v1/deployments")
+            self.assertEqual(response.status_code, 503)
 
     async def test_reads_agent_and_transfer_traffic_stay_open(self):
-        for method, path in (
-            ("GET", "/api/v1/deployments"),
-            ("POST", "/api/agent/command"),
-            ("POST", "/api/v1/controller-transfer/resume"),
-        ):
-            self.assertIsNone(await self._gated(method, path), f"{method} {path}")
+        for gated in (self._gated_incoming, self._gated_outgoing):
+            for method, path in (
+                ("GET", "/api/v1/deployments"),
+                ("POST", "/api/agent/command"),
+                ("POST", "/api/v1/controller-transfer/resume"),
+            ):
+                self.assertIsNone(await gated(method, path), f"{method} {path}")
 
-    async def test_onboarding_writes_stay_open_during_freeze(self):
+    async def test_onboarding_writes_open_only_on_incoming_controller(self):
         for method, path in (
             ("POST", "/api/v1/onboarding/register"),
             ("POST", "/api/v1/onboarding/unregister"),
         ):
-            self.assertIsNone(await self._gated(method, path), f"{method} {path}")
+            self.assertIsNone(
+                await self._gated_incoming(method, path), f"{method} {path}"
+            )
+            response = await self._gated_outgoing(method, path)
+            self.assertEqual(response.status_code, 503)

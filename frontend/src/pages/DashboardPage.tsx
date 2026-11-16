@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Activity,
+  Check,
   Cloud,
+  Copy,
   Gauge,
   Layers,
   RefreshCw,
@@ -17,6 +19,7 @@ import { useResource } from '../hooks/useResource'
 import { communityAccessHint, useCommunityAccess } from '../hooks/useCommunityAccess'
 import { useDashboardStream } from '../hooks/useDashboardStream'
 import type { DashboardStreamResources, DashboardStreamSource } from '../hooks/useDashboardStream'
+import { copyToClipboard } from '../utils/clipboard'
 import { callerLabel, type IpAliases } from '../utils/ipAliases'
 
 function displayValue(value: number | null | undefined, suffix: string, digits = 0) {
@@ -103,6 +106,16 @@ function deploymentRequestIds(deployment: Deployment): string[] {
   for (const id of deployment.served_models ?? []) served.add(id)
   if (served.size) return [...served]
   return deployment.model_id ? [deployment.model_id] : []
+}
+
+/**
+ * The public name a client sends in the API `model` field: the first request
+ * id the deployment publishes, or the backing repository id when no explicit
+ * served name is configured. The running-model row shows it with a
+ * one-click copy button for pasting into API clients.
+ */
+function primaryServedName(deployment: Deployment): string {
+  return deploymentRequestIds(deployment)[0] ?? ''
 }
 
 export type SharedModelGroup = { model: string; deployments: Deployment[] }
@@ -591,12 +604,59 @@ function SessionRow({ model, request, groupLabel, aliases }: { model: string; re
   )
 }
 
+/**
+ * One running deployment row. The public served name is the id a client
+ * sends in the API `model` field, so it gets its own line with a copy
+ * button; when no explicit served name is configured the repository id is
+ * the served name, and that single line carries the button instead of
+ * rendering the same string twice.
+ */
 function DeploymentGroupRow({ deployment, group }: RunningModelRow) {
+  const servedName = primaryServedName(deployment)
+  const copyTarget = servedName || deployment.model_id
+  const servedDiffers = Boolean(servedName) && servedName !== deployment.model_id
+  const [copied, setCopied] = useState(false)
+  const [copyBlocked, setCopyBlocked] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = window.setTimeout(() => setCopied(false), 1800)
+    return () => window.clearTimeout(timer)
+  }, [copied])
+  const copy = async () => {
+    try {
+      await copyToClipboard(copyTarget)
+      setCopyBlocked(false)
+      setCopied(true)
+    } catch {
+      setCopyBlocked(true)
+    }
+  }
   return (
     <div className="dashboard-list-row">
       <span className={`status-dot status-${group.status}`} aria-hidden="true" />
       <span className="sr-only">Status: {group.status}</span>
-      <div><strong>{deployment.alias}</strong><small>{deployment.model_id}</small>{group.label && <small className="deployment-group-nodes">{group.label}</small>}{group.stopPending && <small>Stop pending</small>}{!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}</div>
+      <div>
+        <strong>{deployment.alias}</strong>
+        {servedDiffers && <small>{deployment.model_id}</small>}
+        {copyTarget && (
+          <small className="deployment-served-line">
+            <span className="deployment-served-line-text">{servedDiffers ? `Served name ${servedName}` : copyTarget}</span>
+            <button
+              type="button"
+              className="icon-button compact"
+              aria-label={copied ? `Copied served name ${copyTarget}` : `Copy served name ${copyTarget}`}
+              title={`Copy ${copyTarget}`}
+              onClick={() => void copy()}
+            >
+              {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+            </button>
+          </small>
+        )}
+        {copyBlocked && <small role="alert">Copy was blocked by the browser. Select the name and copy it manually.</small>}
+        {group.label && <small className="deployment-group-nodes">{group.label}</small>}
+        {group.stopPending && <small>Stop pending</small>}
+        {!ACTIVE_DEPLOYMENT_STATUSES.has(deployment.status) && <small>Deployment status: {deployment.status}</small>}
+      </div>
       <RuntimeMark runtime={deployment.runtime} />
     </div>
   )

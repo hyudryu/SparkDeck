@@ -109,13 +109,19 @@ function deploymentRequestIds(deployment: Deployment): string[] {
 }
 
 /**
- * The public name a client sends in the API `model` field: the first request
- * id the deployment publishes, or the backing repository id when no explicit
- * served name is configured. The running-model row shows it with a
- * one-click copy button for pasting into API clients.
+ * The public name a client sends in the API `model` field: the first
+ * explicit served name when one is configured, otherwise the id the gateway
+ * resolves for the deployment — the repository id a managed cluster
+ * deployment's engine advertises, or the alias for a registered external
+ * endpoint, whose health probe reports running without served-name metadata
+ * so the gateway's public-id fallback is its alias. The running-model row
+ * shows it with a one-click copy button for pasting into API clients.
  */
 function primaryServedName(deployment: Deployment): string {
-  return deploymentRequestIds(deployment)[0] ?? ''
+  if (deployment.served_model || (deployment.served_models ?? []).length) {
+    return deploymentRequestIds(deployment)[0] ?? ''
+  }
+  return deployment.managed ? deployment.model_id : deployment.alias
 }
 
 export type SharedModelGroup = { model: string; deployments: Deployment[] }
@@ -607,9 +613,10 @@ function SessionRow({ model, request, groupLabel, aliases }: { model: string; re
 /**
  * One running deployment row. The public served name is the id a client
  * sends in the API `model` field, so it gets its own line with a copy
- * button; when no explicit served name is configured the repository id is
- * the served name, and that single line carries the button instead of
- * rendering the same string twice.
+ * button; when no explicit served name is configured the resolved id (the
+ * repository id, or the alias for external endpoints) is the served name,
+ * and that single line carries the button instead of rendering the same
+ * string twice.
  */
 function DeploymentGroupRow({ deployment, group }: RunningModelRow) {
   const servedName = primaryServedName(deployment)

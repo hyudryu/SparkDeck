@@ -1673,6 +1673,37 @@ describe('Running models served name copy', () => {
     selected_nodes: [{ id: 'node', name: 'Node' }],
   })
 
+  it('copies the alias for an external endpoint without served-name metadata', async () => {
+    // External endpoints report running from a health probe that never
+    // populates served names, so the gateway resolves them by alias; the
+    // repository id would not select the endpoint.
+    const external = { ...wire('endpoint', 'my-endpoint'), kind: 'external' }
+    stubDeployments([external])
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('Served name my-endpoint')
+    expect(screen.getByText('org/shared')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Copy served name org/shared' })).not.toBeInTheDocument()
+
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    let copiedValue = ''
+    const execCommand = vi.fn().mockImplementation(() => {
+      copiedValue = (document.querySelector('textarea[aria-hidden="true"]') as HTMLTextAreaElement | null)?.value ?? ''
+      return true
+    })
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy served name my-endpoint' }))
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      expect(copiedValue).toBe('my-endpoint')
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
+  })
+
   const stubDeployments = (items: unknown[]) => {
     const base = stubDashboardFetch({ active_requests: {} })
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {

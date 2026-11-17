@@ -5,6 +5,7 @@ import type { ControllerTransferPreflight, ControllerTransferStatus, JoinCluster
 import { Button, ErrorState, LoadingState, PageHeader, Panel, Status } from '../components/ui'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { useResource } from '../hooks/useResource'
+import { copyToClipboard } from '../utils/clipboard'
 
 const emptyJoin: JoinClusterInput = { controller_url: '', join_code: '', advertise_url: '', name: '' }
 const maximumNodeNameLength = 80
@@ -45,42 +46,6 @@ function nodeRole(node: NodeInventoryItem, onboarding: OnboardingStatus) {
   if (isCurrentEntryNode(node, onboarding)) return `${onboarding.role === 'controller' ? 'Controller' : 'Worker node'} · Current entry node`
   if (node.id === 'local' || node.local) return 'Controller'
   return 'Worker node'
-}
-
-function copyWithSelection(value: string) {
-  const input = document.createElement('textarea')
-  input.value = value
-  input.setAttribute('readonly', '')
-  input.setAttribute('aria-hidden', 'true')
-  input.style.position = 'fixed'
-  input.style.inset = '0 auto auto -9999px'
-  input.style.opacity = '0'
-  const activeElement = document.activeElement instanceof HTMLElement
-    ? document.activeElement
-    : undefined
-  document.body.appendChild(input)
-  let copied: boolean
-  try {
-    input.select()
-    copied = document.execCommand('copy')
-  } finally {
-    input.remove()
-    activeElement?.focus()
-  }
-  if (!copied) throw new Error('Browser rejected the copy command')
-}
-
-async function copyToClipboard(value: string) {
-  if (window.isSecureContext && navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(value)
-      return
-    } catch {
-      // Permission policies can block the modern API even on secure origins.
-      // Continue within the click handler using the selection-based fallback.
-    }
-  }
-  copyWithSelection(value)
 }
 
 export function ClusterPage() {

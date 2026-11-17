@@ -773,6 +773,13 @@ h2 { font-size: 18px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01
 
 .dashboard-list-row small.deployment-group-nodes { white-space: normal; overflow-wrap: anywhere; }
 
+/* Served-name line: name text keeps the row's ellipsis clipping while the
+   copy button sits inline after it and never collapses. */
+.dashboard-list-row small.deployment-served-line { display: flex; align-items: center; gap: 6px; }
+.dashboard-list-row small.deployment-served-line > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.icon-button.compact { width: 22px; height: 22px; border-radius: 6px; color: var(--text-secondary); }
+.icon-button.compact:hover { color: var(--text-primary); background: var(--bg-subtle); }
+
 .deployment-group-picker .node-option strong { white-space: normal; overflow-wrap: anywhere; }
 
 .patched-images { min-width: 0; }

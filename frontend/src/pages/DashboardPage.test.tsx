@@ -1665,3 +1665,126 @@ describe('Running models shared-instance routing', () => {
     expect(screen.getByRole('button', { name: 'Save routing' })).toBeDisabled()
   })
 })
+
+describe('Running models served name copy', () => {
+  const wire = (id: string, alias: string, servedModels?: string[]) => ({
+    id, alias, runtime: 'vllm', kind: 'managed', status: 'running',
+    model: { repository: 'org/shared' }, ...(servedModels ? { served_models: servedModels } : {}),
+    selected_nodes: [{ id: 'node', name: 'Node' }],
+  })
+
+  it('copies the alias for an external endpoint without served-name metadata', async () => {
+    // External endpoints report running from a health probe that never
+    // populates served names, so the gateway resolves them by alias; the
+    // repository id would not select the endpoint.
+    const external = { ...wire('endpoint', 'my-endpoint'), kind: 'external' }
+    stubDeployments([external])
+    render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+    await screen.findByText('Served name my-endpoint')
+    expect(screen.getByText('org/shared')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Copy served name org/shared' })).not.toBeInTheDocument()
+
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    let copiedValue = ''
+    const execCommand = vi.fn().mockImplementation(() => {
+      copiedValue = (document.querySelector('textarea[aria-hidden="true"]') as HTMLTextAreaElement | null)?.value ?? ''
+      return true
+    })
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy served name my-endpoint' }))
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      expect(copiedValue).toBe('my-endpoint')
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
+  })
+
+  const stubDeployments = (items: unknown[]) => {
+    const base = stubDashboardFetch({ active_requests: {} })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (String(input).includes('/api/v1/deployments')) return json({ items })
+      return base(input as RequestInfo, init)
+    }))
+  }
+
+  it('shows the explicit served name with the repository id and copies it via the fallback path', async () => {
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    let copiedValue = ''
+    const execCommand = vi.fn().mockImplementation(() => {
+      copiedValue = (document.querySelector('textarea[aria-hidden="true"]') as HTMLTextAreaElement | null)?.value ?? ''
+      return true
+    })
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    try {
+      stubDeployments([wire('dgx', 'dgx-model', ['chat-model'])])
+      render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+      await screen.findByText('Served name chat-model')
+      expect(screen.getByText('org/shared')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Copy served name chat-model' }))
+
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      expect(copiedValue).toBe('chat-model')
+      expect(screen.getByRole('button', { name: 'Copied served name chat-model' })).toBeInTheDocument()
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
+  })
+
+  it('carries the copy button on the repository id when no served name is configured', async () => {
+    const originalSecureContext = window.isSecureContext
+    const originalExecCommand = document.execCommand
+    let copiedValue = ''
+    const execCommand = vi.fn().mockImplementation(() => {
+      copiedValue = (document.querySelector('textarea[aria-hidden="true"]') as HTMLTextAreaElement | null)?.value ?? ''
+      return true
+    })
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: false })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    try {
+      stubDeployments([wire('dgx', 'dgx-model')])
+      render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+      // The repository id line is the served name, so it renders once with
+      // the copy button instead of a duplicate "Served name" line.
+      const nameLine = await screen.findByText('org/shared')
+      expect(screen.queryByText(/^Served name /)).not.toBeInTheDocument()
+      const row = nameLine.closest('.dashboard-list-row')
+      expect(row).not.toBeNull()
+      fireEvent.click(within(row as HTMLElement).getByRole('button', { name: 'Copy served name org/shared' }))
+
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+      expect(copiedValue).toBe('org/shared')
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand })
+    }
+  })
+
+  it('copies through the async clipboard API when it is available', async () => {
+    const originalSecureContext = window.isSecureContext
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true })
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    try {
+      stubDeployments([wire('dgx', 'dgx-model', ['chat-model'])])
+      render(<MemoryRouter><DashboardPage /></MemoryRouter>)
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Copy served name chat-model' }))
+
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('chat-model'))
+      expect(screen.getByRole('button', { name: 'Copied served name chat-model' })).toBeInTheDocument()
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', { configurable: true, value: originalSecureContext })
+      Reflect.deleteProperty(navigator, 'clipboard')
+    }
+  })
+})

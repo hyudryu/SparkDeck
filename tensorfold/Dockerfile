@@ -10,9 +10,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 # SparkDeck mounts each node's Hugging Face cache at the HF_HOME path above, so
 # weights already staged by Virtual NAS are reused instead of re-downloaded.
-# TensorFold ships no PyPI package, so the install follows upstream's own
-# instruction and tracks the repository default branch.
-RUN pip install --no-cache-dir "git+https://github.com/ashhart/TensorFold.git"
+# TensorFold ships no PyPI package for its current engine: TensorFold 1.x
+# installs as a native binary (see ../tensorfold-native/), and the Python
+# engine stays at 0.6.6, so the install pins that tag — tracking the
+# repository default branch fails at setup.py since the 1.0.0 release.
+RUN pip install --no-cache-dir "git+https://github.com/ashhart/TensorFold.git@v0.6.6"
 
 EXPOSE 8080
 

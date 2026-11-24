@@ -181,18 +181,68 @@ class TensorfoldContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(labels[MODE_LABEL], "replicated")
         self.assertEqual(labels[NNODES_LABEL], "2")
 
-    async def test_sharded_tensorfold_is_rejected(self):
+    async def test_sharded_rank0_runs_host_networked_serve(self):
         manager = _manager()
 
-        with self.assertRaisesRegex(ValueError, "cannot run sharded"):
+        with patch("manager.Path.exists", return_value=True):
             await _launch(
-                manager, name="tensorfold-shard",
+                manager, name="tensorfold-shard-r0",
                 cluster_member={
                     "mode": "sharded", "deployment_id": "d",
-                    "node_id": "n", "rank": 0,
+                    "node_id": "n", "rank": 0, "nnodes": 2,
+                    "fabric_interface": "enp1s0f1np1",
+                },
+                environment={
+                    "TF_GLM_RANK": "0", "TF_GLM_WORLD": "2",
+                    "NCCL_COMM_ID": "10.0.0.1:29501",
                 },
             )
-        manager._run_managed_container.assert_not_called()
+
+        options = manager._run_managed_container.call_args.args[0]
+        # Rank 0 serves HTTP on the port this node allocated; the controller
+        # places ranks through the environment, not CLI flags.
+        self.assertEqual(
+            options["command"],
+            ["serve", "org/model", "--host", "0.0.0.0", "--port", "8123"],
+        )
+        self.assertEqual(options["environment"]["TF_GLM_RANK"], "0")
+        self.assertEqual(options["environment"]["TF_GLM_WORLD"], "2")
+        self.assertEqual(options["environment"]["NCCL_COMM_ID"], "10.0.0.1:29501")
+        # Cross-host ranks share the vLLM/SGLang sharded shape: host
+        # networking, pinned memory, the RoCE devices, and no port mapping.
+        self.assertEqual(options["network_mode"], "host")
+        self.assertEqual(options["devices"], ["/dev/infiniband:/dev/infiniband"])
+        self.assertNotIn("ports", options)
+        ulimit_names = [u.name for u in options["ulimits"]]
+        self.assertEqual(ulimit_names, ["memlock"])
+        self.assertEqual(options["environment"]["NCCL_SOCKET_IFNAME"], "enp1s0f1np1")
+        self.assertEqual(options["labels"]["io.sparkdeck.service-port"], "8123")
+
+    async def test_sharded_follower_rank_binds_nothing(self):
+        manager = _manager()
+
+        await _launch(
+            manager, name="tensorfold-shard-r1",
+            cluster_member={
+                "mode": "sharded", "deployment_id": "d",
+                "node_id": "n", "rank": 1, "nnodes": 2,
+                "fabric_interface": "enp1s0f1np1",
+            },
+            environment={
+                "TF_GLM_RANK": "1", "TF_GLM_WORLD": "2",
+                "NCCL_COMM_ID": "10.0.0.1:29501",
+            },
+        )
+
+        options = manager._run_managed_container.call_args.args[0]
+        self.assertEqual(options["command"], ["serve", "org/model"])
+        self.assertEqual(options["environment"]["TF_GLM_RANK"], "1")
+        self.assertEqual(options["environment"]["NCCL_COMM_ID"], "10.0.0.1:29501")
+        self.assertEqual(options["network_mode"], "host")
+        self.assertNotIn("ports", options)
+        self.assertNotIn("io.sparkdeck.service-port", options["labels"])
+        # Follower ranks claim no API port.
+        manager._allocate_port.assert_not_awaited()
 
     async def test_missing_image_is_pulled_once(self):
         import docker
@@ -268,17 +318,19 @@ class TensorfoldEvictionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TensorfoldPreflightTests(unittest.IsolatedAsyncioTestCase):
-    async def test_preflight_rejects_sharded_tensorfold_layouts(self):
+    async def test_preflight_rejects_tensorfold_tp_node_mismatch(self):
+        """TensorFold places one rank per selected host, so a sharded launch
+        whose world size disagrees with the node count is refused before any
+        node is contacted."""
         manager = Manager.__new__(Manager)
         manager._reject_hf_cli_credentials = Mock()
-        manager.cluster_nodes = Mock()
-        manager._validate_runtime_file_mount_nodes = Mock()
 
-        with self.assertRaisesRegex(ValueError, "single and replicated layouts"):
+        with self.assertRaisesRegex(ValueError, "one rank per node"):
             await manager._preflight_deployment_launch({
                 "model": "org/model",
                 "engine": "tensorfold",
                 "deployment_mode": "sharded",
+                "tensor_parallel_size": 3,
                 "node_ids": ["local", "spark-2"],
             })
 

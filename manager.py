@@ -14093,29 +14093,51 @@ class Manager:
                     parts.append(cmd[i + 1])
         return "+".join(parts)
 
-    @staticmethod
-    def _served_models_from_cmd(cmd: list, fallback: str = "") -> list[str]:
+    # The flag that names a server's public model id, per engine. vLLM's
+    # ``--served-model-name`` and TensorFold's ``--name`` (the upstream
+    # recipe's SERVED_NAME variable maps onto it) mean the same thing; the
+    # other engines have no such flag, so discovery falls back to the loaded
+    # model path.
+    _SERVED_MODEL_FLAGS: dict[str, tuple[str, ...]] = {
+        "tensorfold": ("--served-model-name", "--name"),
+    }
+    _DEFAULT_SERVED_MODEL_FLAGS = ("--served-model-name",)
+
+    @classmethod
+    def _served_model_flags(cls, engine: Any) -> tuple[str, ...]:
+        return cls._SERVED_MODEL_FLAGS.get(
+            str(engine or ""), cls._DEFAULT_SERVED_MODEL_FLAGS,
+        )
+
+    @classmethod
+    def _served_models_from_cmd(
+        cls, cmd: list, fallback: str = "",
+        flags: tuple[str, ...] = ("--served-model-name",),
+    ) -> list[str]:
         """Return the public model ids configured on an inference server.
 
-        vLLM accepts one or more values after ``--served-model-name``.  The
-        model path/repository used to load weights is not a valid request id
-        when that flag is present, so container discovery must keep the two
+        vLLM accepts one or more values after ``--served-model-name``;
+        TensorFold's serve CLI calls the same concept ``--name``. The model
+        path/repository used to load weights is not a valid request id when
+        a public id is present, so container discovery must keep the two
         concepts separate.
         """
         served: list[str] = []
         for i, token in enumerate(cmd):
             token = str(token)
-            if token.startswith("--served-model-name="):
-                value = token.split("=", 1)[1]
-                if value:
-                    served.append(value)
-                continue
-            if token != "--served-model-name":
-                continue
-            j = i + 1
-            while j < len(cmd) and not str(cmd[j]).startswith("-"):
-                served.append(str(cmd[j]))
-                j += 1
+            for flag in flags:
+                if token.startswith(f"{flag}="):
+                    value = token.split("=", 1)[1]
+                    if value:
+                        served.append(value)
+                    break
+                if token != flag:
+                    continue
+                j = i + 1
+                while j < len(cmd) and not str(cmd[j]).startswith("-"):
+                    served.append(str(cmd[j]))
+                    j += 1
+                break
         # Preserve command-line order while dropping accidental duplicates.
         served = list(dict.fromkeys(served))
         return served or ([fallback] if fallback else [])
@@ -14208,6 +14230,7 @@ class Manager:
         return cls._served_models_from_cmd(
             list(settings.get("extra_args") or []),
             str(deployment.get("model") or ""),
+            cls._served_model_flags(engine),
         )
 
     @staticmethod
@@ -17844,7 +17867,9 @@ class Manager:
         # Quant/dtype tag so token stats can tell apart the same model
         # served at different precisions (e.g. Q4 vs bf16).
         variant = self._variant_from_cmd(cmd)
-        served_models = self._served_models_from_cmd(cmd, model)
+        served_models = self._served_models_from_cmd(
+            cmd, model, self._served_model_flags(engine_label),
+        )
         # A Strata launch has no argv to scan, so its public id is stamped on
         # this label by the launcher; a saved name overrides the model-id
         # fallback. (Plain get: the label is new, so it has no legacy alias.)

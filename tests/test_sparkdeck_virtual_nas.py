@@ -5417,6 +5417,47 @@ class DeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 701.0))
         self.assertEqual(manager._virtual_nas_rate_samples, {})
 
+    def test_flat_inventory_samples_keep_the_last_measured_rate(self):
+        manager = Manager.__new__(Manager)
+        manager._virtual_nas_rate_samples = {}
+        job = {"id": "download-1", "status": "running", "bytes_transferred": 10_000_000}
+
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 100.0))
+        job["bytes_transferred"] = 30_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 110.0), 2_000_000.0,
+        )
+
+        # Inventory scans catch writes in bursts: identical byte counts in a
+        # later snapshot are not a 0 B/s measurement and must not erase the
+        # rate that the previous window measured.
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 120.0), 2_000_000.0,
+        )
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 140.0), 2_000_000.0,
+        )
+
+        # Bytes that move again are measured from the last flat scan, so the
+        # carried rate never covers a window it did not observe.
+        job["bytes_transferred"] = 60_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 150.0), 3_000_000.0,
+        )
+
+        # A carried rate is only trustworthy while it still describes the
+        # current transfer; flat scans past the staleness ceiling retire it.
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 300.0), 3_000_000.0,
+        )
+        self.assertIsNone(manager._sample_virtual_nas_transfer_rate(job, 460.0))
+
+        # Progress after a silent stretch establishes a fresh rate.
+        job["bytes_transferred"] = 70_000_000
+        self.assertAlmostEqual(
+            manager._sample_virtual_nas_transfer_rate(job, 470.0), 1_000_000.0,
+        )
+
 
 class DownloadBandwidthTests(unittest.IsolatedAsyncioTestCase):
     """max_download_bandwidth_mbps must reach the writer process, never other

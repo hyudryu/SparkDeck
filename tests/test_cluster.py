@@ -2410,6 +2410,47 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(instance.usage_rows()[0]["total_cost"], 4.0)
 
+    def test_merge_group_keeps_case_distinct_usage_pricing_editors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "org/Model": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+                "org/model": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {
+                "org/Model": "Shared", "org/model": "Shared",
+            }
+            instance.usage_routing_rules = {}
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            editors = [
+                member for member in row["members"]
+                if member.get("pricing") is not None
+            ]
+
+            self.assertEqual(len(editors), 2)
+            self.assertEqual(
+                {editor["pricing_model"] for editor in editors},
+                {"org/Model", "org/model"},
+            )
+            instance.update_usage_pricing(
+                "org/Model", {"output_cost_per_1m": 2.0},
+            )
+            instance.update_usage_pricing(
+                "org/model", {"output_cost_per_1m": 5.0},
+            )
+            self.assertEqual(instance.usage_rows()[0]["total_cost"], 7.0)
+
     def test_deployment_pricing_wins_over_stored_usage_rates(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

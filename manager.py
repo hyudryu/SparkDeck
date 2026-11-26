@@ -15972,11 +15972,21 @@ class Manager:
                     resolved = self._usage_member_pricing(
                         member["_pricing_model"],
                     )
-                    owner_key = str(
-                        resolved.get("deployment_id")
-                        or resolved.get("pricing_model")
-                        or ""
-                    ).casefold()
+                    # Deployment ids are case-insensitive, but usage identities
+                    # are exact persisted keys: two models differing only by
+                    # case stay separate editable records.
+                    deployment_id = str(
+                        resolved.get("deployment_id") or ""
+                    ).strip()
+                    pricing_model = str(
+                        resolved.get("pricing_model") or ""
+                    ).strip()
+                    if deployment_id:
+                        owner_key = f"deployment:{deployment_id.casefold()}"
+                    elif pricing_model:
+                        owner_key = f"usage:{pricing_model}"
+                    else:
+                        owner_key = ""
                     if owner_key and owner_key in pricing_owners:
                         member.update({
                             "deployment_id": None,

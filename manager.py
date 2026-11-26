@@ -15953,9 +15953,11 @@ class Manager:
                 # A routing destination can itself belong to a merge group,
                 # in which case the public ``route_target`` is intentionally
                 # absent.  Keep using each member's private pricing identity
-                # and expose at most one editor for each resolved deployment.
-                # Prefer the destination's own usage member, then a stable
-                # source, so rerendering cannot move ownership arbitrarily.
+                # and expose at most one editor for each resolved pricing
+                # record: a deployment, or a usage identity several routed
+                # members share. Prefer the destination's own usage member,
+                # then a stable source, so rerendering cannot move ownership
+                # arbitrarily.
                 pricing_members = sorted(
                     row["members"],
                     key=lambda member: (
@@ -15970,8 +15972,12 @@ class Manager:
                     resolved = self._usage_member_pricing(
                         member["_pricing_model"],
                     )
-                    deployment_id = resolved.get("deployment_id")
-                    if deployment_id and deployment_id in pricing_owners:
+                    owner_key = str(
+                        resolved.get("deployment_id")
+                        or resolved.get("pricing_model")
+                        or ""
+                    ).casefold()
+                    if owner_key and owner_key in pricing_owners:
                         member.update({
                             "deployment_id": None,
                             "pricing": None,
@@ -15979,8 +15985,8 @@ class Manager:
                         })
                         continue
                     member.update(resolved)
-                    if deployment_id:
-                        pricing_owners.add(deployment_id)
+                    if owner_key:
+                        pricing_owners.add(owner_key)
                 if estimated_cached:
                     row["cost_estimated"] = True
             row["members"].sort(key=lambda member: (

@@ -2373,6 +2373,43 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(row["total_cost"], 2.0)
 
+    def test_merge_group_exposes_one_editor_per_usage_pricing_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "legacy/a-source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+                "legacy/b-source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {"org/master": "Shared"}
+            instance.usage_routing_rules = {
+                "legacy/a-source": "org/master",
+                "legacy/b-source": "org/master",
+            }
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            editors = [
+                member for member in row["members"]
+                if member.get("pricing") is not None
+            ]
+
+            self.assertEqual(row["merge_group"], "Shared")
+            self.assertEqual(len(editors), 1)
+            self.assertEqual(editors[0]["pricing_model"], "org/master")
+            instance.update_usage_pricing(
+                "org/master", {"output_cost_per_1m": 2.0},
+            )
+            self.assertEqual(instance.usage_rows()[0]["total_cost"], 4.0)
+
     def test_deployment_pricing_wins_over_stored_usage_rates(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

@@ -2294,6 +2294,17 @@ async def update_usage_alias(req: Request):
         raise HTTPException(status, str(exc)) from exc
 
 
+@app.put("/api/token-stats/pricing")
+async def update_usage_pricing(req: Request):
+    """Record rates for a usage identity that no deployment owns."""
+    try:
+        body = await req.json()
+        return manager.update_usage_pricing(body.get("model"), body)
+    except ValueError as exc:
+        status = 404 if str(exc) == "usage model not found" else 400
+        raise HTTPException(status, str(exc)) from exc
+
+
 @app.put("/api/token-stats/rules")
 async def update_usage_routing_rule(req: Request):
     try:

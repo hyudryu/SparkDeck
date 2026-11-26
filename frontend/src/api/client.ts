@@ -1280,6 +1280,14 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(pricing),
     }),
+    updateUsagePricing: (model: string, pricing: {
+      input_cost_per_1m: number | null
+      cache_cost_per_1m: number | null
+      output_cost_per_1m: number | null
+    }) => request<void>('/api/token-stats/pricing', {
+      method: 'PUT',
+      body: JSON.stringify({ model, ...pricing }),
+    }),
     setRoute: (source: string, destination: string) =>
       request<void>('/api/token-stats/rules', {
         method: 'PUT',

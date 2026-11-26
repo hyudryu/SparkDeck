@@ -231,10 +231,71 @@ describe('UsagePage', () => {
     expect(save).toBeDisabled()
   })
 
+  it('records pricing for a usage key that no deployment owns', async () => {
+    const unlinkedSummary = {
+      ...summary,
+      groups: summary.groups.map((group) => ({
+        ...group,
+        members: group.members.map((member) => ({
+          ...member,
+          deployment_id: null,
+          pricing_model: 'org/model',
+          pricing: {
+            input_cost_per_1m: null,
+            cache_cost_per_1m: null,
+            output_cost_per_1m: null,
+          },
+        })),
+      })),
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (init?.method) return json({ ok: true })
+      if (String(input).includes('/hourly') || String(input).includes('/daily')) return json([])
+      return json(unlinkedSummary)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<UsagePage />)
+
+    await user.click(await screen.findByRole('button', { name: 'Show details for Workload' }))
+    const outputPrice = screen.getByRole('spinbutton', { name: 'Output price for org/model' })
+    const save = screen.getByRole('button', { name: 'Save pricing' })
+    expect(outputPrice).toBeEnabled()
+    expect(save).toBeDisabled()
+
+    await user.type(outputPrice, '2')
+    expect(save).toBeEnabled()
+    await user.click(save)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/token-stats/pricing', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({
+        model: 'org/model',
+        input_cost_per_1m: null,
+        cache_cost_per_1m: null,
+        output_cost_per_1m: 2,
+      }),
+    })))
+    expect(await screen.findByText('Updated recorded pricing for org/model.')).toBeInTheDocument()
+    expect(save).toBeDisabled()
+  })
+
   it('keeps pricing read-only when usage cannot be linked to one deployment', async () => {
+    const unownedSummary = {
+      ...summary,
+      groups: summary.groups.map((group) => ({
+        ...group,
+        members: group.members.map((member) => ({
+          ...member,
+          deployment_id: null,
+          pricing: null,
+          pricing_model: null,
+        })),
+      })),
+    }
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       if (String(input).includes('/hourly') || String(input).includes('/daily')) return json([])
-      return json(summary)
+      return json(unownedSummary)
     })
     vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()

@@ -209,7 +209,7 @@ function UsageMemberDetails({ member, busy, onEdit, onErase, onSavePricing }: {
   }, [member.model, member.pricing])
   const parsed = parsePricing(draft)
   const pricingBusy = busy === `pricing:${member.model}`
-  const canEditPricing = Boolean(member.deployment_id && member.pricing)
+  const canEditPricing = Boolean(member.pricing)
   const changed = Boolean(parsed && !pricingMatches(parsed, baseline))
   const savePricing = async (event: FormEvent) => {
     event.preventDefault()
@@ -310,10 +310,12 @@ export function UsagePage() {
   }
   const erase = async (model: string) => { if (!await confirm({ title: `Erase usage for ${model}?`, message: 'This removes all lifetime and hourly usage for this model and cannot be undone.', confirmLabel: 'Erase usage', danger: true })) return; setBusy(`erase:${model}`); setActionError(undefined); try { await api.usage.erase(model); setNotice(`Erased usage for ${model}.`); reload() } catch (reason) { setActionError(reason instanceof Error ? reason.message : 'Could not erase model usage') } finally { setBusy(undefined) } }
   const savePricing = async (member: UsageMember, pricing: UsagePricing) => {
-    if (!member.deployment_id) return
+    if (!member.pricing) return
+    const usageModel = member.pricing_model ?? member.model
     setBusy(`pricing:${member.model}`); setActionError(undefined); setNotice(undefined)
     try {
-      await api.usage.updatePricing(member.deployment_id, pricing)
+      if (member.deployment_id) await api.usage.updatePricing(member.deployment_id, pricing)
+      else await api.usage.updateUsagePricing(usageModel, pricing)
       setNotice(`Updated recorded pricing for ${member.model}.`); summary.reload()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'Could not update recorded pricing')

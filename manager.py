@@ -987,6 +987,12 @@ class Manager:
         self.usage_cache_estimates: dict[str, dict] = (
             self._load_usage_cache_estimates()
         )
+        # Recorded rates for usage identities that no deployment owns. Token
+        # accounting keeps the identity a container was launched with, which
+        # outlives the deployment's current settings after a model edit, so
+        # these rates are keyed by usage key instead of deployment id.
+        self.usage_pricing_path = self.data_dir / "usage_pricing.json"
+        self.usage_pricing: dict[str, dict] = self._load_usage_pricing()
         self.speed_samples_path = self.data_dir / "speed_samples.json"
         self.speed_samples: dict[str, list[dict]] = self._load_speed_samples()
         self._speed_samples_version = 0
@@ -5264,6 +5270,102 @@ class Manager:
         )
         tmp.replace(self.usage_cache_estimates_path)
 
+    _usage_pricing_fields = (
+        "input_cost_per_1m", "cache_cost_per_1m", "output_cost_per_1m",
+    )
+
+    def _load_usage_pricing(self) -> dict[str, dict]:
+        path = getattr(self, "usage_pricing_path", None)
+        if path is None or not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        pricing: dict[str, dict] = {}
+        for model, rates in value.items():
+            model_key = str(model or "").strip()
+            if not model_key or not isinstance(rates, dict):
+                continue
+            try:
+                normalized = {
+                    field: self._pricing_value(rates.get(field), field)
+                    for field in self._usage_pricing_fields
+                }
+            except ValueError:
+                continue
+            if any(rate is not None for rate in normalized.values()):
+                pricing[model_key] = normalized
+        return pricing
+
+    def _save_usage_pricing(self) -> None:
+        path = getattr(self, "usage_pricing_path", None)
+        if path is None:
+            return
+        stored = getattr(self, "usage_pricing", None)
+        if not isinstance(stored, dict):
+            stored = {}
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _usage_pricing_rates(self, model: Any) -> dict[str, Any] | None:
+        """Return recorded rates for one exact usage identity, if any."""
+        stored = getattr(self, "usage_pricing", None)
+        if not isinstance(stored, dict):
+            return None
+        rates = stored.get(str(model or ""))
+        if not isinstance(rates, dict):
+            return None
+        return {
+            field: rates.get(field) for field in self._usage_pricing_fields
+        }
+
+    def _usage_pricing_claims(self, model: Any) -> bool:
+        """Whether any saved deployment claims this usage identity.
+
+        A claim keeps the deployment's recorded pricing authoritative even
+        when the resolution is ambiguous, so a usage-level rate must not
+        silently replace it.
+        """
+        model_key = str(model or "").strip().casefold()
+        if not model_key:
+            return False
+        return any(
+            self._deployment_pricing_model_key(deployment).casefold()
+            == model_key
+            for deployment in getattr(self, "deployments", []) or []
+        )
+
+    def update_usage_pricing(self, model: Any, body: dict) -> dict:
+        """Record rates for a usage identity that no deployment owns."""
+        model_key = str(model or "").strip()
+        if not model_key or model_key not in self.token_stats:
+            raise ValueError("usage model not found")
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+        pricing = {
+            field: self._pricing_value(body.get(field), field)
+            for field in self._usage_pricing_fields
+        }
+        explicit = any(rate is not None for rate in pricing.values())
+        if explicit and self._usage_pricing_claims(model_key):
+            raise ValueError(
+                "usage pricing is managed by a deployment for this model "
+                "identity"
+            )
+        stored = getattr(self, "usage_pricing", None)
+        if not isinstance(stored, dict):
+            stored = self.usage_pricing = {}
+        if explicit:
+            stored[model_key] = pricing
+        else:
+            stored.pop(model_key, None)
+        self._save_usage_pricing()
+        return {"ok": True, "model": model_key, **pricing}
+
     @staticmethod
     def _usage_route_target(model: str, rules: dict[str, str]) -> str:
         """Resolve a model through a validated, possibly chained rule map."""
@@ -6650,15 +6752,35 @@ class Manager:
         return min(matches, key=self._deployment_pricing_owner_key)
 
     def _usage_member_pricing(self, model: str) -> dict[str, Any]:
-        """Return actionable persisted pricing metadata for one Usage member."""
+        """Return actionable persisted pricing metadata for one Usage member.
+
+        Deployment-owned identities keep saving through the deployment. A
+        usage identity no deployment claims (for example historical usage from
+        a container launched before its deployment's model was edited) gets an
+        editable usage-level record instead, so it can still be priced.
+        Conflicting deployment claims stay read-only.
+        """
         deployment = self._deployment_pricing_resolution(model)
         deployment_id = str((deployment or {}).get("id") or "").strip()
-        if not deployment or not deployment_id:
-            return {"deployment_id": None, "pricing": None}
-        settings = deployment.get("launch_settings") or {}
+        if deployment and deployment_id:
+            settings = deployment.get("launch_settings") or {}
+            return {
+                "deployment_id": deployment_id,
+                "pricing": self._deployment_pricing(settings),
+                "pricing_model": model,
+            }
+        if not deployment_id and self._usage_pricing_claims(model):
+            return {
+                "deployment_id": None,
+                "pricing": None,
+                "pricing_model": None,
+            }
         return {
-            "deployment_id": deployment_id,
-            "pricing": self._deployment_pricing(settings),
+            "deployment_id": None,
+            "pricing": self._usage_pricing_rates(model) or {
+                field: None for field in self._usage_pricing_fields
+            },
+            "pricing_model": model,
         }
 
     async def update_deployment_pricing(
@@ -15806,6 +15928,7 @@ class Manager:
                         member.update({
                             "deployment_id": None,
                             "pricing": None,
+                            "pricing_model": None,
                         })
                 if estimated_cached:
                     row["cost_estimated"] = True
@@ -15841,6 +15964,7 @@ class Manager:
                         member.update({
                             "deployment_id": None,
                             "pricing": None,
+                            "pricing_model": None,
                         })
                         continue
                     member.update(resolved)
@@ -15881,12 +16005,14 @@ class Manager:
         output_tokens = stats.get("output", 0)
         cached_tokens = stats.get("cached", 0)
 
-        # Resolve pricing: cluster deployment metadata first, then standalone
+        # Resolve pricing: cluster deployment metadata first, then recorded
+        # usage-level rates for identities no deployment owns, then standalone
         # per-model settings, then the built-in map.
         input_cost_per_1m = 0.0
         output_cost_per_1m = 0.0
         cache_cost_per_1m = 0.0
         deployment_pricing: dict[str, Any] | None = None
+        usage_pricing: dict[str, Any] | None = None
 
         model_lower = model.casefold()
         deployment = self._deployment_pricing_resolution(model)
@@ -15899,6 +16025,16 @@ class Manager:
             }
             if any(value is not None for value in values.values()):
                 deployment_pricing = values
+        elif not self._usage_pricing_claims(model):
+            rates = self._usage_pricing_rates(model)
+            if rates is not None:
+                values = {
+                    "input": rates.get("input_cost_per_1m"),
+                    "output": rates.get("output_cost_per_1m"),
+                    "cache": rates.get("cache_cost_per_1m"),
+                }
+                if any(value is not None for value in values.values()):
+                    usage_pricing = values
 
         # Check per-model unsloth settings
         for key, settings in getattr(self, "unsloth_settings", {}).items():
@@ -15923,16 +16059,18 @@ class Manager:
                     cache_cost_per_1m = float(rates.get("cache", 0))
                     break
 
-        # Cluster fields override their matching defaults independently.
-        # An explicit zero therefore means free, while a blank field keeps
-        # the standalone/built-in rate for that token class.
-        if deployment_pricing is not None:
-            if deployment_pricing["input"] is not None:
-                input_cost_per_1m = float(deployment_pricing["input"])
-            if deployment_pricing["output"] is not None:
-                output_cost_per_1m = float(deployment_pricing["output"])
-            if deployment_pricing["cache"] is not None:
-                cache_cost_per_1m = float(deployment_pricing["cache"])
+        # Cluster and usage fields override their matching defaults
+        # independently. An explicit zero therefore means free, while a blank
+        # field keeps the standalone/built-in rate for that token class.
+        for pricing in (usage_pricing, deployment_pricing):
+            if pricing is None:
+                continue
+            if pricing["input"] is not None:
+                input_cost_per_1m = float(pricing["input"])
+            if pricing["output"] is not None:
+                output_cost_per_1m = float(pricing["output"])
+            if pricing["cache"] is not None:
+                cache_cost_per_1m = float(pricing["cache"])
 
         # Non-cached input tokens are charged at the regular input rate;
         # cached tokens are charged at the (typically lower) cache rate.
@@ -16042,6 +16180,9 @@ class Manager:
         self.speed_samples.pop(model_key, None)
         self.usage_aliases.pop(model_key, None)
         self.usage_merge_groups.pop(model_key, None)
+        usage_pricing = getattr(self, "usage_pricing", None)
+        if isinstance(usage_pricing, dict):
+            usage_pricing.pop(model_key, None)
         cache_estimates = getattr(self, "usage_cache_estimates", None)
         if isinstance(cache_estimates, dict):
             cache_estimates.pop(f"model:{model_key}", None)
@@ -16065,6 +16206,8 @@ class Manager:
         self._save_usage_merge_groups()
         if hasattr(self, "usage_cache_estimates_path"):
             self._save_usage_cache_estimates()
+        if hasattr(self, "usage_pricing_path"):
+            self._save_usage_pricing()
         return {"ok": True, "model": model_key}
 
     def reset_session_token_stats(self) -> dict:

@@ -2284,6 +2284,240 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(member["deployment_id"])
         self.assertIsNone(member["pricing"])
 
+    def test_unlinked_usage_identity_is_editable_and_priced_by_usage_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "org/historical": {
+                    "input": 1_000_000, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.usage_routing_rules = {}
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = [{
+                "id": "deployment-renamed",
+                "model": "org/renamed-model",
+                "launch_settings": {"model": "org/renamed-model"},
+            }]
+
+            row = instance.usage_rows()[0]
+            member = row["members"][0]
+
+            self.assertIsNone(member["deployment_id"])
+            self.assertEqual(member["pricing_model"], "org/historical")
+            self.assertEqual(member["pricing"], {
+                "input_cost_per_1m": None,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": None,
+            })
+            self.assertEqual(row["total_cost"], 0.0)
+
+            instance.update_usage_pricing("org/historical", {
+                "input_cost_per_1m": 1.0,
+                "cache_cost_per_1m": 0.25,
+                "output_cost_per_1m": 2.0,
+            })
+
+            row = instance.usage_rows()[0]
+            self.assertEqual(
+                row["members"][0]["pricing"]["output_cost_per_1m"], 2.0,
+            )
+            self.assertEqual(row["total_cost"], 3.0)
+            self.assertEqual(
+                json.loads(instance.usage_pricing_path.read_text()),
+                {"org/historical": {
+                    "input_cost_per_1m": 1.0,
+                    "cache_cost_per_1m": 0.25,
+                    "output_cost_per_1m": 2.0,
+                }},
+            )
+
+    def test_routed_destination_without_counters_can_record_usage_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "legacy/source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.usage_routing_rules = {
+                "legacy/source": "org/destination",
+            }
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            owner = row["members"][0]
+
+            # The destination exists only as a routing target, yet the row is
+            # billed as it, so its editor must be saveable.
+            self.assertEqual(row["route_target"], "org/destination")
+            self.assertEqual(owner["pricing_model"], "org/destination")
+            instance.update_usage_pricing(
+                "org/destination", {"output_cost_per_1m": 2.0},
+            )
+
+            row = instance.usage_rows()[0]
+            self.assertEqual(
+                row["members"][0]["pricing"]["output_cost_per_1m"], 2.0,
+            )
+            self.assertEqual(row["total_cost"], 2.0)
+
+    def test_merge_group_exposes_one_editor_per_usage_pricing_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "legacy/a-source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+                "legacy/b-source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {"org/master": "Shared"}
+            instance.usage_routing_rules = {
+                "legacy/a-source": "org/master",
+                "legacy/b-source": "org/master",
+            }
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            editors = [
+                member for member in row["members"]
+                if member.get("pricing") is not None
+            ]
+
+            self.assertEqual(row["merge_group"], "Shared")
+            self.assertEqual(len(editors), 1)
+            self.assertEqual(editors[0]["pricing_model"], "org/master")
+            instance.update_usage_pricing(
+                "org/master", {"output_cost_per_1m": 2.0},
+            )
+            self.assertEqual(instance.usage_rows()[0]["total_cost"], 4.0)
+
+    def test_merge_group_keeps_case_distinct_usage_pricing_editors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "org/Model": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+                "org/model": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {
+                "org/Model": "Shared", "org/model": "Shared",
+            }
+            instance.usage_routing_rules = {}
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            editors = [
+                member for member in row["members"]
+                if member.get("pricing") is not None
+            ]
+
+            self.assertEqual(len(editors), 2)
+            self.assertEqual(
+                {editor["pricing_model"] for editor in editors},
+                {"org/Model", "org/model"},
+            )
+            instance.update_usage_pricing(
+                "org/Model", {"output_cost_per_1m": 2.0},
+            )
+            instance.update_usage_pricing(
+                "org/model", {"output_cost_per_1m": 5.0},
+            )
+            self.assertEqual(instance.usage_rows()[0]["total_cost"], 7.0)
+
+    def test_deployment_pricing_wins_over_stored_usage_rates(self) -> None:
+        instance = Manager.__new__(Manager)
+        instance.token_stats = {
+            "org/model": {"input": 0, "cached": 0, "output": 1_000_000},
+        }
+        instance.usage_aliases = {}
+        instance.usage_merge_groups = {}
+        instance.usage_routing_rules = {}
+        instance.speed_samples = {}
+        instance.unsloth_settings = {}
+        instance.usage_pricing = {
+            "org/model": {
+                "input_cost_per_1m": None,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": 7.0,
+            },
+        }
+        instance.deployments = [{
+            "id": "deployment-1",
+            "pricing_model_key": "org/model",
+            "launch_settings": {"output_cost_per_1m": 1.5},
+        }]
+
+        cost = instance.calculate_cost("org/model")
+        member = instance.usage_rows()[0]["members"][0]
+
+        self.assertEqual(cost["output_cost_per_1m"], 1.5)
+        self.assertEqual(member["deployment_id"], "deployment-1")
+        with self.assertRaisesRegex(ValueError, "managed by a deployment"):
+            instance.update_usage_pricing(
+                "org/model", {"output_cost_per_1m": 7.0},
+            )
+
+    def test_erasing_usage_removes_its_recorded_usage_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            instance = Manager.__new__(Manager)
+            instance.token_stats_path = base / "token_stats.json"
+            instance.hourly_token_stats_path = base / "hourly_token_stats.json"
+            instance.speed_samples_path = base / "speed_samples.json"
+            instance.usage_aliases_path = base / "usage_aliases.json"
+            instance.usage_merge_groups_path = base / "usage_merge_groups.json"
+            instance.usage_pricing_path = base / "usage_pricing.json"
+            instance.token_stats = {
+                "org/model": {"input": 1, "cached": 0, "output": 1},
+            }
+            instance.hourly_token_stats = {}
+            instance.speed_samples = {}
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.session_token_stats = {}
+            instance.usage_pricing = {
+                "org/model": {
+                    "input_cost_per_1m": 1.0,
+                    "cache_cost_per_1m": None,
+                    "output_cost_per_1m": 2.0,
+                },
+            }
+            instance._save_usage_pricing()
+
+            instance.erase_usage_model("org/model")
+
+            self.assertNotIn("org/model", instance.usage_pricing)
+            self.assertEqual(
+                json.loads(instance.usage_pricing_path.read_text()), {},
+            )
+
     async def test_clone_identical_pricing_has_one_owner_and_saves_as_a_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = Manager.__new__(Manager)

@@ -1235,6 +1235,8 @@ export interface UsageMember {
   routed_to?: string | null
   deployment_id?: string | null
   pricing?: UsagePricing | null
+  /** Usage identity the pricing applies to when no deployment owns it. */
+  pricing_model?: string | null
 }
 
 export interface UsagePricing {

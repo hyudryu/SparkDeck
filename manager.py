@@ -2435,6 +2435,12 @@ class Manager:
         far more than the inventory cache lifetime. Divide by the interval that
         really elapsed instead of discarding slow samples, which left live
         transfers without any reported rate.
+
+        Writes reach the inventory in bursts, so consecutive snapshots often
+        report identical byte counts. That is not a measurement of 0 B/s: the
+        scan simply caught no completed write. Carry the last rate measured
+        over a window that did move bytes, and retire it only once snapshots
+        have stayed flat long enough to describe a stalled transfer.
         """
         samples = getattr(self, "_virtual_nas_rate_samples", None)
         if samples is None:
@@ -2447,22 +2453,32 @@ class Manager:
         transferred = max(0, int(job.get("bytes_transferred") or 0))
         previous = samples.get(job_id)
         if previous is None:
-            samples[job_id] = (sampled_at, transferred, None)
+            samples[job_id] = (sampled_at, transferred, None, None)
             return None
-        previous_at, previous_bytes, previous_rate = previous
+        previous_at, previous_bytes, previous_rate, rate_sampled_at = previous
         elapsed = sampled_at - previous_at
         if elapsed < VIRTUAL_NAS_RATE_MIN_SAMPLE_GAP_SECONDS:
             # Repeat requests serve the same cached inventory snapshot, so the
             # rate measured for that snapshot still describes the job.
             return previous_rate
         if elapsed > VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS:
-            samples[job_id] = (sampled_at, transferred, None)
+            samples[job_id] = (sampled_at, transferred, None, None)
             return None
         if transferred < previous_bytes:
-            rate = None
-        else:
-            rate = (transferred - previous_bytes) / elapsed
-        samples[job_id] = (sampled_at, transferred, rate)
+            samples[job_id] = (sampled_at, transferred, None, None)
+            return None
+        if transferred == previous_bytes:
+            rate = previous_rate
+            if (
+                rate_sampled_at is not None
+                and sampled_at - rate_sampled_at
+                > VIRTUAL_NAS_RATE_MAX_SAMPLE_GAP_SECONDS
+            ):
+                rate = None
+            samples[job_id] = (sampled_at, transferred, rate, rate_sampled_at)
+            return rate
+        rate = (transferred - previous_bytes) / elapsed
+        samples[job_id] = (sampled_at, transferred, rate, sampled_at)
         return rate
 
     @staticmethod

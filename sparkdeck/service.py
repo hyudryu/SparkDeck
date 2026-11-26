@@ -2324,6 +2324,9 @@ class SparkDeckService:
             "environment", "runtime_file_mounts",
             "gpu_memory_utilization", "gpu_memory_gb",
             "sg_tp_size", "sg_mem_fraction", "sg_cpu_affinity",
+            # The engine image is a durable launch input the manager already
+            # persists and re-applies on rebuild.
+            "image",
             "model",
         }
         unknown = sorted(set(changes) - allowed)
@@ -2987,7 +2990,7 @@ class SparkDeckService:
         # Validate the effective combination: the saved mode plus the new
         # nodes (or the new mode plus the saved nodes) must stay launchable.
         if str(stored.get("runtime")) in (
-            RuntimeKind.LLAMA_CPP.value, RuntimeKind.TENSORFOLD.value,
+            RuntimeKind.LLAMA_CPP.value,
             RuntimeKind.NINFER.value, RuntimeKind.STRATA.value,
         ) and (
             settings.get("deployment_mode") in {"sharded", "grouped_sharded"}
@@ -3402,6 +3405,7 @@ class SparkDeckService:
         result = {"deployment_mode": mode, "required_node_count": count}
         if mode == "sharded" and runtime in {
             RuntimeKind.VLLM.value, RuntimeKind.SGLANG.value,
+            RuntimeKind.TENSORFOLD.value,
         }:
             result["parallel_rank_count"] = world
         return result
@@ -3768,7 +3772,7 @@ class SparkDeckService:
                     raise ValueError("single deployment requires exactly one node")
                 if mode in {"sharded", "grouped_sharded"} and (
                     runtime in (
-                        RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD,
+                        RuntimeKind.LLAMA_CPP,
                         RuntimeKind.NINFER, RuntimeKind.STRATA,
                     )
                 ):
@@ -4250,7 +4254,7 @@ class SparkDeckService:
         if mode == "single" and len(selected_ids) != 1:
             raise ValueError("single deployment requires exactly one node")
         if mode == "sharded" and record.runtime in (
-            RuntimeKind.LLAMA_CPP, RuntimeKind.TENSORFOLD, RuntimeKind.NINFER,
+            RuntimeKind.LLAMA_CPP, RuntimeKind.NINFER,
             RuntimeKind.STRATA,
         ):
             raise ValueError(

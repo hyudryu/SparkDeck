@@ -399,8 +399,10 @@ _LAYA_SERVE_PORT = 8080
 # exact-decoding server for Apple Silicon and NVIDIA GPUs. There is no
 # upstream image, so the default expects a locally prepared image with a
 # pip-installed tensorfold whose Docker entrypoint is the ``tensorfold`` CLI.
-# Weights resolve from the node's shared Hugging Face cache; a single server
-# holds the full model, so only single and replicated layouts are supported.
+# Weights resolve from the node's shared Hugging Face cache. A single server
+# holds the full model on one node; a sharded deployment instead places one
+# rank per selected host over the fabric with the CLI's --tp/--rank/--master
+# flags, rank 0 serving HTTP while the other ranks follow its steps.
 DEFAULT_TENSORFOLD_IMAGE = "sparkdeck/tensorfold:latest"
 _TENSORFOLD_SERVE_PORT = 8080
 
@@ -9097,13 +9099,6 @@ class Manager:
                 "Laya deployments support single and replicated layouts, "
                 "not sharded"
             )
-        if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
-            # One TensorFold server holds the whole model; replicas are the
-            # only way to use more than one node.
-            raise ValueError(
-                "TensorFold deployments support single and replicated layouts, "
-                "not sharded"
-            )
         if engine == "ninfer" and mode in {"sharded", "grouped_sharded"}:
             # One NInfer server loads one artifact on one NVIDIA GPU; replicas
             # are the only way to use more than one node.
@@ -9129,6 +9124,19 @@ class Manager:
             node_ids = node_ids[:1] or [LOCAL_NODE_ID]
         elif len(node_ids) < 2:
             raise ValueError(f"{mode} deployment requires at least two nodes")
+        if engine == "tensorfold" and mode in _SHARDED_MEMBER_MODES:
+            # TensorFold places one rank per selected host: the planner
+            # places each rank through the rank environment variables, so the
+            # requested world size must match the node count exactly.
+            planned_tp = (
+                int(body.get("tensor_parallel_size") or 0) or len(node_ids)
+            )
+            if planned_tp != len(node_ids):
+                raise ValueError(
+                    "TensorFold sharded deployments place one rank per node: "
+                    f"TP{planned_tp} requires exactly {planned_tp} node(s)"
+                )
+            body["tensor_parallel_size"] = planned_tp
         available = {n["id"]: n for n in await self.cluster_nodes()}
         missing = [nid for nid in node_ids if nid not in available]
         offline = [nid for nid in node_ids if nid in available and not available[nid].get("online")]
@@ -9543,6 +9551,19 @@ class Manager:
                     ]
                     if local_rank > 0:
                         payload["extra_args"].append("--headless")
+                elif engine == "tensorfold":
+                    # The native CUDA engine places ranks through the
+                    # environment, not CLI flags: TF_GLM_RANK/TF_GLM_WORLD
+                    # place this rank and NCCL_COMM_ID names the group's
+                    # coordinator address and NCCL bootstrap port. Rank 0
+                    # serves HTTP on the port its node agent allocates;
+                    # follower ranks bind nothing.
+                    payload["environment"] = {
+                        **(payload.get("environment") or {}),
+                        "TF_GLM_RANK": str(local_rank),
+                        "TF_GLM_WORLD": str(tensor_parallel_size),
+                        "NCCL_COMM_ID": f"{group_master_ip}:{group_master_port}",
+                    }
                 else:
                     payload["extra_args"] = self._without_cli_options(
                         payload["extra_args"],
@@ -9726,6 +9747,20 @@ class Manager:
                     ]
                     if rank > 0:
                         payload["extra_args"].append("--headless")
+                elif engine == "tensorfold":
+                    # The native CUDA engine places ranks through the
+                    # environment, not CLI flags: TF_GLM_RANK/TF_GLM_WORLD
+                    # place this rank and NCCL_COMM_ID names rank 0's fabric
+                    # address and NCCL bootstrap port. Every rank also keeps
+                    # a TCP line to rank 0 on the port after NCCL_COMM_ID's.
+                    # Rank 0 serves HTTP on the port its node agent allocates;
+                    # follower ranks bind nothing.
+                    payload["environment"] = {
+                        **(payload.get("environment") or {}),
+                        "TF_GLM_RANK": str(rank),
+                        "TF_GLM_WORLD": str(len(node_ids)),
+                        "NCCL_COMM_ID": f"{master_ip}:29501",
+                    }
                 else:
                     payload["extra_args"] = self._without_cli_options(
                         payload["extra_args"],
@@ -14074,29 +14109,51 @@ class Manager:
                     parts.append(cmd[i + 1])
         return "+".join(parts)
 
-    @staticmethod
-    def _served_models_from_cmd(cmd: list, fallback: str = "") -> list[str]:
+    # The flag that names a server's public model id, per engine. vLLM's
+    # ``--served-model-name`` and TensorFold's ``--name`` (the upstream
+    # recipe's SERVED_NAME variable maps onto it) mean the same thing; the
+    # other engines have no such flag, so discovery falls back to the loaded
+    # model path.
+    _SERVED_MODEL_FLAGS: dict[str, tuple[str, ...]] = {
+        "tensorfold": ("--served-model-name", "--name"),
+    }
+    _DEFAULT_SERVED_MODEL_FLAGS = ("--served-model-name",)
+
+    @classmethod
+    def _served_model_flags(cls, engine: Any) -> tuple[str, ...]:
+        return cls._SERVED_MODEL_FLAGS.get(
+            str(engine or ""), cls._DEFAULT_SERVED_MODEL_FLAGS,
+        )
+
+    @classmethod
+    def _served_models_from_cmd(
+        cls, cmd: list, fallback: str = "",
+        flags: tuple[str, ...] = ("--served-model-name",),
+    ) -> list[str]:
         """Return the public model ids configured on an inference server.
 
-        vLLM accepts one or more values after ``--served-model-name``.  The
-        model path/repository used to load weights is not a valid request id
-        when that flag is present, so container discovery must keep the two
+        vLLM accepts one or more values after ``--served-model-name``;
+        TensorFold's serve CLI calls the same concept ``--name``. The model
+        path/repository used to load weights is not a valid request id when
+        a public id is present, so container discovery must keep the two
         concepts separate.
         """
         served: list[str] = []
         for i, token in enumerate(cmd):
             token = str(token)
-            if token.startswith("--served-model-name="):
-                value = token.split("=", 1)[1]
-                if value:
-                    served.append(value)
-                continue
-            if token != "--served-model-name":
-                continue
-            j = i + 1
-            while j < len(cmd) and not str(cmd[j]).startswith("-"):
-                served.append(str(cmd[j]))
-                j += 1
+            for flag in flags:
+                if token.startswith(f"{flag}="):
+                    value = token.split("=", 1)[1]
+                    if value:
+                        served.append(value)
+                    break
+                if token != flag:
+                    continue
+                j = i + 1
+                while j < len(cmd) and not str(cmd[j]).startswith("-"):
+                    served.append(str(cmd[j]))
+                    j += 1
+                break
         # Preserve command-line order while dropping accidental duplicates.
         served = list(dict.fromkeys(served))
         return served or ([fallback] if fallback else [])
@@ -14189,6 +14246,7 @@ class Manager:
         return cls._served_models_from_cmd(
             list(settings.get("extra_args") or []),
             str(deployment.get("model") or ""),
+            cls._served_model_flags(engine),
         )
 
     @staticmethod
@@ -16133,10 +16191,17 @@ class Manager:
                 tensor_parallel = self._cli_option(args, {"--tp-size"}, int)
             pipeline_parallel = 1
         elif engine == "tensorfold":
-            # TensorFold's CLI has no tensor/pipeline-parallel flags and its
-            # launcher rejects sharded members, so a recipe always describes
-            # one single-GPU server per selected node.
-            tensor_parallel = 1
+            # TensorFold places ranks with --tp/--rank: a recipe persists the
+            # world size as the typed tensor_parallel_size field or as a --tp
+            # argv flag, one rank per selected host.
+            tensor_parallel = recipe.get("tensor_parallel_size")
+            if tensor_parallel is not None:
+                try:
+                    tensor_parallel = int(tensor_parallel)
+                except (TypeError, ValueError):
+                    tensor_parallel = None
+            if tensor_parallel is None:
+                tensor_parallel = self._cli_option(args, {"--tp"}, int)
             pipeline_parallel = 1
         else:
             tensor_parallel = self._cli_option(
@@ -16220,12 +16285,14 @@ class Manager:
             required_nodes = 1
             invalid_mode = f"unsupported persisted deployment mode: {mode}"
             mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
-        if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
-            # Launch preflight rejects sharded TensorFold members; surface the
-            # same constraint at the recipe contract so the UI and the MCP
-            # flow refuse to save an unlaunchable layout.
+        if (
+            engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}
+            and tensor_parallel < 2
+        ):
+            # TensorFold sharded layouts place one rank per host, so the
+            # recipe contract refuses a sharded mode without a world size.
             invalid_mode = (
-                "tensorfold recipes support single or replicated deployment modes"
+                "tensorfold sharded recipes require tensor_parallel_size >= 2"
             )
             mode_error = f"{mode_error}; {invalid_mode}" if mode_error else invalid_mode
         model_revision = self._cli_option(args, {"--revision"})
@@ -16384,12 +16451,19 @@ class Manager:
                 "deployment_mode must be single, sharded, replicated, "
                 "or grouped_sharded"
             )
-        if engine == "tensorfold" and deployment_mode in {
-            "sharded", "grouped_sharded",
-        }:
-            raise ValueError(
-                "tensorfold recipes support single or replicated deployment modes"
+        if engine == "tensorfold" and deployment_mode == "sharded":
+            # One rank per selected host: the world size comes from the typed
+            # field or a --tp argv flag (the contract reads both).
+            typed_tp = (
+                isinstance(tensor_parallel_size, int)
+                and not isinstance(tensor_parallel_size, bool)
+                and tensor_parallel_size > 1
             )
+            arg_tp = self._cli_option(list(extra_args or []), {"--tp"}, int)
+            if not typed_tp and not (isinstance(arg_tp, int) and arg_tp > 1):
+                raise ValueError(
+                    "tensorfold sharded recipes require tensor_parallel_size >= 2"
+                )
         node_ids = self._normalize_recipe_node_ids(node_ids)
         if deployment_mode == "single":
             node_ids = node_ids[:1]
@@ -16582,9 +16656,21 @@ class Manager:
                     "deployment_mode must be single, sharded, replicated, "
                     "or grouped_sharded"
                 )
-            if engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}:
+            merged_tp = merged.get("tensor_parallel_size")
+            if merged_tp is None:
+                merged_tp = self._cli_option(
+                    list(merged.get("extra_args") or []), {"--tp"}, int,
+                )
+            try:
+                merged_tp = int(merged_tp or 0)
+            except (TypeError, ValueError):
+                merged_tp = 0
+            if (
+                engine == "tensorfold" and mode in {"sharded", "grouped_sharded"}
+                and merged_tp < 2
+            ):
                 raise ValueError(
-                    "tensorfold recipes support single or replicated deployment modes"
+                    "tensorfold sharded recipes require tensor_parallel_size >= 2"
                 )
             nodes = self._normalize_recipe_node_ids(merged.get("node_ids"))
             if mode == "single":
@@ -17797,7 +17883,9 @@ class Manager:
         # Quant/dtype tag so token stats can tell apart the same model
         # served at different precisions (e.g. Q4 vs bf16).
         variant = self._variant_from_cmd(cmd)
-        served_models = self._served_models_from_cmd(cmd, model)
+        served_models = self._served_models_from_cmd(
+            cmd, model, self._served_model_flags(engine_label),
+        )
         # A Strata launch has no argv to scan, so its public id is stamped on
         # this label by the launcher; a saved name overrides the model-id
         # fallback. (Plain get: the label is new, so it has no legacy alias.)
@@ -18849,11 +18937,16 @@ class Manager:
         """Launch one TensorFold server, mirroring the llama.cpp shape.
 
         TensorFold resolves the checkpoint itself from the Hugging Face cache
-        (or downloads it), and one server holds the whole model, so sharded
-        layouts are rejected rather than silently degraded.
+        (or downloads it). A single server holds the whole model on one node;
+        a sharded deployment instead places one rank per selected host — the
+        controller places each rank through ``TF_GLM_RANK``/``TF_GLM_WORLD``
+        and ``NCCL_COMM_ID`` environment variables, rank 0 serving HTTP while
+        the other ranks follow its steps.
         """
-        if cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES:
-            raise ValueError("TensorFold deployments cannot run sharded")
+        distributed_member = bool(
+            cluster_member and cluster_member.get("mode") in _SHARDED_MEMBER_MODES
+        )
+        member_rank = int(cluster_member.get("rank") or 0) if cluster_member else 0
         # TensorFold's CUDA backend cannot start without an NVIDIA driver, and
         # its MLX backend needs Apple Silicon, which a Linux container never
         # has. Reject here — before evicting healthy backends — rather than
@@ -18867,7 +18960,10 @@ class Manager:
         # TensorFold takes the node's GPUs for its CUDA backend, so other
         # chat engines must be evicted before the CUDA context is created.
         await self.evict_other_backends(protect="tensorfold")
-        if port is None:
+        if distributed_member and member_rank > 0:
+            # Follower ranks serve no HTTP, so they claim no API port.
+            port = None
+        elif port is None:
             port = await self._allocate_port()
         if name is None:
             safe = model.replace("/", "-").replace("_", "-").lower()
@@ -18881,11 +18977,19 @@ class Manager:
             # The image is guaranteed present by the capped
             # _ensure_runtime_image step below.
             self.client.images.get(image)
-            command = [
-                "serve", model,
-                "--host", "0.0.0.0",
-                "--port", str(_TENSORFOLD_SERVE_PORT),
-            ]
+            command = ["serve", model]
+            if distributed_member:
+                # The controller places each rank through TF_GLM_RANK,
+                # TF_GLM_WORLD and NCCL_COMM_ID environment variables. Rank 0
+                # serves HTTP on the port this node allocated; follower ranks
+                # bind nothing and follow rank 0's steps.
+                if member_rank == 0:
+                    command += ["--host", "0.0.0.0", "--port", str(port)]
+            else:
+                command += [
+                    "--host", "0.0.0.0",
+                    "--port", str(_TENSORFOLD_SERVE_PORT),
+                ]
             command.extend(str(item) for item in extra_args or [])
             self._cluster_launch_update(
                 name, "creating_container", "Creating Docker container",
@@ -18905,6 +19009,10 @@ class Manager:
                     MODE_LABEL: cluster_member.get("mode", "single"),
                     NNODES_LABEL: str(cluster_member.get("nnodes", 1)),
                 })
+                if distributed_member and member_rank == 0 and port:
+                    # Host-networked ranks bind no Docker port mapping, so
+                    # the summary recovers the served port from this label.
+                    labels[SERVICE_PORT_LABEL] = str(port)
             run_options = {
                 "image": image,
                 # The image's entrypoint must be the ``tensorfold`` CLI, so the
@@ -18919,9 +19027,26 @@ class Manager:
                 "shm_size": shm_size or self.settings["shm_size"],
                 "labels": labels,
                 "restart_policy": {"Name": "unless-stopped"},
-                "ports": {f"{_TENSORFOLD_SERVE_PORT}/tcp": port},
             }
             container_environment = dict(environment or {})
+            if distributed_member:
+                # Cross-host ranks exchange collectives over the fabric, so
+                # they share the vLLM/SGLang sharded shape: host networking,
+                # pinned memory, the node's RoCE devices, and one consistent
+                # NCCL transport configuration.
+                run_options["network_mode"] = "host"
+                run_options["ulimits"] = [
+                    docker.types.Ulimit(name="memlock", soft=-1, hard=-1)
+                ]
+                iface = cluster_member.get("fabric_interface")
+                if iface:
+                    container_environment.update(
+                        self._distributed_network_environment(iface)
+                    )
+                if Path("/dev/infiniband").exists():
+                    run_options["devices"] = ["/dev/infiniband:/dev/infiniband"]
+            else:
+                run_options["ports"] = {f"{_TENSORFOLD_SERVE_PORT}/tcp": port}
             # A gated or private checkpoint must authenticate when the server
             # resolves or downloads it, exactly as the vLLM and SGLang paths do.
             container_environment.update(self._container_hf_environment(hf_token))

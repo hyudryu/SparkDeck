@@ -69,9 +69,13 @@ function deploymentDefaults(settings?: AppSettings, localNodeId = 'local'): Crea
     runtime,
     settings: runtime === 'llama.cpp'
       ? { context_length: contextLength, parallel_slots: 1, gpu_layers: 99 }
-      : runtime === 'tensorfold' || runtime === 'ninfer' || runtime === 'strata'
+      : runtime === 'ninfer' || runtime === 'strata'
         ? { context_length: contextLength }
-        : {
+        : runtime === 'tensorfold'
+          ? // TensorFold places one rank per selected host over the fabric,
+            // so the sharded layout picker applies to it too.
+            { context_length: contextLength, tensor_parallel_size: 1 }
+          : {
           context_length: contextLength,
           tensor_parallel_size: 1,
           image: runtime === 'vllm' ? vllmImage : undefined,
@@ -749,7 +753,7 @@ export function ModelsPage() {
         // arguments.
         deployment_mode: ggufArtifact
           ? 'single'
-          : sharded && linkedRuntime !== 'laya' && linkedRuntime !== 'tensorfold' && linkedRuntime !== 'ninfer' && linkedRuntime !== 'strata' ? 'sharded' : current.deployment_mode,
+          : sharded && linkedRuntime !== 'laya' && linkedRuntime !== 'ninfer' && linkedRuntime !== 'strata' ? 'sharded' : current.deployment_mode,
         settings: ggufArtifact
           ? {
             context_length: current.settings.context_length,
@@ -771,6 +775,10 @@ export function ModelsPage() {
                 // vLLM image out of the launch; Manager applies the runtime's
                 // own default image unless the operator set one deliberately.
                 context_length: current.settings.context_length,
+                // TensorFold carries the sharded world size like vLLM does.
+                tensor_parallel_size: linkedRuntime === 'tensorfold'
+                  ? current.settings.tensor_parallel_size
+                  : undefined,
                 artifact: linkedRuntime === 'ninfer'
                   ? (current.runtime === 'ninfer' ? current.settings.artifact : undefined)
                   : undefined,
@@ -862,8 +870,13 @@ export function ModelsPage() {
             quantization: current.settings.quantization,
             artifact: current.settings.artifact,
           }
-          : runtime === 'tensorfold' || runtime === 'ninfer'
+          : runtime === 'ninfer'
             ? { context_length: contextLength }
+            : runtime === 'tensorfold'
+              ? {
+                context_length: contextLength,
+                tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
+              }
             : {
               context_length: contextLength,
               tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : current.settings.tensor_parallel_size ?? 1,
@@ -2218,13 +2231,13 @@ export function ModelsPage() {
     setForm((current) => {
       const contextLength = current.settings.context_length ?? 8192
       const nodeIds = current.node_ids?.length ? current.node_ids : (localNodeId ? [localNodeId] : [])
-      // Sharded layouts need tensor parallelism, which only vLLM and SGLang
-      // provide. Llama server, Laya, and NInfer always run complete replicas;
-      // Manager rejects a sharded single-engine deployment outright, so
-      // offering one here would save a form that cannot launch.
+      // Sharded layouts need tensor parallelism, which vLLM, SGLang, and
+      // TensorFold provide. Llama server, Laya, and NInfer always run
+      // complete replicas; Manager rejects a sharded single-engine
+      // deployment outright, so offering one here would save a form that
+      // cannot launch.
       const sharded = runtime !== 'llama.cpp'
         && runtime !== 'laya'
-        && runtime !== 'tensorfold'
         && runtime !== 'ninfer'
         && runtime !== 'strata'
         && current.deployment_mode === 'sharded'
@@ -2256,7 +2269,17 @@ export function ModelsPage() {
               // applies unless the operator set one for Laya deliberately.
               image: current.runtime === 'laya' ? current.settings.image : undefined,
             }
-            : runtime === 'tensorfold' || runtime === 'ninfer' || runtime === 'strata'
+            : runtime === 'tensorfold'
+              ? {
+                // TensorFold places one rank per selected host over the
+                // fabric, so the sharded world size carries like vLLM's. The
+                // runtime's own default image applies unless the operator
+                // set one deliberately.
+                context_length: current.settings.context_length,
+                tensor_parallel_size: deploymentMode === 'sharded' ? nodeIds?.length ?? 1 : 1,
+                image: current.runtime === runtime ? current.settings.image : undefined,
+              }
+              : runtime === 'ninfer' || runtime === 'strata'
               ? {
                 // Single-engine runtimes: no tensor parallelism. NInfer's
                 // context cap maps to its --max-context flag at launch, and
@@ -3020,7 +3043,7 @@ export function ModelsPage() {
                 help={`${layoutHelp(form.deployment_mode)} Saved with the deployment and preselected at launch; you can change the selection every time you launch.`}
               />}
               {form.managed && form.runtime === 'llama.cpp' && <p className="field-note">{isLocalArtifact(form.settings.artifact) ? 'Llama server runs on the local node for local GGUF artifacts.' : 'Llama server replicas run on each selected node; missing GGUF weights are fetched via Virtual NAS at launch.'}</p>}
-              {form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'tensorfold' && form.runtime !== 'ninfer' && form.runtime !== 'strata' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.' : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
+              {form.managed && form.runtime !== 'llama.cpp' && form.runtime !== 'ninfer' && form.runtime !== 'strata' && (form.node_ids?.length ?? 0) > 1 && <label className="field"><span>Deployment layout</span><select value={form.deployment_mode === 'sharded' ? 'sharded' : form.deployment_mode === 'grouped_sharded' ? 'grouped_sharded' : 'replicated'} onChange={(event) => updateDeploymentMode(event.target.value as 'replicated' | 'sharded' | 'grouped_sharded')}><option value="replicated">Parallel instances (replicated — a full model copy per node)</option><option value="sharded" disabled={!shardedAvailable}>Tensor parallelism (sharded — split one model across the nodes)</option><option value="grouped_sharded" disabled={!shardedAvailable}>Grouped sharded (independent TP groups behind one served name)</option></select><small>{form.deployment_mode === 'sharded' ? (form.runtime === 'tensorfold' ? 'The first selected node is the coordinator; TensorFold places one rank per node over the fabric.' : 'The first selected node is the coordinator, and tensor parallel size follows the selected node count.') : form.deployment_mode === 'grouped_sharded' ? `The nodes split into ${form.settings.instances ?? 1} independent TP${form.settings.tensor_parallel_size ?? 2} engine group(s) that share the served name and load-balance.` : 'Each selected node runs a complete model replica.'}</small></label>}
               {form.managed && form.deployment_mode === 'grouped_sharded' && <label className="field"><span>Instances (independent engine groups)</span><input type="number" min="1" value={form.settings.instances ?? 1} onChange={(event) => setForm({ ...form, settings: { ...form.settings, instances: Math.max(1, Number(event.target.value) || 1) } })} />{(form.settings.tensor_parallel_size ?? 1) * (form.settings.instances ?? 1) !== (form.node_ids?.length ?? 0) && <small className="form-error" role="status">{form.node_ids?.length ?? 0} selected nodes cannot split into {form.settings.instances ?? 1} TP{form.settings.tensor_parallel_size ?? 1} group(s); pick {form.settings.instances ?? 1} × {form.settings.tensor_parallel_size ?? 1} nodes or adjust the counts.</small>}<small>Each instance runs on {form.settings.tensor_parallel_size ?? 2} of the selected nodes; the selection must equal instances × tensor parallel size.</small></label>}
               <div className="field-grid">
                 <label className="field"><span>Context length</span><input type="number" min="256" value={form.settings.context_length} onChange={(event) => {

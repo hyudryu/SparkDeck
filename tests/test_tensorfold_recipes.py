@@ -76,20 +76,31 @@ class TensorfoldRecipeTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await instance.add_recipe("model/a", engine="laya", force_new=True)
 
-    async def test_add_tensorfold_recipe_rejects_sharded_layouts(self) -> None:
+    async def test_add_tensorfold_recipe_sharded_layouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             instance = self._manager(directory)
 
+            # A sharded layout without a world size stays unlaunchable.
             for mode in ("sharded", "grouped_sharded"):
                 with self.subTest(mode=mode):
                     with self.assertRaisesRegex(
-                        ValueError, "single or replicated deployment modes",
+                        ValueError, "tensor_parallel_size >= 2",
                     ):
                         await instance.add_recipe(
                             "model/a", engine="tensorfold", force_new=True,
                             deployment_mode=mode,
                             node_ids=["node-a", "node-b"],
                         )
+
+            # TP2 over two hosts is the supported sharded layout: one rank
+            # per selected node, the world size carried by --tp.
+            recipe = await instance.add_recipe(
+                "model/a", engine="tensorfold", force_new=True,
+                deployment_mode="sharded",
+                node_ids=["node-a", "node-b"],
+                extra_args=["--tp", "2"],
+            )
+            self.assertEqual(recipe["deployment_mode"], "sharded")
 
     async def test_update_tensorfold_recipe_rejects_unsupported_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -103,7 +114,7 @@ class TensorfoldRecipeTests(unittest.IsolatedAsyncioTestCase):
                 await instance.update_recipe(
                     "tf-1", {"gpu_memory_utilization": 0.9},
                 )
-            with self.assertRaisesRegex(ValueError, "single or replicated"):
+            with self.assertRaisesRegex(ValueError, "tensor_parallel_size >= 2"):
                 await instance.update_recipe(
                     "tf-1", {"deployment_mode": "sharded"},
                 )
@@ -112,6 +123,15 @@ class TensorfoldRecipeTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(updated["extra_args"], ["--top-k", "20"])
             self.assertEqual(updated["engine"], "tensorfold")
+            sharded = await instance.update_recipe(
+                "tf-1",
+                {
+                    "deployment_mode": "sharded",
+                    "extra_args": ["--tp", "2"],
+                    "node_ids": ["node-a", "node-b"],
+                },
+            )
+            self.assertEqual(sharded["deployment_mode"], "sharded")
 
     def test_tensorfold_contract_ignores_parallel_flags(self) -> None:
         instance = Manager.__new__(Manager)
@@ -123,7 +143,7 @@ class TensorfoldRecipeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contract["pipeline_parallel_size"], 1)
         self.assertEqual(contract["required_node_count"], 1)
 
-    def test_tensorfold_contract_flags_sharded_layouts_unsupported(self) -> None:
+    def test_tensorfold_contract_flags_tp1_sharded_layouts_unsupported(self) -> None:
         instance = Manager.__new__(Manager)
         for mode in ("sharded", "grouped_sharded"):
             with self.subTest(mode=mode):
@@ -133,8 +153,27 @@ class TensorfoldRecipeTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertFalse(contract["supported"])
                 self.assertIn(
-                    "single or replicated deployment modes", str(contract["error"]),
+                    "tensor_parallel_size >= 2", str(contract["error"]),
                 )
+
+    def test_tensorfold_contract_accepts_tp2_sharded_layout(self) -> None:
+        instance = Manager.__new__(Manager)
+        contract = instance.recipe_deployment_contract({
+            "engine": "tensorfold", "deployment_mode": "sharded",
+            "tensor_parallel_size": 2,
+            "node_ids": ["node-a", "node-b"], "extra_args": [],
+        })
+        self.assertTrue(contract["supported"])
+        self.assertEqual(contract["required_node_count"], 2)
+        self.assertEqual(contract["tensor_parallel_size"], 2)
+        # A --tp argv flag is an equally valid world-size source.
+        from_args = instance.recipe_deployment_contract({
+            "engine": "tensorfold", "deployment_mode": "sharded",
+            "node_ids": ["node-a", "node-b"],
+            "extra_args": ["--tp", "2"],
+        })
+        self.assertTrue(from_args["supported"])
+        self.assertEqual(from_args["required_node_count"], 2)
 
     def test_load_recipes_keeps_tensorfold_supported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

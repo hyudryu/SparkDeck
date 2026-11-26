@@ -520,6 +520,31 @@ class BuildBundleTests(unittest.TestCase):
         self.assertEqual(bundle["transfer_state"]["phase"], "promoted")
         self.assertEqual(bundle["new_controller_node_id"], "target-id")
 
+    def test_bundle_moves_recorded_usage_pricing(self):
+        service, _manager = self._service()
+        (self.root / "usage_pricing.json").write_text(json.dumps({
+            "legacy/source": {
+                "input_cost_per_1m": 1.0,
+                "cache_cost_per_1m": None,
+                "output_cost_per_1m": 2.0,
+            },
+        }), encoding="utf-8")
+        bundle = service._build_bundle({
+            "id": "job-1",
+            "target_node_id": "target-id",
+            "target_name": "Target",
+            "target_url": "http://127.0.0.1:7000",
+            "warnings": [],
+            "started_at": time.time(),
+        })
+
+        self.assertEqual(
+            bundle["json_files"]["usage_pricing.json"]["legacy/source"][
+                "output_cost_per_1m"
+            ],
+            2.0,
+        )
+
     def test_status_redacts_the_private_forward_token(self):
         service, _manager = self._service()
         service._write({

@@ -2337,6 +2337,42 @@ class DistributedLaunchTests(unittest.IsolatedAsyncioTestCase):
                 }},
             )
 
+    def test_routed_destination_without_counters_can_record_usage_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = Manager.__new__(Manager)
+            instance.usage_pricing_path = Path(directory) / "usage_pricing.json"
+            instance.usage_pricing = {}
+            instance.token_stats = {
+                "legacy/source": {
+                    "input": 0, "cached": 0, "output": 1_000_000,
+                },
+            }
+            instance.usage_aliases = {}
+            instance.usage_merge_groups = {}
+            instance.usage_routing_rules = {
+                "legacy/source": "org/destination",
+            }
+            instance.speed_samples = {}
+            instance.unsloth_settings = {}
+            instance.deployments = []
+
+            row = instance.usage_rows()[0]
+            owner = row["members"][0]
+
+            # The destination exists only as a routing target, yet the row is
+            # billed as it, so its editor must be saveable.
+            self.assertEqual(row["route_target"], "org/destination")
+            self.assertEqual(owner["pricing_model"], "org/destination")
+            instance.update_usage_pricing(
+                "org/destination", {"output_cost_per_1m": 2.0},
+            )
+
+            row = instance.usage_rows()[0]
+            self.assertEqual(
+                row["members"][0]["pricing"]["output_cost_per_1m"], 2.0,
+            )
+            self.assertEqual(row["total_cost"], 2.0)
+
     def test_deployment_pricing_wins_over_stored_usage_rates(self) -> None:
         instance = Manager.__new__(Manager)
         instance.token_stats = {

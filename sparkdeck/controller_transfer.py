@@ -69,6 +69,7 @@ TRANSFERRED_JSON_FILENAMES = (
     "usage_merge_groups.json",
     "usage_routing_rules.json",
     "usage_cache_estimates.json",
+    "usage_pricing.json",
     "source_ip_routing_rules.json",
     "speed_samples.json",
     "token_stats.json",

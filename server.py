@@ -2299,6 +2299,8 @@ async def update_usage_pricing(req: Request):
     """Record rates for a usage identity that no deployment owns."""
     try:
         body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
         return manager.update_usage_pricing(body.get("model"), body)
     except ValueError as exc:
         status = 404 if str(exc) == "usage model not found" else 400

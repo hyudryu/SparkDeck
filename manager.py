@@ -5342,7 +5342,18 @@ class Manager:
     def update_usage_pricing(self, model: Any, body: dict) -> dict:
         """Record rates for a usage identity that no deployment owns."""
         model_key = str(model or "").strip()
-        if not model_key or model_key not in self.token_stats:
+        # Routed usage is billed and displayed under the destination, which
+        # may exist only as a routing target and never record counters itself.
+        routed_destinations = {
+            str(destination).strip()
+            for destination in (
+                getattr(self, "usage_routing_rules", None) or {}
+            ).values()
+        }
+        if not model_key or (
+            model_key not in self.token_stats
+            and model_key not in routed_destinations
+        ):
             raise ValueError("usage model not found")
         if not isinstance(body, dict):
             raise ValueError("request body must be a JSON object")

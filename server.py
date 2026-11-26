@@ -512,12 +512,20 @@ class _SecurityHeadersMiddleware:
         # the bundle snapshot onward: acknowledged writes would live only on
         # the outgoing machine and silently vanish when it archives its
         # store. Inference (/v1), agent traffic, and the transfer's own
-        # endpoints keep working.
+        # endpoints keep working. Onboarding stays open only on the incoming
+        # (promoted) controller, which adopts a lost node through the
+        # standard join flow (/api/v1/onboarding/register); on the outgoing
+        # controller a join would be acknowledged after the snapshot and
+        # silently lost when its registry is archived.
         if (
             request.method in {"POST", "PUT", "PATCH", "DELETE"}
             and path.startswith("/api/")
             and not path.startswith("/api/agent/")
             and not path.startswith("/api/v1/controller-transfer")
+            and not (
+                path.startswith("/api/v1/onboarding/")
+                and controller_transfer.onboarding_writes_open()
+            )
             and controller_transfer.blocks_management_writes()
         ):
             return JSONResponse(

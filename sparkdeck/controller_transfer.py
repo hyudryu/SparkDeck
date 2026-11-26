@@ -1112,6 +1112,21 @@ class TransferService:
             "bundling", "staging", "promoting", "rebinding", "demoting",
         }
 
+    def onboarding_writes_open(self) -> bool:
+        """Whether onboarding joins may write while a transfer is running.
+
+        Only the incoming (promoted) controller needs onboarding during a
+        transfer: it adopts workers that lost their assignment through the
+        standard join flow. On the outgoing controller a join would be
+        acknowledged into the registry after the bundle snapshot was taken
+        and then silently lost when that registry is archived at demote, so
+        it stays frozen there.
+        """
+        state = self._read()
+        if not state.get("active"):
+            return True
+        return bool(state.get("incoming"))
+
     # ---------- target-side (agent) surface ----------
 
     def agent_preflight(self) -> dict:
